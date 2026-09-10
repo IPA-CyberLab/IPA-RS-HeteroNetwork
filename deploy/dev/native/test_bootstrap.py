@@ -63,7 +63,7 @@ class BootstrapTests(unittest.TestCase):
             commands = [call.args[0] for call in run.call_args_list]
             self.assertEqual(commands[0][-1], "update")
             self.assertIn("/usr/bin/apt-get", commands[1])
-            self.assertEqual(commands[1][-6:], list(b.PREREQUISITE_PACKAGES))
+            self.assertEqual(commands[1][-len(b.PREREQUISITE_PACKAGES):], list(b.PREREQUISITE_PACKAGES))
             self.assertIn("--no-upgrade", commands[1])
             self.assertEqual(commands[2], ["/usr/bin/wg", "--version"])
             self.assertEqual(before, {p.name: p.read_bytes() for p in bundle.iterdir()})
@@ -334,6 +334,12 @@ class BootstrapTests(unittest.TestCase):
         before = {p["wireguard_public_key"]: ["100", "100"] for p in peers}
         allowed = {p["wireguard_public_key"]: [p["vpn_ip"] + "/32"] for p in peers}
         handshakes = {p["wireguard_public_key"]: [str(int(b.time.time()))] for p in peers}
+        quarantine = b.quarantine_key(local["wireguard_public_key"])
+        before[quarantine] = ["0", "0"]
+        allowed[quarantine] = ["10.251.0.0/24"]
+        handshakes[quarantine] = ["0"]
+        endpoints = {key: ["127.0.0.1:9"] for key in before}
+        keepalive = {key: ["off"] for key in before}
         for route_device in ("dev0", "heteronetwork0"):
             def fake_run(args, timeout=60):
                 if args[0] == "/usr/bin/wg":
@@ -342,9 +348,91 @@ class BootstrapTests(unittest.TestCase):
                     return json.dumps([{"dev": route_device}]).encode()
                 return b""
             with patch.object(b, "health_json", return_value=local), patch.object(b, "run", side_effect=fake_run), \
-                 patch.object(b, "wg_table", side_effect=lambda field: {"transfer": before, "allowed-ips": allowed, "latest-handshakes": handshakes}[field]):
+                 patch.object(b, "wg_table", side_effect=lambda field: {"transfer": before, "allowed-ips": allowed, "latest-handshakes": handshakes,
+                                                                       "endpoints": endpoints, "persistent-keepalive": keepalive}[field]):
                 with self.assertRaises(ValueError):
                     b.vpn_sample(local, peers, "test-token")
+
+    def test_quarantine_observed_states_and_reject_wrong_properties(self):
+        observed = ["pVE9Orzr0Ma9yB093+lhePcGwwvUZBf1Xkps3V6yMf4=",
+                    "bWJ0Ussv3onMq7sWMDYChwfbI9bwCe3TWjxNfUTTkvY=",
+                    "z+Kby2GMvvDfXybYW43bSIsr0O9dpc1qjurxzqFn6U8="]
+        for key in observed:
+            keys = {key, "remote1", "remote2"}
+            tables = {field: {k: value for k in keys} for field, value in (
+                ("allowed-ips", ["10.251.0.0/24"]), ("endpoints", ["127.0.0.1:9"]),
+                ("persistent-keepalive", ["off"]), ("latest-handshakes", ["0"]))}
+            with patch.object(b, "wg_table", side_effect=lambda field: tables[field]):
+                b.check_quarantine(key, keys)
+                for field, bad in (("allowed-ips", ["0.0.0.0/0"]), ("endpoints", ["172.28.240.1:9"]),
+                                   ("persistent-keepalive", ["1"]), ("latest-handshakes", ["123"])):
+                    saved = tables[field][key]
+                    tables[field][key] = bad
+                    with self.assertRaises(ValueError):
+                        b.check_quarantine(key, keys)
+                    tables[field][key] = saved
+                tables["endpoints"]["arbitrary-extra"] = ["127.0.0.1:9"]
+                with self.assertRaises(ValueError):
+                    b.check_quarantine(key, keys)
+
+    def test_quarantine_low_order_and_collision_exhaustion_fail_closed(self):
+        local = self.roster()["nodes"][0]["wireguard_public_key"]
+        for candidate in (bytes(32), base64.b64decode(local)):
+            with patch.object(b.hashlib, "sha256") as sha:
+                sha.return_value.digest.return_value = candidate
+                with self.assertRaises(ValueError):
+                    b.quarantine_key(local)
+                self.assertEqual(sha.call_count, 256)
+
+    def test_quarantine_skips_low_order_and_collision_candidates(self):
+        local = self.roster()["nodes"][0]["wireguard_public_key"]
+        valid = base64.b64decode(self.roster()["nodes"][1]["wireguard_public_key"])
+        with patch.object(b.hashlib, "sha256") as sha:
+            sha.return_value.digest.side_effect = [bytes(32), base64.b64decode(local), valid]
+            self.assertEqual(b.quarantine_key(local), base64.b64encode(valid).decode())
+            self.assertEqual([call.args[0][-1] for call in sha.call_args_list], [0, 1, 2])
+
+    def test_actual_public_roster_quarantine_derivation(self):
+        # Public-only vectors from roster SHA256 92c4aaf6...854e2816.
+        vectors = [
+            ("tMpCOi9GUqVL0ttiDn+qoTahEpzXX88NFVW4i6yy3jw=", "pVE9Orzr0Ma9yB093+lhePcGwwvUZBf1Xkps3V6yMf4="),
+            ("aXcMWiey+13qNMLsh/qZkvJ/gqwyLFk6CrprwkXVN24=", "bWJ0Ussv3onMq7sWMDYChwfbI9bwCe3TWjxNfUTTkvY="),
+            ("dM9/+X+A16gNcnzvOeBWsb8ssLaNGkBndkN3R575WUs=", "z+Kby2GMvvDfXybYW43bSIsr0O9dpc1qjurxzqFn6U8=")]
+        for local, expected in vectors:
+            self.assertEqual(b.quarantine_key(local), expected)
+
+    def test_vpn_sample_accepts_only_derived_quarantine_with_active_remotes(self):
+        local, *peers = self.roster()["nodes"]
+        key = b.quarantine_key(local["wireguard_public_key"])
+        expected = base64.b64encode(b.hashlib.sha256(
+            b"HeteroNetwork bounded overlay quarantine key v1\0"
+            + local["wireguard_public_key"].encode() + bytes([0])).digest()).decode()
+        self.assertEqual(key, expected)
+        remote_keys = {p["wireguard_public_key"] for p in peers}
+        tables = {
+            "allowed-ips": {p["wireguard_public_key"]: [p["vpn_ip"] + "/32"] for p in peers},
+            "endpoints": {k: ["172.28.240.12:51820"] for k in remote_keys},
+            "persistent-keepalive": {k: ["25"] for k in remote_keys},
+            "latest-handshakes": {k: [str(int(b.time.time()))] for k in remote_keys}}
+        for field, value in (("allowed-ips", ["10.251.0.0/24"]), ("endpoints", ["127.0.0.1:9"]),
+                             ("persistent-keepalive", ["off"]), ("latest-handshakes", ["0"])):
+            tables[field][key] = value
+        transfers = [0]
+        def table(field):
+            if field == "transfer":
+                transfers[0] += 1
+                return {**{k: [str(transfers[0] * 100)] * 2 for k in remote_keys}, key: ["0", "0"]}
+            return tables[field]
+        def run(args, timeout=60):
+            if args[0] == "/usr/bin/wg":
+                return local["wireguard_public_key"].encode()
+            return b'[{"dev":"heteronetwork0"}]' if args[0] == "/usr/sbin/ip" else b""
+        with patch.object(b, "health_json", return_value=local), patch.object(b, "run", side_effect=run), \
+                patch.object(b, "wg_table", side_effect=table):
+            b.vpn_sample(local, peers, "test-token")
+            tables["allowed-ips"]["wrong-derived-key"] = tables["allowed-ips"].pop(key)
+            with self.assertRaises(ValueError):
+                b.vpn_sample(local, peers, "test-token")
 
 
 if __name__ == "__main__":

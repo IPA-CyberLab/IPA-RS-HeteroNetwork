@@ -30,7 +30,7 @@ BIN = Path("/opt/heteronetwork/bin")
 JOURNAL = Path("/var/lib/heteronetwork-dev-bootstrap")
 UNITS = Path("/etc/systemd/system")
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
-PREREQUISITE_PACKAGES = ("python3", "iproute2", "iputils-ping", "curl", "systemd", "wireguard-tools")
+PREREQUISITE_PACKAGES = ("python3", "python3-cryptography", "iproute2", "iputils-ping", "curl", "systemd", "wireguard-tools")
 
 
 def require(condition, message):
@@ -232,7 +232,7 @@ def stage(artifact_path, archive_path, inventory_path, output):
             f"Dedicated {guest['name']} only; UUID {guest['product_uuid']}; machine ID {guest['machine_id']}.\n"
             "Transfer this entire directory through the approved provisioning/admin path, then make it root-owned and private.\n"
             "Do not transfer issuer.key or another guest's directory. Do not copy production configuration.\n"
-            "Required guest packages: python3, iproute2, iputils-ping, curl, wireguard-tools, systemd.\n"
+            "Required guest packages: python3, python3-cryptography, iproute2, iputils-ping, curl, wireguard-tools, systemd.\n"
             "Curie must place the payload at /opt/heteronetwork-dev-bootstrap (root:root, directory 0700),\n"
             "Curie's fresh devadmin already has temporary bootstrap NOPASSWD ALL inside this exclusive VM.\n"
             "This tool does not alter cloud-init, sudoers, SSH policy or administrator credentials.\n"
@@ -472,6 +472,42 @@ def wg_table(field):
     return {row[0]: row[1:] for row in rows}
 
 
+def quarantine_key(local_public_key):
+    raw = base64.b64decode(local_public_key, validate=True)
+    require(len(raw) == 32 and base64.b64encode(raw).decode() == local_public_key,
+            "Noncanonical local WireGuard key")
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    except ImportError as error:
+        raise ValueError("VPN verification requires distro python3-cryptography X25519") from error
+    # Match ipars-agent's u8 counter loop and ipars-crypto's fixed X25519 probe.
+    probe = X25519PrivateKey.from_private_bytes(bytes([0x42]) * 32)
+    for counter in range(256):
+        candidate_raw = hashlib.sha256(
+            b"HeteroNetwork bounded overlay quarantine key v1\0"
+            + local_public_key.encode("ascii") + bytes([counter])).digest()
+        candidate = base64.b64encode(candidate_raw).decode()
+        if candidate == local_public_key:
+            continue
+        try:
+            shared = probe.exchange(X25519PublicKey.from_public_bytes(candidate_raw))
+        except ValueError:
+            # OpenSSL rejects null shared secrets rather than returning zero.
+            continue
+        if shared != bytes(32):
+            return candidate
+    raise ValueError("No valid bounded-overlay quarantine candidate")
+
+
+def check_quarantine(key, keys):
+    for field, expected in (("allowed-ips", ["10.251.0.0/24"]),
+                            ("endpoints", ["127.0.0.1:9"]),
+                            ("persistent-keepalive", ["off"]),
+                            ("latest-handshakes", ["0"])):
+        table = wg_table(field)
+        require(set(table) == keys and table[key] == expected, "Unexpected quarantine peer state")
+
+
 def vpn_sample(local, peers, api_token):
     health_json(URL + "/healthz")
     status = health_json("http://127.0.0.1:9780/v1/status", api_token)
@@ -480,9 +516,13 @@ def vpn_sample(local, peers, api_token):
     require(run(["/usr/bin/wg", "show", "heteronetwork0", "public-key"], timeout=5).decode().strip()
             == local["wireguard_public_key"], "Kernel WireGuard identity differs from pinned agent")
     keys = {peer["wireguard_public_key"] for peer in peers}
+    quarantine = quarantine_key(local["wireguard_public_key"])
+    require(len(keys) == 2 and quarantine not in keys, "Invalid remote/quarantine peer identities")
+    all_keys = keys | {quarantine}
+    check_quarantine(quarantine, all_keys)
     before = wg_table("transfer")
     allowed = wg_table("allowed-ips")
-    require(set(before) == keys and set(allowed) == keys, "Unexpected or missing encrypted peer")
+    require(set(before) == all_keys and set(allowed) == all_keys, "Unexpected or missing encrypted peer")
     for peer in peers:
         key, address = peer["wireguard_public_key"], peer["vpn_ip"]
         require(allowed[key] == [address + "/32"], "Unexpected encrypted route scope")
@@ -490,7 +530,8 @@ def vpn_sample(local, peers, api_token):
         require(route and all(entry.get("dev") == "heteronetwork0" for entry in route), "Peer route bypasses VPN")
         run(["/usr/bin/ping", "-n", "-I", "heteronetwork0", "-c", "1", "-W", "2", address], timeout=5)
     after, handshakes = wg_table("transfer"), wg_table("latest-handshakes")
-    require(set(after) == keys and set(handshakes) == keys, "Encrypted peer set changed")
+    require(set(after) == all_keys and set(handshakes) == all_keys, "Encrypted peer set changed")
+    check_quarantine(quarantine, all_keys)
     for key in keys:
         require(len(before[key]) == len(after[key]) == 2 and all(int(a) > int(b) for a, b in zip(after[key], before[key])),
                 "No bidirectional encrypted traffic growth")

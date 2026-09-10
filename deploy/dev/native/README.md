@@ -79,7 +79,8 @@ and no group/other write access. The output directory must not already exist.
 
 Each payload includes `INSTRUCTIONS.txt`. Install guest 1 first, then explicitly
 start it; start guests 2/3 after the CP is healthy. Required guest packages are
-Python 3, iproute2, iputils ping, curl, systemd and WireGuard tools/support.
+Python 3 with cryptography X25519, iproute2, iputils ping, curl, systemd and
+WireGuard tools/support.
 The explicit `prerequisites` command below can install the fixed OS packages;
 `install` and `start` never install packages implicitly.
 
@@ -101,8 +102,8 @@ are accepted, using the fresh image's administrator-controlled distro apt
 configuration. No repository, signing key, sudoers or network configuration is
 added; inherited proxy/apt environment is cleared.
 
-The fixed packages are `python3`, `iproute2`, `iputils-ping`, `curl`, `systemd`
-and `wireguard-tools`. Apt metadata update must succeed; installation uses
+The fixed packages are `python3`, `python3-cryptography`, `iproute2`,
+`iputils-ping`, `curl`, `systemd` and `wireguard-tools`. Apt metadata update must succeed; installation uses
 `--no-install-recommends --no-upgrade`, with bounded lock/network/process waits.
 There is no arbitrary package, URL or command parameter. Apt dependencies and
 normal package maintainer scripts still run as root. Existing installed target
@@ -207,11 +208,35 @@ sudo /usr/bin/python3 /opt/heteronetwork-dev-bootstrap/bootstrap-dev-guest.py ve
 ```
 
 This gate takes 13 samples over at least 60 seconds: CP and authenticated agent
-health, pinned local identity, exactly the two expected WireGuard peers, routes
+health, pinned local identity, exactly the two expected remote WireGuard peers
+plus the local bounded-overlay quarantine peer, routes
 through `heteronetwork0`, interface-bound pings, recent handshakes, and increasing
 encrypted RX/TX counters for both peers. It reads no WireGuard private keys.
 A failed recheck invalidates previous local evidence. Repeating `start` also
 requires fresh verification.
+
+The quarantine peer is not ignored: derive its key from the agent's exact
+`HeteroNetwork bounded overlay quarantine key v1\0` domain, local canonical
+base64 public-key ASCII and one counter byte, trying 0 through 255 in order.
+It skips a candidate equal to the local key or rejected as low-order, matching
+the agent's complete bounded loop, and fails closed on exhaustion.
+Candidate validation uses `cryptography` X25519 with the same fixed `[0x42; 32]`
+private probe as `ipars-crypto` and rejects a null shared secret. Guest-local
+`python3-cryptography` with X25519 support is required for this verification;
+the verification command never installs it implicitly. It is included in the
+explicit fresh-guest prerequisite package list. The three already-installed
+dev guests have confirmed this dependency; do not rerun fresh-only prerequisites
+on them.
+
+Before and after peer pings, the derived quarantine must have exactly endpoint
+`127.0.0.1:9`, allowed IP `10.251.0.0/24`, keepalive `off` and handshake `0`.
+Every inspected table must contain precisely the two roster remotes and this
+one derived key. Arbitrary extra peers are rejected, even with identical
+loopback settings. Remote `/32` scopes, interface-bound routes, fresh handshakes
+and bidirectional counter growth remain mandatory in all 13 samples. Nothing
+disables or reconfigures quarantine. Public-key derivation vectors for all three
+guests match the observed quarantine keys and the independently SHA-verified
+public roster. Fixture checks do not replace sustained live verification.
 
 The deployment owner must collect passing reports from **all three** guests with
 the same cluster and roster digest, checked within the preceding five minutes,
