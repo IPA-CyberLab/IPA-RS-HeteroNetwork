@@ -37,6 +37,36 @@ not why synchronization failed. Neither a missing route nor version
 incompatibility has been established. No production
 changes or new remote checks accompanied this doc update.
 
+## Subsequent Cluster Verification: 2026-09-10
+
+After the preparation checkpoint above, the deployment owner reported successful
+init/join of all three Kubernetes `v1.36.4` control-plane nodes using helper
+`04ea6c54bd295e963197a223056665378bcecffa02977b1f89ad117b75e739cf`, delivered
+separately at `/opt/heteronetwork-dev-kubeadm-2d6e6d1f/kubeadm-ha-node.sh`.
+Join secrets remained root-only; no production issuer or credentials were reused.
+The `04ea` helper did not fail init: its later Flannel client dry-run produced
+six JSON documents rather than a List, so transformation stopped **before apply**.
+
+Commit `bc407d33`, helper SHA-256
+`2dddc699eeb2b728b8b9c0b56358d354b27fc4b1e8821bb32f63151dc67b57ea`,
+was then delivered to **DEV1 only** at
+`/opt/heteronetwork-dev-kubeadm-bc407d33/kubeadm-ha-node.sh`. It accepts the
+document stream as well as a List. Retrying Flannel installation succeeded,
+followed by finalization with three CoreDNS replicas; no reset or preparation
+rerun was involved.
+
+Actual `verify-cluster` exited 0, reporting three control-plane nodes and all
+three Ready. Full-MTU underlay checks, cross-node Pod traffic, per-node DNS and
+Service VIP checks passed; runtime Flannel MTU was 1230. This evidence is reported
+by the deployment owner, not a new remote check performed for this doc update.
+
+No fault/failover test was performed. All three guests reside on one physical
+host, so this does not establish physical-host resilience. The native
+HeteroNetwork CP remains single-instance SQLite on DEV1, separate from the
+three-node Kubernetes control plane. Sudo production enforcement and cloud
+services are not activated. The earlier preparation and VPN checkpoints remain
+historical records, not claims about the current phase or perpetual health.
+
 ## Exact Dependencies
 
 Standard `prepare` needs these checkout-relative files:

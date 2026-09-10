@@ -22,11 +22,26 @@ Recovered journals all report `phase: vpn-verified-local` for cluster
 | hetero-dev-3 | 1789074706 | 21:11:46 | 13 | 61.637 s |
 
 This is historical native/VPN evidence, not a current health guarantee. All
-reports retain `kubernetes_ready: false`; no Kubernetes readiness, HeteroNetwork
-CP HA or sudo activation is established. The initial CP remains single-instance
+reports retain `kubernetes_ready: false`; those VPN reports alone establish no
+Kubernetes readiness, HeteroNetwork CP HA or sudo activation. The initial CP remains single-instance
 SQLite. Re-run the required fresh health gates before later deployment phases.
 This documentation update used the owner's reported evidence, not new remote
 inspection or execution.
+
+### Subsequent Kubernetes Evidence: 2026-09-10
+
+The deployment owner subsequently reported successful Kubernetes `v1.36.4`
+init/join on all three guests, Flannel installation and CoreDNS finalization to
+three replicas. `verify-cluster` exited 0: three control-plane nodes, all three
+Ready, full-MTU underlay checks, cross-node Pod traffic, per-node DNS and
+Service VIP checks passed; runtime Flannel MTU was 1230. See
+[KUBERNETES.md](KUBERNETES.md) for helper delivery identities and the initial
+Flannel JSON-stream failure, which occurred before apply and was corrected.
+
+This is dated functional evidence, not a fault/failover test. All guests share
+one physical host. The native HeteroNetwork CP is still a single SQLite instance
+on DEV1; sudo production enforcement and cloud services are not activated by
+this work. These results do not change the earlier VPN journal fields.
 
 ## Fixed Boundary
 
