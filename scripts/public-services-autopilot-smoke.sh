@@ -407,6 +407,18 @@ if [ "${1:-}" = "--status-retention-only" ]; then
   write_status public "$fresh_time"
   run_reconciler
   run_reconciler
+  grep -q '^Environment="HETERONETWORK_AGENT_CONTROL_PLANE_URL=http://10.250.0.4:19088"$' "$agent_gateway_drop_in" ||
+    fail "promotion did not stage the trusted local CP override"
+  # Upgrade a previously staged gateway-only drop-in using normal reconciliation.
+  sed -i '/HETERONETWORK_AGENT_CONTROL_PLANE_URL=/d' "$agent_gateway_drop_in"
+  run_reconciler
+  grep -q '^restart --no-block heteronetwork-agent.service$' "$systemctl_log" ||
+    fail "old gateway staging did not activate the local CP override"
+  grep -q '^Environment="HETERONETWORK_AGENT_CONTROL_PLANE_URL=http://10.250.0.4:19088"$' "$agent_gateway_drop_in" ||
+    fail "old gateway staging was not upgraded"
+  run_reconciler
+  ! grep -Eq '^restart .*heteronetwork-agent.service$' "$systemctl_log" ||
+    fail "unchanged local CP staging restarted the agent"
   : >"$fake_state/status-unavailable"
   run_reconciler
   assert_active heteronetwork-control-plane.service

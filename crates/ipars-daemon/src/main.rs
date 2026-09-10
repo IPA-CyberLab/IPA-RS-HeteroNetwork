@@ -9129,7 +9129,7 @@ async fn run_agent(
         persist_agent_seed_directory(runtime.as_ref(), &store, &token.claims.bootstrap_endpoints)?;
     }
     let control_plane_seeds = if let Some(control_plane_url) = args.control_plane_url.as_ref() {
-        vec![control_plane_url.clone()]
+        operator_control_plane_seeds(control_plane_url, &runtime.state().control_plane_seed_urls)?
     } else if let Some(token) = join_token.as_ref() {
         token
             .claims
@@ -21785,7 +21785,7 @@ fn agent_control_plane_base_urls_with_persisted(
     persisted_control_plane_seed_urls: &[String],
 ) -> anyhow::Result<Vec<String>> {
     if let Some(override_url) = override_url {
-        return normalize_http_base_urls([override_url.to_string()], "control-plane URL");
+        return operator_control_plane_seeds(override_url, persisted_control_plane_seed_urls);
     }
     let mut base_urls = Vec::new();
     if persisted_bootstrap_endpoints.is_empty() {
@@ -21805,6 +21805,20 @@ fn agent_control_plane_base_urls_with_persisted(
     }
     base_urls.extend(persisted_control_plane_seed_urls.iter().cloned());
     normalize_http_base_urls(base_urls, "control-plane endpoint")
+}
+
+fn operator_control_plane_seeds(
+    override_url: &str,
+    existing: &[String],
+) -> anyhow::Result<Vec<String>> {
+    // Only the operator override and already trusted seeds participate. Never promote
+    // discovered peer/service endpoints into durable operator fallback configuration.
+    let mut urls = normalize_http_base_urls(
+        std::iter::once(override_url.to_string()).chain(existing.iter().cloned()),
+        "operator control-plane seed",
+    )?;
+    urls.truncate(MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND);
+    Ok(urls)
 }
 
 fn control_plane_base_urls(
@@ -43197,6 +43211,67 @@ exec sleep 60
         assert_eq!(
             runtime_signal_urls(&runtime, &signal_fallback)?,
             vec!["https://active.example:9443".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operator_control_plane_seeds_preserve_trusted_fallbacks() -> anyhow::Result<()> {
+        let local = "http://10.250.0.4:19088";
+        let previous = vec!["https://trusted.example/".to_string(), local.to_string()];
+        let merged = operator_control_plane_seeds(local, &previous)?;
+        assert_eq!(
+            merged,
+            vec![local.to_string(), "https://trusted.example".to_string()]
+        );
+        assert_eq!(operator_control_plane_seeds(local, &merged)?, merged);
+        assert_eq!(
+            agent_control_plane_base_urls_with_persisted(None, Some(local), None, &[], &previous,)?,
+            merged
+        );
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        runtime.replace_control_plane_seed_urls(&merged, Utc::now())?;
+        runtime.merge_active_bootstrap_endpoints(
+            &[
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: "http://10.250.0.10:19088".into(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: "http://10.250.0.10:19443".into(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: "udp://10.250.0.10:19444".into(),
+                },
+            ],
+            Utc::now(),
+        )?;
+        let selected = runtime_control_plane_urls(&runtime, &[])?;
+        assert!(selected.contains(&local.to_string()));
+        assert!(selected.contains(&"https://trusted.example".to_string()));
+        assert!(selected.contains(&"http://10.250.0.10:19088".to_string()));
+        assert_eq!(runtime.state().control_plane_seed_urls, merged);
+        Ok(())
+    }
+
+    #[test]
+    fn operator_control_plane_seeds_are_bounded_and_validated() -> anyhow::Result<()> {
+        let existing = (0..MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
+            .map(|index| format!("https://trusted-{index}.example"))
+            .collect::<Vec<_>>();
+        let merged = operator_control_plane_seeds("http://10.250.0.4:19088", &existing)?;
+        assert_eq!(merged.len(), MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND);
+        assert_eq!(merged[0], "http://10.250.0.4:19088");
+        assert_eq!(&merged[1..], &existing[..existing.len() - 1]);
+        assert!(operator_control_plane_seeds("udp://10.250.0.4:19088", &existing).is_err());
+        assert!(
+            operator_control_plane_seeds("http://10.250.0.4:19088", &["invalid".into()]).is_err()
         );
         Ok(())
     }
