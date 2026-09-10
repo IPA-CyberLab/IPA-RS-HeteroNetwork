@@ -1,6 +1,6 @@
 # Fresh Dev Kubernetes Preparation
 
-Source support only: the already verified dev4 archive still contains the old
+The already verified dev4 archive still contains the old
 helper. Do not edit that archive, substitute its contents, or claim its digest
 covers this change. Use a later reviewed release containing this helper, or a
 separately reviewed, explicitly digest-pinned source delivery approved by the
@@ -9,7 +9,7 @@ deployment owner. No native packaging inventory changes are needed for the
 
 ## Actual Preparation: 2026-09-10
 
-The deployment owner reported successful preparation on all three dev guests,
+Preparation completed successfully on all three dev guests,
 followed by read-only verification: kubeadm `v1.36.4`, containerd `2.2.1`, and
 active agent, containerd, `heteronetwork-kube-apiserver-lb` and pod-routing
 services. Persisted `fresh-dev` configuration uses node addresses
@@ -39,7 +39,7 @@ changes or new remote checks accompanied this doc update.
 
 ## Subsequent Cluster Verification: 2026-09-10
 
-After the preparation checkpoint above, the deployment owner reported successful
+After the preparation checkpoint above, deployment completed successful
 init/join of all three Kubernetes `v1.36.4` control-plane nodes using helper
 `04ea6c54bd295e963197a223056665378bcecffa02977b1f89ad117b75e739cf`, delivered
 separately at `/opt/heteronetwork-dev-kubeadm-2d6e6d1f/kubeadm-ha-node.sh`.
@@ -57,8 +57,17 @@ rerun was involved.
 
 Actual `verify-cluster` exited 0, reporting three control-plane nodes and all
 three Ready. Full-MTU underlay checks, cross-node Pod traffic, per-node DNS and
-Service VIP checks passed; runtime Flannel MTU was 1230. This evidence is reported
-by the deployment owner, not a new remote check performed for this doc update.
+Service VIP checks passed; runtime Flannel MTU was 1230.
+
+Read-only API verification observed kube-system UID
+`a39281cb-d273-4c5f-b7a7-fca722fb417b` and exactly the three expected dev nodes,
+all Ready on `10.251.0.1` through `.3`. The existing policy-only kube-router
+manifest (`deploy/gitops/network-policy-engine/kube-router.yaml`, SHA-256
+`a9ff6c2fd9f05ff3144e119f84c4fb480e6ed297795950892438affbaf80717b`)
+passed server-side dry-run and was applied to this UID-checked dev cluster.
+Its DaemonSet reached 3/3 Ready. Actual allow/deny enforcement verification is
+still a separate gate. The production kube-system UID query timed out; no
+production identity or health conclusion was inferred from the dev results.
 
 No fault/failover test was performed. All three guests reside on one physical
 host, so this does not establish physical-host resilience. The native
