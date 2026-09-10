@@ -1,9 +1,10 @@
 # Guarded Dev Libvirt Provisioning
 
 The provisioner implements local root-only creation and bounded first-boot
-verification. The reviewed first apply installed the guard but stopped before
-any pool/guest creation. The normalization/recovery fix below requires fresh
-parent/reviewer clearance before any further host action.
+verification. After reviewed guard recovery and seed repairs, all three owned
+guests passed live boot verification and a subsequent regular apply passed
+idempotently. Earlier failures and their bounded repair procedures remain
+documented below; they are not outstanding blockers for this allocation.
 
 ## Fixed Allocation
 
@@ -177,10 +178,10 @@ apply, real nft readback normalization and tightly gated guard recovery. They us
 temporary fixtures and synthetic subprocesses, not real libvirt,
 nft mutations, SSH or guest creation.
 
-Review precedes recovery or another apply. Host preflight and privileged nft
-check passed; both scoped tables were installed by the failed first apply. No
-NAT, guest boot, packet isolation or Internet pass is claimed. Apply checks kernel
-readback and boot, not a packet reachability matrix.
+Review precedes recovery or another apply. Host preflight, privileged nft checks,
+guard readback and live guest boot verification passed as recorded below.
+No packet-isolation matrix or public Internet reachability pass is claimed.
+Apply checks kernel readback and boot, not a packet reachability matrix.
 After reviewed creation, separately verify DHCP/DNS, public egress, denied
 host/production destinations and IPv6 using only these guests. Kubernetes and
 application bootstrap remain separate.
@@ -313,3 +314,26 @@ refusals, invocation of plain clean without flags, preserved identities, and
 successful/failed simulated selected-guest transport. No remote inspection,
 clean, guest boot or live repair is executed by the tests. Live inspection is
 the first step after the parent/reviewer approves and pins the source.
+
+## Actual Execution Evidence
+
+The parent reported the following completed live operations on `ichikawap1`,
+using reviewed source SHA-256
+`1e205ef51716cef3edf24ce9f002cc0013af5af3f5e9fabcab293085ec625a80`
+from commit `00ca13c8b20e891be354a7f375818f6f05bfa8a2`:
+
+- Serial repairs of `hetero-dev-1`, `hetero-dev-2` and `hetero-dev-3` each exited
+  zero with `cloud_init_verified: true` and `keys_rotated: false`.
+- A subsequent regular `apply --confirm-create hetero-dev --image-directory`
+  using the existing verified image directory exited zero. Its
+  `guests_boot_verified` contained all three names, `guard_verified` was true,
+  and `production_modified` was false.
+- That apply reused existing owned resources and disks without resource
+  recreation or key rotation. It passed journal ownership and boot gates after
+  the repairs; no journal/hash reset was used to obtain success.
+
+These are actual parent-operated results, distinct from the mocked focused tests.
+They establish VM bootstrap and this warm idempotent apply, not an observed host
+reboot or a comprehensive network isolation test. No native HeteroNetwork service
+or Kubernetes installation has been performed in these guests. All three VMs
+share one physical host and therefore **do not provide physical HA**.
