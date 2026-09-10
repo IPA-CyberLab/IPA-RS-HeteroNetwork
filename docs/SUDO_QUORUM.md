@@ -249,6 +249,39 @@ outside the threat model. UID lifecycle management, key provisioning and operati
 recovery require further production review. The clock floor cannot protect against
 an administrator restoring or replacing the trusted database itself.
 
+### Reproducible Version 2 E2E
+
+On a Linux development host with a local Docker engine, run:
+
+```sh
+bash scripts/test-sudo-quorum-v2.sh
+```
+
+The runner builds matching CLI, HTTP signer and local daemon binaries, reports
+public artifact hashes and uses a disposable internal-only Docker network. It
+does not mount host configuration, publish ports, invoke host sudo or export keys.
+Three real signer processes use disposable dealer shares and a mock OIDC UserInfo
+endpoint; this is not a production Keycloak or DKG ceremony test. Both `sudo-issue`
+and `sudo-approve` must lead to actual UID-zero execution, with unchanged fixture
+sudoers/password checks. Failure cases include signer loss, replay, expiry, wrong
+identity and invalid requester proofs; restart must preserve consumed records.
+
+Default runtime bounds are two CPUs, 2 GiB memory and 256 tasks. The explicit
+`--local-rlimits` mode is only for development environments lacking domain cgroup
+controllers and is forbidden in CI. It instead uses 32 tasks, 256 MiB hard address
+space per process, 120 CPU seconds per process, at most two CPU affinities, and a
+600-second wall timeout. Its aggregate address-space ceiling is 8 GiB, not the
+default 2 GiB memory limit. Cleanup removes only resources carrying this run's
+unique ownership label. The release-only workflow requires this E2E job before
+publishing the release container; a successful local run alone is not a release.
+
+Verified on 2026-09-10 at 18:24:34 UTC using `--local-rlimits`: both real CLI
+paths, restart/replay and all denial cases passed; runner exit status was zero
+and owned resources were cleaned up. Image SHA256 was
+`1f54b42044c3e4c282a2f41f86f54e015f4e137cebb2b1b451869257255145f9`.
+The default cgroup-bounded CI execution and production rollout are not established
+by this local result.
+
 ## Security Contract
 
 Ordinary local sudo execution must satisfy BOTH existing sudoers/authentication

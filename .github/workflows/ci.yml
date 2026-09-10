@@ -98,6 +98,28 @@ jobs:
       - name: Check all targets on MSRV
         run: cargo +"$RUST_MSRV_TOOLCHAIN" check --locked --workspace --all-targets
 
+  sudo-quorum-e2e:
+    name: Majority sudo end-to-end
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust components
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+
+      - name: Check local approval prototype
+        run: |
+          cargo fmt --manifest-path prototypes/sudo-quorum/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path prototypes/sudo-quorum/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path prototypes/sudo-quorum/Cargo.toml
+
+      - name: Run isolated real sudo and signing API integration
+        run: bash scripts/test-sudo-quorum-v2.sh
+
   macos-client:
     name: Native macOS client
     runs-on: macos-15
@@ -505,6 +527,7 @@ jobs:
       - init-spawn-smoke
       - helm-smoke
       - kind-smoke
+      - sudo-quorum-e2e
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:

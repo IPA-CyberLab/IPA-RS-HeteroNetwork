@@ -1,0 +1,35 @@
+# Use a NEW staging directory, never the repository or a host configuration directory.
+# Required files: ipars, local-sudo-v2, sudo_v2_fixture, full_v2_e2e.py,
+# privilege_gate.c, privilege_v2_gate.c, privilege_v2_ack_test.c,
+# sudo_plugin.h (pinned digest below). Prefer scripts/test-sudo-quorum-v2.sh.
+# Build Rust artifacts separately with their respective locked manifests.
+# Workspace: cargo build --locked -p ipars-cli --bin ipars
+# Workspace: cargo build --locked -p ipars-control-plane-http --example sudo_v2_fixture
+# Prototype: cargo build --locked --manifest-path prototypes/sudo-quorum/Cargo.toml --bin local-sudo-v2
+# Stage the resulting ELF binaries (same architecture as this Debian image).
+# Do not run until the parent has approved compatible localv2 artifacts.
+# docker build -f /path/to/Dockerfile.full-v2 -t ipars-full-v2:test STAGING
+# docker network create --internal --subnet 172.30.99.0/24 ipars-full-v2
+# docker run --rm --network ipars-full-v2 --ip 172.30.99.2 ipars-full-v2:test
+# No bind mounts, privileged mode, published ports, or host network.
+ARG BASE_IMAGE=debian:trixie-slim
+FROM ${BASE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sudo gcc libc6-dev python3 ca-certificates libpam-modules \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/full-v2
+COPY sudo_plugin.h /usr/local/include/sudo_plugin.h
+RUN echo '11234d6e47e6da95adcb3ace71dc93f1d94b759aeca4cd938d829c076adfb35f  /usr/local/include/sudo_plugin.h' | sha256sum -c -
+COPY privilege_gate.c privilege_v2_gate.c privilege_v2_ack_test.c ./
+RUN gcc -std=c11 -Wall -Wextra -Werror -fPIC -shared privilege_v2_gate.c -o privilege_v2_gate.so \
+    && gcc -std=c11 -Wall -Wextra -Werror privilege_v2_ack_test.c -o privilege_v2_ack_test \
+    && ./privilege_v2_ack_test \
+    && (id fixture >/dev/null 2>&1 || useradd --uid 1000 --create-home fixture) \
+    && test "$(id -u fixture)" = 1000 \
+    && mkdir -m 0700 /etc/ipars-sudo-v2 /var/lib/ipars-sudo-v2 \
+    && mkdir -m 0755 /run/ipars-sudo-v2 \
+    && touch DISPOSABLE
+COPY ipars local-sudo-v2 sudo_v2_fixture full_v2_e2e.py ./
+RUN chmod 0755 ipars local-sudo-v2 sudo_v2_fixture \
+    && chmod 0644 full_v2_e2e.py
+ENTRYPOINT ["python3", "/opt/full-v2/full_v2_e2e.py"]
