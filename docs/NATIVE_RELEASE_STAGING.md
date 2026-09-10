@@ -321,3 +321,24 @@ not establish runtime readiness or provision policy, keys or services. Publicati
 must establish the companion's clean source and actual payload identity, and
 the companion installer must verify its bytes independently. No currently
 selected release is retroactively assigned a synthetic sudo archive binding.
+
+## Observed DEV Selection: dev.6
+
+On 2026-09-10, release run `34538542968` completed successfully for commit
+`22c4e3baf5de53f70bbac08f5fe62a0590e24526`. The published catalog and both
+archives were downloaded from release `v0.1.15-dev.6`. The preparation and
+selection commands independently validated all payloads against that catalog.
+The resulting artifact ID is
+`57cfd22395cfaa85557f94fb039f79acc6f15a8f5b0b4b2155f3ba88fa23a228`.
+
+`deploy/releases/channels.json` revision 9 selects this release for DEV only.
+The native archive SHA256 is
+`ddd1cf26a1b6957ef64cf6506f744188f415ac92dafee1db2b7b82fc361c45ca`;
+the sudo companion archive SHA256 is
+`0a1d2c9c0d39435e53777557a859a734ef0d1af7d5cc07e0de27d673a8cba569`.
+Both `prepared` and `sudo_prepared` were true; `activation_performed` was false.
+
+This release contains the native `local-sudo-v2 --check-config` implementation.
+Do not invoke that argument on older binaries: those binaries may ignore it and
+start the service. No DEV or production agent was replaced by this selection,
+and no production channel, sudo configuration or running service was changed.
