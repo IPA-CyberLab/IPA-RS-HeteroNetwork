@@ -18,6 +18,9 @@ pub struct QuorumSignerArgs {
     pub check_config: bool,
     #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_MANIFEST_PATH")]
     pub manifest_path: PathBuf,
+    /// Explicit trusted old manifest for a reviewed membership transition ceremony.
+    #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_ROTATION_ANCHOR_PATH")]
+    pub rotation_anchor_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_KEY_PACKAGE_PATH")]
     pub key_package_path: PathBuf,
     #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_NODE_ID")]
@@ -123,6 +126,9 @@ pub async fn configure_control_plane<S: ipars_control_plane::ControlPlaneStore>(
             anchor.manifest_epoch == manifest.epoch && anchor.manifest_digest == digest,
             "admin quorum manifest conflicts with the shared anchor"
         );
+        plane
+            .publish_admin_quorum_manifest(manifest.clone())
+            .await?;
     } else {
         let registered: std::collections::BTreeSet<_> = plane
             .list_nodes()
@@ -140,7 +146,7 @@ pub async fn configure_control_plane<S: ipars_control_plane::ControlPlaneStore>(
             "initial admin quorum roster must include every registered non-client node"
         );
         plane
-            .bind_admin_quorum_manifest(manifest.epoch, &digest)
+            .initialize_admin_quorum_manifest(manifest.clone())
             .await?;
     }
     Ok(Some(manifest))
@@ -165,9 +171,19 @@ pub async fn run_signer(args: QuorumSignerArgs) -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)?
     .with_backchannel_fallback_base_urls(args.oidc_backchannel_fallback_base_urls)
     .map_err(anyhow::Error::msg)?;
-    let app =
+    let app = if let Some(path) = args.rotation_anchor_path {
+        let old = read_config(&path, false)?;
+        ipars_control_plane_http::quorum::signer_router_with_rotation_anchor(
+            manifest,
+            key_package,
+            args.node_id,
+            auth,
+            old,
+        )
+    } else {
         ipars_control_plane_http::quorum::signer_router(manifest, key_package, args.node_id, auth)
-            .map_err(anyhow::Error::msg)?;
+    }
+    .map_err(anyhow::Error::msg)?;
     if args.check_config {
         tracing::info!("quorum signer configuration is valid");
         return Ok(());
@@ -186,6 +202,7 @@ mod tests {
         let mut args = QuorumSignerArgs {
             check_config: false,
             manifest_path: "manifest.json".into(),
+            rotation_anchor_path: None,
             key_package_path: "share.json".into(),
             node_id: "node-test".into(),
             listen: "10.250.0.1:19790".parse()?,
@@ -264,9 +281,20 @@ mod tests {
             .open(&path)?;
         serde_json::to_writer(file, &manifest)?;
         let result = configure_control_plane(&plane, Some(&path)).await;
-        std::fs::remove_file(path)?;
         assert!(result.is_err());
         assert!(plane.get_admin_quorum_manifest_anchor().await?.is_none());
+        assert!(plane.get_active_admin_quorum_manifest().await?.is_none());
+        // An existing matching anchor may publish its public configuration, never replace it.
+        plane
+            .bind_admin_quorum_manifest(manifest.epoch, &manifest.digest()?)
+            .await?;
+        let configured = configure_control_plane(&plane, Some(&path)).await;
+        std::fs::remove_file(path)?;
+        assert_eq!(configured?.as_ref(), Some(&manifest));
+        assert_eq!(
+            plane.get_active_admin_quorum_manifest().await?,
+            Some(manifest)
+        );
         Ok(())
     }
 

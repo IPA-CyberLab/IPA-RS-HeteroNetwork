@@ -65,16 +65,37 @@ anchor rejects a different manifest or epoch; removing a local configuration
 file is not an authorized downgrade. Operator bearer credentials must not
 bypass quorum-required management mutations once enabled.
 
-Pause enrollment and membership changes during initial activation. The initial
-roster check is not a transactional membership-reconfiguration protocol. A new
+Drain all in-flight management mutations and pause new management mutations on
+every replica during initial activation, including enrollment and membership
+changes. The initial roster check and legacy request admission are not a
+transactional membership-reconfiguration protocol. A new
 binary that is already running without a verifier must reject management
 mutations once the shared anchor appears, until it is restarted with the
 approved manifest; reads and signed agent protocol traffic can continue.
 
-Membership changes, key refresh and epoch rotation need a coordinated ceremony
-and transition protocol. Automatic roster shrinking, emergency threshold
-reduction and forced manifest replacement are not supported. FROST signatures
-are not themselves a Raft log or a Byzantine membership consensus protocol.
+Membership changes use a fresh DKG ceremony and an epoch transition approved by
+both the old and new frozen majorities. The transition binds the complete new
+manifest digest, old digest, cluster, epoch, nonce and expiry. The shared store
+atomically compares the old anchor, installs the new public manifest and retains
+transition history. Competing or stale transitions fail; old-epoch capabilities
+cannot be consumed after the transition. This is a key-group replacement, not
+in-place share refresh. Automatic roster shrinking, emergency threshold reduction
+and forced manifest replacement are not supported. FROST signatures are not
+themselves a Raft log or a Byzantine membership consensus protocol.
+
+Rotation signing is explicitly enabled with `--rotation-anchor-path` (environment
+`HETERONETWORK_ADMIN_QUORUM_ROTATION_ANCHOR_PATH`). This root/daemon-owned public
+configuration supplies the trusted old manifest; an HTTP caller cannot nominate
+its own trust anchor. New signing shares must still be generated and installed on
+their intended VMs before the ceremony. Existing signer endpoints and new staging
+endpoints must be distinct while both groups operate. Do not copy a live share or
+replace all signers before the old group has approved the transition.
+
+After acceptance, provision the new public manifest on each control plane before
+its next restart. Startup deliberately refuses a local manifest that disagrees
+with the shared anchor; it does not silently trust a changed database as a new
+bootstrap authority. Archive public transition evidence and stop the old signing
+processes using the reviewed rollout procedure.
 
 Existing protocol traffic such as signed agent heartbeats is separate from
 human management authorization. Read-only console access retains its existing
@@ -172,7 +193,7 @@ credentials.
 
 ## Verification And Deployment Status
 
-The September 10 implementation passed 50 focused tests: eight crypto tests,
+The initial September 10 implementation passed 50 focused tests: eight crypto tests,
 four SQLite ledger tests, one disposable PostgreSQL HA ledger test, thirteen
 quorum HTTP tests, thirteen existing OIDC regressions, four daemon configuration
 tests, and seven CLI tests. The CLI coverage includes the three-part file DKG
@@ -185,13 +206,22 @@ exactly one was accepted. It also checked pre-use revocation, a consume/revoke
 race, reconnect durability and manifest mismatch. Its disposable database,
 container and credential files were removed; no production database was used.
 
+The subsequent rotation core/storage change passed ten core tests, nine local
+storage checks, three control-plane regressions and two disposable PostgreSQL
+checks. These cover joint signatures, epoch and key replacement, competing
+transitions, active public manifests and serialization with old-token consumption.
+An operation admitted before rotation can still finish afterward; rotation is
+not cancellation of an already-dispatched operation.
+
 This implementation has not been activated on the live six-node cluster. No
 production key-generation ceremony, share deployment or end-to-end test across
 those six VMs has been performed. Complete their management access and original
 storage recovery before provisioning shares. In particular, never manufacture
 the missing voters' shares on one accessible VM merely to enable the feature.
 OS sudo and direct database administration remain outside this authorization
-boundary; membership rotation remains unsupported.
+boundary. The separate [sudo design and verifier prototype](SUDO_QUORUM.md) is
+not an installed privilege-enforcement plugin. Membership rotation has not been
+exercised on the production VMs.
 
 ## References
 
