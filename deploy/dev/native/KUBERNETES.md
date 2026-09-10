@@ -75,6 +75,25 @@ configuration failure requires inspection, not automatic reset/retry or erasing
 After successful preparation, the existing `init`, `refresh-join-bundle` and
 `join-control-plane` workflow applies with the same dev environment. Transfer
 new dev join credentials only through the authenticated administration path.
+The reviewed init/Flannel fixes must be delivered separately before those
+operations; already delivered preparation helpers and verified release archives
+are not updated by a source commit.
+
+`init` captures both stdout and stderr from kubeadm configuration validation and
+initialization in a private temporary file, removed on exit. Neither successful
+join instructions nor failure output containing credentials is echoed. Failure
+reports are sanitized; inspect local cluster state before retrying rather than
+assuming initialization made no changes. Join credentials remain available only
+through the existing private join-bundle workflow.
+
+`install-flannel` first verifies the pinned upstream YAML checksum, retains the
+existing interface pin, and converts it to a Kubernetes JSON List using kubectl
+client dry-run. A structured jq transform parses the sole `kube-flannel-cfg`
+ConfigMap's `net-conf.json`, replacing only `Network` with the validated pod CIDR
+(`172.29.0.0/16` for fresh-dev) before apply. Missing/duplicate ConfigMaps or
+malformed network JSON fail closed. Other fields and the existing MTU patch are
+preserved; neither the pinned upstream bytes nor any release archive is changed.
+
 Flannel installation, cluster verification and workload readiness are separate
 gates; successful preparation does not mean a ready Kubernetes cluster. The
 initial HeteroNetwork SQLite control plane remains single-instance, not CP HA.

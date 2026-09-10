@@ -2220,6 +2220,20 @@ refresh_worker_join_bundle() {
   printf 'worker join bundle refreshed at %s (credentials not printed)\n' "$bundle"
 }
 
+run_private_kubeadm_init() (
+  local config="$1" output
+  output="$(mktemp)"
+  trap 'rm -f "$output"' EXIT
+  chmod 0600 "$output"
+  # Both normal output and errors may contain join credentials.
+  if ! kubeadm config validate --config "$config" >"$output" 2>&1; then
+    die "kubeadm configuration validation failed; output suppressed"
+  fi
+  if ! kubeadm init --config "$config" >"$output" 2>&1; then
+    die "kubeadm init failed; output suppressed; inspect local cluster state before retrying"
+  fi
+)
+
 initialize_cluster() {
   require_root
   validate_control_plane_config
@@ -2242,8 +2256,10 @@ initialize_cluster() {
   config="$(mktemp)"
   render_init_config "$version" >"$config"
   chmod 0600 "$config"
-  kubeadm config validate --config "$config"
-  kubeadm init --config "$config"
+  if ! run_private_kubeadm_init "$config"; then
+    rm -f "$config"
+    die "control-plane initialization did not complete"
+  fi
   rm -f "$config"
   reconcile_kubelet_api_endpoint
   configure_root_kubeconfig
@@ -2388,6 +2404,26 @@ join_worker() {
   trap - EXIT
 }
 
+render_flannel_network() {
+  validate_cidr_literal "$pod_cidr"
+  jq -e --arg network "$pod_cidr" '
+    def target: .kind == "ConfigMap" and .metadata.name == "kube-flannel-cfg"
+      and .metadata.namespace == "kube-flannel";
+    if .kind != "List" or (.items | type) != "array" then
+      error("expected Kubernetes manifest List")
+    elif ([.items[] | select(target)] | length) != 1 then
+      error("expected exactly one Flannel ConfigMap")
+    else
+      .items |= map(if target then
+        .data["net-conf.json"] |= (fromjson |
+          if type != "object" or (.Network | type) != "string" then
+            error("invalid Flannel network configuration")
+          else .Network = $network | tojson end)
+        else . end)
+    end
+  '
+}
+
 install_flannel() {
   require_root
   validate_control_plane_config
@@ -2399,9 +2435,10 @@ install_flannel() {
   [[ -f /etc/kubernetes/admin.conf ]] || die "this node is not an initialized control plane"
   export KUBECONFIG=/etc/kubernetes/admin.conf
 
-  local manifest patched actual_hash underlay_mtu
+  local manifest patched network_manifest actual_hash underlay_mtu
   manifest="$(mktemp)"
   patched="$(mktemp)"
+  network_manifest="$(mktemp)"
   curl -fL --retry 3 --connect-timeout 10 "$FLANNEL_MANIFEST_URL" -o "$manifest"
   actual_hash="$(sha256sum "$manifest" | awk '{print $1}')"
   [[ "$actual_hash" == "$FLANNEL_MANIFEST_SHA256" ]] \
@@ -2412,12 +2449,14 @@ install_flannel() {
   ' "$manifest" >"$patched"
   [[ "$(grep -Fc -- "--iface=${interface}" "$patched")" == "1" ]] \
     || die "failed to pin Flannel to $interface"
-  kubectl apply -f "$patched"
+  kubectl create --dry-run=client --validate=false -f "$patched" -o json \
+    | render_flannel_network >"$network_manifest"
+  kubectl apply -f "$network_manifest"
   underlay_mtu="$(ip -o link show dev "$interface" | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
   kubectl -n kube-flannel patch daemonset/kube-flannel-ds \
     --type=strategic \
     --patch "$(render_flannel_mtu_patch "$underlay_mtu")" >/dev/null
-  rm -f "$manifest" "$patched"
+  rm -f "$manifest" "$patched" "$network_manifest"
   kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout=5m
 }
 

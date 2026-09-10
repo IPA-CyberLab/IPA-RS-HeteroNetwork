@@ -1,5 +1,6 @@
 """Non-privileged profile tests; no host preparation or network calls."""
 import os
+import json
 from pathlib import Path
 import subprocess
 import shlex
@@ -11,6 +12,54 @@ SCRIPT = Path(__file__).with_name("kubeadm-ha-node.sh")
 
 
 class DevProfileTests(unittest.TestCase):
+    def flannel_fixture(self):
+        return {"kind": "List", "items": [
+            {"kind": "ConfigMap", "metadata": {"name": "kube-flannel-cfg", "namespace": "kube-flannel"},
+             "data": {"net-conf.json": json.dumps({"Network": "10.244.0.0/16",
+                       "Backend": {"Type": "vxlan"}, "EnableNFTables": False}), "other": "preserved"}},
+            {"kind": "DaemonSet", "metadata": {"name": "kube-flannel-ds"},
+             "spec": {"args": ["--iface=heteronetwork0"], "mtu": 1370}}]}
+
+    def test_flannel_network_structured_transform_preserves_other_fields(self):
+        fixture = self.flannel_fixture()
+        result = self.run_shell("printf '%s' " + shlex.quote(json.dumps(fixture)) + " | render_flannel_network")
+        actual = json.loads(result.stdout)
+        expected_network = json.loads(fixture["items"][0]["data"]["net-conf.json"])
+        expected_network["Network"] = "172.29.0.0/16"
+        self.assertEqual(json.loads(actual["items"][0]["data"]["net-conf.json"]), expected_network)
+        actual["items"][0]["data"]["net-conf.json"] = fixture["items"][0]["data"]["net-conf.json"]
+        self.assertEqual(actual, fixture)
+
+    def test_flannel_network_rejects_missing_duplicate_and_bad_json(self):
+        for mode in ("missing", "duplicate", "bad-json", "wrong-shape", "bad-cidr"):
+            fixture = self.flannel_fixture()
+            if mode == "missing":
+                fixture["items"].pop(0)
+            elif mode == "duplicate":
+                fixture["items"].append(fixture["items"][0])
+            elif mode == "bad-json":
+                fixture["items"][0]["data"]["net-conf.json"] = "invalid"
+            elif mode == "wrong-shape":
+                fixture["items"][0]["data"]["net-conf.json"] = "[]"
+            prefix = "pod_cidr=invalid; " if mode == "bad-cidr" else ""
+            with self.subTest(mode=mode):
+                self.run_shell(prefix + "printf '%s' " + shlex.quote(json.dumps(fixture))
+                               + " | render_flannel_network", False)
+
+    def test_kubeadm_init_never_echoes_credentials_success_or_failure(self):
+        for failure in ("none", "validate", "init"):
+            with tempfile.TemporaryDirectory() as directory:
+                result = self.run_shell("export TMPDIR=" + shlex.quote(directory) + '''
+kubeadm() {
+  printf 'fixture-join-token-stdout\n'
+  printf 'fixture-certificate-key-stderr\n' >&2
+  [[ "$1" != ''' + shlex.quote("config" if failure == "validate" else failure) + ''' ]]
+}
+run_private_kubeadm_init /unused/test-config
+''', failure == "none")
+                self.assertNotIn("fixture-", result.stdout + result.stderr)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
     def run_shell(self, code, success=True):
         setup = '''
 source "$1" help >/dev/null
