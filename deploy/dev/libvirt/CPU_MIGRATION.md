@@ -43,3 +43,24 @@ host and fail together if that host fails.
 Focused tests cover wrong identities, unreviewed CPUs, unchanged non-CPU XML and
 idempotent transformation. They do not power-cycle guests. Live results must be
 recorded separately from those fixture tests.
+
+## Observed Live Migration: 2026-09-10
+
+The guarded helper completed successfully in order DEV2, DEV3, DEV1, waiting
+for the preceding guest's success before invoking the next. Each result reported
+a cold restart, verified v2 flags, and all three Kubernetes nodes and PostgreSQL
+instances Ready again. The helper updated the owned definition hashes through
+the migration journal; no disk, seed, network or production definition changed.
+
+DEV1 had been the PostgreSQL primary. After its restart the observed primary was
+`dev-identity-postgres-2`, with three Ready database instances. This confirms an
+observed primary change and recovery during this maintenance, not write
+durability or uninterrupted authentication under failure.
+
+Delivered migration source SHA256:
+`685470f620320fc8b7b41e65b79b904468a580c452e40ac742e4b1ba533eae31`.
+Provisioner source SHA256:
+`395316db12546e408dfd3bb92db16480f67da0bbb3dbb8130abec6ad2e638f0a`.
+The private root bundle on the physical host is
+`/opt/heteronetwork-dev-cpu-685470f6`; it preserves the reviewed relative paths.
+All three completed records are in the existing provisioner journal.

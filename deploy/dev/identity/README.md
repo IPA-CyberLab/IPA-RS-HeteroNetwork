@@ -106,3 +106,11 @@ This verifies the current read-only replication state, not write durability
 during a failure. No primary termination, VM fault, recovery exercise or physical
 HA test was performed in this step. Keycloak and live majority-authorized sudo
 issuance/enforcement remain unconfigured.
+
+After the subsequent one-guest-at-a-time CPU migration, `verify.py` passed again:
+the primary was `dev-identity-postgres-2`, with DEV1 and DEV3 as streaming quorum
+standbys, `synchronous_commit=on` and `ANY 1` synchronous standby selection.
+The primary change was observed during DEV1 maintenance. No write-loss or
+uninterrupted-login test is implied. Keycloak server rollout and verified HTTPS
+discovery now pass as recorded in [KEYCLOAK.md](KEYCLOAK.md); owner login and sudo
+issuance/enforcement are still unfinished.

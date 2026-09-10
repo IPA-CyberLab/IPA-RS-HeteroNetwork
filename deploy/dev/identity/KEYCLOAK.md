@@ -146,3 +146,27 @@ and `sse4_2`; none of those checked additional v2 flags was missing. This is
 evidence of a guest CPU exposure problem, not a successful post-migration check.
 The 180-second rollout observation terminated unsuccessfully. No VM CPU was
 changed, no VM was restarted, and no owner account was created in this step.
+
+## Post-Migration Runtime Verification
+
+The subsequent guarded [CPU migration](../libvirt/CPU_MIGRATION.md) completed for
+DEV2, DEV3 and DEV1. Keycloak then rolled out successfully: all three replicas
+were Ready on their separate DEV VMs.
+
+`verify-keycloak.py` passed against all three individual Pod addresses on 8443
+and the Service at `172.30.58.34:443`. It connects to the observed addresses while
+retaining the actual hostname for TLS SNI and certificate verification, using
+the private DEV CA certificate. No TLS verification bypass is used. All four
+paths returned HTTP 200 discovery with issuer
+`https://id.dev.heterocloud.mizuame.app/realms/master` and matching authorization,
+token and JWKS endpoints. It never reads the bootstrap password or CA private key.
+
+The observed Pods were `dev-keycloak-595858cd64-6nk9p` on DEV1,
+`dev-keycloak-595858cd64-rqg9g` on DEV2, and
+`dev-keycloak-595858cd64-mhhd4` on DEV3. Those names and addresses are evidence,
+not permanent configuration. The verifier discovers current Pods and service IP.
+
+This checks the master realm's public discovery only. The intended DEV realm,
+clients, owner account, public DNS/trust/routing, authenticated login/refresh and
+majority-authorized sudo issuance/enforcement remain separate unfinished work.
+Neither replica readiness nor discovery proves authentication-session HA.
