@@ -1,0 +1,85 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "Namespace",
+      "metadata": {
+        "name": "hetero-dev-identity",
+        "labels": {"app.kubernetes.io/part-of": "dev-identity"},
+        "annotations": {"heteronetwork.dev/kube-system-uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b"}
+      }
+    },
+    {
+      "apiVersion": "storage.k8s.io/v1",
+      "kind": "StorageClass",
+      "metadata": {
+        "name": "dev-identity-local",
+        "labels": {"app.kubernetes.io/part-of": "dev-identity"},
+        "annotations": {"storageclass.kubernetes.io/is-default-class": "false"}
+      },
+      "provisioner": "kubernetes.io/no-provisioner",
+      "volumeBindingMode": "WaitForFirstConsumer",
+      "reclaimPolicy": "Retain",
+      "allowVolumeExpansion": false
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolume",
+      "metadata": {
+        "name": "dev-identity-postgres-local-1",
+        "labels": {"app.kubernetes.io/part-of": "dev-identity", "heteronetwork.dev/storage-purpose": "identity-postgres"},
+        "annotations": {"heteronetwork.dev/kube-system-uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b"}
+      },
+      "spec": {
+        "capacity": {"storage": "8Gi"},
+        "volumeMode": "Filesystem",
+        "accessModes": ["ReadWriteOnce"],
+        "persistentVolumeReclaimPolicy": "Retain",
+        "storageClassName": "dev-identity-local",
+        "claimRef": {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "namespace": "hetero-dev-identity", "name": "dev-identity-postgres-1"},
+        "local": {"path": "/var/lib/heteronetwork-dev-storage/identity-postgres"},
+        "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["hetero-dev-1"]}]}]}}
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolume",
+      "metadata": {
+        "name": "dev-identity-postgres-local-2",
+        "labels": {"app.kubernetes.io/part-of": "dev-identity", "heteronetwork.dev/storage-purpose": "identity-postgres"},
+        "annotations": {"heteronetwork.dev/kube-system-uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b"}
+      },
+      "spec": {
+        "capacity": {"storage": "8Gi"},
+        "volumeMode": "Filesystem",
+        "accessModes": ["ReadWriteOnce"],
+        "persistentVolumeReclaimPolicy": "Retain",
+        "storageClassName": "dev-identity-local",
+        "claimRef": {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "namespace": "hetero-dev-identity", "name": "dev-identity-postgres-2"},
+        "local": {"path": "/var/lib/heteronetwork-dev-storage/identity-postgres"},
+        "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["hetero-dev-2"]}]}]}}
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolume",
+      "metadata": {
+        "name": "dev-identity-postgres-local-3",
+        "labels": {"app.kubernetes.io/part-of": "dev-identity", "heteronetwork.dev/storage-purpose": "identity-postgres"},
+        "annotations": {"heteronetwork.dev/kube-system-uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b"}
+      },
+      "spec": {
+        "capacity": {"storage": "8Gi"},
+        "volumeMode": "Filesystem",
+        "accessModes": ["ReadWriteOnce"],
+        "persistentVolumeReclaimPolicy": "Retain",
+        "storageClassName": "dev-identity-local",
+        "claimRef": {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "namespace": "hetero-dev-identity", "name": "dev-identity-postgres-3"},
+        "local": {"path": "/var/lib/heteronetwork-dev-storage/identity-postgres"},
+        "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["hetero-dev-3"]}]}]}}
+      }
+    }
+  ]
+}
