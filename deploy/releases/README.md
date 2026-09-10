@@ -59,3 +59,19 @@ digests. Both image builds and the Rust, scheduling, monitoring and chart checks
 completed successfully. Earlier failed candidates were not selected or retagged.
 All five components now have dev selections; no production promotion or runtime
 deployment follows automatically from this catalog change.
+
+## HeteroNetwork Dev.4 Selection
+
+Revision 6 selects `0.1.15-dev.4`, source
+`c5f8502ae9f57f35726345f4c361651152deff1e`, from successful
+[release run 34521073321](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/34521073321).
+Both published native archives were downloaded and verified with
+`native-release-stage.py prepare`, followed by `select` at revision 6.
+The prepared artifact ID is
+`f5fbb42753ac0378763f1228d149b504b0bddddc04cd905fafbf3f7ed8c6969a`.
+
+This selection binds the release-profile sudo companion, including its source
+commit, plugin header and file hashes. Preparation reported `sudo_prepared: true`
+and `activation_performed: false`. No production sudo policy or service was
+changed. Guest bootstrap, dev application validation and production activation
+remain separate required steps.
