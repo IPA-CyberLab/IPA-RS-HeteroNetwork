@@ -65,3 +65,25 @@ preserve and inspect all state; do not delete the directory or regenerate keys
 to force progress. A new ceremony requires an explicitly reviewed new identity
 and epoch, not an automatic retry. Keep intermediate secret files private until
 all participants have accepted the manifest and the retention step is approved.
+
+## Pinned SSH Transport
+
+`scripts/dev-sudo-dkg-transport.py` is the explicit physical-host coordinator for
+ichikawap1. It accepts only the phases above plus `exchange-round1` and
+`exchange-round2`. It checks the private provisioner key and known-hosts file,
+then runs all three guest preflights before a phase. It never accepts arbitrary
+hosts, commands, file paths or recipients. SSH stdout/stdin and execution time
+are bounded; all subprocess error text is suppressed.
+
+Invoke one phase at a time from the reviewed root-owned copy, in this order:
+`preflight`, `part1`, `exchange-round1`, `part2`, `exchange-round2`, `part3`,
+`inspect`. Do not rerun completed generation phases. Packet delivery alone is
+idempotent when the existing recipient file exactly equals the sender's bytes;
+different or partial contents cause a stop rather than replacement.
+
+Confidential round-two packets pass through physical-host memory between two
+pinned SSH sessions. They are never written to a host staging file or included
+in command arguments, nor are packet contents or their hashes printed. This
+physical host is a trusted coordinator and already controls the dev guests;
+this transport is not suitable evidence of secrecy from that administrator.
+Final `inspect` requires identical public manifest file hashes on all guests.
