@@ -9,13 +9,15 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: v0.1.67
+    targetRevision: v0.1.70
     path: deploy/helm/heterocloud
     helm:
       releaseName: heterocloud
       valueFiles:
         - ../../environments/heteronet/values.yaml
       valuesObject:
+        image:
+          tag: "0.1.70@sha256:ca9cbefeb0ad2573b607c92b33bcc02d29271a0d1a6ad2576ee4e33ee429f5ec"
         hostAliases:
           - ip: "10.96.180.79"
             hostnames:
