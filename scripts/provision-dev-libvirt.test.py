@@ -325,6 +325,12 @@ class DevPlanTests(unittest.TestCase):
             inspected, runner = invoke()
             self.assertTrue(inspected["ok"])
             runner.assert_not_called()
+            # Actual DEV1 Init.paths.cloud_dir includes this trailing slash.
+            cloud_dir = "/var/lib/cloud/"
+            inspected, runner = invoke()
+            self.assertTrue(inspected["ok"])
+            runner.assert_not_called()
+            cloud_dir = "/var/lib/cloud"
             for blocker in ("hook", "seed", "workload", "cloud-dir", "hook-dir"):
                 if blocker == "hook":
                     (hooks / "unreviewed").write_text("test")

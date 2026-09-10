@@ -921,7 +921,7 @@ def guest_clean_main():
         stage = "fresh-clean-scope"
         init = Init(ds_deps=[])
         init.read_cfg()
-        assert str(init.paths.cloud_dir) == "/var/lib/cloud"
+        assert str(init.paths.cloud_dir) in ("/var/lib/cloud", "/var/lib/cloud/")
         assert str(settings.CLEAN_RUNPARTS_DIR) == "/etc/cloud/clean.d"
         hooks = pathlib.Path("/etc/cloud/clean.d")
         assert not hooks.is_symlink() and (not hooks.exists() or not list(hooks.iterdir()))
