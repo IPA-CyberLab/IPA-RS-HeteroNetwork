@@ -7,7 +7,8 @@ container. Its JSON output is desired state, not proof of a successful rollout.
 
 ## Workflow
 
-Download the release's `release-artifact.json` from the release publisher. Review
+Download the release's `heteronetwork-release-artifact.json` from the publisher
+(the examples below name the local copy `release-artifact.json`). Review
 the repository, release commit and image digest before selecting it. Store channel
 state in a trusted, writable deployment directory under version control; do not
 put credentials in this file.

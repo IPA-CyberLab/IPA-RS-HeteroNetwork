@@ -40,6 +40,19 @@ test('mutable image references and invalid fields fail closed', () => {
   }
 });
 
+test('malformed maps and contradictory histories fail closed', () => {
+  assert.throws(() => transition({...empty(), dev: []}, 'stage', artifact, 0));
+  const state = transition(transition(empty(), 'stage', artifact, 0), 'promote', artifact, 1);
+  for (const patch of [{command: 'stage'}, {revision: 9}, {component: 'flow'}, {before: artifact}]) {
+    const broken = structuredClone(state);
+    Object.assign(broken.history[1], patch);
+    assert.throws(() => transition(broken, 'rollback', artifact, 2));
+  }
+  const missing = structuredClone(state);
+  delete missing.prod.heteronetwork;
+  assert.throws(() => transition(missing, 'rollback', artifact, 2));
+});
+
 test('file update is idempotent and rejects competing lock or symlink', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'release-channels-'));
   try {

@@ -5,6 +5,9 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const components = new Set(['heteronetwork', 'heterocloud', 'flow', 'flash', 'syouyu']);
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value) &&
+  Object.getPrototypeOf(value) === Object.prototype;
+const same = (a, b) => a && b && JSON.stringify(validateArtifact(a)) === JSON.stringify(validateArtifact(b));
 export function validateArtifact(value) {
   if (!value || value.schema_version !== 1 || !components.has(value.component) ||
       typeof value.version !== 'string' || !/^v?\d+\.\d+\.\d+(?:[.-][A-Za-z0-9._-]+)?$/.test(value.version) ||
@@ -17,8 +20,8 @@ export function validateArtifact(value) {
 }
 
 export function transition(state, command, artifact, expectedRevision) {
-  if (!state || state.schema_version !== 1 || !Number.isSafeInteger(state.revision) || state.revision < 0 ||
-      !state.dev || !state.prod || !Array.isArray(state.history) || state.history.length !== state.revision) {
+  if (!object(state) || state.schema_version !== 1 || !Number.isSafeInteger(state.revision) || state.revision < 0 ||
+      !object(state.dev) || !object(state.prod) || !Array.isArray(state.history) || state.history.length !== state.revision) {
     throw new Error('Invalid release channel state');
   }
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== state.revision) {
@@ -29,16 +32,44 @@ export function transition(state, command, artifact, expectedRevision) {
       if (validateArtifact(current).component !== component) throw new Error('Invalid component mapping');
     }
   }
+  const replay = {dev: {}, prod: {}};
+  const promoted = [];
+  for (const [index, entry] of state.history.entries()) {
+    if (!object(entry) || entry.revision !== index + 1 ||
+        !['stage', 'promote', 'rollback'].includes(entry.command) ||
+        entry.channel !== (entry.command === 'stage' ? 'dev' : 'prod') ||
+        typeof entry.at !== 'string' || !Number.isFinite(Date.parse(entry.at))) {
+      throw new Error('Invalid release history');
+    }
+    const after = validateArtifact(entry.after);
+    if (entry.component !== after.component) throw new Error('Invalid history component');
+    const before = replay[entry.channel][entry.component] ?? null;
+    if (before === null ? entry.before !== null : !same(before, entry.before)) {
+      throw new Error('Broken release history chain');
+    }
+    if (entry.command === 'promote' && !same(replay.dev[entry.component], after)) {
+      throw new Error('History contains an unstaged promotion');
+    }
+    if (entry.command === 'rollback' && !promoted.some(previous => same(previous, after))) {
+      throw new Error('History contains an unknown rollback');
+    }
+    replay[entry.channel][entry.component] = after;
+    if (entry.command === 'promote') promoted.push(after);
+  }
+  for (const channel of ['dev', 'prod']) {
+    if (Object.keys(replay[channel]).length !== Object.keys(state[channel]).length ||
+        Object.entries(replay[channel]).some(([component, value]) => !same(value, state[channel][component]))) {
+      throw new Error('Release selections do not match their history');
+    }
+  }
   if (!['stage', 'promote', 'rollback'].includes(command)) throw new Error('Unknown release command');
   const selected = validateArtifact(artifact);
   const component = selected.component;
   const channel = command === 'stage' ? 'dev' : 'prod';
-  const same = (a, b) => a && b && JSON.stringify(validateArtifact(a)) === JSON.stringify(validateArtifact(b));
   if (command === 'promote' && !same(state.dev[component], selected)) {
     throw new Error('Production must use the exact artifact currently staged in dev');
   }
-  if (command === 'rollback' && !state.history.some(entry =>
-    entry.channel === 'prod' && same(entry.after, selected))) {
+  if (command === 'rollback' && !promoted.some(previous => same(previous, selected))) {
     throw new Error('Rollback target has never been promoted to production');
   }
   if (same(state[channel][component], selected)) return state;
