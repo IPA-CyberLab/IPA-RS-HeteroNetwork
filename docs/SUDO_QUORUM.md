@@ -104,6 +104,28 @@ admin signing endpoints must not be repurposed as a generic signing oracle.
 Until that contract, independent review and access-recovery testing are complete,
 the working container path is a prototype, not installable production enforcement.
 
+Required production issuance invariants (not implemented by this prototype):
+
+- Pin the host-attestation public key to `(cluster, host_node_id, key_epoch)` in
+  trusted signer configuration. Its signature covers the complete typed challenge;
+  a request-supplied key must never establish its own authority.
+- Map each local UID to an issuer-scoped `(issuer, subject)` identity. Matching a
+  subject alone is insufficient across identity providers. Each signer independently
+  verifies the authenticated identity against this trusted mapping.
+- Include the requester public key in both the host-authenticated challenge and
+  the threshold-signed grant. Both signing rounds require proof of possession over
+  that exact challenge. Redemption proof still needs an explicit reviewed contract:
+  issuance-only proof does not make a captured grant non-transferable.
+- Provision the policy represented by `policy_digest` to each signer through a
+  trusted configuration path. An opaque caller-supplied digest is not evidence
+  that the UID mapping or privilege scope is authorized.
+- Keep redemption subordinate to the host's live pending invocation. Closing that
+  invocation invalidates redemption even if remote signing rounds later finish.
+
+These are a versioned sudo-specific protocol, not extensions permitting arbitrary
+message signing through the HTTP administration signer. No production CLI token
+issuance is implied by the offline fixture or these requirements.
+
 Kernel/physical/root/DB-owner control and a compromised signing majority remain
 outside the threat model. Clock rollback, UID lifecycle management, signer
 attestation, safe GC and operational recovery require further production review.
