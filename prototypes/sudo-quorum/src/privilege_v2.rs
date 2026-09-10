@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-    SqlitePool,
+    SqliteConnection, SqlitePool,
 };
 use std::{
     path::Path,
@@ -85,29 +85,116 @@ impl V2Verifier {
             .connect_with(options)
             .await
             .map_err(|_| Error::Ledger)?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS sudo_v2_anchor(id INTEGER PRIMARY KEY CHECK(id=1),digest BLOB NOT NULL)")
-            .execute(&pool).await.map_err(|_| Error::Ledger)?;
-        sqlx::query("INSERT OR IGNORE INTO sudo_v2_anchor VALUES(1,?)")
-            .bind(&anchor[..])
-            .execute(&pool)
+        let mut migration = pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|_| Error::Ledger)?;
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *migration)
+            .await
+            .map_err(|_| Error::Ledger)?;
+        if !(0..=1).contains(&version) {
+            return Err(Error::Configuration);
+        }
+        let tables: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .fetch_all(&mut *migration).await.map_err(|_| Error::Ledger)?;
+        let fresh_database = version == 0 && tables.is_empty();
+        let expected = if version == 0 {
+            vec!["sudo_v2_anchor", "sudo_v2_invocations"]
+        } else {
+            vec!["sudo_v2_anchor", "sudo_v2_clock", "sudo_v2_invocations"]
+        };
+        if !fresh_database && tables != expected {
+            return Err(Error::Configuration);
+        }
+        if version == 0 {
+            sqlx::query("CREATE TABLE IF NOT EXISTS sudo_v2_anchor(id INTEGER PRIMARY KEY CHECK(id=1),digest BLOB NOT NULL)")
+            .execute(&mut *migration).await.map_err(|_| Error::Ledger)?;
+            if fresh_database {
+                sqlx::query("INSERT INTO sudo_v2_anchor VALUES(1,?)")
+                    .bind(&anchor[..])
+                    .execute(&mut *migration)
+                    .await
+                    .map_err(|_| Error::Ledger)?;
+            }
+        }
         let stored: Vec<u8> = sqlx::query_scalar("SELECT digest FROM sudo_v2_anchor WHERE id=1")
-            .fetch_one(&pool)
+            .fetch_one(&mut *migration)
             .await
             .map_err(|_| Error::Ledger)?;
         if stored != anchor {
-            pool.close().await;
             return Err(Error::Configuration);
         }
-        sqlx::query("CREATE TABLE IF NOT EXISTS sudo_v2_invocations(nonce BLOB PRIMARY KEY,uid INTEGER NOT NULL,expires INTEGER NOT NULL,challenge BLOB,redemption BLOB,consumed INTEGER NOT NULL DEFAULT 0)")
-            .execute(&pool).await.map_err(|_| Error::Ledger)?;
+        if version == 0 {
+            sqlx::query("CREATE TABLE IF NOT EXISTS sudo_v2_invocations(nonce BLOB PRIMARY KEY,uid INTEGER NOT NULL,expires INTEGER NOT NULL,challenge BLOB,redemption BLOB,consumed INTEGER NOT NULL DEFAULT 0)")
+                .execute(&mut *migration).await.map_err(|_| Error::Ledger)?;
+            // Legacy ledgers had no time floor: quarantine until every old grant expires.
+            let last_expiry: i64 =
+                sqlx::query_scalar("SELECT coalesce(max(expires),0) FROM sudo_v2_invocations")
+                    .fetch_one(&mut *migration)
+                    .await
+                    .map_err(|_| Error::Ledger)?;
+            let floor = i64::try_from(now()?)
+                .map_err(|_| Error::Time)?
+                .max(last_expiry);
+            sqlx::query("CREATE TABLE sudo_v2_clock(id INTEGER PRIMARY KEY CHECK(id=1),floor INTEGER NOT NULL CHECK(floor>=0))")
+                .execute(&mut *migration).await.map_err(|_| Error::Ledger)?;
+            sqlx::query("INSERT INTO sudo_v2_clock VALUES(1,?)")
+                .bind(floor)
+                .execute(&mut *migration)
+                .await
+                .map_err(|_| Error::Ledger)?;
+            sqlx::query("PRAGMA user_version=1")
+                .execute(&mut *migration)
+                .await
+                .map_err(|_| Error::Ledger)?;
+        } else {
+            let _: i64 = sqlx::query_scalar("SELECT floor FROM sudo_v2_clock WHERE id=1")
+                .fetch_one(&mut *migration)
+                .await
+                .map_err(|_| Error::Ledger)?;
+            let _: i64 = sqlx::query_scalar("SELECT count(*) FROM sudo_v2_invocations")
+                .fetch_one(&mut *migration)
+                .await
+                .map_err(|_| Error::Ledger)?;
+        }
+        migration.commit().await.map_err(|_| Error::Ledger)?;
         Ok(Self {
             config,
             host_key,
             anchor,
             pool,
         })
+    }
+
+    async fn observe_locked(connection: &mut SqliteConnection) -> Result<u64> {
+        let fresh = now()?;
+        let result = sqlx::query("UPDATE sudo_v2_clock SET floor=? WHERE id=1 AND floor<=?")
+            .bind(i64::try_from(fresh).map_err(|_| Error::Time)?)
+            .bind(i64::try_from(fresh).map_err(|_| Error::Time)?)
+            .execute(connection)
+            .await
+            .map_err(|_| Error::Ledger)?;
+        if result.rows_affected() != 1 {
+            return Err(Error::Time);
+        }
+        Ok(fresh)
+    }
+
+    /// Persist a monotone wall-time floor; rollback blocks admission, never changes the clock.
+    pub async fn observed_now(&self) -> Result<u64> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| Error::Ledger)?;
+        let fresh = Self::observe_locked(&mut transaction).await?;
+        transaction.commit().await.map_err(|_| Error::Ledger)?;
+        let after = now()?;
+        if after < fresh {
+            return Err(Error::Time);
+        }
+        Ok(after)
     }
 
     pub async fn begin(&self, uid: u32, adapter_nonce: [u8; 32]) -> Result<V2Session> {
@@ -120,15 +207,28 @@ impl V2Verifier {
         if adapter_nonce == [0; 32] || !host.callers.contains_key(&uid) {
             return Err(Error::Context);
         }
-        let issued_at = now()?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| Error::Ledger)?;
+        let issued_at = Self::observe_locked(&mut transaction).await?;
+        // At most one capacity-sized batch; never delete an unexpired record or the anchor.
+        sqlx::query("DELETE FROM sudo_v2_invocations WHERE nonce IN (SELECT nonce FROM sudo_v2_invocations WHERE expires<=? LIMIT 1024)")
+            .bind(i64::try_from(issued_at).map_err(|_| Error::Time)?)
+            .execute(&mut *transaction).await.map_err(|_| Error::Ledger)?;
         let expires_at = issued_at
             .checked_add(MAX_SUDO_TTL_SECS)
             .ok_or(Error::Time)?;
         let result = sqlx::query("INSERT INTO sudo_v2_invocations(nonce,uid,expires) SELECT ?,?,? WHERE (SELECT count(*) FROM sudo_v2_invocations)<1024 AND EXISTS(SELECT 1 FROM sudo_v2_anchor WHERE id=1 AND digest=?)")
             .bind(&adapter_nonce[..]).bind(uid).bind(i64::try_from(expires_at).map_err(|_| Error::Time)?)
-            .bind(&self.anchor[..]).execute(&self.pool).await.map_err(|_| Error::Ledger)?;
+            .bind(&self.anchor[..]).execute(&mut *transaction).await.map_err(|_| Error::Ledger)?;
         if result.rows_affected() != 1 {
             return Err(Error::Unavailable);
+        }
+        transaction.commit().await.map_err(|_| Error::Ledger)?;
+        if now()? < issued_at {
+            return Err(Error::Time);
         }
         Ok(V2Session {
             uid,
@@ -184,7 +284,7 @@ impl V2Verifier {
             expires_at: session.expires_at,
         };
         grant
-            .validate(&self.config.policy, now()?)
+            .validate(&self.config.policy, self.observed_now().await?)
             .map_err(|_| Error::Context)?;
         let challenge = SudoChallenge {
             host_signature: self
@@ -203,7 +303,7 @@ impl V2Verifier {
         }
         session.challenge = Some(challenge.clone());
         challenge
-            .validate(&self.config.policy, now()?)
+            .validate(&self.config.policy, self.observed_now().await?)
             .map_err(|_| Error::Time)?;
         Ok(challenge)
     }
@@ -218,7 +318,7 @@ impl V2Verifier {
         }
         token
             .challenge
-            .validate(&self.config.policy, now()?)
+            .validate(&self.config.policy, self.observed_now().await?)
             .map_err(|_| Error::Context)?;
         let signature =
             frost::Signature::deserialize(&token.signature).map_err(|_| Error::Signature)?;
@@ -248,7 +348,7 @@ impl V2Verifier {
             caller_uid: session.uid,
             runas_uid: 0,
             nonce,
-            issued_at: now()?,
+            issued_at: self.observed_now().await?,
             expires_at: session.expires_at,
         };
         let digest = Sha256::digest(invocation.proof_bytes(&token).map_err(|_| Error::Context)?);
@@ -260,7 +360,7 @@ impl V2Verifier {
         }
         token
             .challenge
-            .validate(&self.config.policy, now()?)
+            .validate(&self.config.policy, self.observed_now().await?)
             .map_err(|_| Error::Time)?;
         session.redemption = Some((token, invocation.clone()));
         Ok(invocation)
@@ -283,7 +383,7 @@ impl V2Verifier {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|_| Error::Ledger)?;
-        let fresh = now()?;
+        let fresh = Self::observe_locked(&mut transaction).await?;
         verified.validate_at(fresh).map_err(|_| Error::Time)?;
         let result = sqlx::query("UPDATE sudo_v2_invocations SET consumed=1 WHERE nonce=? AND uid=? AND challenge=? AND redemption=? AND consumed=0 AND expires>? AND EXISTS(SELECT 1 FROM sudo_v2_anchor WHERE id=1 AND digest=?)")
             .bind(&session.nonce[..]).bind(session.uid).bind(&challenge[..]).bind(&digest[..])
@@ -292,9 +392,13 @@ impl V2Verifier {
         if result.rows_affected() != 1 {
             return Err(Error::Unavailable);
         }
-        verified.validate_at(now()?).map_err(|_| Error::Time)?;
+        verified
+            .validate_at(Self::observe_locked(&mut transaction).await?)
+            .map_err(|_| Error::Time)?;
         transaction.commit().await.map_err(|_| Error::Ledger)?;
-        verified.validate_at(now()?).map_err(|_| Error::Time)?;
+        verified
+            .validate_at(self.observed_now().await?)
+            .map_err(|_| Error::Time)?;
         Ok(verified)
     }
 
@@ -369,6 +473,10 @@ mod tests {
     }
 
     fn issue(f: &Fixture, challenge: SudoChallenge) -> TestResult<SudoToken> {
+        issue_at(f, challenge, now()?)
+    }
+
+    fn issue_at(f: &Fixture, challenge: SudoChallenge, time: u64) -> TestResult<SudoToken> {
         let mut engines = Vec::new();
         let mut responses = Vec::new();
         let mut commitments = BTreeMap::new();
@@ -390,12 +498,8 @@ mod tests {
                 .sign(&request.proof_bytes()?)
                 .to_bytes()
                 .to_vec();
-            let response = engine.round1_sudo(
-                &f.config.policy,
-                &challenge.grant.identity,
-                &request,
-                now()?,
-            )?;
+            let response =
+                engine.round1_sudo(&f.config.policy, &challenge.grant.identity, &request, time)?;
             commitments.insert(
                 frost::Identifier::try_from(response.identifier)?,
                 response.commitments,
@@ -420,12 +524,7 @@ mod tests {
                 .to_vec();
             shares.insert(
                 frost::Identifier::try_from(response.identifier)?,
-                engine.round2_sudo(
-                    &f.config.policy,
-                    &challenge.grant.identity,
-                    &request,
-                    now()?,
-                )?,
+                engine.round2_sudo(&f.config.policy, &challenge.grant.identity, &request, time)?,
             );
         }
         Ok(SudoToken {
@@ -437,6 +536,160 @@ mod tests {
             )?
             .serialize()?,
         })
+    }
+
+    #[tokio::test]
+    async fn expired_capacity_reused_without_reviving_old_token() -> TestResult {
+        let f = fixture()?;
+        let dir = tempfile::tempdir()?;
+        let verifier =
+            V2Verifier::open(&dir.path().join("ledger"), f.config.clone(), f.host.clone()).await?;
+        let mut old = verifier.begin(1000, [8; 32]).await?;
+        let mut challenge = verifier
+            .bind_requester(&mut old, f.requester.verifying_key().to_bytes())
+            .await?;
+        // Historical signed grant, without waiting or altering the host clock.
+        challenge.grant.issued_at = now()? - 120;
+        challenge.grant.expires_at = challenge.grant.issued_at + 60;
+        challenge.host_signature = f
+            .host
+            .sign(&challenge.grant.attestation_bytes()?)
+            .to_bytes()
+            .to_vec();
+        let token = issue_at(&f, challenge.clone(), challenge.grant.issued_at)?;
+        sqlx::query("UPDATE sudo_v2_invocations SET expires=? WHERE nonce=?")
+            .bind(i64::try_from(challenge.grant.expires_at)?)
+            .bind(&old.nonce[..])
+            .execute(&verifier.pool)
+            .await?;
+        let mut tx = verifier.pool.begin().await?;
+        for i in 0u32..1023 {
+            let mut nonce = [9; 32];
+            nonce[..4].copy_from_slice(&i.to_be_bytes());
+            sqlx::query("INSERT INTO sudo_v2_invocations(nonce,uid,expires) VALUES(?,1000,?)")
+                .bind(&nonce[..])
+                .bind(i64::try_from(now()? + 60)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        let mut fresh = verifier.begin(1000, old.nonce).await?;
+        verifier
+            .bind_requester(&mut fresh, f.requester.verifying_key().to_bytes())
+            .await?;
+        assert!(verifier.submit_token(&mut fresh, token).await.is_err());
+        assert!(verifier.begin(1000, [10; 32]).await.is_err()); // All 1024 are now live.
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sudo_v2_invocations")
+            .fetch_one(&verifier.pool)
+            .await?;
+        assert_eq!(count, 1024);
+        verifier.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_floor_survives_restart_and_blocks_gc_and_consumption() -> TestResult {
+        let f = fixture()?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("ledger");
+        let verifier = V2Verifier::open(&path, f.config.clone(), f.host.clone()).await?;
+        let mut session = verifier.begin(1000, [11; 32]).await?;
+        let challenge = verifier
+            .bind_requester(&mut session, f.requester.verifying_key().to_bytes())
+            .await?;
+        let token = issue(&f, challenge)?;
+        let invocation = verifier.submit_token(&mut session, token.clone()).await?;
+        let proof = f
+            .requester
+            .sign(&invocation.proof_bytes(&token)?)
+            .to_bytes();
+        sqlx::query("UPDATE sudo_v2_clock SET floor=?")
+            .bind(i64::try_from(now()? + 120)?)
+            .execute(&verifier.pool)
+            .await?;
+        sqlx::query("INSERT INTO sudo_v2_invocations(nonce,uid,expires) VALUES(?,1000,1)")
+            .bind(&[12u8; 32][..])
+            .execute(&verifier.pool)
+            .await?;
+        verifier.close().await;
+        let reopened = V2Verifier::open(&path, f.config, f.host).await?;
+        assert!(matches!(
+            reopened.begin(1000, [13; 32]).await,
+            Err(Error::Time)
+        ));
+        assert!(matches!(
+            reopened.consume(&session, &proof).await,
+            Err(Error::Time)
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sudo_v2_invocations")
+            .fetch_one(&reopened.pool)
+            .await?;
+        assert_eq!(count, 2);
+        reopened.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_quarantines_and_unknown_schema_is_not_reset() -> TestResult {
+        let f = fixture()?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("ledger");
+        let verifier = V2Verifier::open(&path, f.config.clone(), f.host.clone()).await?;
+        verifier.begin(1000, [14; 32]).await?;
+        sqlx::query("DROP TABLE sudo_v2_clock")
+            .execute(&verifier.pool)
+            .await?;
+        sqlx::query("PRAGMA user_version=0")
+            .execute(&verifier.pool)
+            .await?;
+        verifier.close().await;
+        let migrated = V2Verifier::open(&path, f.config.clone(), f.host.clone()).await?;
+        assert!(matches!(
+            migrated.begin(1000, [15; 32]).await,
+            Err(Error::Time)
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sudo_v2_invocations")
+            .fetch_one(&migrated.pool)
+            .await?;
+        assert_eq!(count, 1);
+        sqlx::query("PRAGMA user_version=99")
+            .execute(&migrated.pool)
+            .await?;
+        assert!(matches!(
+            V2Verifier::open(&path, f.config, f.host).await,
+            Err(Error::Configuration)
+        ));
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&migrated.pool)
+            .await?;
+        assert_eq!(version, 99);
+        sqlx::query("PRAGMA user_version=1")
+            .execute(&migrated.pool)
+            .await?;
+        sqlx::query("DROP TABLE sudo_v2_clock")
+            .execute(&migrated.pool)
+            .await?;
+        assert!(matches!(
+            V2Verifier::open(&path, migrated.config.clone(), migrated.host_key.clone()).await,
+            Err(Error::Configuration)
+        ));
+        sqlx::query("PRAGMA user_version=0")
+            .execute(&migrated.pool)
+            .await?;
+        sqlx::query("DELETE FROM sudo_v2_anchor")
+            .execute(&migrated.pool)
+            .await?;
+        assert!(
+            V2Verifier::open(&path, migrated.config.clone(), migrated.host_key.clone())
+                .await
+                .is_err()
+        );
+        let anchors: i64 = sqlx::query_scalar("SELECT count(*) FROM sudo_v2_anchor")
+            .fetch_one(&migrated.pool)
+            .await?;
+        assert_eq!(anchors, 0); // Missing durable anchors are never silently recreated.
+        migrated.close().await;
+        Ok(())
     }
 
     #[tokio::test]

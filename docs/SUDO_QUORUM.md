@@ -180,6 +180,48 @@ owner mapping or policy. After a matching majority token is submitted, it create
 a distinct fresh redemption nonce. Requester proof, live-session binding, immutable
 ledger anchor and atomic single-use consumption must all succeed before approval.
 
+For an already configured isolated version 2 test environment, leave the original
+sudo invocation waiting in its first terminal. The trusted root plugin prints its
+64-hex-character invocation handle. In a second terminal on the same host, as the
+same original non-root user, set `HANDLE` to that printed value and run:
+
+```sh
+ipars quorum sudo-approve --handle "$HANDLE" --policy sudo-policy.json \
+  --requester-key requester.key --oidc-token owner-access-token
+```
+
+Do not run this approval client through sudo or switch users: its kernel real UID
+must be nonzero and equal its effective UID. The requester key and owner access
+token must be private files owned by that user with mode 0600. The locally trusted
+policy pins the host attestation keys, UID-to-owner mapping and complete frozen
+signer manifest. HTTPS signer endpoints are accepted; literal-IP HTTP endpoints
+require the existing explicit `--vpn-cidr CIDR` transport option.
+
+The CLI connects only to `/run/ipars-sudo-v2/submit.sock`, rejecting symlinks and
+non-root-owned or group/other-writable directory ancestry. It authenticates kernel
+peer UID zero before sending any data. Each local exchange has a three-second
+timeout and version-checked, bounded 16 KiB frames; there is no socket override.
+`BindRequester` returns a host-signed challenge that must match the handle, the
+client's kernel UID, the requester key and the trusted policy before any signer
+request. The CLI gathers and independently verifies a frozen majority, then sends
+`SubmitToken` without writing a token file. It checks the returned fresh redemption
+nonce, UID, scope and expiry, signs the requester proof, and independently verifies
+the core redemption contract before sending `Redeem`.
+
+The handle names one live invocation, not a reusable session. The challenge's
+at-most-60-second lifetime starts at host issuance and is not extended by running
+the client or waiting for signers. Fresh expiry checks apply during signing and
+before submission and redemption. Closing the original invocation, expiry or
+service restart invalidates its pending approval. Timeouts and lost replies are
+not retried automatically; a lost reply does not undo durable consumption.
+
+Only a version 2 `Submitted` reply produces `{"status":"approval_submitted"}`.
+This means approval was submitted, **not that the root command executed or
+succeeded**. The CLI spawns neither sudo nor SSH, provides no SSH fanout or command
+executor, and leaves execution to the original sudo process. Expiry limits new
+admissions, not the lifetime of an already admitted process. This workflow does
+not install the local service or enable production enforcement.
+
 The version 2 adapter acknowledgement includes the trusted expiry. The C plugin
 checks realtime expiry and its monotonic deadline after receiving the complete
 acknowledgement, preventing buffered approvals from being accepted after expiry.
@@ -187,15 +229,25 @@ Lost acknowledgements do not undo consumption. Ordinary sudoers authentication
 still applies; this remains a privilege admission gate, not a root sandbox.
 
 Wire data lives in `ipars_quorum::sudo::local`; the prototype reexports those types.
-The version 1 protocol is not accepted on version 2 sockets. Record GC, automatic
-stale-socket recovery and approved local policy rotation are not implemented; the
-1,024-record lifetime limit therefore still makes this unsuitable for unattended
-production enforcement. Never delete ledger evidence or downgrade to password-only
-authorization to work around those limits.
+The version 1 protocol is not accepted on version 2 sockets. Version 2 admission
+collects at most 1,024 expired records transactionally, retaining all unexpired
+records and the immutable anchor. A persisted wall-clock floor rejects rollback
+before collection or consumption. Capacity remains 1,024 retained records; it is
+not reset on restart. Legacy ledger migration quarantines admission through the
+latest recorded expiry; unknown or incomplete schemas fail closed.
+
+A root-private lifetime process lock serializes cooperating version 2 servers.
+Restart removes only trusted, unchanged socket entries whose connection is refused;
+live listeners and unsafe paths are rejected. The initial upgrade MUST first stop
+nonlocking legacy servers and their automatic restarts: connection refusal cannot
+exclude a legacy process between bind and listen. Never delete the database or
+anchor to recover service. Approved local policy rotation, production packaging
+and recovery rollout remain incomplete; do not deploy unattended enforcement yet.
 
 Kernel/physical/root/DB-owner control and a compromised signing majority remain
-outside the threat model. Clock rollback, UID lifecycle management, signer
-attestation, safe GC and operational recovery require further production review.
+outside the threat model. UID lifecycle management, key provisioning and operational
+recovery require further production review. The clock floor cannot protect against
+an administrator restoring or replacing the trusted database itself.
 
 ## Security Contract
 
