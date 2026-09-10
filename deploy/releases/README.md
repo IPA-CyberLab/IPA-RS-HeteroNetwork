@@ -75,3 +75,14 @@ commit, plugin header and file hashes. Preparation reported `sudo_prepared: true
 and `activation_performed: false`. No production sudo policy or service was
 changed. Guest bootstrap, dev application validation and production activation
 remain separate required steps.
+
+## HeteroCloud Dev.2 Selection
+
+Revision 7 selects `0.1.71-dev.2`, source
+`197a8184cadbcd32d7a2fac7f9ecf92cb8a8b6d2`, after successful
+[release run 34533354126](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud/actions/runs/34533354126).
+The downloaded artifact binds image digest
+`sha256:c3f189bbca05830da15d7a8a4c102246c7137fc3a5ab30d70c3cc329689db3f9`.
+This chart enforces HTTPS owner-console secure cookies; the dev overlay enables
+them and Helm verification checks the rendered arguments. This is a verified
+release selection, not a deployed HeteroCloud service or production promotion.
