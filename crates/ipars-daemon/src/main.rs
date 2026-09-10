@@ -40776,6 +40776,18 @@ exec sleep 60
     #[tokio::test]
     async fn signal_negotiation_retains_active_relay_session_when_renewal_fails(
     ) -> anyhow::Result<()> {
+        assert_signal_negotiation_after_failed_relay_renewal(true).await
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_discards_ineligible_relay_session_when_admission_fails(
+    ) -> anyhow::Result<()> {
+        assert_signal_negotiation_after_failed_relay_renewal(false).await
+    }
+
+    async fn assert_signal_negotiation_after_failed_relay_renewal(
+        old_relay_is_eligible: bool,
+    ) -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -40815,10 +40827,19 @@ exec sleep 60
             })
             .await;
 
-        let mut relay = node_record("relay-new");
+        // Renewal failure may retain an active session only while its relay
+        // remains in the eligible directory returned by signal negotiation.
+        let mut relay = node_record(if old_relay_is_eligible {
+            "relay-old"
+        } else {
+            "relay-new"
+        });
         relay.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
-            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            public_endpoint: Some(SocketAddr::from((
+                [203, 0, 113, if old_relay_is_eligible { 30 } else { 31 }],
+                51820,
+            ))),
             admission_url: Some(unused_http_base_url().await?),
             max_sessions: 100,
             active_sessions: 0,
@@ -40879,14 +40900,25 @@ exec sleep 60
             .path_record_for_peer(&peer.node_id)
             .await
             .context("relay path record should be stored")?;
-        assert_eq!(record.selected_state, PathState::Relay);
-        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-old")));
-        let session = runtime
-            .relay_session(&peer.node_id)
-            .await
-            .context("existing relay session should be retained")?;
-        assert_eq!(session.relay_node, NodeId::from_string("relay-old"));
-        assert_eq!(session.session_id, "session-old");
+        if old_relay_is_eligible {
+            assert_eq!(record.selected_state, PathState::Relay);
+            assert_eq!(record.relay_node, Some(NodeId::from_string("relay-old")));
+            let session = runtime
+                .relay_session(&peer.node_id)
+                .await
+                .context("existing eligible relay session should be retained")?;
+            assert_eq!(session.relay_node, NodeId::from_string("relay-old"));
+            assert_eq!(session.session_id, "session-old");
+        } else {
+            assert_eq!(record.selected_state, PathState::Unreachable);
+            assert_eq!(record.relay_node, None);
+            assert!(record
+                .score
+                .reasons
+                .iter()
+                .any(|reason| reason == "relay_admission_failed"));
+            assert!(runtime.relay_session(&peer.node_id).await.is_none());
+        }
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.relay_admission_attempt_count, 1);
         assert_eq!(metrics.relay_admission_success_count, 0);
@@ -40899,6 +40931,8 @@ exec sleep 60
 
         signal_task.abort();
         control_plane_task.abort();
+        let _ = signal_task.await;
+        let _ = control_plane_task.await;
         Ok(())
     }
 
