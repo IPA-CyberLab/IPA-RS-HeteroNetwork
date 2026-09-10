@@ -1,7 +1,7 @@
 //! Versioned local-only sudo-v2 transport. Existing v1 sockets/types are not accepted.
 use crate::{
     local::{listener, trusted},
-    privilege_v2::{now, LocalV2Config, V2Verifier},
+    privilege_v2::{now, validate_local_config, LocalV2Config, V2Verifier},
 };
 use ed25519_dalek::SigningKey;
 pub use ipars_quorum::sudo::local::{
@@ -271,7 +271,7 @@ async fn submit(mut stream: UnixStream, pending: Pending) -> io::Result<()> {
     .await
 }
 
-pub async fn serve() -> io::Result<()> {
+fn load_validated_config() -> io::Result<(LocalV2Config, SigningKey)> {
     if !nix::unistd::geteuid().is_root() {
         return Err(denied());
     }
@@ -281,6 +281,17 @@ pub async fn serve() -> io::Result<()> {
     let seed = private_file(Path::new(HOST_KEY), 32)?;
     let seed: &[u8; 32] = seed.as_slice().try_into().map_err(|_| denied())?;
     let key = SigningKey::from_bytes(seed);
+    validate_local_config(&config, &key).map_err(|_| denied())?;
+    Ok((config, key))
+}
+
+/// Fixed-path, root-only validation. No runtime directory, ledger, lock or IPC access.
+pub fn check_config() -> io::Result<()> {
+    load_validated_config().map(|_| ())
+}
+
+pub async fn serve() -> io::Result<()> {
+    let (config, key) = load_validated_config()?;
     trusted(Path::new(RUN), true, Some(0o755))?;
     trusted(Path::new(STATE), true, Some(0o700))?;
     let _process_lock = process_lock(&Path::new(STATE).join("server.lock"))?;

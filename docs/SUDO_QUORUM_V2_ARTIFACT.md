@@ -140,6 +140,33 @@ and catalog. Upload has no `--clobber`; partial publication requires investigati
 not replacement. Focused emitter/binder/schema tests run in release verification.
 This workflow binding still does not install or activate sudo on any host.
 
+## Read-Only Configuration Check: New Builds Only
+
+**Do not invoke `local-sudo-v2 --check-config` on the existing dev5 artifact or
+any older/unverified binary. Older binaries ignore arguments and start the
+server instead, potentially opening or creating the ledger, process lock and
+IPC sockets. The flag is not a safe feature-detection probe.**
+
+The new source implementation accepts exactly `--check-config` and uses the
+same policy and host-attestation-key validation as runtime startup. It requires
+root and the existing fixed, strictly checked `/etc/ipars-sudo-v2/config.json`
+and `/etc/ipars-sudo-v2/host.key` paths; there are no path overrides. Success or
+failure emits no key material. This branch returns before accessing runtime
+directories, opening the ledger, acquiring the process lock or touching sockets.
+
+Use this feature only after a newly built, independently verified future release
+is confirmed by its exact source commit and companion digest to include this
+implementation. No already released artifact gains the feature from a source
+change. Do not execute an old binary with this flag, `--help`, or another guessed
+argument to discover support. This documentation does not authorize an upgrade,
+release, service start or plugin activation.
+
+The separate `scripts/dev-sudo-readiness.py` checker remains static: it never
+executes the installed companion, including dev5. Its artifact, public-policy
+pin and service-file checks are prerequisites, not activation clearance. A
+successful native configuration check also does not validate an existing ledger,
+effective service overrides, sudo plugin loading, or the full privileged E2E path.
+
 ## Separate Activation Review
 
 Before any later activation, independently review the installed sudo approval

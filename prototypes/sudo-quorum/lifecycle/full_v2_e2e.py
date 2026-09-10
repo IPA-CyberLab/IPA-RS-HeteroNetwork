@@ -4,6 +4,7 @@ Only the requester companion runs as UID 1000. All threshold signatures come
 from the real HTTP routers through the real CLI, never an offline token fixture.
 """
 import http.server
+import hashlib
 import ipaddress
 import json
 import os
@@ -288,6 +289,72 @@ def consumed():
         return {bytes(row[0]) for row in db.execute("SELECT nonce FROM sudo_v2_invocations WHERE consumed = 1")}
 
 
+def check_config_readonly_regression():
+    # This binary and fixture are built together from current source by the harness.
+    # Never use --check-config to detect support in an older released artifact.
+    check(Path("/.dockerenv").exists() and os.getuid() == 0
+          and Path(__file__).resolve().parent == ROOT, "disposable root container only")
+    state_roots = [Path("/run/ipars-sudo-v2"), Path("/var/lib/ipars-sudo-v2")]
+
+    def snapshot():
+        result = {}
+        for root in state_roots:
+            paths = [root, *sorted(root.rglob("*"))] if root.exists() else [root]
+            for path in paths:
+                if not path.exists() and not path.is_symlink():
+                    result[str(path)] = None
+                    continue
+                meta = path.lstat()
+                check(not path.is_symlink(), "unexpected fixture state symlink")
+                result[str(path)] = (meta.st_ino, meta.st_mode, meta.st_uid, meta.st_gid,
+                                     meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns,
+                                     hashlib.sha256(path.read_bytes()).digest() if path.is_file() else None)
+        return result
+
+    for root in state_roots:
+        check(not root.exists() or not list(root.iterdir()), "configuration check requires pristine runtime state")
+    before = snapshot()
+    config = Path("/etc/ipars-sudo-v2/config.json")
+    key = Path("/etc/ipars-sudo-v2/host.key")
+    original_config, original_key = config.read_bytes(), key.read_bytes()
+    command = [str(ROOT / "local-sudo-v2"), "--check-config"]
+
+    def attempt(success, nonroot=False):
+        result = caller(command, timeout=5) if nonroot else subprocess.run(
+            command, capture_output=True, timeout=5)
+        check(result.returncode == (0 if success else 1), "unexpected check-config exit")
+        expected_stdout = b"local sudo-v2 configuration valid; no runtime state opened\n" if success else b""
+        expected_stderr = b"" if success else b"local sudo-v2 configuration rejected\n"
+        check(result.stdout == expected_stdout and result.stderr == expected_stderr,
+              "check-config output must contain only fixed nonsecret messages")
+        check(snapshot() == before, "check-config changed runtime, ledger, lock or IPC state")
+
+    try:
+        attempt(True)
+        check(len(original_key) == 32, "fixture attestation seed length")
+        key.write_bytes(bytes([original_key[0] ^ 1]) + original_key[1:])
+        try:
+            attempt(False)
+        finally:
+            key.write_bytes(original_key)
+        invalid = json.loads(original_config)
+        invalid["policy"]["schema_version"] = 1
+        config.write_text(json.dumps(invalid))
+        try:
+            attempt(False)
+        finally:
+            config.write_bytes(original_config)
+        attempt(False, nonroot=True)
+        attempt(True)
+    finally:
+        key.write_bytes(original_key)
+        config.write_bytes(original_config)
+        check(snapshot() == before, "configuration checks left runtime state behind")
+    check(key.read_bytes() == original_key and config.read_bytes() == original_config,
+          "fixture originals were not restored")
+    print("PASS read-only native config: valid, wrong key, invalid policy, nonroot; no runtime writes", flush=True)
+
+
 def main():
     check(Path("/.dockerenv").exists() and os.getuid() == 0
           and Path(__file__).resolve().parent == ROOT, "disposable root container only")
@@ -309,6 +376,7 @@ def main():
     check(not any(row.split()[1] == "00000000" for row in routes), "internal network required")
     os.umask(0o077)
     subprocess.run([str(ROOT / "sudo_v2_fixture"), "init"], check=True, timeout=10)
+    check_config_readonly_regression()
     for name in ("policy.json", "requester.key", "requester.pub"):
         os.chown(ROOT / name, 1000, 1000)
     # Only CLI outputs are writable by the caller; binaries and plugin stay root-owned.

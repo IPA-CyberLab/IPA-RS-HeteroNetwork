@@ -34,6 +34,20 @@ pub struct LocalV2Config {
     pub policy: SudoPolicy,
 }
 
+/// Validate the same public policy and local attestation identity without opening state.
+pub fn validate_local_config(config: &LocalV2Config, host_key: &SigningKey) -> Result<()> {
+    config.policy.validate().map_err(|_| Error::Configuration)?;
+    let host = config
+        .policy
+        .hosts
+        .get(&config.host_node_id)
+        .ok_or(Error::Configuration)?;
+    if host_key.verifying_key().to_bytes() != host.attestation_public_key {
+        return Err(Error::Configuration);
+    }
+    Ok(())
+}
+
 pub struct V2Verifier {
     config: LocalV2Config,
     host_key: SigningKey,
@@ -54,15 +68,7 @@ pub struct V2Session {
 impl V2Verifier {
     /// The embedding root service validates file provenance before this in-process API.
     pub async fn open(path: &Path, config: LocalV2Config, host_key: SigningKey) -> Result<Self> {
-        config.policy.validate().map_err(|_| Error::Configuration)?;
-        let host = config
-            .policy
-            .hosts
-            .get(&config.host_node_id)
-            .ok_or(Error::Configuration)?;
-        if host_key.verifying_key().to_bytes() != host.attestation_public_key {
-            return Err(Error::Configuration);
-        }
+        validate_local_config(&config, &host_key)?;
         let mut binding = b"heteronetwork-local-sudo-v2-anchor\0".to_vec();
         binding.extend_from_slice(
             config
@@ -470,6 +476,44 @@ mod tests {
                 .map(frost::keys::KeyPackage::try_from)
                 .collect::<std::result::Result<_, _>>()?,
         })
+    }
+
+    #[test]
+    fn check_config_accepts_valid_identity_without_state() -> TestResult {
+        let f = fixture()?;
+        let directory = tempfile::tempdir()?;
+        validate_local_config(&f.config, &f.host)?;
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_config_rejects_invalid_policy_and_key_before_ledger() -> TestResult {
+        for mismatch in [false, true] {
+            let mut f = fixture()?;
+            if mismatch {
+                f.host = SigningKey::generate(&mut OsRng);
+            } else {
+                f.config.policy.schema_version = 1;
+            }
+            assert!(validate_local_config(&f.config, &f.host).is_err());
+            let directory = tempfile::tempdir()?;
+            assert!(
+                V2Verifier::open(&directory.path().join("sudo-v2.sqlite"), f.config, f.host)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn check_config_rejects_unknown_host() -> TestResult {
+        let mut f = fixture()?;
+        f.config.host_node_id = "not-in-policy".into();
+        assert!(validate_local_config(&f.config, &f.host).is_err());
+        Ok(())
     }
 
     fn issue(f: &Fixture, challenge: SudoChallenge) -> TestResult<SudoToken> {
