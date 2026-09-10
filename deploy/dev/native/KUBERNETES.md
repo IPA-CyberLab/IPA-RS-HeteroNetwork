@@ -7,6 +7,30 @@ separately reviewed, explicitly digest-pinned source delivery approved by the
 deployment owner. No native packaging inventory changes are needed for the
 `fresh-dev` path. No guest commands have been run as part of these tests.
 
+## Actual Preparation: 2026-09-10
+
+The deployment owner reported successful preparation on all three dev guests,
+followed by read-only verification: kubeadm `v1.36.4`, containerd `2.2.1`, and
+active agent, containerd, `heteronetwork-kube-apiserver-lb` and pod-routing
+services. Persisted `fresh-dev` configuration uses node addresses
+`10.251.0.1`, `.2`, `.3`, pod CIDR `172.29.0.0/16` and service CIDR
+`172.30.0.0/16`. `/etc/kubernetes/admin.conf` was absent on all three.
+
+The delivered preparation helper remains the separately reviewed `47dc...`
+source, delivered at
+`/opt/heteronetwork-dev-kubeadm-d9514d31/kubeadm-ha-node.sh`, not substituted into
+the release archive. Commit `2d6e6d1f` and helper SHA-256
+`04ea6c54bd295e963197a223056665378bcecffa02977b1f89ad117b75e739cf`
+(init output protection and Flannel CIDR fixes) **have not yet been delivered**
+at this checkpoint. Init and Flannel installation have not run. This establishes
+host preparation only, not Kubernetes readiness or control-plane HA.
+
+Separate production caveat, reported read-only by the owner: `.10:19088` refused
+connections; agent status identified build `0.1.0`, revision `bed2a7a`, started
+at 20:54:25 UTC before this task, and `/v1/peers` returned 404, causing backend
+autopilot failure. This is not a production-health claim or a dev deployment
+result. No production changes or new remote checks accompanied this doc update.
+
 ## Exact Dependencies
 
 Standard `prepare` needs these checkout-relative files:
