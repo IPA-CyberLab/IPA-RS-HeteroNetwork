@@ -91,7 +91,7 @@ reprovisioning, not automatic mapping reuse.
 
 ### Signing Boundary
 
-There is **no production sudo signer protocol yet**. The container uses
+The local prototype has **no production sudo signer integration yet**. The container uses
 `examples/disposable-fixture.rs`, an offline 2-of-3 dealer-key test fixture that
 refuses to run outside a root container. Never install the example or its keys.
 It signs only the typed sudo privilege domain, not arbitrary messages.
@@ -104,7 +104,7 @@ admin signing endpoints must not be repurposed as a generic signing oracle.
 Until that contract, independent review and access-recovery testing are complete,
 the working container path is a prototype, not installable production enforcement.
 
-Required production issuance invariants (not implemented by this prototype):
+Required production issuance invariants (not implemented by this v1 prototype):
 
 - Pin the host-attestation public key to `(cluster, host_node_id, key_epoch)` in
   trusted signer configuration. Its signature covers the complete typed challenge;
@@ -125,6 +125,28 @@ Required production issuance invariants (not implemented by this prototype):
 These are a versioned sudo-specific protocol, not extensions permitting arbitrary
 message signing through the HTTP administration signer. No production CLI token
 issuance is implied by the offline fixture or these requirements.
+
+### Version 2 Integration
+
+The shared typed protocol in `crates/ipars-quorum/src/sudo.rs` is version 2 and
+must not be mixed with the version 1 local prototype. A dedicated signer mode is
+selected with `iparsd quorum-signer --sudo-policy-path POLICY.json`; it rejects
+simultaneous rotation configuration and a policy whose manifest differs from the
+explicit signer manifest. It exposes only the sudo signing routes, not an executor.
+The existing `--check-config` mode validates inputs without opening a listener.
+
+Tracked, opt-in deployment templates are
+`deploy/systemd/heteronetwork-sudo-quorum-signer.service` and
+`deploy/systemd/sudo-quorum-signer.env.example`. They use a separate configuration
+directory and systemd credential path. Provision the intended per-VM shares through
+the reviewed DKG ceremony, never through the container's dealer-key fixture. The
+version 2 policy pins an exact HTTPS issuer; an existing HTTP-only issuer must be
+addressed explicitly before deployment, not silently rewritten or accepted.
+
+These templates are not installed or enabled automatically. Version 2 still needs
+the local host-attestation, fresh redemption proof and durable consumption adapter
+integrated end to end, followed by recovery and real-voter rollout verification.
+Starting a signing service alone does not enforce sudo on a VM.
 
 Kernel/physical/root/DB-owner control and a compromised signing majority remain
 outside the threat model. Clock rollback, UID lifecycle management, signer

@@ -1,0 +1,42 @@
+[Unit]
+Description=HeteroNetwork host-attested majority sudo signer
+Requires=heteronetwork-agent.service
+After=network-online.target heteronetwork-agent.service
+ConditionPathExists=/etc/heteronetwork/sudo-quorum/manifest.json
+ConditionPathExists=/etc/heteronetwork/sudo-quorum/policy.json
+ConditionPathExists=/etc/heteronetwork/sudo-quorum/signer.env
+ConditionPathExists=/etc/credstore/heteronetwork-sudo-quorum-share.json
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=/etc/heteronetwork/sudo-quorum/signer.env
+Environment=HETERONETWORK_ADMIN_QUORUM_MANIFEST_PATH=/etc/heteronetwork/sudo-quorum/manifest.json
+Environment=HETERONETWORK_SUDO_QUORUM_POLICY_PATH=/etc/heteronetwork/sudo-quorum/policy.json
+LoadCredential=quorum-share.json:/etc/credstore/heteronetwork-sudo-quorum-share.json
+ExecStart=/opt/heteronetwork/bin/iparsd quorum-signer --key-package-path %d/quorum-share.json
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitCORE=0
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

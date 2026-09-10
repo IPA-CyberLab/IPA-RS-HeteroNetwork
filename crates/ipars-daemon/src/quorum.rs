@@ -1,8 +1,8 @@
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{ensure, Context};
 use clap::Args;
@@ -21,6 +21,13 @@ pub struct QuorumSignerArgs {
     /// Explicit trusted old manifest for a reviewed membership transition ceremony.
     #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_ROTATION_ANCHOR_PATH")]
     pub rotation_anchor_path: Option<PathBuf>,
+    /// Run only the host-attested sudo signer protocol with a trusted local policy.
+    #[arg(
+        long,
+        env = "HETERONETWORK_SUDO_QUORUM_POLICY_PATH",
+        conflicts_with = "rotation_anchor_path"
+    )]
+    pub sudo_policy_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_KEY_PACKAGE_PATH")]
     pub key_package_path: PathBuf,
     #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_NODE_ID")]
@@ -52,17 +59,55 @@ pub struct QuorumSignerArgs {
 }
 
 pub fn read_config<T: DeserializeOwned>(path: &Path, secret: bool) -> anyhow::Result<T> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
-        .open(path)
-        .context("cannot open quorum configuration file")?;
-    let metadata = file.metadata()?;
+    use nix::fcntl::{openat, OFlag};
+    use nix::sys::stat::Mode;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let components: Vec<_> = absolute.components().collect();
     ensure!(
-        metadata.is_file(),
-        "quorum configuration must be a regular file"
+        components.len() >= 2
+            && components[0] == Component::RootDir
+            && components[1..]
+                .iter()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "quorum configuration requires a path without parent traversal"
     );
     let uid = nix::unistd::geteuid().as_raw();
+    let mut directory = File::open("/")?;
+    // Walk through pinned directory descriptors; checking path metadata alone
+    // would leave a race between validation and opening the configuration.
+    for (index, component) in components[1..].iter().enumerate() {
+        let metadata = directory.metadata()?;
+        ensure!(
+            metadata.is_dir()
+                && (metadata.uid() == 0 || metadata.uid() == uid)
+                && (metadata.mode() & 0o022 == 0
+                    || (metadata.uid() == 0 && metadata.mode() & 0o1000 != 0)),
+            "quorum configuration directory is not trusted"
+        );
+        let Component::Normal(name) = component else {
+            anyhow::bail!("invalid quorum configuration path");
+        };
+        let last = index + 2 == components.len();
+        let mut flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+        if !last {
+            flags |= OFlag::O_DIRECTORY;
+        }
+        directory = File::from(
+            openat(&directory, Path::new(name), flags, Mode::empty())
+                .context("cannot open trusted quorum configuration path")?,
+        );
+    }
+    let file = directory;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "quorum configuration must be a single-link regular file"
+    );
     ensure!(
         metadata.uid() == 0 || metadata.uid() == uid,
         "quorum configuration has an untrusted owner"
@@ -154,6 +199,10 @@ pub async fn configure_control_plane<S: ipars_control_plane::ControlPlaneStore>(
 
 pub async fn run_signer(args: QuorumSignerArgs) -> anyhow::Result<()> {
     validate_listen(&args)?;
+    ensure!(
+        args.sudo_policy_path.is_none() || args.rotation_anchor_path.is_none(),
+        "sudo signing and manifest rotation require separate signer processes"
+    );
     let manifest = read_config(&args.manifest_path, false)?;
     let key_package = read_config(&args.key_package_path, true)?;
     let auth = super::WebUiAuthConfig::new(
@@ -171,7 +220,19 @@ pub async fn run_signer(args: QuorumSignerArgs) -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)?
     .with_backchannel_fallback_base_urls(args.oidc_backchannel_fallback_base_urls)
     .map_err(anyhow::Error::msg)?;
-    let app = if let Some(path) = args.rotation_anchor_path {
+    let app = if let Some(path) = args.sudo_policy_path {
+        let policy: ipars_quorum::sudo::SudoPolicy = read_config(&path, false)?;
+        ensure!(
+            policy.manifest == manifest,
+            "sudo policy conflicts with the configured quorum manifest"
+        );
+        ipars_control_plane_http::quorum::sudo::sudo_signer_router(
+            policy,
+            key_package,
+            args.node_id,
+            auth,
+        )
+    } else if let Some(path) = args.rotation_anchor_path {
         let old = read_config(&path, false)?;
         ipars_control_plane_http::quorum::signer_router_with_rotation_anchor(
             manifest,
@@ -194,8 +255,42 @@ pub async fn run_signer(args: QuorumSignerArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn sudo_signer_mode_cannot_enable_rotation() -> anyhow::Result<()> {
+        let command = || QuorumSignerArgs::augment_args(clap::Command::new("signer"));
+        let mut argv = vec![
+            "signer",
+            "--manifest-path",
+            "manifest.json",
+            "--key-package-path",
+            "share.json",
+            "--node-id",
+            "node-test",
+            "--listen",
+            "127.0.0.1:19791",
+            "--oidc-issuer-url",
+            "https://id.example/realm",
+            "--oidc-required-email",
+            "owner@example.test",
+            "--oidc-required-subject",
+            "owner",
+            "--sudo-policy-path",
+            "policy.json",
+            "--check-config",
+        ];
+        command().try_get_matches_from(&argv)?;
+        argv.extend(["--rotation-anchor-path", "old.json"]);
+        let result = command().try_get_matches_from(&argv);
+        assert!(
+            matches!(result, Err(error) if error.kind() == clap::error::ErrorKind::ArgumentConflict)
+        );
+        Ok(())
+    }
 
     #[test]
     fn signer_never_binds_wildcard_or_cleartext_public_address() -> anyhow::Result<()> {
@@ -203,6 +298,7 @@ mod tests {
             check_config: false,
             manifest_path: "manifest.json".into(),
             rotation_anchor_path: None,
+            sudo_policy_path: None,
             key_package_path: "share.json".into(),
             node_id: "node-test".into(),
             listen: "10.250.0.1:19790".parse()?,
@@ -315,6 +411,24 @@ mod tests {
         assert!(read_config::<serde_json::Value>(&link, false).is_err());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
         assert!(read_config::<serde_json::Value>(&path, true).is_err());
+        assert!(read_config::<serde_json::Value>(&path, false).is_ok());
+        let alias = dir.join("hardlink.json");
+        std::fs::hard_link(&path, &alias)?;
+        assert!(read_config::<serde_json::Value>(&path, false).is_err());
+        assert!(read_config::<serde_json::Value>(&alias, false).is_err());
+        std::fs::remove_file(alias)?;
+        let directory_link = dir.join("directory-link");
+        std::os::unix::fs::symlink(&dir, &directory_link)?;
+        assert!(
+            read_config::<serde_json::Value>(&directory_link.join("config.json"), false).is_err()
+        );
+        std::fs::create_dir(dir.join("child"))?;
+        let traversed = dir.join("child/../config.json");
+        assert!(traversed.is_file());
+        assert!(read_config::<serde_json::Value>(&traversed, false).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+        assert!(read_config::<serde_json::Value>(&path, false).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         assert!(read_config::<serde_json::Value>(&path, false).is_ok());
         std::fs::remove_dir_all(dir)?;
         Ok(())
