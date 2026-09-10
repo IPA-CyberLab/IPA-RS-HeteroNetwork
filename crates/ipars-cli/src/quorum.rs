@@ -25,6 +25,8 @@ use zeroize::Zeroizing;
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
+mod sudo;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CeremonyRoster {
@@ -344,6 +346,8 @@ pub enum QuorumCommand {
     Request(RequestArgs),
     /// Collect approvals from frozen manifest members and write a quorum token.
     Issue(IssueArgs),
+    /// Collect a frozen majority for a host-attested sudo grant; does not execute it.
+    SudoIssue(sudo::SudoIssueArgs),
     /// Execute an approved request with requester proof of possession.
     Execute(ExecuteArgs),
     /// Prepare an exact old-to-new quorum manifest transition after a new DKG ceremony.
@@ -1258,6 +1262,7 @@ pub async fn run(command: QuorumCommand) -> anyhow::Result<()> {
         },
         QuorumCommand::Request(args) => create_request(args)?,
         QuorumCommand::Issue(args) => issue(args).await?,
+        QuorumCommand::SudoIssue(args) => sudo::issue(args).await?,
         QuorumCommand::Execute(args) => return execute(args).await,
         QuorumCommand::RotationRequest(args) => create_rotation_request(args)?,
         QuorumCommand::RotationVerify(args) => return verify_rotation_file(args),

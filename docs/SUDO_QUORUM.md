@@ -148,6 +148,22 @@ the local host-attestation, fresh redemption proof and durable consumption adapt
 integrated end to end, followed by recovery and real-voter rollout verification.
 Starting a signing service alone does not enforce sudo on a VM.
 
+The coordinator accepts a version 2 challenge already signed by the trusted local
+host mechanism. It does not manufacture that attestation or execute sudo:
+
+```sh
+ipars quorum sudo-issue --policy sudo-policy.json --challenge host-challenge.json \
+  --requester-key requester.key --oidc-token owner-access-token \
+  --token-out sudo-token.json
+```
+
+The challenge must bind the requester's public key before issuance. The CLI checks
+every frozen signer endpoint before sending credentials, gathers a fixed majority,
+verifies the aggregate signature, and publishes a private token without replacing
+an existing file. Output requires a trusted Unix directory. This command alone
+does not redeem the token: the local adapter must request and verify a fresh
+redemption proof and durably consume the live invocation.
+
 Kernel/physical/root/DB-owner control and a compromised signing majority remain
 outside the threat model. Clock rollback, UID lifecycle management, signer
 attestation, safe GC and operational recovery require further production review.
