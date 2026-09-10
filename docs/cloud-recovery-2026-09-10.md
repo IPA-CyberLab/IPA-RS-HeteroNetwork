@@ -146,3 +146,29 @@ its latest reachability list contained only itself. The 32-member ceiling is
 not the blocker. Do not remove `.proxy-only`, copy full-member credentials, or
 start a replica outside the authorized provisioning path. No placement or
 static-Pod memory change was forced during this incident.
+
+## Final Checkpoint, 06:12 UTC
+
+The extended functional run completed at 06:11:42 with exit 0. Two Chromium
+peers exchanged and verified an exact 13-byte payload in both directions with
+normal ICE (selected host/host) and a diagnostic relay-only run (selected
+relay/relay), confirmed using DataChannel and candidate-pair statistics.
+Flash `pwd` succeeded without page errors. The room subsequently returned 404
+and disappeared from its scoped list; all four issued contexts were revoked.
+This is not a load test, a separate-LAN NAT matrix, or SFU media coverage.
+
+An earlier media attempt failed because the test omitted `flow.signal.connect`;
+it was diagnosed as `permission_denied`, not a production signaling defect.
+Its room also expired and its contexts were revoked. The corrected runner adds
+an explicit permission preflight and preserves failed-run evidence.
+
+The final three cold browser sweeps all authenticated, with observed Keycloak
+POST responses in 3,085 ms, 866 ms and 199 ms. Each passed 14/15 pages; each
+failed Syouyu readiness and its credential API 409. HeteroCloud remains on
+0.1.70, Argo Healthy/Synced, with all expected API/owner/worker replicas Ready.
+Escape retained the same Pod UID and restart count.
+
+No complete-suite pass or complete-HA claim is justified. Approved management
+access to the original Syouyu storage host is still required, and the `.5`
+capacity risk described above remains. Pre-existing local Registry/Argo resource
+edits were not committed, reverted, or applied by this recovery.
