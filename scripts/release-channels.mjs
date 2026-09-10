@@ -16,7 +16,30 @@ export function validateArtifact(value) {
       !/^ghcr\.io\/ipa-cyberlab\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/.test(value.image)) {
     throw new Error('Invalid immutable release artifact');
   }
-  return Object.fromEntries(['schema_version', 'component', 'version', 'commit', 'image'].map(k => [k, value[k]]));
+  const artifact = Object.fromEntries(['schema_version', 'component', 'version', 'commit', 'image'].map(k => [k, value[k]]));
+  if (value.native !== undefined) {
+    if (value.component !== 'heteronetwork' || !object(value.native) ||
+        Object.keys(value.native).length !== 1 || !object(value.native['linux-amd64'])) {
+      throw new Error('Unsupported native artifact platform');
+    }
+    const bundle = value.native['linux-amd64'];
+    const expectedAsset = `heteronetwork-${value.version.replace(/^v/, '')}-linux-amd64.tar.gz`;
+    if (bundle.asset !== expectedAsset || !/^[a-f0-9]{64}$/.test(bundle.sha256 ?? '') ||
+        !object(bundle.files) || Object.keys(bundle.files).length > 64 ||
+        ['bin/ipars', 'bin/iparsd', 'bin/ipars-k8s-controller'].some(name => !Object.hasOwn(bundle.files, name))) {
+      throw new Error('Invalid native artifact manifest');
+    }
+    const files = {};
+    for (const name of Object.keys(bundle.files).sort()) {
+      if (!/^(bin\/(ipars|iparsd|ipars-k8s-controller)|libexec\/[a-z][a-z0-9-]*\.sh)$/.test(name) ||
+          typeof bundle.files[name] !== 'string' || !/^[a-f0-9]{64}$/.test(bundle.files[name])) {
+        throw new Error('Invalid native artifact file');
+      }
+      files[name] = bundle.files[name];
+    }
+    artifact.native = {'linux-amd64': {asset: expectedAsset, sha256: bundle.sha256, files}};
+  }
+  return artifact;
 }
 
 export function transition(state, command, artifact, expectedRevision) {

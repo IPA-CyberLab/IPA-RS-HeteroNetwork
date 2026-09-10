@@ -53,6 +53,22 @@ test('malformed maps and contradictory histories fail closed', () => {
   assert.throws(() => transition(missing, 'rollback', artifact, 2));
 });
 
+test('native checksums are retained and bound to promotion', () => {
+  const native = {'linux-amd64': {asset: 'heteronetwork-1.2.3-linux-amd64.tar.gz',
+    sha256: 'c'.repeat(64), files: {'bin/ipars': 'd'.repeat(64), 'bin/iparsd': 'e'.repeat(64),
+      'bin/ipars-k8s-controller': 'f'.repeat(64)}}};
+  const release = {...artifact, native};
+  const state = transition(empty(), 'stage', release, 0);
+  assert.deepEqual(state.dev.heteronetwork.native, native);
+  const changed = structuredClone(release);
+  changed.native['linux-amd64'].sha256 = 'a'.repeat(64);
+  assert.throws(() => transition(state, 'promote', changed, 1));
+  assert.throws(() => transition(state, 'promote', artifact, 1));
+  assert.deepEqual(transition(state, 'promote', release, 1).prod.heteronetwork.native, native);
+  changed.native['linux-amd64'].files['../outside'] = 'a'.repeat(64);
+  assert.throws(() => validateArtifact(changed));
+});
+
 test('file update is idempotent and rejects competing lock or symlink', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'release-channels-'));
   try {

@@ -32,7 +32,7 @@ AUX = {
         "grafana": ("monitoring.grafana.image", "digest"),
         "busybox": ("coturn.performance.tuningImage", "tag"),
     },
-    "flash": {}, "syouyu": {"garage": ("garage.image", "tag")},
+    "flash": {}, "syouyu": {"garage": ("garage.image", "digest")},
 }
 IMAGE = re.compile(r"^([a-z0-9][a-z0-9._:/-]+)@(sha256:[a-f0-9]{64})$")
 VERSION = re.compile(r"^v?\d+\.\d+\.\d+(?:[.-][A-Za-z0-9._-]+)?$")

@@ -96,11 +96,12 @@ Postgres/Redis-compatible entrypoints. Disabled components do not need image
 pins. `--helm-check` rejects any emitted container image absent from the selected
 artifacts or supplied auxiliary pins, including mutable chart defaults.
 
-**Current blocker:** Syouyu's Garage schema requires tag exactly `v2.3.0` and its
-template has no digest field. It rejects immutable Garage overrides. A separately
-owned sibling-chart change is required before that component can pass the strict
-Helm check. Do not bypass the schema or treat the other three renders as coverage
-of Syouyu. No sibling files were changed here.
+Garage uses separate `garage.image.digest` and `garage.image.tag` parameters.
+Supply its auxiliary pin with `version: "v2.3.0"`, retaining the schema's required
+tag, and the real immutable image reference. The selected Syouyu chart revision
+must support the optional digest field; older chart revisions reject it. The
+updated local chart passes the strict digest render check. No sibling files were
+changed here.
 
 ## Render and Check
 
@@ -136,5 +137,6 @@ HELM_CHANNEL_TESTS=1 python -m unittest discover \
 
 Tests use clearly synthetic artifact digests only in memory, check replay-chain
 rejection, production setting preservation, fresh dev storage, explicit CIDR
-overrides, and actual local Helm output. The Syouyu schema blocker is asserted
-explicitly, not counted as a successful render.
+overrides, and actual local Helm output for all four services, including exact
+Garage digest preservation. These local render tests do not attest remote chart
+commits or runtime image availability.

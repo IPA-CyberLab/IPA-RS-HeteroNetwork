@@ -33,6 +33,7 @@ def fixtures():
             "service_cidrs": ["172.21.0.0/16"], "dns_cidrs": ["172.21.0.10/32"],
             "auxiliary_images": {name: pin(name) for name in
                                  ("postgres", "redis", "flow-livekit", "coturn", "garage")}}
+    site["auxiliary_images"]["garage"]["version"] = "v2.3.0"
     return state, site
 
 
@@ -121,10 +122,17 @@ class RendererTests(unittest.TestCase):
             self.assertIn("-dev", destination["namespace"])
 
     @unittest.skipUnless(os.environ.get("HELM_CHANNEL_TESTS") == "1" and shutil.which("helm"), "opt-in local Helm check")
-    def test_local_helm_supported_dev_charts(self):
+    def test_local_helm_all_dev_charts(self):
         state, site = fixtures()
 
         def inspect(app, documents):
+            if app["metadata"]["name"] == "heterocloud-syouyu-dev":
+                garage_images = [container["image"] for document in documents
+                    if document and document.get("kind") == "StatefulSet"
+                    for container in document["spec"]["template"]["spec"]["containers"]
+                    if container["name"] == "garage"]
+                self.assertEqual(len(garage_images), 1)
+                self.assertEqual(render.canonical_image(garage_images[0]), site["auxiliary_images"]["garage"]["image"])
             if app["metadata"]["name"] != "heterocloud-dev":
                 return
             policies = [d for d in documents if d and d.get("kind") == "NetworkPolicy"]
@@ -136,13 +144,10 @@ class RendererTests(unittest.TestCase):
             self.assertIn("172.21.0.0/16", serialized)
 
         apps = render.render(state, "dev", site)
-        counts = render.check_helm([app for app in apps if app["metadata"]["name"] != "heterocloud-syouyu-dev"], state, "dev", site,
+        counts = render.check_helm(apps, state, "dev", site,
                                    render.ROOT.parent, inspect_documents=inspect)
-        self.assertEqual(len(counts), 3)
+        self.assertEqual(len(counts), 4)
         print("Local Helm resource counts:", counts)
-        with self.assertRaisesRegex(ValueError, "garage.image.tag"):
-            render.check_helm([app for app in apps if app["metadata"]["name"] == "heterocloud-syouyu-dev"],
-                              state, "dev", site, render.ROOT.parent)
 
 
 if __name__ == "__main__":
