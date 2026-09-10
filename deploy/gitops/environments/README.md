@@ -10,7 +10,9 @@ Artifacts are keyed by `heterocloud`, `flow`, `flash`, and `syouyu`. Each
 artifact's full commit becomes the chart source revision and its exact image
 digest becomes the primary image override. `heteronetwork` is validated but
 not rendered: **native VM deployment is separate and not performed here**.
-Native VM channel staging is not implemented by this work.
+Verified native byte preparation and selection are available through the
+[native staging tool](../../../docs/NATIVE_RELEASE_STAGING.md), using this same
+channel state. Actual VM activation is separate and is not performed here.
 
 Promotion history proves artifact identity, not successful dev testing or
 deployment. Operator verification is still required before promoting. There
@@ -100,8 +102,8 @@ Garage uses separate `garage.image.digest` and `garage.image.tag` parameters.
 Supply its auxiliary pin with `version: "v2.3.0"`, retaining the schema's required
 tag, and the real immutable image reference. The selected Syouyu chart revision
 must support the optional digest field; older chart revisions reject it. The
-updated local chart passes the strict digest render check. No sibling files were
-changed here.
+updated local chart passes the strict digest render check. The renderer does not
+modify sibling charts.
 
 ## Render and Check
 

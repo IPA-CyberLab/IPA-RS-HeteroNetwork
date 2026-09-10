@@ -40,6 +40,11 @@ jobs:
       - name: Test release artifact contract
         run: node --test scripts/release-artifact-manifest.test.mjs scripts/release-channels.test.mjs scripts/package-native-release.test.mjs
 
+      - name: Validate native staging boundaries
+        run: |
+          python3 scripts/native-release-stage.test.py
+          node --check scripts/native-release-stage.catalog.mjs
+
       - name: Run strict Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 

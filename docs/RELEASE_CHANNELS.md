@@ -66,8 +66,16 @@ stale `.lock` file. Never use an untrusted shared directory for this operation.
 
 ## Activation Limits
 
-Container channel selection does not yet update the native VM binaries. Do not
-describe a changed channel file as a VM upgrade. Production quorum enforcement
+Native Linux/amd64 releases now include an optional `native` map binding the
+archive and every binary/helper checksum to this same artifact. Promotion checks
+include that map; changing or omitting native hashes is not the same release.
+The release workflow packages binaries from the stopped, just-built image rather
+than building a second native variant. It publishes the extended manifest and
+native archive together as release assets, without overwriting existing assets.
+
+[Native preparation and inspection](NATIVE_RELEASE_STAGING.md) use this same
+channel state. They do not update live VM binaries. Do not describe a changed
+channel file or prepared slot as a VM upgrade. Production quorum enforcement
 requires the complete intended signing roster to be provisioned and every control
 plane upgraded before activation; see [ADMIN_QUORUM.md](ADMIN_QUORUM.md).
 
