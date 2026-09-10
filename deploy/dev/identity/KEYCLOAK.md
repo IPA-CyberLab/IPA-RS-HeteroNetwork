@@ -170,3 +170,8 @@ This checks the master realm's public discovery only. The intended DEV realm,
 clients, owner account, public DNS/trust/routing, authenticated login/refresh and
 majority-authorized sudo issuance/enforcement remain separate unfinished work.
 Neither replica readiness nor discovery proves authentication-session HA.
+
+The later [realm setup](REALM.md) created and verified `heterocloud-dev` and its
+two DEV clients, including successful device-authorization initiation and a
+no-configuration-change repeat. Owner enrollment/login and sudo enforcement are
+still not established by that setup.

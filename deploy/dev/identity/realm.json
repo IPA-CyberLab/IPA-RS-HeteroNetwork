@@ -1,0 +1,69 @@
+{
+  "realm": "heterocloud-dev",
+  "enabled": true,
+  "displayName": "HeteroCloud DEV",
+  "sslRequired": "all",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "failureFactor": 5,
+  "waitIncrementSeconds": 30,
+  "maxFailureWaitSeconds": 900,
+  "accessTokenLifespan": 180,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 28800,
+  "attributes": {
+    "heteronetwork.dev.cluster-uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b"
+  },
+  "clients": [
+    {
+      "clientId": "heterocloud-dev-web",
+      "name": "HeteroCloud DEV console",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://dev.heterocloud.mizuame.app/api/v1/auth/oidc/callback",
+        "https://owner.dev.heterocloud.mizuame.app/api/v1/auth/oidc/callback"
+      ],
+      "webOrigins": [
+        "https://dev.heterocloud.mizuame.app",
+        "https://owner.dev.heterocloud.mizuame.app"
+      ],
+      "defaultClientScopes": ["profile", "email"],
+      "optionalClientScopes": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "oauth2.device.authorization.grant.enabled": "false",
+        "heteronetwork.dev.cluster-uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b"
+      }
+    },
+    {
+      "clientId": "heteronetwork-dev-web",
+      "name": "HeteroNetwork DEV device authorization",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "defaultClientScopes": ["profile", "email"],
+      "optionalClientScopes": [],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true",
+        "heteronetwork.dev.cluster-uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b"
+      }
+    }
+  ]
+}
