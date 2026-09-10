@@ -39,8 +39,8 @@ changes or new remote checks accompanied this doc update.
 
 ## Subsequent Cluster Verification: 2026-09-10
 
-After the preparation checkpoint above, deployment completed successful
-init/join of all three Kubernetes `v1.36.4` control-plane nodes using helper
+After the preparation checkpoint above, all three Kubernetes `v1.36.4`
+control-plane nodes were initialized/joined successfully using helper
 `04ea6c54bd295e963197a223056665378bcecffa02977b1f89ad117b75e739cf`, delivered
 separately at `/opt/heteronetwork-dev-kubeadm-2d6e6d1f/kubeadm-ha-node.sh`.
 Join secrets remained root-only; no production issuer or credentials were reused.
@@ -65,9 +65,19 @@ all Ready on `10.251.0.1` through `.3`. The existing policy-only kube-router
 manifest (`deploy/gitops/network-policy-engine/kube-router.yaml`, SHA-256
 `a9ff6c2fd9f05ff3144e119f84c4fb480e6ed297795950892438affbaf80717b`)
 passed server-side dry-run and was applied to this UID-checked dev cluster.
-Its DaemonSet reached 3/3 Ready. Actual allow/deny enforcement verification is
-still a separate gate. The production kube-system UID query timed out; no
+Its DaemonSet reached 3/3 Ready. The production kube-system UID query timed out; no
 production identity or health conclusion was inferred from the dev results.
+
+The separate `scripts/verify-dev-network-policy.py` gate (commit `d2048dc1`,
+SHA-256 `42a18adc834fa6e34071818336b24773562a29403971e7527d2299a829f09743`)
+then passed against this cluster. All six directed TCP paths passed baseline,
+Ingress deny, Ingress allow, Egress deny and Egress restoration checks, with two
+consecutive matching samples per phase. The probe used cached immutable image
+`docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0`.
+UID-preconditioned cleanup completed for namespace UID
+`3c938efb-8160-49af-ad3f-36f94dc072e6`; no tenant namespace was used. This verifies
+these TCP NetworkPolicy cases, not every future Flash policy or host-network
+workload's isolation.
 
 No fault/failover test was performed. All three guests reside on one physical
 host, so this does not establish physical-host resilience. The native
