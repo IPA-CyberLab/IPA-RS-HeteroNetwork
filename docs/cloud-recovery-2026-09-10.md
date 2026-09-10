@@ -32,11 +32,11 @@ new versioned release. The helper SHA256 is
   API readiness and Node Ready confirmed afterward.
 - `.6`: the temporary `60-local-control-plane-recovery.conf` was removed only
   after verifying the equivalent managed `40` setting; daemon-reload followed.
-- `.5`: recovery override active; permanent artifacts staged, not installed
-  at this checkpoint. Do not remove the temporary `60` until managed `40` is
-  verified with the same effective endpoint.
-- `.10`: same recovery source is running with an earlier unlabelled build;
-  the correct labelled artifact remains to be rolled out.
+- `.5`: permanent artifacts installed; build `bed2a7a`, agent active and API
+  readiness verified. Temporary `60` removed after matching managed `40` was
+  confirmed, followed by daemon-reload.
+- `.10`: labelled artifact installed atomically; one bounded agent restart;
+  build `bed2a7a` and API readiness verified afterward.
 - `.3` and `.4`: no deployment; management access is unavailable.
 
 Roll one agent at a time, verify quorum/API and fresh paths between changes,
@@ -58,7 +58,8 @@ and JWKS, so a definitive substage cause is not established. A subsequent
 success does not establish reliable authentication under failover.
 
 Independent own-fixture checks verified Flow room create (201), join (200),
-read-back (200), and deletion (subsequent 404 and absence from the room list).
+read-back (200), and automatic idle expiry (subsequent 404 and absence from the
+room list; no room-delete endpoint is exposed).
 Both temporary access contexts were revoked (204). Flash Web Shell executed
 `pwd` and disconnected without page errors. These checks do not constitute a
 new full WebRTC media/NAT traversal test.
