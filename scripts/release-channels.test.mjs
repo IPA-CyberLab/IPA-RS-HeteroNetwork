@@ -65,6 +65,8 @@ test('native checksums are retained and bound to promotion', () => {
   assert.throws(() => transition(state, 'promote', changed, 1));
   assert.throws(() => transition(state, 'promote', artifact, 1));
   assert.deepEqual(transition(state, 'promote', release, 1).prod.heteronetwork.native, native);
+  assert.throws(() => validateArtifact({...release,
+    image: `ghcr.io/ipa-cyberlab/unrelated@sha256:${'a'.repeat(64)}`}));
   changed.native['linux-amd64'].files['../outside'] = 'a'.repeat(64);
   assert.throws(() => validateArtifact(changed));
 });

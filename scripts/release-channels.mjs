@@ -18,7 +18,9 @@ export function validateArtifact(value) {
   }
   const artifact = Object.fromEntries(['schema_version', 'component', 'version', 'commit', 'image'].map(k => [k, value[k]]));
   if (value.native !== undefined) {
-    if (value.component !== 'heteronetwork' || !object(value.native) ||
+    if (value.component !== 'heteronetwork' ||
+        !/^ghcr\.io\/ipa-cyberlab\/heteronetwork@sha256:[a-f0-9]{64}$/.test(value.image) ||
+        !object(value.native) ||
         Object.keys(value.native).length !== 1 || !object(value.native['linux-amd64'])) {
       throw new Error('Unsupported native artifact platform');
     }

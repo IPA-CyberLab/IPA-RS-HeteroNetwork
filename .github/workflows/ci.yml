@@ -38,7 +38,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test release artifact contract
-        run: node --test scripts/release-artifact-manifest.test.mjs
+        run: node --test scripts/release-artifact-manifest.test.mjs scripts/release-channels.test.mjs scripts/package-native-release.test.mjs
 
       - name: Run strict Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -523,7 +523,9 @@ jobs:
         run: |
           set -euo pipefail
           assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
-          if printf '%s\n' "$assets" | grep -Fxq 'heteronetwork-release-artifact.json'; then
+          native_asset="heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz"
+          if printf '%s\n' "$assets" | grep -Fxq 'heteronetwork-release-artifact.json' \
+            || printf '%s\n' "$assets" | grep -Fxq "$native_asset"; then
             echo 'Release artifact already exists; reuse it for promotion, do not rebuild.' >&2
             exit 1
           fi
@@ -556,7 +558,22 @@ jobs:
           IMAGE: ghcr.io/ipa-cyberlab/heteronetwork
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           REPO_DIGESTS_FILE: ${{ runner.temp }}/repo-digests.json
-        run: node scripts/release-artifact-manifest.mjs generate > "$RUNNER_TEMP/heteronetwork-release-artifact.json"
+        run: node scripts/release-artifact-manifest.mjs generate > "$RUNNER_TEMP/release-base.json"
+
+      - name: Package the same build for native VM staging
+        env:
+          IMAGE: ghcr.io/ipa-cyberlab/heteronetwork
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$IMAGE:$GITHUB_SHA" --format '{{.Architecture}}')" = amd64
+          container="$(docker create "$IMAGE:$GITHUB_SHA")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          mkdir "$RUNNER_TEMP/native-binaries" "$RUNNER_TEMP/native-release"
+          for binary in ipars iparsd ipars-k8s-controller; do
+            docker cp "$container:/usr/local/bin/$binary" "$RUNNER_TEMP/native-binaries/$binary"
+          done
+          node scripts/package-native-release.mjs \
+            "$RUNNER_TEMP/release-base.json" "$RUNNER_TEMP/native-binaries" "$RUNNER_TEMP/native-release"
 
       # The same digest-pinned artifact is promoted through dev and prod; no rebuild.
       - name: Attach immutable artifact to release
@@ -564,4 +581,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/heteronetwork-release-artifact.json"
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$RUNNER_TEMP/native-release/heteronetwork-release-artifact.json" \
+            "$RUNNER_TEMP/native-release/heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz"
