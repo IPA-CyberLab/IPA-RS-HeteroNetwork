@@ -3,7 +3,30 @@
 `scripts/bootstrap-dev-guest.py` prepares private guest payloads locally. Its
 separate `install` and `start` commands run only when explicitly invoked on the
 matching fresh guest. Nothing calls SSH, libvirt, Kubernetes or a remote command
-endpoint. This tooling has not been deployed or exercised on real guests.
+endpoint. Dated guest-local execution evidence is recorded below.
+
+## Actual Evidence: 2026-09-10
+
+The deployment owner reported successful prerequisites, native installation and
+startup on all three exclusive dev guests using released dev4 binaries and the
+reviewed verifier helper SHA-256
+`d07d4b72565b15228dc3f0c8e3fb508cc8ad3e11670484e6c8103dcb66f5cefe`.
+Recovered journals all report `phase: vpn-verified-local` for cluster
+`02282a57-784b-4269-90a0-8fda47ee62ec` and public roster SHA-256
+`92c4aaf6bf830c486db37d5446e8430d7a33d97b07091845f8da2e0b854e2816`:
+
+| Guest | checked_at (Unix seconds) | UTC time | Samples | Duration |
+| --- | --- | --- | --- | --- |
+| hetero-dev-1 | 1789074580 | 21:09:40 | 13 | 61.611 s |
+| hetero-dev-2 | 1789074643 | 21:10:43 | 13 | 61.609 s |
+| hetero-dev-3 | 1789074706 | 21:11:46 | 13 | 61.637 s |
+
+This is historical native/VPN evidence, not a current health guarantee. All
+reports retain `kubernetes_ready: false`; no Kubernetes readiness, HeteroNetwork
+CP HA or sudo activation is established. The initial CP remains single-instance
+SQLite. Re-run the required fresh health gates before later deployment phases.
+This documentation update used the owner's reported evidence, not new remote
+inspection or execution.
 
 ## Fixed Boundary
 
@@ -274,4 +297,5 @@ python3 -B -m unittest discover -s deploy/dev/native -p test_bootstrap.py -v
 Tests use isolated local directories, synthetic non-executable archives and a
 mocked credential CLI. They do not prove guest enrollment, WireGuard connectivity,
 CP availability, sustained encrypted reachability or the published binary's
-runtime behavior. All guest-local checks remain pending live validation.
+runtime behavior. The dated actual evidence above is separate from these offline
+tests and does not replace fresh live validation for subsequent operations.
