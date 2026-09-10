@@ -78,3 +78,31 @@ Ready replicas and a successful apply are not sufficient HA evidence. Verify
 the mounted ownership, generated claims, actual replication/synchronous settings,
 write/read behavior and controlled primary recovery before deploying Keycloak.
 All dev VMs share one physical host, and static local PVs have no spare volumes.
+
+## Observed Runtime: 2026-09-10
+
+The operator rollout completed, and storage, network and database phases applied
+successfully to kube-system UID `a39281cb-d273-4c5f-b7a7-fca722fb417b`.
+All three PostgreSQL Pods became Ready, with claims bound to the matching static
+local PVs on `hetero-dev-1`, `hetero-dev-2` and `hetero-dev-3`.
+
+`verify.py` passed against the actual database through local PostgreSQL sockets.
+It reuses the protected apply helper's cluster guards and bounded command runner;
+it does not read credentials or change database contents. Deliver its reviewed
+bytes beside the root-owned `apply.py`, then run:
+
+```sh
+sudo python3 /opt/heteronetwork-dev-identity/verify.py
+```
+
+The observed primary was `dev-identity-postgres-1`. Both other instances were in
+recovery and appeared on the primary as `streaming`, `quorum` standbys.
+`synchronous_commit` was `on`; `synchronous_standby_names` used `ANY 1`.
+The checker currently expects the initial numbered Pod-to-PV placement. A later
+replacement with different instance names needs a separately reviewed check;
+do not rename instances or reset storage simply to satisfy this checker.
+
+This verifies the current read-only replication state, not write durability
+during a failure. No primary termination, VM fault, recovery exercise or physical
+HA test was performed in this step. Keycloak and live majority-authorized sudo
+issuance/enforcement remain unconfigured.
