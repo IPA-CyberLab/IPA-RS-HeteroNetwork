@@ -171,6 +171,11 @@ spec:
             - 10.250.0.0/24
           kubernetesApiCidrs:
             - 10.96.0.0/12
+            # kube-router evaluates egress after Service DNAT to API endpoints.
+            - 10.250.0.10/32
+            - 10.250.0.5/32
+            - 10.250.0.6/32
+            - 10.250.0.8/32
           kubernetesApiPorts:
             - 443
             - 6443
