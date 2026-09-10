@@ -91,7 +91,7 @@ reprovisioning, not automatic mapping reuse.
 
 ### Signing Boundary
 
-The local prototype has **no production sudo signer integration yet**. The container uses
+The version 1 local prototype has **no production sudo signer integration**. Its container uses
 `examples/disposable-fixture.rs`, an offline 2-of-3 dealer-key test fixture that
 refuses to run outside a root container. Never install the example or its keys.
 It signs only the typed sudo privilege domain, not arbitrary messages.
@@ -143,9 +143,9 @@ the reviewed DKG ceremony, never through the container's dealer-key fixture. The
 version 2 policy pins an exact HTTPS issuer; an existing HTTP-only issuer must be
 addressed explicitly before deployment, not silently rewritten or accepted.
 
-These templates are not installed or enabled automatically. Version 2 still needs
-the local host-attestation, fresh redemption proof and durable consumption adapter
-integrated end to end, followed by recovery and real-voter rollout verification.
+These templates are not installed or enabled automatically. Version 2's local
+adapter exists as a separate isolated prototype described below. Recovery, release
+packaging, real-voter provisioning and rollout verification remain incomplete.
 Starting a signing service alone does not enforce sudo on a VM.
 
 The coordinator accepts a version 2 challenge already signed by the trusted local
@@ -163,6 +163,35 @@ verifies the aggregate signature, and publishes a private token without replacin
 an existing file. Output requires a trusted Unix directory. This command alone
 does not redeem the token: the local adapter must request and verify a fresh
 redemption proof and durably consume the live invocation.
+
+### Root-Local Version 2
+
+`local-sudo-v2` and `lifecycle/privilege_v2_gate.c` use separate sockets under
+`/run/ipars-sudo-v2`, config `/etc/ipars-sudo-v2/config.json`, a private raw 32-byte
+attestation seed at `/etc/ipars-sudo-v2/host.key`, and durable state under
+`/var/lib/ipars-sudo-v2`. These paths are not production installation instructions;
+no host sudo configuration is modified by building them. The configured host key
+must match the host's public key in the full trusted version 2 policy.
+
+The root adapter supplies the kernel-checked original UID and a fresh nonce. Only
+that UID can bind its requester public key over the submission socket. The service
+then signs the complete host challenge; it never accepts a supplied UID, host,
+owner mapping or policy. After a matching majority token is submitted, it creates
+a distinct fresh redemption nonce. Requester proof, live-session binding, immutable
+ledger anchor and atomic single-use consumption must all succeed before approval.
+
+The version 2 adapter acknowledgement includes the trusted expiry. The C plugin
+checks realtime expiry and its monotonic deadline after receiving the complete
+acknowledgement, preventing buffered approvals from being accepted after expiry.
+Lost acknowledgements do not undo consumption. Ordinary sudoers authentication
+still applies; this remains a privilege admission gate, not a root sandbox.
+
+Wire data lives in `ipars_quorum::sudo::local`; the prototype reexports those types.
+The version 1 protocol is not accepted on version 2 sockets. Record GC, automatic
+stale-socket recovery and approved local policy rotation are not implemented; the
+1,024-record lifetime limit therefore still makes this unsuitable for unattended
+production enforcement. Never delete ledger evidence or downgrade to password-only
+authorization to work around those limits.
 
 Kernel/physical/root/DB-owner control and a compromised signing majority remain
 outside the threat model. Clock rollback, UID lifecycle management, signer

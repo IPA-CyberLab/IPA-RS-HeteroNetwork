@@ -2,7 +2,9 @@ target/*
 !target/debug/
 target/debug/*
 !target/debug/local-sudo-grants
+!target/debug/local-sudo-v2
 !target/debug/examples/
 target/debug/examples/*
 !target/debug/examples/disposable-fixture
+!target/debug/examples/disposable-v2-fixture
 **/__pycache__

@@ -1,0 +1,15 @@
+FROM ipars-sudo-quorum-lifecycle:test
+COPY lifecycle/privilege_v2_ack_test.c /opt/quorum-lifecycle/
+COPY lifecycle/privilege_gate.c lifecycle/privilege_gate_test.c lifecycle/privilege_v2_gate.c lifecycle/privilege_v2_test.py /opt/quorum-lifecycle/
+COPY target/debug/local-sudo-v2 /opt/quorum-lifecycle/local-sudo-v2
+COPY target/debug/examples/disposable-v2-fixture /opt/quorum-lifecycle/disposable-v2-fixture
+RUN gcc -std=c11 -Wall -Wextra -Werror -fPIC -shared privilege_v2_gate.c -o privilege_v2_gate.so \
+    && gcc -std=c11 -Wall -Wextra -Werror -fPIC -shared privilege_gate.c -o privilege_gate.so \
+    && gcc -std=c11 -Wall -Wextra -Werror privilege_gate_test.c -o privilege_gate_test \
+    && ./privilege_gate_test \
+    && gcc -std=c11 -Wall -Wextra -Werror privilege_v2_ack_test.c -o privilege_v2_ack_test \
+    && ./privilege_v2_ack_test \
+    && useradd --uid 1001 --create-home other \
+    && mkdir -m 0755 /run/ipars-sudo-v2 \
+    && mkdir -m 0700 /var/lib/ipars-sudo-v2 /etc/ipars-sudo-v2
+ENTRYPOINT ["python3", "/opt/quorum-lifecycle/privilege_v2_test.py"]

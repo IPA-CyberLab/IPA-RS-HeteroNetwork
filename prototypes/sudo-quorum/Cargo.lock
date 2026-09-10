@@ -707,6 +707,7 @@ dependencies = [
 name = "ipars-host-authorization-prototype"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
  "ipars-quorum",
  "nix",
  "rand_core",
@@ -718,6 +719,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

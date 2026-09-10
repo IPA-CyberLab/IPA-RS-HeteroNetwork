@@ -38,7 +38,7 @@ fn seconds() -> io::Result<i64> {
 }
 
 /// Root-only ancestry is checked before opening any privileged file or socket.
-fn trusted(path: &Path, directory: bool, mode: Option<u32>) -> io::Result<()> {
+pub(super) fn trusted(path: &Path, directory: bool, mode: Option<u32>) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(denied());
     }
@@ -83,7 +83,7 @@ pub fn load_policy() -> io::Result<PrivilegePolicy> {
     serde_json::from_slice(&bytes).map_err(|_| denied())
 }
 
-fn listener(path: &str, mode: u32) -> io::Result<UnixListener> {
+pub(super) fn listener(path: &str, mode: u32) -> io::Result<UnixListener> {
     // Never unlink an existing socket or silently replace another service.
     let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
     socket.bind(&socket2::SockAddr::unix(path)?)?;

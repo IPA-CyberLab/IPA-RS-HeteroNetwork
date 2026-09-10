@@ -4,7 +4,10 @@
 
 #[cfg(target_os = "linux")]
 pub mod local;
+#[cfg(target_os = "linux")]
+pub mod local_v2;
 pub mod privilege;
+pub mod privilege_v2;
 
 use ipars_quorum::{frost, Manifest};
 use rand_core::{OsRng, RngCore};
