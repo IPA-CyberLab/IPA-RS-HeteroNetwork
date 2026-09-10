@@ -427,6 +427,7 @@ def dependency_closure(records):
     edges = {name: set() for name in by_name}
     boundary = set()
     outside_dependents = set()
+    outside_by_unit = {}
     for record in records:
         for prop in DEPENDENCIES:
             boundary.update(name for name in record[prop] if name not in by_name)
@@ -434,8 +435,12 @@ def dependency_closure(records):
             if dependency in edges:
                 edges[dependency].add(record["name"])
         edges[record["name"]].update(name for name in record["RequiredBy"] + record["BoundBy"] + record["ConsistsOf"] if name in by_name)
-        outside_dependents.update(name for name in record["RequiredBy"] + record["BoundBy"] + record["ConsistsOf"] if name not in by_name)
+        outside_by_unit[record["name"]] = {
+            name for name in record["RequiredBy"] + record["BoundBy"] + record["ConsistsOf"]
+            if name not in by_name}
+        outside_dependents.update(outside_by_unit[record["name"]])
     closure = {}
+    outside_by_origin = {}
     for origin in edges:
         found, pending = set(), list(edges[origin])
         while pending:
@@ -444,7 +449,11 @@ def dependency_closure(records):
                 found.add(name)
                 pending.extend(edges[name])
         closure[origin] = sorted(found)
+        # Propagate known boundary edges without claiming to inspect beyond them.
+        outside_by_origin[origin] = sorted(set().union(
+            *(outside_by_unit[name] for name in found | {origin})))
     return {"requires_binds_to_partof_dependents": closure,
+            "uninspected_stop_dependents_by_origin": outside_by_origin,
             "uninspected_boundary_units": sorted(boundary),
             "uninspected_stop_dependents": sorted(outside_dependents), "scope": "heteronetwork_units_only"}
 

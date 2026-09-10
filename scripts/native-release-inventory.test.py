@@ -135,6 +135,22 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(len(dependents["heteronetwork-agent.service"]), 4)
         self.assertIn("heteronetwork-control-plane.service", dependents["heteronetwork-gateway.service"])
         self.assertEqual(closure["uninspected_stop_dependents"], ["kubelet.service"])
+        outside = closure["uninspected_stop_dependents_by_origin"]
+        self.assertEqual(outside["heteronetwork-agent.service"], ["kubelet.service"])
+        self.assertEqual(outside["heteronetwork-gateway.service"], ["kubelet.service"])
+        self.assertEqual(outside["heteronetwork-stun.service"], [])
+
+    def test_external_stop_boundary_propagation_handles_cycles_and_deduplication(self):
+        records = inventory.parse_show(encode(
+            properties(PartOf="heteronetwork-gateway.service", RequiredBy="kubelet.service"),
+            properties("heteronetwork-gateway.service", PartOf="heteronetwork-agent.service",
+                       BoundBy="kubelet.service", ConsistsOf="external.service")))
+        result = inventory.dependency_closure(records)
+        for name in ("heteronetwork-agent.service", "heteronetwork-gateway.service"):
+            self.assertEqual(result["uninspected_stop_dependents_by_origin"][name],
+                             ["external.service", "kubelet.service"])
+            self.assertNotIn(name, result["requires_binds_to_partof_dependents"][name])
+        self.assertEqual(inventory.dependency_closure([])["uninspected_stop_dependents_by_origin"], {})
 
     def test_strict_escaped_dependency_names_remain_literal(self):
         mount = r"run-credentials-heteronetwork\x2dcontrol\x2dplane.service.mount"

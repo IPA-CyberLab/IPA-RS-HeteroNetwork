@@ -224,6 +224,13 @@ Exit status 0 is scoped evidence collection, **not deployment readiness**:
 rollout authorization, current HA health, state/schema compatibility or rollback
 safety. Recheck host facts immediately before any separately approved activation.
 
+`dependencies.uninspected_stop_dependents_by_origin` attributes external stop
+boundaries to each inspected unit, including transitive paths through inspected
+units. For example, a gateway may affect kubelet through its dependent agent.
+This is only a known boundary, not a complete external dependency graph; the
+collector neither inspects those external units nor clears the incomplete-evidence
+gate. Never treat an empty per-origin boundary as proof that restarting is safe.
+
 On the supplied `.10` observation, Agent requires Gateway, while Control Plane,
 Signal and STUN each require and bind to Agent. An Agent stop therefore requires
 explicit dependent-service restart and recovered HA readiness before progressing
