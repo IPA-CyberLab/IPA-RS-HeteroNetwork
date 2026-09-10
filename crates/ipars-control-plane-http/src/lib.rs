@@ -757,6 +757,8 @@ where
             post(admin_pin_path::<S, L>),
         )
         .route(quorum::REVOCATIONS_PATH, post(quorum::revoke::<S, L>))
+        .route(quorum::MANIFEST_PATH, get(quorum::active_manifest::<S, L>))
+        .route(quorum::ROTATION_PATH, post(quorum::apply_rotation::<S, L>))
         .route_layer(middleware::from_fn_with_state(
             management_auth,
             require_management_auth,
@@ -1880,6 +1882,21 @@ struct ManagementAuth {
     quorum_anchor_probe: quorum::AnchorProbe,
 }
 
+async fn check_legacy_mutation_anchor(auth: &ManagementAuth) -> Result<(), Response> {
+    let error = match (auth.quorum_anchor_probe)().await {
+        Ok(false) => return Ok(()),
+        Ok(true) => "quorum manifest configuration reload required",
+        Err(()) => "quorum authorization store unavailable",
+    };
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response())
+}
+
 async fn require_management_auth(
     State(auth): State<Arc<ManagementAuth>>,
     request: Request,
@@ -1892,26 +1909,8 @@ async fn require_management_auth(
                 Err(response) => response,
             };
         }
-        match (auth.quorum_anchor_probe)().await {
-            Ok(false) => {}
-            Ok(true) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: "quorum manifest configuration reload required".to_string(),
-                    }),
-                )
-                    .into_response()
-            }
-            Err(()) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: "quorum authorization store unavailable".to_string(),
-                    }),
-                )
-                    .into_response()
-            }
+        if let Err(response) = check_legacy_mutation_anchor(&auth).await {
+            return response;
         }
     }
     let provided = bearer_token_from_headers(request.headers());
@@ -1928,6 +1927,13 @@ async fn require_management_auth(
         None
     };
     if operator_authenticated || oidc_validation == Some(AccessTokenValidation::Valid) {
+        // OIDC may await remote I/O while another CP activates the shared anchor.
+        // Activation must still drain mutations for the final check/dispatch gap.
+        if quorum::mutating(request.method()) {
+            if let Err(response) = check_legacy_mutation_anchor(&auth).await {
+                return response;
+            }
+        }
         return next.run(request).await;
     }
     if oidc_validation == Some(AccessTokenValidation::Unavailable) {

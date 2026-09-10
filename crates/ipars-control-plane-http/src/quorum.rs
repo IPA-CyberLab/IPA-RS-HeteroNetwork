@@ -2,6 +2,13 @@
 //! New-code instances without a local manifest fail closed after shared-anchor activation.
 //! This cannot constrain old binaries, a rogue root, or the database owner.
 
+mod rotation;
+pub(super) use rotation::{active_manifest, apply_rotation};
+pub use rotation::{
+    signer_router_with_rotation_anchor, RotationRound1Request, RotationRound2Request,
+    MANIFEST_PATH, ROTATION_PATH,
+};
+
 use axum::body::{to_bytes, Bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -158,11 +165,9 @@ impl QuorumVerifier {
         if manifest.cluster_id != plane.config().cluster_id.as_str() {
             return Err("admin quorum manifest cluster mismatch".to_string());
         }
-        let manifest = Arc::new(manifest);
         let capacity = Arc::new(Semaphore::new(16));
         Ok(Self {
             verify_and_consume: Arc::new(move |request| {
-                let manifest = manifest.clone();
                 let plane = plane.clone();
                 let capacity = capacity.clone();
                 Box::pin(async move {
@@ -172,6 +177,9 @@ impl QuorumVerifier {
                             "quorum verifier capacity exhausted",
                         )
                     })?;
+                    if request.uri().path() == ROTATION_PATH {
+                        return rotation::authorize_rotation(plane.as_ref(), request).await;
+                    }
                     let token: CapabilityToken =
                         decode_header(request.headers(), QUORUM_TOKEN_HEADER).ok_or_else(|| {
                             rejected(StatusCode::UNAUTHORIZED, "quorum capability required")
@@ -188,6 +196,7 @@ impl QuorumVerifier {
                         ));
                     }
                     let (mut parts, bytes) = bounded_body(request, MAX_ADMIN_BODY_BYTES).await?;
+                    let manifest = rotation::load_active(plane.as_ref()).await?;
                     if parts.uri.path() == REVOCATIONS_PATH {
                         parse_revocation(&bytes).map_err(IntoResponse::into_response)?;
                     }
@@ -509,6 +518,313 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+    fn sign_transition(
+        group: &Manifest,
+        keys: &[frost::keys::KeyPackage],
+        old: &Manifest,
+        transition: &ipars_quorum::ManifestTransition,
+    ) -> TestResult<Vec<u8>> {
+        let mut engines = keys
+            .iter()
+            .enumerate()
+            .take(usize::from(group.threshold()))
+            .map(|(i, key)| {
+                SignerEngine::new(
+                    group.clone(),
+                    &format!("node-{}", i + 1),
+                    key.clone(),
+                    4,
+                    60,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rounds = engines
+            .iter_mut()
+            .map(|engine| engine.round1_rotation(old, transition, transition.issued_at))
+            .collect::<Result<Vec<_>, _>>()?;
+        let commitments = rounds
+            .iter()
+            .map(|r| Ok((frost::Identifier::try_from(r.identifier)?, r.commitments)))
+            .collect::<TestResult<BTreeMap<_, _>>>()?;
+        let package = frost::SigningPackage::new(commitments, &transition.signing_bytes()?);
+        let shares = engines
+            .iter_mut()
+            .zip(rounds)
+            .map(|(engine, r)| {
+                Ok((
+                    frost::Identifier::try_from(r.identifier)?,
+                    engine.round2_rotation(
+                        r.session_id,
+                        old,
+                        transition,
+                        &package,
+                        transition.issued_at,
+                    )?,
+                ))
+            })
+            .collect::<TestResult<BTreeMap<_, _>>>()?;
+        Ok(frost::aggregate(&package, &shares, &group.public_keys()?)?.serialize()?)
+    }
+
+    #[tokio::test]
+    async fn rotation_http_requires_both_groups_and_cas_then_uses_active_epoch() -> TestResult {
+        let (old, old_keys, _, _) = fixture()?;
+        let (mut new, new_keys, mut claims, _) = fixture()?;
+        new.epoch = old.epoch + 1;
+        let transition = ipars_quorum::ManifestTransition {
+            old_manifest_digest: old.digest()?,
+            new_manifest: new.clone(),
+            request_id: [42; 32],
+            issued_at: claims.issued_at,
+            expires_at: claims.expires_at,
+        };
+        let rotation = ipars_quorum::ManifestRotation {
+            old_signature: sign_transition(&old, &old_keys, &old, &transition)?,
+            new_signature: sign_transition(&new, &new_keys, &old, &transition)?,
+            transition,
+        };
+        let plane = test_plane(Arc::new(InMemoryStore::default()))?;
+        plane
+            .bind_admin_quorum_manifest(old.epoch, &old.digest()?)
+            .await?;
+        plane.publish_admin_quorum_manifest(old.clone()).await?;
+        let app = super::super::router(
+            http_state(plane.clone()).with_admin_quorum_manifest(old.clone())?,
+        );
+        let send = |value: &ipars_quorum::ManifestRotation, path: &str| -> TestResult<Request> {
+            Ok(Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("authorization", "Bearer test-operator-token")
+                .body(Body::from(serde_json::to_vec(value)?))?)
+        };
+        let mut invalid = rotation.clone();
+        invalid.new_signature = invalid.old_signature.clone();
+        assert_eq!(
+            app.clone()
+                .oneshot(send(&invalid, ROTATION_PATH)?)
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        invalid = rotation.clone();
+        invalid.old_signature = invalid.new_signature.clone();
+        assert_eq!(
+            app.clone()
+                .oneshot(send(&invalid, ROTATION_PATH)?)
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(send(&rotation, &format!("{ROTATION_PATH}?x=1"))?)
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(send(&rotation, ROTATION_PATH)?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            plane.get_active_admin_quorum_manifest().await?,
+            Some(new.clone())
+        );
+        assert_ne!(
+            app.clone()
+                .oneshot(send(&rotation, ROTATION_PATH)?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(MANIFEST_PATH)
+                    .header("authorization", "Bearer test-operator-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let active: Manifest =
+            serde_json::from_slice(&to_bytes(response.into_body(), MAX_ADMIN_BODY_BYTES).await?)?;
+        assert_eq!(active, new);
+        claims.epoch = new.epoch;
+        claims.manifest_digest = new.digest()?;
+        let requester = SigningKey::from_bytes(&[7; 32]);
+        claims.requester_public_key = requester.verifying_key().to_bytes();
+        let proof = RequestProof {
+            signature: requester.sign(&claims.proof_bytes()).to_bytes().to_vec(),
+        };
+        // The existing verifier reads the new shared epoch without a router restart.
+        let token = signed_token(&new, &new_keys, &claims, &proof)?;
+        let verifier = QuorumVerifier::new(old, plane)?;
+        let request = Request::builder()
+            .method(&*claims.method)
+            .uri(&claims.path)
+            .header(
+                QUORUM_TOKEN_HEADER,
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token)?),
+            )
+            .header(
+                QUORUM_PROOF_HEADER,
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&proof)?),
+            )
+            .body(Body::from(" { }\n"))?;
+        assert!(verifier.authorize(request).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotation_http_unconfigured_operator_cannot_apply() -> TestResult {
+        let plane = test_plane(Arc::new(InMemoryStore::default()))?;
+        let app = super::super::router(http_state(plane));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(ROTATION_PATH)
+                    .header("authorization", "Bearer test-operator-token")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(serde_json::from_value::<RotationRound1Request>(
+            serde_json::json!({"old_manifest":{}})
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotation_http_signer_pins_old_manifest_and_requires_owner_each_round() -> TestResult {
+        let (old, keys, claims, _) = fixture()?;
+        let (mut new, _, _, _) = fixture()?;
+        new.epoch = old.epoch + 1;
+        let transition = ipars_quorum::ManifestTransition {
+            old_manifest_digest: old.digest()?,
+            new_manifest: new,
+            request_id: [43; 32],
+            issued_at: claims.issued_at,
+            expires_at: claims.expires_at,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let provider = Router::new().route(
+            "/realms/test/protocol/openid-connect/userinfo",
+            get(|| async {
+                Json(serde_json::json!({"sub":"owner", "email":"owner@example.test"}))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, provider).await;
+        });
+        let auth = WebUiAuthConfig::new(
+            super::super::WebAuthProvider::Keycloak,
+            "https://issuer.example.test/realms/test".into(),
+            "test-client".into(),
+            None,
+            Some(format!("http://{address}/realms/test")),
+            "openid".into(),
+        )?
+        .with_required_email("owner@example.test".into())?
+        .with_required_subject("owner".into())?;
+        let app = signer_router_with_rotation_anchor(
+            old.clone(),
+            keys[0].clone(),
+            "node-1",
+            auth,
+            old.clone(),
+        )?;
+        let request =
+            |value: serde_json::Value, authorized: bool, round: u8| -> TestResult<Request> {
+                let mut builder = Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/quorum/rotation/round{round}"));
+                if authorized {
+                    builder = builder.header("authorization", "Bearer owner-token");
+                }
+                Ok(builder.body(Body::from(serde_json::to_vec(&value)?))?)
+            };
+        let body = serde_json::to_value(RotationRound1Request {
+            transition: transition.clone(),
+        })?;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(body.clone(), false, 1)?)
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut substituted = body.clone();
+        substituted["old_manifest"] = serde_json::to_value(&old)?;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(substituted, true, 1)?)
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut wrong_anchor = body.clone();
+        wrong_anchor["transition"]["old_manifest_digest"] = serde_json::json!("a".repeat(64));
+        assert_eq!(
+            app.clone()
+                .oneshot(request(wrong_anchor, true, 1)?)
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = app.clone().oneshot(request(body, true, 1)?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let first: ipars_quorum::Round1Response =
+            serde_json::from_slice(&to_bytes(response.into_body(), MAX_SIGNER_BODY_BYTES).await?)?;
+        let mut second_engine = SignerEngine::new(old.clone(), "node-2", keys[1].clone(), 4, 60)?;
+        let second = second_engine.round1_rotation(&old, &transition, claims.issued_at)?;
+        let package = frost::SigningPackage::new(
+            BTreeMap::from([
+                (
+                    frost::Identifier::try_from(first.identifier)?,
+                    first.commitments,
+                ),
+                (
+                    frost::Identifier::try_from(second.identifier)?,
+                    second.commitments,
+                ),
+            ]),
+            &transition.signing_bytes()?,
+        );
+        let body = serde_json::to_value(RotationRound2Request {
+            session_id: first.session_id,
+            transition,
+            signing_package: package,
+        })?;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(body.clone(), false, 2)?)
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(body.clone(), true, 2)?)
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.oneshot(request(body, true, 2)?).await?.status(),
+            StatusCode::BAD_REQUEST
+        );
+        server.abort();
+        Ok(())
+    }
+
     fn fixture() -> TestResult<(
         Manifest,
         Vec<frost::keys::KeyPackage>,
@@ -615,6 +931,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_mutation_rechecks_anchor_after_delayed_oidc() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (started, resume) = (entered.clone(), release.clone());
+        let provider = Router::new().route(
+            "/realms/test/protocol/openid-connect/userinfo",
+            get(move || {
+                let (started, resume) = (started.clone(), resume.clone());
+                async move {
+                    started.notify_one();
+                    resume.notified().await;
+                    Json(serde_json::json!({"sub":"owner", "email":"owner@example.test"}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, provider).await;
+        });
+        let oidc = WebUiAuthConfig::new(
+            super::super::WebAuthProvider::Keycloak,
+            "https://issuer.example.test/realms/test".into(),
+            "test-client".into(),
+            None,
+            Some(format!("http://{address}/realms/test")),
+            "openid".into(),
+        )?
+        .with_required_email("owner@example.test".into())?
+        .with_required_subject("owner".into())?;
+        let plane = test_plane(Arc::new(InMemoryStore::default()))?;
+        let auth = Arc::new(super::super::ManagementAuth {
+            operator_api_bearer_token: None,
+            web_ui_auth: Some(Arc::new(oidc)),
+            quorum_verifier: None,
+            quorum_anchor_probe: anchor_probe(plane.clone()),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/admin/policy",
+                post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::OK }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth,
+                super::super::require_management_auth,
+            ));
+        let pending = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/admin/policy")
+                    .header("authorization", "Bearer owner-token")
+                    .body(Body::empty())
+                    .expect("test request"),
+            )
+            .await
+        });
+        let started = timeout(Duration::from_secs(3), entered.notified()).await;
+        if started.is_err() {
+            pending.abort();
+            server.abort();
+            return Err("OIDC request did not start".into());
+        }
+        let (manifest, _, _, _) = fixture()?;
+        plane
+            .bind_admin_quorum_manifest(manifest.epoch, &manifest.digest()?)
+            .await?;
+        release.notify_one();
+        let response = pending.await??;
+        server.abort();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preexisting_unconfigured_cp_observes_later_shared_anchor_and_fails_closed(
     ) -> TestResult {
         let (manifest, _, _, _) = fixture()?;
@@ -683,6 +1081,9 @@ mod tests {
         let plane = test_plane(Arc::new(InMemoryStore::default()))?;
         plane
             .bind_admin_quorum_manifest(manifest.epoch, &manifest.digest()?)
+            .await?;
+        plane
+            .publish_admin_quorum_manifest(manifest.clone())
             .await?;
         let app =
             super::super::router(http_state(plane).with_admin_quorum_manifest(manifest.clone())?);
@@ -828,6 +1229,9 @@ mod tests {
         plane_a
             .bind_admin_quorum_manifest(manifest.epoch, &manifest.digest()?)
             .await?;
+        plane_a
+            .publish_admin_quorum_manifest(manifest.clone())
+            .await?;
         let a = admin_app(QuorumVerifier::new(manifest.clone(), plane_a)?);
         let b = admin_app(QuorumVerifier::new(manifest, plane_b)?);
         for (method, path, body) in [
@@ -908,6 +1312,9 @@ mod tests {
         assert_ne!(response.status(), StatusCode::OK);
         plane
             .bind_admin_quorum_manifest(manifest.epoch, &manifest.digest()?)
+            .await?;
+        plane
+            .publish_admin_quorum_manifest(manifest.clone())
             .await?;
         let mut incompatible = manifest.clone();
         incompatible.epoch += 1;
