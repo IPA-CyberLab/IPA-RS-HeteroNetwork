@@ -1,0 +1,63 @@
+fullnameOverride: heterocloud-flow-dev
+runtime:
+  hostNetwork: false
+secrets:
+  create: false
+  existingSecret: heterocloud-flow-dev-secrets
+providerAuth:
+  issuer: heterocloud-dev
+  audience: heterocloud-flow-dev
+principalAuth:
+  issuer: heterocloud-dev
+  audience: heterocloud-flow-dev-data
+database:
+  externalPort: 5432
+  proxy:
+    enabled: false
+    addresses: []
+    endpointNodeNames: {}
+  nodeSelector: {}
+  migrateOnApiStart: false
+  migrationJob:
+    enabled: true
+api:
+  replicaCount: 3
+  publicUrls: ["https://flow.${domain}"]
+  publicService:
+    enabled: false
+matchmaker:
+  replicaCount: 3
+signaling:
+  replicaCount: 3
+  publicUrls: ["wss://flow.${domain}"]
+  publicService:
+    enabled: false
+livekit:
+  replicaCount: 3
+  internalUrl: http://heterocloud-flow-dev-livekit:7880
+  publicUrls: ["wss://flow.${domain}"]
+  existingConfigSecret: heterocloud-flow-dev-livekit-config
+coturn:
+  replicaCount: 3
+  additionalPools: []
+  realm: turn.${domain}
+  publicHosts: ["turn.${domain}"]
+  relayAddress:
+    mode: host
+    mappings: []
+  performance:
+    tuneHostUdpBuffers: false
+redis:
+  enabled: false
+externalRedis:
+  address: redis.heterocloud-flow-dev.svc.cluster.local:6379
+  sentinelUrls: []
+  passwordSecretKey: redis-password
+postgresql-ha:
+  enabled: false
+monitoring:
+  prometheus:
+    enabled: false
+  grafana:
+    enabled: false
+nodeSelector: {}

@@ -1,0 +1,51 @@
+fullnameOverride: heterocloud-syouyu-dev
+secrets:
+  create: false
+  existingSecret: heterocloud-syouyu-dev-secrets
+providerAuth:
+  issuer: heterocloud-dev
+  audience: heterocloud-syouyu
+principalAuth:
+  issuer: heterocloud-dev
+  audience: heterocloud-syouyu-dev-data
+api:
+  replicaCount: 3
+database:
+  port: 5432
+garage:
+  replicaCount: 3
+  config:
+    replicationFactor: 3
+    s3RootDomain: .s3.${domain}
+  persistence:
+    meta:
+      storageClass: ${storage_class}
+      size: 2Gi
+    data:
+      storageClass: ${storage_class}
+      size: 10Gi
+  layout:
+    tags: [syouyu-dev]
+  s3Service:
+    type: ClusterIP
+    publicEndpoint: https://s3.${domain}
+  gateway:
+    enabled: false
+pdb:
+  api:
+    enabled: false
+monitoring:
+  serviceMonitor:
+    enabled: false
+networkPolicy:
+  apiIngress:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: heterocloud-dev
+  monitoringIngress: []
+  database:
+    sameNamespace: true
+    podSelector:
+      app.kubernetes.io/name: dev-postgres
+    peers: []
+    externalCidrs: []

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "channel": "dev",
+  "project": "hetero-platform-dev",
+  "requires_dedicated_cluster": true,
+  "namespaces": {
+    "heterocloud": "heterocloud-dev",
+    "heterocloud-flow": "heterocloud-flow-dev",
+    "heterocloud-flash": "heterocloud-flash-dev",
+    "heterocloud-syouyu": "heterocloud-syouyu-dev"
+  }
+}

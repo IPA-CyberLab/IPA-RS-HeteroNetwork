@@ -1,0 +1,23 @@
+fullnameOverride: heterocloud-flash-dev
+api:
+  replicaCount: 1
+controller:
+  replicaCount: 1
+publicDomain: flash.${domain}
+workloadNamespace: heterocloud-flash-dev-workloads
+runtimeClass:
+  create: false
+  name: gvisor
+persistence:
+  enabled: true
+  storageClass: ${storage_class}
+adminVolumeClaims: []
+adminVolumeMounts: {}
+providerAuth:
+  issuer: heterocloud-dev
+  audience: heterocloud-flash-dev
+  existingSecret: heterocloud-flash-dev-provider-auth
+  publicKeysJson: ""
+registry:
+  enabled: false
+nodeSelector: {}
