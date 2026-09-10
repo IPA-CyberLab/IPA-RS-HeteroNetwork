@@ -28,9 +28,22 @@ rejected. The tool does not verify test evidence automatically: the operator mus
 review it before promotion.
 
 The supported component names are `heteronetwork`, `heterocloud`, `flow`, `flash`
-and `syouyu`. Releases from other repositories must supply the same schema before
-being selected; this does not install release publishing workflows into those
-repositories.
+and `syouyu`. Their release workflows now generate the same schema. Selection
+does not trigger those workflows or deploy the resulting image. Download assets
+only from a successful publication; older releases may not contain this contract.
+
+| Component | Release asset |
+| --- | --- |
+| HeteroNetwork | `heteronetwork-release-artifact.json` |
+| HeteroCloud | `heterocloud-release-artifact.json` |
+| Flow | `flow-release-artifact.json` |
+| Flash | `flash-release-artifact.json` |
+| Syouyu | `syouyu-release-artifact.json` |
+
+Release uploads refuse replacement. Registry tags remain mutable aliases; never
+substitute a version or Git tag for the manifest's digest reference. Flash's
+architecture artifacts are scoped to the workflow attempt: retry all image jobs
+together, not only a failed assembly job that lacks that attempt's inputs.
 
 Flow artifacts also require `companions.livekit.image`, containing the digest-pinned
 `ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit` image published from the same

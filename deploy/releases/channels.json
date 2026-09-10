@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "dev": {
+    "heteronetwork": {
+      "schema_version": 1,
+      "component": "heteronetwork",
+      "version": "0.1.15-dev.3",
+      "commit": "eb3c9e145bf9e298aafba9bd0d1afad361d4192a",
+      "image": "ghcr.io/ipa-cyberlab/heteronetwork@sha256:365fd05790f65284373116d105b46cc59f369cf088c0d2263337aa9a5f8bfb15",
+      "native": {
+        "linux-amd64": {
+          "asset": "heteronetwork-0.1.15-dev.3-linux-amd64.tar.gz",
+          "sha256": "6d43d2f17b784fef3931ab500c6e5785f6868cf8ca262ada9d2fa957a9ffa03c",
+          "files": {
+            "bin/ipars": "c6dd2501be30f2927318f7fb769cec67601ed29999d4b4e037af3109799e5f33",
+            "bin/ipars-k8s-controller": "80aaa9478047a4689b3a374ae1e7c4050181eb510c7d9f1b25f92c7c4c9819e8",
+            "bin/iparsd": "deaad8667726697add954cb33f8e9f0e6401a05365e98407e35d96f8bd572708",
+            "libexec/keycloak-autopilot.sh": "07946bd45138d466ea94c170c5c28323c0039a32a78956c650174c5df349782b",
+            "libexec/keycloak-ha-node.sh": "c94ed3366c3b627f4df4b5cf121b0d80a91325c72d448f91427234dc5e554857",
+            "libexec/kubeadm-ha-autopilot.sh": "b4fd9571214cfe816402ba516f1361af3111aacbd62b93294fccdbc372516e0e",
+            "libexec/kubeadm-ha-node.sh": "d0899266234f66a4090e0db278aab2231099fd802a761e4732b8c08c8eb0144b",
+            "libexec/postgres-ha-autopilot.sh": "d5518f514de3bd083e432854b124e9ebfeb8de84c15a3158418bd86439616fce",
+            "libexec/postgres-ha-node.sh": "d9a9d5195738f59f898a4ef139d81bf1fcb9f7c433a892b9432db8dd17f2b0ad",
+            "libexec/public-services-autopilot.sh": "0f4d3bbcf9437ca1e8fe07d8cf86a9534434316988c1c103a8001523f1ab03fd",
+            "libexec/public-services-bootstrap.sh": "c62facf2f0265cdc23f3f8e53ed44bbb0bcd3fc4dd16ac1109cb4809b1f94d07",
+            "libexec/reconcile-owner-console-auth.sh": "9aca468cde3dc5652fdcb600cb595734442cf71eb0ee11339797ce1cca69962e"
+          }
+        }
+      }
+    }
+  },
+  "prod": {},
+  "history": [
+    {
+      "revision": 1,
+      "command": "stage",
+      "channel": "dev",
+      "component": "heteronetwork",
+      "before": null,
+      "after": {
+        "schema_version": 1,
+        "component": "heteronetwork",
+        "version": "0.1.15-dev.3",
+        "commit": "eb3c9e145bf9e298aafba9bd0d1afad361d4192a",
+        "image": "ghcr.io/ipa-cyberlab/heteronetwork@sha256:365fd05790f65284373116d105b46cc59f369cf088c0d2263337aa9a5f8bfb15",
+        "native": {
+          "linux-amd64": {
+            "asset": "heteronetwork-0.1.15-dev.3-linux-amd64.tar.gz",
+            "sha256": "6d43d2f17b784fef3931ab500c6e5785f6868cf8ca262ada9d2fa957a9ffa03c",
+            "files": {
+              "bin/ipars": "c6dd2501be30f2927318f7fb769cec67601ed29999d4b4e037af3109799e5f33",
+              "bin/ipars-k8s-controller": "80aaa9478047a4689b3a374ae1e7c4050181eb510c7d9f1b25f92c7c4c9819e8",
+              "bin/iparsd": "deaad8667726697add954cb33f8e9f0e6401a05365e98407e35d96f8bd572708",
+              "libexec/keycloak-autopilot.sh": "07946bd45138d466ea94c170c5c28323c0039a32a78956c650174c5df349782b",
+              "libexec/keycloak-ha-node.sh": "c94ed3366c3b627f4df4b5cf121b0d80a91325c72d448f91427234dc5e554857",
+              "libexec/kubeadm-ha-autopilot.sh": "b4fd9571214cfe816402ba516f1361af3111aacbd62b93294fccdbc372516e0e",
+              "libexec/kubeadm-ha-node.sh": "d0899266234f66a4090e0db278aab2231099fd802a761e4732b8c08c8eb0144b",
+              "libexec/postgres-ha-autopilot.sh": "d5518f514de3bd083e432854b124e9ebfeb8de84c15a3158418bd86439616fce",
+              "libexec/postgres-ha-node.sh": "d9a9d5195738f59f898a4ef139d81bf1fcb9f7c433a892b9432db8dd17f2b0ad",
+              "libexec/public-services-autopilot.sh": "0f4d3bbcf9437ca1e8fe07d8cf86a9534434316988c1c103a8001523f1ab03fd",
+              "libexec/public-services-bootstrap.sh": "c62facf2f0265cdc23f3f8e53ed44bbb0bcd3fc4dd16ac1109cb4809b1f94d07",
+              "libexec/reconcile-owner-console-auth.sh": "9aca468cde3dc5652fdcb600cb595734442cf71eb0ee11339797ce1cca69962e"
+            }
+          }
+        }
+      },
+      "at": "2026-09-10T18:52:25.046Z"
+    }
+  ]
+}
