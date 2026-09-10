@@ -8,6 +8,10 @@ const components = new Set(['heteronetwork', 'heterocloud', 'flow', 'flash', 'sy
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value) &&
   Object.getPrototypeOf(value) === Object.prototype;
 const same = (a, b) => a && b && JSON.stringify(validateArtifact(a)) === JSON.stringify(validateArtifact(b));
+export const SUDO_PLUGIN_HEADER_SHA256 = '11234d6e47e6da95adcb3ace71dc93f1d94b759aeca4cd938d829c076adfb35f';
+const sudoFiles = {'bin/local-sudo-v2': 0o755, 'lib/quorum_v2_gate.so': 0o644, 'NOT_ENABLED.txt': 0o644};
+const exactKeys = (value, names) => object(value) &&
+  JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...names].sort());
 export function validateArtifact(value) {
   if (!value || value.schema_version !== 1 || !components.has(value.component) ||
       typeof value.version !== 'string' || !/^v?\d+\.\d+\.\d+(?:[.-][A-Za-z0-9._-]+)?$/.test(value.version) ||
@@ -51,6 +55,37 @@ export function validateArtifact(value) {
       files[name] = bundle.files[name];
     }
     artifact.native = {'linux-amd64': {asset: expectedAsset, sha256: bundle.sha256, files}};
+  }
+  if (value.sudo_native !== undefined) {
+    if (value.component !== 'heteronetwork' ||
+        !/^ghcr\.io\/ipa-cyberlab\/heteronetwork@sha256:[a-f0-9]{64}$/.test(value.image) ||
+        !exactKeys(value.sudo_native, ['linux-amd64'])) {
+      throw new Error('Unsupported sudo artifact platform or component');
+    }
+    const bundle = value.sudo_native['linux-amd64'];
+    if (!exactKeys(bundle, ['asset', 'sha256', 'source_commit', 'profile', 'plugin_header_sha256', 'files']) ||
+        bundle.asset !== `heteronetwork-${value.version.replace(/^v/, '')}-sudo-v2-linux-amd64.tar.gz` ||
+        typeof bundle.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(bundle.sha256) ||
+        bundle.source_commit !== value.commit || bundle.profile !== 'release' ||
+        bundle.plugin_header_sha256 !== SUDO_PLUGIN_HEADER_SHA256 ||
+        !exactKeys(bundle.files, Object.keys(sudoFiles))) {
+      throw new Error('Invalid sudo release binding');
+    }
+    const files = {};
+    for (const name of Object.keys(sudoFiles).sort()) {
+      const entry = bundle.files[name];
+      const maximum = name === 'NOT_ENABLED.txt' ? 65536 : 256 * 1024 * 1024;
+      if (!exactKeys(entry, ['sha256', 'size', 'mode']) ||
+          typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256) ||
+          !Number.isSafeInteger(entry.size) || entry.size <= 0 || entry.size > maximum ||
+          entry.mode !== sudoFiles[name]) {
+        throw new Error('Invalid sudo payload metadata');
+      }
+      files[name] = {sha256: entry.sha256, size: entry.size, mode: entry.mode};
+    }
+    artifact.sudo_native = {'linux-amd64': {asset: bundle.asset, sha256: bundle.sha256,
+      source_commit: bundle.source_commit, profile: bundle.profile,
+      plugin_header_sha256: bundle.plugin_header_sha256, files}};
   }
   return artifact;
 }

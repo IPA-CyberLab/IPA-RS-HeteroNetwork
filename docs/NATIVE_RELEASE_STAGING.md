@@ -278,3 +278,19 @@ They cover fixed read-only commands, bounded output/timeouts, credential-output
 suppression, inactive-unit discovery, dependency closure, executable evidence,
 unknown consumers, symlink/race rejection and incomplete reporting. They do not
 collect live production inventory or execute any artifact.
+
+## Sudo Companion Identity
+
+The shared HeteroNetwork catalog also accepts an optional `sudo_native` binding
+for a separate Linux amd64 sudo-v2 archive. It binds the version-derived asset
+name, archive SHA256, matching source commit, release build profile, pinned sudo
+plugin header, and the exact hashes, sizes and modes of the daemon, plugin and
+disabled-state notice. These fields participate in stage/promote/rollback equality
+and history replay; omitting or changing them cannot match a selected release.
+
+This validation checks metadata, not build provenance or deployed policy. The
+native preparation tool described above handles only the main native archive;
+it does not extract, verify or activate the separate sudo archive. Publication
+must establish the companion's clean source and actual payload identity, and
+the companion installer must verify its bytes independently. No currently
+selected release is retroactively assigned a synthetic sudo archive binding.
