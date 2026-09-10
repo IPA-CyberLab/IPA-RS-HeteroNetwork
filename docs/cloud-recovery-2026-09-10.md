@@ -114,3 +114,35 @@ At 05:49 UTC, all four API, three owner-console and four worker replicas were
 Ready on this image. Argo CD reported Healthy/Synced. A browser sweep during
 the rolling update authenticated and passed 14/15 pages; only Syouyu failed.
 Tenant Flash workload specs and containers were not changed by this rollout.
+
+## Remaining Capacity Risk
+
+A later cold login exceeded the browser's 15-second wait for the Keycloak
+authentication POST. The runner originally left that response promise
+unhandled while awaiting the click; `416b85bc` fixes evidence collection,
+without suppressing the timeout. `08caff80` records sanitized form destinations
+and POST timing. Subsequent sweeps authenticated, but these successes do not
+prove that the historical tail-latency problem is eliminated.
+
+Read-only diagnostics found `.5` withdrawn from the Keycloak edge pool at
+05:50:49 after a 2,003 ms health timeout, returning at 05:51:25. The host has
+roughly 4 GiB RAM and a shared rotational disk, elevated I/O PSI, and about
+614 MiB swap in use. System processes consumed about 1.28 GiB and Pods 1.77 GiB.
+API-server RSS was about 1.09 GiB, with no corresponding Pod memory request;
+existing requested memory was already 96% of allocatable. System/kube
+reservations total 1 GiB. This is a capacity-accounting gap, not evidence that
+the authentication POST itself was conclusively attributed to one process.
+
+At the diagnostic snapshot, the PostgreSQL primary had 110 idle connections
+against a 300 limit, no blocked sessions/ungranted locks, and two synchronous
+replicas with 12--30 ms lag. Keycloak's `.10` and `.5` pools had no waiters;
+the cache view contained the expected three members. No database restart or
+primary switch was performed.
+
+`.8` has substantially more free memory, but its legitimate database bundle is
+proxy-only and lacks the Keycloak provisioning secrets. It is selected by the
+database autopilot, but reciprocal underlay eligibility has not converged;
+its latest reachability list contained only itself. The 32-member ceiling is
+not the blocker. Do not remove `.proxy-only`, copy full-member credentials, or
+start a replica outside the authorized provisioning path. No placement or
+static-Pod memory change was forced during this incident.
