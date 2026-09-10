@@ -46,13 +46,14 @@ const runDirectory = await fs.mkdtemp(path.join(artifactDirectory, "heterocloud-
 await fs.chmod(runDirectory, 0o700);
 const report = { startedAt: new Date().toISOString(), mode: diagnostic ? "unauthenticated-diagnostic" : "authenticated", result: "incomplete", attempts: [] };
 
-const browser = await chromium.launch({
-  headless: true,
-  args: ["--disable-dev-shm-usage"],
-});
-
+let browser;
 let failed = false;
 try {
+  browser = await chromium.launch({
+    headless: true,
+    args: ["--disable-dev-shm-usage"],
+    timeout: timeoutMs,
+  });
   for (let attempt = 1; attempt <= (diagnostic ? 1 : attempts); attempt += 1) {
     const startedAt = Date.now();
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, serviceWorkers: "block" });
@@ -139,7 +140,9 @@ try {
       await usernameField.fill(username);
       await passwordField.fill(password);
 
-      const authenticationResponsePromise = page.waitForResponse(
+      // Attach rejection handlers to both operations immediately. Waiting for the
+      // click first can leave the response timeout unhandled while navigation stalls.
+      const [authenticationResponse] = await Promise.all([page.waitForResponse(
         (response) => {
           const request = response.request();
           const url = new URL(response.url());
@@ -149,9 +152,7 @@ try {
           );
         },
         { timeout: timeoutMs },
-      );
-      await submitButton.click({ timeout: timeoutMs });
-      const authenticationResponse = await authenticationResponsePromise;
+      ), submitButton.click({ timeout: timeoutMs })]);
       if (authenticationResponse.status() >= 400) {
         throw new Error(
           `Keycloak authentication POST returned HTTP ${authenticationResponse.status()}`,
@@ -309,11 +310,21 @@ try {
       record.requestFailures = requestFailures;
       record.expectedUnauthenticatedErrors = expectedErrors;
       record.optionalAnalyticsBlockedByCsp = securityBlocks;
-      await context.close();
+      await context.close().catch((error) => {
+        failed = true;
+        record.result = "failed";
+        record.errors.push(`context cleanup: ${formatError(error)}`);
+      });
     }
   }
+} catch (error) {
+  failed = true;
+  report.error = formatError(error);
 } finally {
-  await browser.close();
+  await browser?.close().catch((error) => {
+    failed = true;
+    report.cleanupError = formatError(error);
+  });
   report.finishedAt = new Date().toISOString();
   report.result = failed ? "failed" : diagnostic ? "diagnostic-only-not-full-pass" : "passed";
   await fs.writeFile(path.join(runDirectory, "report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
