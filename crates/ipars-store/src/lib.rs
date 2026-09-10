@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ipars_control_plane::{
-    ensure_token_definition_matches, overlay_route_catalog_epoch, AdminCapabilityRevocation,
-    AdminCapabilityUse, AdminQuorumManifestAnchor, ControlPlaneError, ControlPlaneStore,
-    HeartbeatStoreUpdate, KeycloakCandidateLease, RejoinNodeStoreUpdate, RemovedNode, TokenLedger,
-    ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS, MAX_ADMIN_CAPABILITY_LEDGER_RECORDS,
+    ensure_token_definition_matches, overlay_route_catalog_epoch, validate_admin_public_manifest,
+    AdminCapabilityRevocation, AdminCapabilityUse, AdminQuorumManifest, AdminQuorumManifestAnchor,
+    AdminQuorumRotationHistory, ControlPlaneError, ControlPlaneStore, HeartbeatStoreUpdate,
+    KeycloakCandidateLease, RejoinNodeStoreUpdate, RemovedNode, TokenLedger,
+    VerifiedAdminQuorumRotation, ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS,
+    MAX_ADMIN_CAPABILITY_LEDGER_RECORDS,
 };
 use ipars_types::api::ClientGatewaySelection;
 use ipars_types::{
@@ -20,7 +22,23 @@ const PATH_PAIR_QUERY_CHUNK_SIZE: usize = 200;
 const MAX_KEYCLOAK_CANDIDATE_QUERY_LIMIT: usize = 64;
 // Separate from membership and migration locks. Serializes the global capacity/GC gate.
 const ADMIN_CAPABILITY_LEDGER_LOCK_ID: i64 = 0x4950_4152_5341_444d;
-const ADMIN_CAPABILITY_SCHEMA: [&str; 3] = [
+const ADMIN_CAPABILITY_SCHEMA: [&str; 5] = [
+    "CREATE TABLE IF NOT EXISTS admin_quorum_public_manifests (
+        cluster_id TEXT NOT NULL,
+        manifest_digest TEXT NOT NULL,
+        manifest_epoch TEXT NOT NULL,
+        manifest_json TEXT NOT NULL,
+        PRIMARY KEY (cluster_id, manifest_digest)
+    )",
+    "CREATE TABLE IF NOT EXISTS admin_quorum_rotation_history (
+        cluster_id TEXT NOT NULL,
+        manifest_epoch TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        rotation_json TEXT NOT NULL,
+        installed_at_millis BIGINT NOT NULL,
+        PRIMARY KEY (cluster_id, manifest_epoch),
+        UNIQUE (cluster_id, request_id)
+    )",
     "CREATE TABLE IF NOT EXISTS admin_quorum_manifest_anchors (
         cluster_id TEXT PRIMARY KEY NOT NULL,
         manifest_epoch TEXT NOT NULL,
@@ -388,6 +406,190 @@ impl SqliteControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for SqliteControlPlaneStore {
+    async fn initialize_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        let anchor = validate_admin_public_manifest(cluster, &manifest)?;
+        let json = serde_json::to_string(&manifest).map_err(json_error)?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("INSERT INTO admin_quorum_manifest_anchors (cluster_id, manifest_epoch, manifest_digest)
+            SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM admin_capability_ledger WHERE cluster_id = ?1)
+            AND NOT EXISTS (SELECT 1 FROM admin_quorum_rotation_history WHERE cluster_id = ?1)
+            AND NOT EXISTS (SELECT 1 FROM admin_quorum_public_manifests WHERE cluster_id = ?1)
+            ON CONFLICT(cluster_id) DO NOTHING")
+            .bind(cluster.as_str()).bind(anchor.manifest_epoch.to_string()).bind(&anchor.manifest_digest)
+            .execute(&mut *transaction).await.map_err(sql_error)?;
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_quorum_manifest_anchors WHERE cluster_id = ?1 AND manifest_epoch = ?2 AND manifest_digest = ?3")
+            .bind(cluster.as_str()).bind(anchor.manifest_epoch.to_string()).bind(&anchor.manifest_digest)
+            .fetch_one(&mut *transaction).await.map_err(sql_error)?;
+        if matches != 1 {
+            return Err(ControlPlaneError::Store(
+                "admin public manifest anchor mismatch".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO admin_quorum_public_manifests (cluster_id, manifest_digest, manifest_epoch, manifest_json)
+            VALUES (?1, ?2, ?3, ?4) ON CONFLICT(cluster_id, manifest_digest) DO NOTHING")
+            .bind(cluster.as_str()).bind(&anchor.manifest_digest).bind(anchor.manifest_epoch.to_string()).bind(json)
+            .execute(&mut *transaction).await.map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn publish_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        let anchor = validate_admin_public_manifest(cluster, &manifest)?;
+        let json = serde_json::to_string(&manifest).map_err(json_error)?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_quorum_manifest_anchors WHERE cluster_id = ?1 AND manifest_epoch = ?2 AND manifest_digest = ?3")
+            .bind(cluster.as_str()).bind(anchor.manifest_epoch.to_string()).bind(&anchor.manifest_digest)
+            .fetch_one(&mut *transaction).await.map_err(sql_error)?;
+        if matches != 1 {
+            return Err(ControlPlaneError::Store(
+                "admin public manifest anchor mismatch".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO admin_quorum_public_manifests (cluster_id, manifest_digest, manifest_epoch, manifest_json)
+            VALUES (?1, ?2, ?3, ?4) ON CONFLICT(cluster_id, manifest_digest) DO NOTHING")
+            .bind(cluster.as_str()).bind(&anchor.manifest_digest).bind(anchor.manifest_epoch.to_string()).bind(json)
+            .execute(&mut *transaction).await.map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_active_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifest>, ControlPlaneError> {
+        // One statement returns a coherent anchor/config snapshot while CAS may run elsewhere.
+        let row = sqlx::query("SELECT a.manifest_epoch, a.manifest_digest, p.manifest_json
+            FROM admin_quorum_manifest_anchors a LEFT JOIN admin_quorum_public_manifests p
+            ON a.cluster_id = p.cluster_id AND a.manifest_digest = p.manifest_digest WHERE a.cluster_id = ?1")
+            .bind(cluster.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
+        let Some(row) = row else {
+            self.get_admin_quorum_manifest_anchor(cluster).await?;
+            return Ok(None);
+        };
+        let anchor = admin_anchor(
+            row.try_get("manifest_epoch").map_err(sql_error)?,
+            row.try_get("manifest_digest").map_err(sql_error)?,
+        )?;
+        let json: Option<String> = row.try_get("manifest_json").map_err(sql_error)?;
+        let json = json.ok_or_else(|| {
+            ControlPlaneError::Store("active admin public manifest missing".into())
+        })?;
+        let manifest: AdminQuorumManifest = serde_json::from_str(&json).map_err(json_error)?;
+        if validate_admin_public_manifest(cluster, &manifest)? != anchor {
+            return Err(ControlPlaneError::Store(
+                "active admin public manifest mismatch".into(),
+            ));
+        }
+        Ok(Some(manifest))
+    }
+
+    async fn rotate_admin_quorum_manifest(
+        &self,
+        verified: VerifiedAdminQuorumRotation,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let now = Utc::now();
+        if verified
+            .validate_at(now.timestamp().try_into().unwrap_or(0))
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let rotation = verified.rotation();
+        let cluster = ClusterId::from_string(rotation.transition.new_manifest.cluster_id.clone());
+        let old = validate_admin_public_manifest(&cluster, verified.old_manifest())?;
+        let new = validate_admin_public_manifest(&cluster, &rotation.transition.new_manifest)?;
+        let result = sqlx::query(
+            "UPDATE admin_quorum_manifest_anchors SET manifest_epoch = ?4, manifest_digest = ?5
+            WHERE cluster_id = ?1 AND manifest_epoch = ?2 AND manifest_digest = ?3",
+        )
+        .bind(cluster.as_str())
+        .bind(old.manifest_epoch.to_string())
+        .bind(&old.manifest_digest)
+        .bind(new.manifest_epoch.to_string())
+        .bind(&new.manifest_digest)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if result.rows_affected() != 1 {
+            return Ok(false);
+        }
+        for manifest in [verified.old_manifest(), &rotation.transition.new_manifest] {
+            let anchor = validate_admin_public_manifest(&cluster, manifest)?;
+            sqlx::query("INSERT INTO admin_quorum_public_manifests (cluster_id, manifest_digest, manifest_epoch, manifest_json)
+                VALUES (?1, ?2, ?3, ?4) ON CONFLICT(cluster_id, manifest_digest) DO NOTHING")
+                .bind(cluster.as_str()).bind(anchor.manifest_digest).bind(anchor.manifest_epoch.to_string())
+                .bind(serde_json::to_string(manifest).map_err(json_error)?)
+                .execute(&mut *transaction).await.map_err(sql_error)?;
+        }
+        let request_id: String = rotation
+            .transition
+            .request_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let inserted = sqlx::query(
+            "INSERT INTO admin_quorum_rotation_history
+            (cluster_id, manifest_epoch, request_id, rotation_json, installed_at_millis)
+            VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+        )
+        .bind(cluster.as_str())
+        .bind(new.manifest_epoch.to_string())
+        .bind(request_id)
+        .bind(serde_json::to_string(rotation).map_err(json_error)?)
+        .bind(now.timestamp_millis())
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if inserted.rows_affected() != 1 {
+            return Ok(false);
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(true)
+    }
+
+    async fn list_admin_quorum_rotation_history(
+        &self,
+        cluster: &ClusterId,
+        limit: u32,
+    ) -> Result<Vec<AdminQuorumRotationHistory>, ControlPlaneError> {
+        let rows = sqlx::query("SELECT rotation_json, installed_at_millis FROM admin_quorum_rotation_history
+            WHERE cluster_id = ?1 ORDER BY LENGTH(manifest_epoch) DESC, manifest_epoch DESC LIMIT ?2")
+            .bind(cluster.as_str()).bind(i64::from(limit.min(100))).fetch_all(&self.pool).await.map_err(sql_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let json: String = row.try_get("rotation_json").map_err(sql_error)?;
+                let millis: i64 = row.try_get("installed_at_millis").map_err(sql_error)?;
+                let installed_at = DateTime::from_timestamp_millis(millis).ok_or_else(|| {
+                    ControlPlaneError::Store("invalid admin rotation timestamp".into())
+                })?;
+                Ok(AdminQuorumRotationHistory {
+                    rotation: serde_json::from_str(&json).map_err(json_error)?,
+                    installed_at,
+                })
+            })
+            .collect()
+    }
     async fn bind_admin_quorum_manifest(
         &self,
         cluster_id: &ClusterId,
@@ -405,6 +607,8 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             "INSERT INTO admin_quorum_manifest_anchors (cluster_id, manifest_epoch, manifest_digest)
              SELECT ?1, ?2, ?3 WHERE NOT EXISTS
              (SELECT 1 FROM admin_capability_ledger WHERE cluster_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM admin_quorum_rotation_history WHERE cluster_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM admin_quorum_public_manifests WHERE cluster_id = ?1)
              ON CONFLICT(cluster_id) DO NOTHING",
         )
         .bind(cluster_id.as_str()).bind(manifest_epoch.to_string()).bind(manifest_digest)
@@ -437,7 +641,9 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .bind(cluster_id.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
         if row.is_none() {
             let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM admin_capability_ledger WHERE cluster_id = ?1",
+                "SELECT (SELECT COUNT(*) FROM admin_capability_ledger WHERE cluster_id = ?1)
+                    + (SELECT COUNT(*) FROM admin_quorum_public_manifests WHERE cluster_id = ?1)
+                    + (SELECT COUNT(*) FROM admin_quorum_rotation_history WHERE cluster_id = ?1)",
             )
             .bind(cluster_id.as_str())
             .fetch_one(&self.pool)
@@ -2086,6 +2292,193 @@ impl PostgresControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for PostgresControlPlaneStore {
+    async fn initialize_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        let anchor = validate_admin_public_manifest(cluster, &manifest)?;
+        let json = serde_json::to_string(&manifest).map_err(json_error)?;
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ADMIN_CAPABILITY_LEDGER_LOCK_ID)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("INSERT INTO admin_quorum_manifest_anchors (cluster_id, manifest_epoch, manifest_digest)
+            SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM admin_capability_ledger WHERE cluster_id = $1)
+            AND NOT EXISTS (SELECT 1 FROM admin_quorum_rotation_history WHERE cluster_id = $1)
+            AND NOT EXISTS (SELECT 1 FROM admin_quorum_public_manifests WHERE cluster_id = $1)
+            ON CONFLICT(cluster_id) DO NOTHING")
+            .bind(cluster.as_str()).bind(anchor.manifest_epoch.to_string()).bind(&anchor.manifest_digest)
+            .execute(&mut *transaction).await.map_err(sql_error)?;
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_quorum_manifest_anchors WHERE cluster_id = $1 AND manifest_epoch = $2 AND manifest_digest = $3")
+            .bind(cluster.as_str()).bind(anchor.manifest_epoch.to_string()).bind(&anchor.manifest_digest)
+            .fetch_one(&mut *transaction).await.map_err(sql_error)?;
+        if matches != 1 {
+            return Err(ControlPlaneError::Store(
+                "admin public manifest anchor mismatch".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO admin_quorum_public_manifests (cluster_id, manifest_digest, manifest_epoch, manifest_json)
+            VALUES ($1, $2, $3, $4) ON CONFLICT(cluster_id, manifest_digest) DO NOTHING")
+            .bind(cluster.as_str()).bind(&anchor.manifest_digest).bind(anchor.manifest_epoch.to_string()).bind(json)
+            .execute(&mut *transaction).await.map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn publish_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        let anchor = validate_admin_public_manifest(cluster, &manifest)?;
+        let json = serde_json::to_string(&manifest).map_err(json_error)?;
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ADMIN_CAPABILITY_LEDGER_LOCK_ID)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_quorum_manifest_anchors WHERE cluster_id = $1 AND manifest_epoch = $2 AND manifest_digest = $3")
+            .bind(cluster.as_str()).bind(anchor.manifest_epoch.to_string()).bind(&anchor.manifest_digest)
+            .fetch_one(&mut *transaction).await.map_err(sql_error)?;
+        if matches != 1 {
+            return Err(ControlPlaneError::Store(
+                "admin public manifest anchor mismatch".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO admin_quorum_public_manifests (cluster_id, manifest_digest, manifest_epoch, manifest_json)
+            VALUES ($1, $2, $3, $4) ON CONFLICT(cluster_id, manifest_digest) DO NOTHING")
+            .bind(cluster.as_str()).bind(&anchor.manifest_digest).bind(anchor.manifest_epoch.to_string()).bind(json)
+            .execute(&mut *transaction).await.map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_active_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifest>, ControlPlaneError> {
+        // One statement returns a coherent anchor/config snapshot while CAS may run elsewhere.
+        let row = sqlx::query("SELECT a.manifest_epoch, a.manifest_digest, p.manifest_json
+            FROM admin_quorum_manifest_anchors a LEFT JOIN admin_quorum_public_manifests p
+            ON a.cluster_id = p.cluster_id AND a.manifest_digest = p.manifest_digest WHERE a.cluster_id = $1")
+            .bind(cluster.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
+        let Some(row) = row else {
+            self.get_admin_quorum_manifest_anchor(cluster).await?;
+            return Ok(None);
+        };
+        let anchor = admin_anchor(
+            row.try_get("manifest_epoch").map_err(sql_error)?,
+            row.try_get("manifest_digest").map_err(sql_error)?,
+        )?;
+        let json: Option<String> = row.try_get("manifest_json").map_err(sql_error)?;
+        let json = json.ok_or_else(|| {
+            ControlPlaneError::Store("active admin public manifest missing".into())
+        })?;
+        let manifest: AdminQuorumManifest = serde_json::from_str(&json).map_err(json_error)?;
+        if validate_admin_public_manifest(cluster, &manifest)? != anchor {
+            return Err(ControlPlaneError::Store(
+                "active admin public manifest mismatch".into(),
+            ));
+        }
+        Ok(Some(manifest))
+    }
+
+    async fn rotate_admin_quorum_manifest(
+        &self,
+        verified: VerifiedAdminQuorumRotation,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ADMIN_CAPABILITY_LEDGER_LOCK_ID)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let now = Utc::now();
+        if verified
+            .validate_at(now.timestamp().try_into().unwrap_or(0))
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let rotation = verified.rotation();
+        let cluster = ClusterId::from_string(rotation.transition.new_manifest.cluster_id.clone());
+        let old = validate_admin_public_manifest(&cluster, verified.old_manifest())?;
+        let new = validate_admin_public_manifest(&cluster, &rotation.transition.new_manifest)?;
+        let result = sqlx::query(
+            "UPDATE admin_quorum_manifest_anchors SET manifest_epoch = $4, manifest_digest = $5
+            WHERE cluster_id = $1 AND manifest_epoch = $2 AND manifest_digest = $3",
+        )
+        .bind(cluster.as_str())
+        .bind(old.manifest_epoch.to_string())
+        .bind(&old.manifest_digest)
+        .bind(new.manifest_epoch.to_string())
+        .bind(&new.manifest_digest)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if result.rows_affected() != 1 {
+            return Ok(false);
+        }
+        for manifest in [verified.old_manifest(), &rotation.transition.new_manifest] {
+            let anchor = validate_admin_public_manifest(&cluster, manifest)?;
+            sqlx::query("INSERT INTO admin_quorum_public_manifests (cluster_id, manifest_digest, manifest_epoch, manifest_json)
+                VALUES ($1, $2, $3, $4) ON CONFLICT(cluster_id, manifest_digest) DO NOTHING")
+                .bind(cluster.as_str()).bind(anchor.manifest_digest).bind(anchor.manifest_epoch.to_string())
+                .bind(serde_json::to_string(manifest).map_err(json_error)?)
+                .execute(&mut *transaction).await.map_err(sql_error)?;
+        }
+        let request_id: String = rotation
+            .transition
+            .request_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let inserted = sqlx::query(
+            "INSERT INTO admin_quorum_rotation_history
+            (cluster_id, manifest_epoch, request_id, rotation_json, installed_at_millis)
+            VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(cluster.as_str())
+        .bind(new.manifest_epoch.to_string())
+        .bind(request_id)
+        .bind(serde_json::to_string(rotation).map_err(json_error)?)
+        .bind(now.timestamp_millis())
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if inserted.rows_affected() != 1 {
+            return Ok(false);
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(true)
+    }
+
+    async fn list_admin_quorum_rotation_history(
+        &self,
+        cluster: &ClusterId,
+        limit: u32,
+    ) -> Result<Vec<AdminQuorumRotationHistory>, ControlPlaneError> {
+        let rows = sqlx::query("SELECT rotation_json, installed_at_millis FROM admin_quorum_rotation_history
+            WHERE cluster_id = $1 ORDER BY LENGTH(manifest_epoch) DESC, manifest_epoch DESC LIMIT $2")
+            .bind(cluster.as_str()).bind(i64::from(limit.min(100))).fetch_all(&self.pool).await.map_err(sql_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let json: String = row.try_get("rotation_json").map_err(sql_error)?;
+                let millis: i64 = row.try_get("installed_at_millis").map_err(sql_error)?;
+                let installed_at = DateTime::from_timestamp_millis(millis).ok_or_else(|| {
+                    ControlPlaneError::Store("invalid admin rotation timestamp".into())
+                })?;
+                Ok(AdminQuorumRotationHistory {
+                    rotation: serde_json::from_str(&json).map_err(json_error)?,
+                    installed_at,
+                })
+            })
+            .collect()
+    }
     async fn bind_admin_quorum_manifest(
         &self,
         cluster_id: &ClusterId,
@@ -2103,6 +2496,8 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             "INSERT INTO admin_quorum_manifest_anchors (cluster_id, manifest_epoch, manifest_digest)
              SELECT $1, $2, $3 WHERE NOT EXISTS
              (SELECT 1 FROM admin_capability_ledger WHERE cluster_id = $1)
+             AND NOT EXISTS (SELECT 1 FROM admin_quorum_rotation_history WHERE cluster_id = $1)
+             AND NOT EXISTS (SELECT 1 FROM admin_quorum_public_manifests WHERE cluster_id = $1)
              ON CONFLICT(cluster_id) DO NOTHING",
         ).bind(cluster_id.as_str()).bind(manifest_epoch.to_string()).bind(manifest_digest)
             .execute(&mut *transaction).await.map_err(sql_error)?;
@@ -2133,7 +2528,9 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .bind(cluster_id.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
         if row.is_none() {
             let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM admin_capability_ledger WHERE cluster_id = $1",
+                "SELECT (SELECT COUNT(*) FROM admin_capability_ledger WHERE cluster_id = $1)
+                    + (SELECT COUNT(*) FROM admin_quorum_public_manifests WHERE cluster_id = $1)
+                    + (SELECT COUNT(*) FROM admin_quorum_rotation_history WHERE cluster_id = $1)",
             )
             .bind(cluster_id.as_str())
             .fetch_one(&self.pool)
@@ -4207,6 +4604,300 @@ mod tests {
         first.pool.close().await;
         second.pool.close().await;
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    fn signed_admin_rotation(
+        cluster: &ClusterId,
+        now: u64,
+    ) -> Result<VerifiedAdminQuorumRotation, Box<dyn std::error::Error>> {
+        use ipars_quorum::{frost, Manifest, ManifestRotation, ManifestTransition, Member};
+        let mut groups = Vec::new();
+        for (count, epoch) in [(3u16, 1), (4u16, 2)] {
+            let (shares, public) = frost::keys::generate_with_dealer(
+                count,
+                count / 2 + 1,
+                frost::keys::IdentifierList::Default,
+                rand_core::OsRng,
+            )?;
+            let manifest = Manifest {
+                schema_version: 1,
+                cluster_id: cluster.as_str().into(),
+                epoch,
+                members: (1..=count)
+                    .map(|identifier| Member {
+                        identifier,
+                        node_id: format!("node-{identifier}"),
+                        endpoint: format!("https://node-{identifier}.example/"),
+                    })
+                    .collect(),
+                public_key_package: public.serialize()?,
+            };
+            let keys: Vec<_> = shares
+                .into_values()
+                .map(frost::keys::KeyPackage::try_from)
+                .collect::<Result<_, _>>()?;
+            groups.push((manifest, keys));
+        }
+        let mut request_id = [0; 32];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut request_id);
+        let transition = ManifestTransition {
+            old_manifest_digest: groups[0].0.digest()?,
+            new_manifest: groups[1].0.clone(),
+            request_id,
+            issued_at: now,
+            expires_at: now + 300,
+        };
+        let mut signatures = Vec::new();
+        for (manifest, keys) in &groups {
+            let rounds: Vec<_> = keys
+                .iter()
+                .take(usize::from(manifest.threshold()))
+                .map(|key| frost::round1::commit(key.signing_share(), &mut rand_core::OsRng))
+                .collect();
+            let commitments = keys
+                .iter()
+                .zip(&rounds)
+                .map(|(key, (_, commitment))| (*key.identifier(), *commitment))
+                .collect();
+            let package = frost::SigningPackage::new(commitments, &transition.signing_bytes()?);
+            let shares = keys
+                .iter()
+                .zip(rounds)
+                .map(|(key, (nonces, _))| {
+                    frost::round2::sign(&package, &nonces, key)
+                        .map(|share| (*key.identifier(), share))
+                })
+                .collect::<Result<_, _>>()?;
+            signatures
+                .push(frost::aggregate(&package, &shares, &manifest.public_keys()?)?.serialize()?);
+        }
+        let rotation = ManifestRotation {
+            transition,
+            old_signature: signatures[0].clone(),
+            new_signature: signatures[1].clone(),
+        };
+        Ok(ipars_quorum::verify_rotation(&groups[0].0, &rotation, now)?)
+    }
+
+    async fn exercise_admin_rotation<S: ControlPlaneStore + Clone + 'static>(
+        first: S,
+        second: S,
+        cluster: ClusterId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let verified = signed_admin_rotation(&cluster, Utc::now().timestamp().try_into()?)?;
+        let old = verified.old_manifest().clone();
+        let new = verified.rotation().transition.new_manifest.clone();
+        assert!(first
+            .publish_admin_quorum_manifest(&cluster, old.clone())
+            .await
+            .is_err());
+        first
+            .initialize_admin_quorum_manifest(&cluster, old.clone())
+            .await?;
+        first
+            .initialize_admin_quorum_manifest(&cluster, old.clone())
+            .await?;
+        assert!(first
+            .initialize_admin_quorum_manifest(&cluster, new.clone())
+            .await
+            .is_err());
+        first
+            .publish_admin_quorum_manifest(&cluster, old.clone())
+            .await?;
+        assert_eq!(
+            second.get_active_admin_quorum_manifest(&cluster).await?,
+            Some(old.clone())
+        );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(9));
+        let mut concurrent_use = admin_use("rotation-racing-token");
+        concurrent_use.cluster_id = cluster.clone();
+        concurrent_use.manifest_epoch = old.epoch;
+        concurrent_use.manifest_digest = old.digest()?;
+        let consumer = second.clone();
+        let consumer_barrier = barrier.clone();
+        let consuming = tokio::spawn(async move {
+            consumer_barrier.wait().await;
+            consumer.consume_admin_capability(concurrent_use).await
+        });
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..8 {
+            let store = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let barrier = barrier.clone();
+            let verified = verified.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store.rotate_admin_quorum_manifest(verified).await
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            winners += usize::from(result??);
+        }
+        assert_eq!(winners, 1);
+        // A successful use must have acquired the shared transaction lock before CAS.
+        let _admitted_before_cas = consuming.await??;
+        assert!(
+            !second
+                .rotate_admin_quorum_manifest(verified.clone())
+                .await?
+        );
+        assert_eq!(
+            second.get_active_admin_quorum_manifest(&cluster).await?,
+            Some(new.clone())
+        );
+        let history = second
+            .list_admin_quorum_rotation_history(&cluster, 1000)
+            .await?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(&history[0].rotation, verified.rotation());
+        assert!(second
+            .list_admin_quorum_rotation_history(&cluster, 0)
+            .await?
+            .is_empty());
+        assert!(first
+            .bind_admin_quorum_manifest(&cluster, old.epoch, &old.digest()?)
+            .await
+            .is_err());
+        assert!(first
+            .publish_admin_quorum_manifest(&cluster, old.clone())
+            .await
+            .is_err());
+        let mut record = admin_use("rotation-old-token");
+        record.cluster_id = cluster.clone();
+        record.manifest_epoch = old.epoch;
+        record.manifest_digest = old.digest()?;
+        assert!(!second.consume_admin_capability(record.clone()).await?);
+        assert!(
+            !second
+                .revoke_admin_capability(admin_revocation(&record))
+                .await?
+        );
+        record.manifest_epoch = new.epoch;
+        record.manifest_digest = new.digest()?;
+        assert!(second.consume_admin_capability(record).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_rotation_cas_public_config_history_and_restart(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (url, path) = temp_sqlite_url("admin-rotation");
+        let first = SqliteControlPlaneStore::connect(&url).await?;
+        let second = SqliteControlPlaneStore::connect(&url).await?;
+        let cluster = ClusterId::from_string("rotation-sqlite");
+        exercise_admin_rotation(first.clone(), second.clone(), cluster.clone()).await?;
+        first.pool.close().await;
+        second.pool.close().await;
+        let reopened = SqliteControlPlaneStore::connect(&url).await?;
+        let active = reopened
+            .get_active_admin_quorum_manifest(&cluster)
+            .await?
+            .ok_or("missing active manifest")?;
+        assert_eq!(active.epoch, 2);
+        assert_eq!(
+            reopened
+                .list_admin_quorum_rotation_history(&cluster, 10)
+                .await?
+                .len(),
+            1
+        );
+        // Lost anchors must not let initial binding overwrite retained rotation trust/history.
+        sqlx::query("DELETE FROM admin_quorum_manifest_anchors")
+            .execute(&reopened.pool)
+            .await?;
+        sqlx::query("DELETE FROM admin_capability_ledger")
+            .execute(&reopened.pool)
+            .await?;
+        assert!(reopened
+            .bind_admin_quorum_manifest(&cluster, active.epoch, &active.digest()?)
+            .await
+            .is_err());
+        reopened.pool.close().await;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_admin_rotation_cas() -> Result<(), Box<dyn std::error::Error>> {
+        let store = std::sync::Arc::new(ipars_control_plane::InMemoryStore::default());
+        // InMemoryStore itself is not Clone; the SQL tests exercise cross-pool races.
+        let cluster = ClusterId::from_string("rotation-memory");
+        let verified = signed_admin_rotation(&cluster, Utc::now().timestamp().try_into()?)?;
+        let old = verified.old_manifest();
+        store
+            .bind_admin_quorum_manifest(&cluster, old.epoch, &old.digest()?)
+            .await?;
+        store
+            .publish_admin_quorum_manifest(&cluster, old.clone())
+            .await?;
+        assert!(store.rotate_admin_quorum_manifest(verified.clone()).await?);
+        assert!(!store.rotate_admin_quorum_manifest(verified).await?);
+        assert_eq!(
+            store
+                .get_active_admin_quorum_manifest(&cluster)
+                .await?
+                .ok_or("missing manifest")?
+                .epoch,
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_rotation_serializes_with_old_token_consume(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (url, path) = temp_sqlite_url("admin-rotation-consume");
+        let first = SqliteControlPlaneStore::connect(&url).await?;
+        let second = SqliteControlPlaneStore::connect(&url).await?;
+        let cluster = ClusterId::from_string("rotation-consume");
+        let verified = signed_admin_rotation(&cluster, Utc::now().timestamp().try_into()?)?;
+        let old = verified.old_manifest();
+        first
+            .bind_admin_quorum_manifest(&cluster, old.epoch, &old.digest()?)
+            .await?;
+        let mut record = admin_use("rotation-concurrent-consume");
+        record.cluster_id = cluster;
+        record.manifest_epoch = old.epoch;
+        record.manifest_digest = old.digest()?;
+        let (rotated, consumed) = tokio::join!(
+            first.rotate_admin_quorum_manifest(verified),
+            second.consume_admin_capability(record.clone())
+        );
+        assert!(rotated?);
+        // Either operation may win the lock. A use admitted before CAS remains audited.
+        let _admitted_before_cas = consumed?;
+        record.request_id = "rotation-after-cas".into();
+        assert!(!second.consume_admin_capability(record).await?);
+        first.pool.close().await;
+        second.pool.close().await;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable ipars_admin_ledger_test PostgreSQL database"]
+    async fn postgres_admin_rotation_cas_public_config_history(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("IPARS_TEST_POSTGRES_URL")?;
+        let pool = PgPool::connect(&url).await?;
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            database, "ipars_admin_ledger_test",
+            "test refuses other databases"
+        );
+        let first = PostgresControlPlaneStore::from_pool(pool).await?;
+        let second = PostgresControlPlaneStore::connect(&url).await?;
+        let cluster = ClusterId::from_string(format!("rotation-pg-{}", NodeId::new()));
+        exercise_admin_rotation(first.clone(), second.clone(), cluster).await?;
+        first.pool.close().await;
+        second.pool.close().await;
         Ok(())
     }
 

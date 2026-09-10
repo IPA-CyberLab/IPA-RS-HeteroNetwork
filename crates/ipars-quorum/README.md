@@ -75,3 +75,58 @@ be positive. Additional routes
 must be explicitly reviewed before extending `allowed_mutation`.
 
 Run only this crate's focused tests with `cargo test -p ipars-quorum --lib`.
+
+## Membership and key rotation
+
+`ManifestTransition` contains `old_manifest_digest: String`,
+`new_manifest: Manifest`, `request_id: [u8; 32]`, `issued_at: u64`, and
+`expires_at: u64`. Its `signing_bytes() -> Result<Vec<u8>>` is distinct from
+ordinary capabilities and binds the old digest, computed new manifest digest,
+cluster, next epoch, request ID, and validity window. The new digest commits to
+the full roster, endpoints, and public key package. Member ordering is canonical.
+
+`ManifestRotation { transition, old_signature: Vec<u8>, new_signature: Vec<u8> }`
+requires both groups' FROST signatures over exactly the same transition bytes.
+`verify_rotation(&old_manifest, &rotation, now) -> Result<VerifiedRotation>` checks
+both signatures, cluster equality, strict epoch increment without overflow,
+distinct new group key, frozen majorities, and a lifetime of at most 300 seconds.
+The new group's signature proves that its signing threshold possesses the new
+shares. Production provisioning still uses authenticated DKG, never a dealer.
+
+`SignerEngine::round1_rotation(&old, &transition, now)` and
+`round2_rotation(session_id, &old, &transition, &package, now)` work for either
+group, sharing the ordinary session capacity and nonce lifecycle. The transport
+must authenticate the configured owner and install the trusted old anchor before
+calling these methods, including on a proposed new signer. These methods do not
+accept an arbitrary raw-message signing request. Each signer must match either
+the exact old or exact new manifest digest.
+
+`VerifiedRotation` has private fields and no Deserialize implementation. Storage
+accepts this verified value, rechecks expiry after acquiring its transaction
+lock, then CASes the exact old anchor to the new one. It cannot force-overwrite a
+newer epoch. The same lock protects capability consumption and revocation.
+
+The control-plane/store API provides:
+
+- `initialize_admin_quorum_manifest(cluster, manifest)`: atomic first anchor and
+  public-config installation, or idempotent installation matching an existing
+  anchor. Existing incompatible anchors and unanchored retained history deny.
+  Initial all-registered-node roster validation remains the caller's obligation.
+- `publish_admin_quorum_manifest(cluster, manifest)`: attaches public config to
+  an already matching anchor, including migration from a digest-only anchor.
+- `get_active_admin_quorum_manifest(cluster)`: coherent active anchor/config
+  snapshot. Missing config behind an existing anchor is an error, not permission
+  to bootstrap another manifest.
+- `rotate_admin_quorum_manifest(verified) -> Result<bool>`: joint authorization,
+  atomic anchor CAS, both public manifests persisted, signed transition history.
+- `list_admin_quorum_rotation_history(cluster, limit)`: newest first, capped at
+  100 entries. `ControlPlane` wrappers supply its configured cluster automatically.
+
+After rotation, verifiers must read the active public manifest rather than retain
+the startup manifest. Old-token consume transactions ordered after CAS fail even
+if a verifier cached the old manifest before the transition. A mutation whose
+consume transaction completed before CAS was already admitted and may finish
+afterward; this API does not cancel already authorized work. Runtime startup must
+prefer stored active config, not try to rebind a stale bootstrap file. New signer
+private key installation and authenticated roster lifecycle are external to this
+public-config store. No online-node count changes a threshold.

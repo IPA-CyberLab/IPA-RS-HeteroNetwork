@@ -244,6 +244,35 @@ pub struct AdminQuorumManifestAnchor {
     pub manifest_digest: String,
 }
 
+pub use ipars_quorum::{
+    Manifest as AdminQuorumManifest, ManifestRotation as AdminQuorumRotation,
+    VerifiedRotation as VerifiedAdminQuorumRotation,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminQuorumRotationHistory {
+    pub rotation: AdminQuorumRotation,
+    pub installed_at: chrono::DateTime<Utc>,
+}
+
+pub fn validate_admin_public_manifest(
+    cluster: &ClusterId,
+    manifest: &AdminQuorumManifest,
+) -> Result<AdminQuorumManifestAnchor, ControlPlaneError> {
+    if cluster.as_str() != manifest.cluster_id {
+        return Err(ControlPlaneError::Store(
+            "admin manifest cluster mismatch".into(),
+        ));
+    }
+    let digest = manifest
+        .digest()
+        .map_err(|_| ControlPlaneError::Store("invalid admin public manifest".into()))?;
+    Ok(AdminQuorumManifestAnchor {
+        manifest_epoch: manifest.epoch,
+        manifest_digest: digest,
+    })
+}
+
 impl AdminQuorumManifestAnchor {
     pub fn is_valid(&self) -> bool {
         self.manifest_digest.len() == 64
@@ -334,6 +363,57 @@ impl AdminCapabilityRevocation {
 
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
+    /// Initial voter validation is external. Atomically installs both anchor and public config;
+    /// never replaces an existing incompatible anchor or retained history.
+    async fn initialize_admin_quorum_manifest(
+        &self,
+        _cluster: &ClusterId,
+        _manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin manifest initialization unsupported".into(),
+        ))
+    }
+    /// Publish public config only for an already installed, exactly matching trust anchor.
+    async fn publish_admin_quorum_manifest(
+        &self,
+        _cluster: &ClusterId,
+        _manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin public manifest unsupported".into(),
+        ))
+    }
+
+    async fn get_active_admin_quorum_manifest(
+        &self,
+        _cluster: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifest>, ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin public manifest unsupported".into(),
+        ))
+    }
+
+    /// CAS and history insert must share the consume/revoke transaction lock.
+    async fn rotate_admin_quorum_manifest(
+        &self,
+        _rotation: VerifiedAdminQuorumRotation,
+    ) -> Result<bool, ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin manifest rotation unsupported".into(),
+        ))
+    }
+
+    async fn list_admin_quorum_rotation_history(
+        &self,
+        _cluster: &ClusterId,
+        _limit: u32,
+    ) -> Result<Vec<AdminQuorumRotationHistory>, ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin manifest history unsupported".into(),
+        ))
+    }
+
     /// Immutable opt-in anchor. An incompatible existing anchor must never be replaced.
     async fn bind_admin_quorum_manifest(
         &self,
@@ -694,6 +774,8 @@ pub struct InMemoryStore {
 struct AdminCapabilityLedgerState {
     anchors: BTreeMap<ClusterId, AdminQuorumManifestAnchor>,
     entries: BTreeMap<(ClusterId, u64, String), (AdminCapabilityUse, bool)>,
+    manifests: BTreeMap<(ClusterId, String), AdminQuorumManifest>,
+    rotations: BTreeMap<(ClusterId, u64), AdminQuorumRotationHistory>,
 }
 
 impl InMemoryStore {
@@ -748,6 +830,144 @@ fn advance_in_memory_overlay_routing_epoch(
 
 #[async_trait]
 impl ControlPlaneStore for InMemoryStore {
+    async fn initialize_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        let anchor = validate_admin_public_manifest(cluster, &manifest)?;
+        let mut ledger = self.admin_capabilities.lock().await;
+        if let Some(existing) = ledger.anchors.get(cluster) {
+            if existing != &anchor {
+                return Err(ControlPlaneError::Store(
+                    "admin public manifest anchor mismatch".into(),
+                ));
+            }
+        } else if ledger.entries.keys().any(|(id, _, _)| id == cluster)
+            || ledger.manifests.keys().any(|(id, _)| id == cluster)
+            || ledger.rotations.keys().any(|(id, _)| id == cluster)
+        {
+            return Err(ControlPlaneError::Store(
+                "unanchored admin history requires review".into(),
+            ));
+        }
+        ledger
+            .manifests
+            .insert((cluster.clone(), anchor.manifest_digest.clone()), manifest);
+        ledger.anchors.insert(cluster.clone(), anchor);
+        Ok(())
+    }
+    async fn publish_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        let anchor = validate_admin_public_manifest(cluster, &manifest)?;
+        let mut ledger = self.admin_capabilities.lock().await;
+        if ledger.anchors.get(cluster) != Some(&anchor) {
+            return Err(ControlPlaneError::Store(
+                "admin public manifest anchor mismatch".into(),
+            ));
+        }
+        ledger
+            .manifests
+            .insert((cluster.clone(), anchor.manifest_digest), manifest);
+        Ok(())
+    }
+
+    async fn get_active_admin_quorum_manifest(
+        &self,
+        cluster: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifest>, ControlPlaneError> {
+        let ledger = self.admin_capabilities.lock().await;
+        let Some(anchor) = ledger.anchors.get(cluster) else {
+            if ledger.entries.keys().any(|(id, _, _)| id == cluster)
+                || ledger.manifests.keys().any(|(id, _)| id == cluster)
+                || ledger.rotations.keys().any(|(id, _)| id == cluster)
+            {
+                return Err(ControlPlaneError::Store(
+                    "unanchored admin history requires review".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        let manifest = ledger
+            .manifests
+            .get(&(cluster.clone(), anchor.manifest_digest.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                ControlPlaneError::Store("active admin public manifest missing".into())
+            })?;
+        if validate_admin_public_manifest(cluster, &manifest)? != *anchor {
+            return Err(ControlPlaneError::Store(
+                "active admin public manifest mismatch".into(),
+            ));
+        }
+        Ok(Some(manifest))
+    }
+
+    async fn rotate_admin_quorum_manifest(
+        &self,
+        verified: VerifiedAdminQuorumRotation,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut ledger = self.admin_capabilities.lock().await;
+        let now = Utc::now();
+        if verified
+            .validate_at(now.timestamp().try_into().unwrap_or(0))
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let rotation = verified.rotation();
+        let cluster = ClusterId::from_string(rotation.transition.new_manifest.cluster_id.clone());
+        let old = validate_admin_public_manifest(&cluster, verified.old_manifest())?;
+        let new = validate_admin_public_manifest(&cluster, &rotation.transition.new_manifest)?;
+        if ledger.anchors.get(&cluster) != Some(&old)
+            || ledger
+                .rotations
+                .contains_key(&(cluster.clone(), new.manifest_epoch))
+            || ledger.rotations.iter().any(|((id, _), history)| {
+                id == &cluster
+                    && history.rotation.transition.request_id == rotation.transition.request_id
+            })
+        {
+            return Ok(false);
+        }
+        ledger.manifests.insert(
+            (cluster.clone(), old.manifest_digest),
+            verified.old_manifest().clone(),
+        );
+        ledger.manifests.insert(
+            (cluster.clone(), new.manifest_digest.clone()),
+            rotation.transition.new_manifest.clone(),
+        );
+        ledger.rotations.insert(
+            (cluster.clone(), new.manifest_epoch),
+            AdminQuorumRotationHistory {
+                rotation: rotation.clone(),
+                installed_at: now,
+            },
+        );
+        ledger.anchors.insert(cluster, new);
+        Ok(true)
+    }
+
+    async fn list_admin_quorum_rotation_history(
+        &self,
+        cluster: &ClusterId,
+        limit: u32,
+    ) -> Result<Vec<AdminQuorumRotationHistory>, ControlPlaneError> {
+        let ledger = self.admin_capabilities.lock().await;
+        Ok(ledger
+            .rotations
+            .iter()
+            .rev()
+            .filter(|((id, _), _)| id == cluster)
+            .take(limit.min(100) as usize)
+            .map(|(_, record)| record.clone())
+            .collect())
+    }
+
     async fn bind_admin_quorum_manifest(
         &self,
         cluster_id: &ClusterId,
@@ -777,6 +997,14 @@ impl ControlPlaneStore for InMemoryStore {
             .entries
             .keys()
             .any(|(cluster, _, _)| cluster == cluster_id)
+            || ledger
+                .manifests
+                .keys()
+                .any(|(cluster, _)| cluster == cluster_id)
+            || ledger
+                .rotations
+                .keys()
+                .any(|(cluster, _)| cluster == cluster_id)
         {
             return Err(ControlPlaneError::Store(
                 "unanchored admin capability ledger requires review".to_string(),
@@ -2202,6 +2430,51 @@ where
     ) -> Result<Option<AdminQuorumManifestAnchor>, ControlPlaneError> {
         self.store
             .get_admin_quorum_manifest_anchor(&self.config.cluster_id)
+            .await
+    }
+
+    pub async fn initialize_admin_quorum_manifest(
+        &self,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        self.store
+            .initialize_admin_quorum_manifest(&self.config.cluster_id, manifest)
+            .await
+    }
+
+    pub async fn publish_admin_quorum_manifest(
+        &self,
+        manifest: AdminQuorumManifest,
+    ) -> Result<(), ControlPlaneError> {
+        self.store
+            .publish_admin_quorum_manifest(&self.config.cluster_id, manifest)
+            .await
+    }
+
+    pub async fn get_active_admin_quorum_manifest(
+        &self,
+    ) -> Result<Option<AdminQuorumManifest>, ControlPlaneError> {
+        self.store
+            .get_active_admin_quorum_manifest(&self.config.cluster_id)
+            .await
+    }
+
+    pub async fn rotate_admin_quorum_manifest(
+        &self,
+        rotation: VerifiedAdminQuorumRotation,
+    ) -> Result<bool, ControlPlaneError> {
+        if rotation.old_manifest().cluster_id != self.config.cluster_id.as_str() {
+            return Ok(false);
+        }
+        self.store.rotate_admin_quorum_manifest(rotation).await
+    }
+
+    pub async fn list_admin_quorum_rotation_history(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<AdminQuorumRotationHistory>, ControlPlaneError> {
+        self.store
+            .list_admin_quorum_rotation_history(&self.config.cluster_id, limit)
             .await
     }
 

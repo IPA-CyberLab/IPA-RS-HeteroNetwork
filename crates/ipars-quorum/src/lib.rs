@@ -4,6 +4,8 @@
 
 pub use frost_ed25519 as frost;
 pub use frost_ed25519::keys::dkg;
+mod rotation;
+pub use rotation::{verify_rotation, ManifestRotation, ManifestTransition, VerifiedRotation};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};
@@ -302,7 +304,7 @@ pub struct Round1Response {
 
 // Secret-bearing structs intentionally have no Debug/Clone/Serialize implementation.
 struct Pending {
-    claims: CapabilityClaims,
+    message: Vec<u8>,
     created_at: u64,
     expires_at: u64,
     nonces: frost::round1::SigningNonces,
@@ -368,6 +370,17 @@ impl SignerEngine {
             .retain(|_, pending| now >= pending.created_at && now < pending.expires_at);
         claims.validate(&self.manifest, now)?;
         proof.verify(claims)?;
+        self.allocate_pending(claims.signing_bytes(), claims.expires_at, now)
+    }
+
+    fn allocate_pending(
+        &mut self,
+        message: Vec<u8>,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<Round1Response> {
+        self.pending
+            .retain(|_, pending| now >= pending.created_at && now < pending.expires_at);
         if self.pending.len() >= self.max_pending {
             return Err(Error::Capacity);
         }
@@ -382,11 +395,9 @@ impl SignerEngine {
         self.pending.insert(
             session_id,
             Pending {
-                claims: claims.clone(),
+                message,
                 created_at: now,
-                expires_at: now
-                    .saturating_add(self.pending_ttl_secs)
-                    .min(claims.expires_at),
+                expires_at: now.saturating_add(self.pending_ttl_secs).min(expires_at),
                 nonces,
                 commitments,
             },
@@ -411,10 +422,23 @@ impl SignerEngine {
             return Err(Error::Time);
         }
         claims.validate(&self.manifest, now)?;
+        self.sign_pending(pending, &claims.signing_bytes(), signing_package, now)
+    }
+
+    fn sign_pending(
+        &self,
+        pending: Pending,
+        message: &[u8],
+        signing_package: &frost::SigningPackage,
+        now: u64,
+    ) -> Result<frost::round2::SignatureShare> {
+        if now < pending.created_at || now >= pending.expires_at {
+            return Err(Error::Time);
+        }
         let commitments = signing_package.signing_commitments();
         let public = self.manifest.public_keys()?;
-        if pending.claims != *claims
-            || signing_package.message() != &claims.signing_bytes()
+        if pending.message != message
+            || signing_package.message() != message
             || commitments.len() < usize::from(self.manifest.threshold())
             || commitments.len() > self.manifest.members.len()
             || commitments

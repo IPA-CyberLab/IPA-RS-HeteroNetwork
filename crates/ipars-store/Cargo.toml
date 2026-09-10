@@ -16,6 +16,8 @@ sqlx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+ipars-quorum = { path = "../ipars-quorum" }
+rand_core.workspace = true
 ipnet.workspace = true
 tokio.workspace = true
 
