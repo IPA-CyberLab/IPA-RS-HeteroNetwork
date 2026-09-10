@@ -573,7 +573,7 @@ mod tests {
         corrupt.signature[0] ^= 1;
         assert!(verify_token(&policy, &corrupt, 100).is_err());
         assert!(verify_token(&policy, &token, 160).is_err());
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize()?.join(format!(
             "sudo-cli-{}-{}",
             std::process::id(),
             URL_SAFE_NO_PAD.encode(token.signature.as_slice())
@@ -600,6 +600,7 @@ mod tests {
                 .try_fill_bytes(&mut nonce)
                 .map_err(|_| anyhow::anyhow!("cannot generate test directory name"))?;
             let path = std::env::temp_dir()
+                .canonicalize()?
                 .join(format!("sudo-publish-{}", URL_SAFE_NO_PAD.encode(nonce)));
             std::fs::DirBuilder::new().mode(0o700).create(&path)?;
             Ok(Self(path))

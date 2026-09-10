@@ -368,8 +368,9 @@ mod tests {
             ),
             std::sync::Arc::new(ipars_control_plane::InMemoryStore::default()),
         );
-        let path =
-            std::env::temp_dir().join(format!("hn-quorum-manifest-{}.json", uuid_for_test()));
+        let path = std::env::temp_dir()
+            .canonicalize()?
+            .join(format!("hn-quorum-manifest-{}.json", uuid_for_test()));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -396,7 +397,9 @@ mod tests {
 
     #[test]
     fn configuration_reader_rejects_symlinks_and_public_secrets() -> anyhow::Result<()> {
-        let dir = std::env::temp_dir().join(format!("hn-quorum-config-{}", uuid_for_test()));
+        let dir = std::env::temp_dir()
+            .canonicalize()?
+            .join(format!("hn-quorum-config-{}", uuid_for_test()));
         std::fs::create_dir(&dir)?;
         let path = dir.join("config.json");
         let link = dir.join("link.json");
