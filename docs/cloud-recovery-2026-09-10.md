@@ -95,3 +95,22 @@ but this network-policy repair cannot restore missing Garage data members.
 
 Full authenticated E2E remains failed until Syouyu recovers. Redis failover data
 continuity remains unverified; see `flow-recovery-evidence-2026-09-10.md`.
+
+## OIDC Deployment
+
+HeteroCloud `1160279` adds sanitized failure-stage diagnostics and bounded
+retries for idempotent discovery/JWKS reads only. Authorization-code exchange
+is never replayed; redirects, issuer/signature validation and response-size
+bounds remain enforced. Independent review found no production-code defect;
+the shared-deadline regression assertion was subsequently strengthened.
+
+Releases 0.1.68 and 0.1.69 did not publish images because their validation gates
+failed on lint/formatting. They were marked prerelease and never deployed.
+Release 0.1.70 passed all release validation, image publication, and CLI jobs
+for Linux, macOS and Windows. GitOps commit `9de6bf84` pins its image index:
+`sha256:ca9cbefeb0ad2573b607c92b33bcc02d29271a0d1a6ad2576ee4e33ee429f5ec`.
+
+At 05:49 UTC, all four API, three owner-console and four worker replicas were
+Ready on this image. Argo CD reported Healthy/Synced. A browser sweep during
+the rolling update authenticated and passed 14/15 pages; only Syouyu failed.
+Tenant Flash workload specs and containers were not changed by this rollout.
