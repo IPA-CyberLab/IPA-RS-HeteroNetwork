@@ -11,10 +11,13 @@ publish = false
 ipars-quorum = { path = "../../crates/ipars-quorum" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nix = { version = "0.30", features = ["user"] }
+socket2 = { version = "0.6", features = ["all"] }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"

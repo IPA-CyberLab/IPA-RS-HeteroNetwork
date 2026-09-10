@@ -1,0 +1,8 @@
+target/*
+!target/debug/
+target/debug/*
+!target/debug/local-sudo-grants
+!target/debug/examples/
+target/debug/examples/*
+!target/debug/examples/disposable-fixture
+**/__pycache__

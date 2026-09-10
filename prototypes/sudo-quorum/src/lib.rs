@@ -1,5 +1,10 @@
-//! Non-executing sudo approval verifier prototype. No plugin, socket, PAM, or shell code.
-//! All context supplied here must eventually come from a reviewed trusted sudo bridge.
+//! Isolated sudo authorization prototypes; no execution or HTTP authorization routes.
+//! The exact-context verifier below accepts untrusted test metadata. The separate
+//! privilege/local modules implement the explicit one-use sudo privilege profile.
+
+#[cfg(target_os = "linux")]
+pub mod local;
+pub mod privilege;
 
 use ipars_quorum::{frost, Manifest};
 use rand_core::{OsRng, RngCore};

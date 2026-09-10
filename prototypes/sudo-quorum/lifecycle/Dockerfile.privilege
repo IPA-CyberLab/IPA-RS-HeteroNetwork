@@ -1,0 +1,12 @@
+# Build the lifecycle evidence image first. This image is disposable test-only.
+FROM ipars-sudo-quorum-lifecycle:test
+COPY lifecycle/privilege_gate.c lifecycle/privilege_gate_test.c lifecycle/privilege_test.py /opt/quorum-lifecycle/
+COPY target/debug/local-sudo-grants /opt/quorum-lifecycle/local-sudo-grants
+COPY target/debug/examples/disposable-fixture /opt/quorum-lifecycle/disposable-fixture
+RUN gcc -std=c11 -Wall -Wextra -Werror -fPIC -shared privilege_gate.c -o privilege_gate.so \
+    && gcc -std=c11 -Wall -Wextra -Werror privilege_gate_test.c -o privilege_gate_test \
+    && ./privilege_gate_test \
+    && useradd --uid 1001 --create-home other \
+    && mkdir -m 0755 /run/ipars-sudo-prototype \
+    && mkdir -m 0700 /var/lib/ipars-sudo-prototype
+ENTRYPOINT ["python3", "/opt/quorum-lifecycle/privilege_test.py"]
