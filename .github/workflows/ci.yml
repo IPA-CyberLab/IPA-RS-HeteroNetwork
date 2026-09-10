@@ -38,7 +38,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test release artifact contract
-        run: node --test scripts/release-artifact-manifest.test.mjs scripts/release-channels.test.mjs scripts/package-native-release.test.mjs
+        run: |
+          node --test scripts/release-artifact-manifest.test.mjs scripts/release-channels.test.mjs scripts/package-native-release.test.mjs scripts/bind-sudo-release-artifact.test.mjs
+          python3 -B -m unittest discover -s scripts -p test_sudo_quorum_v2_artifact.py -v
 
       - name: Validate native staging boundaries
         run: |
@@ -557,11 +559,30 @@ jobs:
           set -euo pipefail
           assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
           native_asset="heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz"
+          sudo_asset="heteronetwork-${RELEASE_TAG#v}-sudo-v2-linux-amd64.tar.gz"
           if printf '%s\n' "$assets" | grep -Fxq 'heteronetwork-release-artifact.json' \
-            || printf '%s\n' "$assets" | grep -Fxq "$native_asset"; then
+            || printf '%s\n' "$assets" | grep -Fxq "$native_asset" \
+            || printf '%s\n' "$assets" | grep -Fxq "$sudo_asset"; then
             echo 'Release artifact already exists; reuse it for promotion, do not rebuild.' >&2
             exit 1
           fi
+
+      - name: Build inactive sudo release payload from exact source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/sudo-cargo-target
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = release
+          node scripts/release-artifact-manifest.mjs validate
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 90 --retry 2 \
+            'https://raw.githubusercontent.com/sudo-project/sudo/d1b48c651cec19fe37d1f0d3299d2283fb0f88e4/include/sudo_plugin.h' \
+            --output "$RUNNER_TEMP/sudo_plugin.h"
+          bash scripts/package-sudo-quorum-v2.sh \
+            --sudo-header "$RUNNER_TEMP/sudo_plugin.h" --out-dir "$RUNNER_TEMP/sudo-release" \
+            --profile release --source-commit "$GITHUB_SHA" --version "$RELEASE_TAG"
 
       - name: Authenticate to GHCR
         env:
@@ -593,6 +614,16 @@ jobs:
           REPO_DIGESTS_FILE: ${{ runner.temp }}/repo-digests.json
         run: node scripts/release-artifact-manifest.mjs generate > "$RUNNER_TEMP/release-base.json"
 
+      - name: Bind verified sudo payload into HeteroNetwork artifact
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          node scripts/bind-sudo-release-artifact.mjs bind \
+            "$RUNNER_TEMP/release-base.json" "$RUNNER_TEMP/sudo-release/release-contract.json" \
+            "$RUNNER_TEMP/sudo-release/heteronetwork-${RELEASE_TAG#v}-sudo-v2-linux-amd64.tar.gz" \
+            "$RUNNER_TEMP/release-with-sudo.json"
+
       - name: Package the same build for native VM staging
         env:
           IMAGE: ghcr.io/ipa-cyberlab/heteronetwork
@@ -606,7 +637,18 @@ jobs:
             docker cp "$container:/usr/local/bin/$binary" "$RUNNER_TEMP/native-binaries/$binary"
           done
           node scripts/package-native-release.mjs \
-            "$RUNNER_TEMP/release-base.json" "$RUNNER_TEMP/native-binaries" "$RUNNER_TEMP/native-release"
+            "$RUNNER_TEMP/release-with-sudo.json" "$RUNNER_TEMP/native-binaries" "$RUNNER_TEMP/native-release"
+
+      - name: Verify final native and sudo release bindings
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          node scripts/release-artifact-manifest.mjs validate
+          node scripts/bind-sudo-release-artifact.mjs verify \
+            "$RUNNER_TEMP/native-release/heteronetwork-release-artifact.json" \
+            "$RUNNER_TEMP/sudo-release/heteronetwork-${RELEASE_TAG#v}-sudo-v2-linux-amd64.tar.gz" \
+            "$RUNNER_TEMP/native-release/heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz"
 
       # The same digest-pinned artifact is promoted through dev and prod; no rebuild.
       - name: Attach immutable artifact to release
@@ -615,6 +657,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
+          set -euo pipefail
           gh release upload "$RELEASE_TAG" \
             "$RUNNER_TEMP/native-release/heteronetwork-release-artifact.json" \
-            "$RUNNER_TEMP/native-release/heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz"
+            "$RUNNER_TEMP/native-release/heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz" \
+            "$RUNNER_TEMP/sudo-release/heteronetwork-${RELEASE_TAG#v}-sudo-v2-linux-amd64.tar.gz"
