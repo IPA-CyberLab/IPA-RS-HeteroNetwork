@@ -499,7 +499,9 @@ after reload; merely rendering the application shell is insufficient. Existing
 Flow/Flash/Syouyu details are discovered from that account's list responses and
 visited read-only. Detail checks require the base service/bucket read model and
 rendered resource heading; they do not certify metrics, credential operations,
-provider health, or full backend functionality. Registry has no separate detail route. Detail navigation clicks
+provider health, or full backend functionality. Detail resources must nevertheless
+report API state `ready`: provisioning or failed fixtures fail the sweep even
+when their pages render successfully. Registry has no separate detail route. Detail navigation clicks
 visible links where available, otherwise opens the discovered detail URL (including
 resources outside the visible table page). Coverage follows the UI's selected
 organization, falling back to the first membership in the fresh context, not
@@ -509,7 +511,12 @@ reported as incomplete rather than silently counted as full coverage.
 
 Console errors, JavaScript exceptions, request failures, and HTTP errors including
 API 4xx are captured. Only the expected pre-login session 401 is exempted and
-recorded separately. Waits use `HETEROCLOUD_BROWSER_E2E_TIMEOUT_MS` (default 30000,
+recorded separately from application HTTP failures. The optional Cloudflare
+analytics beacon being blocked by the application's deliberate `script-src`
+CSP is recorded as a separate security warning, not an application failure.
+Other blocked scripts, JavaScript exceptions and API failures remain fatal;
+the test does not weaken the production CSP. Waits use
+`HETEROCLOUD_BROWSER_E2E_TIMEOUT_MS` (default 30000,
 range 5000..120000); attempts remain bounded by the existing attempts setting.
 Start incident checks with `HETEROCLOUD_BROWSER_E2E_ATTEMPTS=1`.
 

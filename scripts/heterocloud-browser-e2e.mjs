@@ -63,6 +63,7 @@ try {
     report.attempts.push(record);
     const readModels = new Map();
     const expectedErrors = [];
+    const securityBlocks = [];
     const serverErrors = [];
     const requestFailures = [];
 
@@ -77,6 +78,10 @@ try {
       }
     });
     page.on("requestfailed", (request) => {
+      if (isOptionalBeacon(request.url()) && request.failure()?.errorText === "csp") {
+        securityBlocks.push(`CSP blocked optional analytics: ${safeUrl(request.url())}`);
+        return;
+      }
         requestFailures.push(
           `${request.method()} ${safeUrl(request.url())}: ${sanitize(request.failure()?.errorText ?? "unknown error")}`,
         );
@@ -84,6 +89,12 @@ try {
     page.on("pageerror", (error) => record.errors.push(`javascript: ${sanitize(error.message)}`));
     page.on("console", (message) => {
       if (message.type() !== "error") return;
+      if (message.text().includes("https://static.cloudflareinsights.com/beacon.min.js") &&
+          /Content Security Policy|Content-Security-Policy/.test(message.text()) &&
+          message.text().includes("script-src")) {
+        securityBlocks.push(sanitize(message.text()));
+        return;
+      }
       const expected = !record.authenticated && safeUrl(message.location().url) === `${baseUrl.origin}/api/v1/auth/session` && message.text().includes("401");
       (expected ? expectedErrors : record.errors).push(`console: ${sanitize(message.text())}`);
     });
@@ -207,6 +218,13 @@ try {
             await new Promise((resolve) => setTimeout(resolve, 100));
           }
           if (!endpoints.every((endpoint) => readModels.has(endpoint))) throw new Error("Page read models did not return HTTP 200 JSON before deadline");
+          if (detail) {
+            const resource = readModels.get(endpoints[0]);
+            entry.resourceState = resource?.state ?? "missing";
+            if (resource?.state !== "ready") {
+              throw new Error(`Resource is not ready: ${entry.resourceState}`);
+            }
+          }
           await page.getByRole("heading", { level: 1, name: title, exact: true }).waitFor({ state: "visible" });
           await page.locator('[aria-busy="true"]').first().waitFor({ state: "hidden" });
           await page.getByText(/取得できませんでした|接続できません|所属組織がありません/).first().waitFor({ state: "hidden" });
@@ -273,6 +291,7 @@ try {
       record.serverErrors = serverErrors;
       record.requestFailures = requestFailures;
       record.expectedUnauthenticatedErrors = expectedErrors;
+      record.optionalAnalyticsBlockedByCsp = securityBlocks;
       await context.close();
     }
   }
@@ -331,6 +350,14 @@ function safeUrl(value) {
     const url = new URL(value, baseUrl);
     return `${url.protocol}//${url.host}${url.pathname}`;
   } catch { return "[invalid URL]"; }
+}
+
+function isOptionalBeacon(value) {
+  try {
+    const url = new URL(value);
+    return url.origin === "https://static.cloudflareinsights.com" &&
+      /^\/beacon\.min\.js(?:\/|$)/.test(url.pathname);
+  } catch { return false; }
 }
 
 function sanitize(value) {
