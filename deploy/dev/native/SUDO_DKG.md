@@ -113,3 +113,8 @@ This establishes the DEV DKG ceremony only. It does not establish real owner
 OIDC authentication, live signer issuance, sudo-plugin enforcement, production
 key provisioning or independent physical failure tolerance. Intermediate secret
 files remain private on each guest pending the explicit retention step.
+
+The subsequent [inactive companion installation](SUDO_INSTALL.md) placed dev6
+sudo binaries on all three guests without executing them, changing shares or
+enabling a service/plugin. This does not change the DKG-only scope of the ceremony
+evidence above.
