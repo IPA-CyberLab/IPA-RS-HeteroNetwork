@@ -87,3 +87,29 @@ in command arguments, nor are packet contents or their hashes printed. This
 physical host is a trusted coordinator and already controls the dev guests;
 this transport is not suitable evidence of secrecy from that administrator.
 Final `inspect` requires identical public manifest file hashes on all guests.
+
+## Observed Ceremony: 2026-09-10
+
+All three identity-pinned guests completed real `preflight`, `part1`, `part2`,
+`part3` and `inspect` with exit status 0. Each packet exchange delivered all six
+directed sender/recipient pairs. The final per-guest manifest file SHA-256 was
+identical on all three:
+`ec4d9c6cccac45a8afa56544279b28382af6dd9e885c25a3f478da9e61e99235`.
+This is the hash of the CLI's compact JSON file without a trailing newline.
+The public contents are recorded in `sudo-manifest.json`; the repository file
+adds a final newline. No private state or key share was exported to the repository.
+
+Guest helper source: `b0b55b6d`, SHA-256
+`0fc2ac15c65cb2a69fee5a15157d02476afdc0284629c44d45f299d4d48c7cfe`.
+Transport source: `ed18ad7c`, SHA-256
+`af2ca782f169d5d7e6284ceab423be97ca8b092979adcb07bfd2f3613c81e33e`.
+The transport was executed from hash-verified bytes on the physical host; its
+operator staging copy was not installed as a host system service. Guest helper,
+roster and CLI were placed in new root-owned private bundles. The existing
+agent binaries were not replaced. Fourteen guest-wrapper and twelve transport
+fixture tests passed before the corresponding live operations.
+
+This establishes the DEV DKG ceremony only. It does not establish real owner
+OIDC authentication, live signer issuance, sudo-plugin enforcement, production
+key provisioning or independent physical failure tolerance. Intermediate secret
+files remain private on each guest pending the explicit retention step.
