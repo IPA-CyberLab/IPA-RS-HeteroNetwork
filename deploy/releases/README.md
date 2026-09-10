@@ -35,3 +35,16 @@ digest is `sha256:cd4150194ff1133ec6faf04567110dab14e905cd436744b02a4892ee180935
 Verification and both architecture builds passed before the final image was
 published. This records a dev selection, not a deployed workload or production
 promotion.
+
+## HeteroCloud And Syouyu Dev Selections
+
+Revisions 3 and 4 select the published artifacts from successful release runs:
+
+| Component | Version | Source commit | Release run |
+| --- | --- | --- | --- |
+| HeteroCloud | `0.1.71-dev.1` | `361b62213246b41f1765c381438c33af96f59dc9` | [34516902105](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud/actions/runs/34516902105) |
+| Syouyu | `0.1.7-dev.1` | `a15d8ab0f60685b932ca8f6d2a9ed88e4f96d3a9` | [34516904320](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu/actions/runs/34516904320) |
+
+The downloaded release JSON supplied the image digests recorded in
+`channels.json`. Neither selection activates a service. Production remains
+unchanged; fresh dev deployment and end-to-end validation are still required.

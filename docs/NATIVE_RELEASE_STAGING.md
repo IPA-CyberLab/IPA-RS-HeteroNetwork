@@ -150,6 +150,97 @@ filesystem with normal Linux semantics, not independent networked copies.
 
 ## Activation Limitations
 
+### Read-Only Host Inventory
+
+Before implementing or authorizing native activation, collect the installed host
+facts with the fixed-scope local inventory tool:
+
+```sh
+python3 -B scripts/native-release-inventory.py
+```
+
+Run it locally through an already authorized administration channel. It has no
+remote host, command, unit, filesystem-root or output-file option. It does not
+connect to production from another machine, invoke archived/installed payloads,
+restart services, change channel state, or write an activation selector. It emits
+JSON to stdout; collecting evidence is **not activation or a completed rollout**.
+Actual live switching, dependent-service restart, health verification and rollback
+remain the next implementation task.
+
+The collector uses fixed `/usr/bin/systemctl show` calls with allowlisted
+key/value properties. It discovers the full `heteronetwork-*` unit namespace,
+including DB, Keycloak, PostgreSQL/bootstrap/public-services/Relay-autopilot
+services and timers. Fixed unit-directory discovery supplements loaded systemd
+units so inactive/unloaded installed units are not silently omitted. It records
+load/active/sub/enabled states, dependency edges, the transitive
+Requires/BindsTo/PartOf dependent closure, and unit-fragment/drop-in hashes and
+ownership/modes. Dependencies outside that namespace are identified as an
+uninspected boundary; external stop dependents make the evidence incomplete.
+The closure is restart-planning evidence, not an executed systemd job plan.
+Dependency lists parse systemctl's whole-word double quoting and doubled
+backslashes with a bounded, validated quoted-word parser. Dependency names may
+contain complete `\x` escapes followed by two lowercase hex digits (for example
+`\x2d` in a systemd credential mount). They remain literal
+metadata, bounded to 255 characters; malformed escapes, encoded controls and
+encoded slashes are rejected. Unterminated/concatenated quotes and bare backslashes
+in the serialized property are rejected rather than silently stripped. This does
+not expand queried unit names or allowed filesystem paths.
+
+The fixed payload inventory hashes all three binaries and nine packaged helpers
+at `/opt/heteronetwork/bin` and `/opt/heteronetwork/libexec`. The independently
+installed `/opt/heteronetwork/bin/caddy` is reported separately under `preserve`;
+it is not part of the native release or permission to replace the whole `bin`
+directory. File reads use pinned no-follow directory descriptors and report
+untrusted ownership/modes, links, missing/inaccessible files and observed races
+as incomplete evidence. Only the conventional `/lib` to `/usr/lib` vendor-unit
+alias is normalized; arbitrary file/directory symlinks are not followed.
+
+Main/control process executable hashes are collected through the kernel's
+`/proc/PID/exe` link when permitted, without reading command lines or environments.
+A bounded visible-process scan reports unclassified consumers of fixed native
+paths or matching installed executable inodes. Unit-file literal artifact
+references are reported, but are not proof of effective command execution.
+An interpreter hash cannot identify its running helper script; those bindings
+remain unverified. Other PID namespaces, copied executables at unrelated paths,
+future invocations and arbitrary external-unit consumers are outside this scan.
+No configuration/environment values, ExecStart arguments, key contents, unit
+contents or subprocess error text are emitted.
+
+Bounds: 256 units, 64 drop-ins per unit, 8,192 entries per unit directory, 4,096
+visible processes, 1 MiB per unit/drop-in, 2 MiB per helper, 256 MiB per executable,
+and 2 GiB total hashed bytes. Each systemctl call has a five-second timeout and
+2 MiB output limit, with up to one additional second for killed-child cleanup;
+collection checks a 120-second overall budget between reads.
+The final report is capped at 8 MiB. These are not hard deadlines for a stalled
+kernel filesystem read. Reads may update filesystem access times; the tool
+performs no explicit filesystem writes.
+
+`evidence_complete` describes only successful collection within that scope.
+Unknown roles/consumers, unobservable processes, unavailable properties, missing
+artifacts, unsafe metadata or exceeded bounds produce issues and exit status 2.
+Exit status 0 is scoped evidence collection, **not deployment readiness**:
+`deployment_ready` and `activation_performed` are always false, and
+`snapshot_atomic` is false. The report does not establish release provenance,
+rollout authorization, current HA health, state/schema compatibility or rollback
+safety. Recheck host facts immediately before any separately approved activation.
+
+On the supplied `.10` observation, Agent requires Gateway, while Control Plane,
+Signal and STUN each require and bind to Agent. An Agent stop therefore requires
+explicit dependent-service restart and recovered HA readiness before progressing
+to another host; a successful inventory does not satisfy either gate.
+Supplied read-only `.10` observations identify Web UI port `19088` and Control
+Plane port `19443`, with successful `/healthz` responses; port `18088` is not
+listening. These are supplied host facts, not probes performed by this inventory
+tool. Revalidate actual listeners rather than assuming deployment-template ports.
+
+The supplied read-only non-root `.10` v3 inventory on 2026-09-10 parsed 32 units
+with no `invalid_systemctl_dependencies` errors. Exit status remained 2: process
+permissions, unreviewed roles/dependents, unverified helper bindings and the
+missing host `ipars-k8s-controller` still leave evidence incomplete. The report
+sets `evidence_complete`, `deployment_ready` and `activation_performed` to false.
+This verifies collection/parsing, not root-level completeness or a deployment;
+no activation was performed.
+
 The existing `rollout-console-owner-update.sh` is a specialized, executing rollout
 helper. It expects a different archive layout, installs configuration, reconciles
 authentication, and restarts services. **Do not pass this native archive to it.**
@@ -172,6 +263,7 @@ sudo/PAM, or operate tenant containers.
 
 ```sh
 python3 scripts/native-release-stage.test.py
+python3 -B scripts/native-release-inventory.test.py
 node --check scripts/native-release-stage.catalog.mjs
 ```
 
@@ -180,3 +272,9 @@ ELF fixtures. Integration runs the committed package builder with those fixtures
 and the nine real helper files, stages/promotes through the shared channel tool,
 and verifies preparation/selection preserves every byte. It does not execute any
 packaged program and is not a VM rollout or runtime-health test.
+
+Inventory tests mock systemd/process discovery and use inert temporary files.
+They cover fixed read-only commands, bounded output/timeouts, credential-output
+suppression, inactive-unit discovery, dependency closure, executable evidence,
+unknown consumers, symlink/race rejection and incomplete reporting. They do not
+collect live production inventory or execute any artifact.
