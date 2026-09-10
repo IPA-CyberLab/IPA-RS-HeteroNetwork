@@ -172,3 +172,29 @@ No complete-suite pass or complete-HA claim is justified. Approved management
 access to the original Syouyu storage host is still required, and the `.5`
 capacity risk described above remains. Pre-existing local Registry/Argo resource
 edits were not committed, reverted, or applied by this recovery.
+
+## Retired mh-k8sp1, 12:47 UTC
+
+At the user's explicit request, removed `mh-k8sp1` (formerly `mizuame`),
+node `node-fa3539e2cfe894916288527d3a97d8f1`, VPN `10.250.0.2`.
+Its Tailscale address `100.123.154.79` was offline; the stored last heartbeat
+was August 11. The node was already absent from Kubernetes.
+
+Used the authenticated `DELETE /v1/admin/nodes/{node_id}` operation, not raw
+SQL. An approved root SSH session on ichikawap1 ran a temporary control-plane
+process against the existing database, bound only to loopback with a random
+ephemeral operator credential. Its short-lived service lease referenced the
+existing production control-plane endpoint, never the loopback listener.
+The production control-plane process and its authentication configuration
+were not restarted or changed.
+
+Preflight matched the exact cluster, node ID, hostname and VPN address.
+Removal deleted ten related path records and preserved all six other node
+registrations. A fresh temporary process confirmed the target remained absent.
+Kubernetes `/readyz` returned `ok`; Escape retained UID
+`08942b6b-7a5d-408d-9a88-16acfbe24b40`, Running, restart count 1.
+
+This removes network registration, not files or services on the offline host.
+Its agent could not be disabled remotely. No Kubernetes node, PVC, underlying
+data, Tailscale device or other HeteroNetwork node was deleted. In particular,
+`uc-k8sp1` and `mh-k8sp2` remain untouched by this retirement.
