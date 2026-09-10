@@ -289,8 +289,28 @@ disabled-state notice. These fields participate in stage/promote/rollback equali
 and history replay; omitting or changing them cannot match a selected release.
 
 This validation checks metadata, not build provenance or deployed policy. The
-native preparation tool described above handles only the main native archive;
-it does not extract, verify or activate the separate sudo archive. Publication
+native preparation tool requires `--sudo-archive` whenever the selected catalog
+contains `sudo_native` (and rejects that argument without a binding). For example:
+
+```sh
+python3 scripts/native-release-stage.py prepare --root /trusted/private-staging \
+  --channels /trusted/channels.json --environment dev \
+  --archive /trusted/heteronetwork-1.2.3-linux-amd64.tar.gz \
+  --sudo-archive /trusted/heteronetwork-1.2.3-sudo-v2-linux-amd64.tar.gz
+```
+
+The fixed sibling packager validator checks the companion archive digest,
+manifest and payload hashes/sizes/modes, ELF architecture, disabled notice,
+source commit, clean release profile, ACK regression and pinned plugin header.
+The catalog binding must match the verified metadata. Companion bytes are stored
+under `slots/<artifact-id>/sudo/`, with private directories and non-executable
+`0400` files; archive installation modes are verified but not applied. Inspection
+and selection revalidate the companion archive and every staged payload before
+returning `prepared: true` and `sudo_prepared: true`. A missing or altered
+companion prevents preparation/selection, including reuse of an existing slot.
+Catalogs without a binding retain base-only verification and report
+`sudo_prepared: false`. No payload is executed, installed or activated; this does
+not establish runtime readiness or provision policy, keys or services. Publication
 must establish the companion's clean source and actual payload identity, and
 the companion installer must verify its bytes independently. No currently
 selected release is retroactively assigned a synthetic sudo archive binding.

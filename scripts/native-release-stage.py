@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -81,6 +82,80 @@ def native(manifest):
     return manifest["native"]["linux-amd64"]
 
 
+def sudo_validator():
+    # Import only trusted checkout code, never anything from an archive or slot.
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sudo-quorum-v2-artifact.py")
+    spec = importlib.util.spec_from_file_location("sudo_artifact_validator", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def sudo_payloads(raw, manifest):
+    validator = sudo_validator()
+    binding = manifest["sudo_native"]["linux-amd64"]
+    payloads, metadata = validator.decode_archive(raw, binding["sha256"])
+    provenance = metadata.get("provenance")
+    require(isinstance(provenance, dict)
+            and provenance.get("source_commit") == binding["source_commit"] == manifest["commit"]
+            and provenance.get("profile") == binding["profile"] == "release"
+            and provenance.get("source_dirty") is False
+            and provenance.get("ack_regression") == "passed",
+            "Sudo source provenance mismatch")
+    require(metadata["sudo_plugin_header_sha256"] == binding["plugin_header_sha256"]
+            and metadata["files"] == binding["files"], "Sudo payload binding mismatch")
+    return payloads
+
+
+def stage_sudo(slot, raw, payloads):
+    os.mkdir("sudo", 0o700, dir_fd=slot)
+    directory = os.open("sudo", DIRECTORY, dir_fd=slot)
+    try:
+        write_bytes(directory, "archive.tar.gz", raw)
+        for group in ("bin", "lib"):
+            os.mkdir(group, 0o700, dir_fd=directory)
+            child = os.open(group, DIRECTORY, dir_fd=directory)
+            try:
+                for path, data in payloads.items():
+                    if path.startswith(group + "/"):
+                        write_bytes(child, path.split("/")[1], data)
+                os.fchmod(child, 0o500)
+                os.fsync(child)
+            finally:
+                os.close(child)
+        write_bytes(directory, "NOT_ENABLED.txt", payloads["NOT_ENABLED.txt"])
+        os.fchmod(directory, 0o500)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def inspect_sudo(slot, manifest):
+    directory = os.open("sudo", DIRECTORY, dir_fd=slot)
+    try:
+        trusted_directory(directory, private=True)
+        require(set(os.listdir(directory)) == {"archive.tar.gz", "NOT_ENABLED.txt", "bin", "lib"},
+                "Unexpected sudo slot contents")
+        raw = read_owned(directory, "archive.tar.gz", sudo_validator().MAX_TOTAL, mode=0o400)
+        payloads = sudo_payloads(raw, manifest)
+        for group in ("bin", "lib"):
+            child = os.open(group, DIRECTORY, dir_fd=directory)
+            try:
+                trusted_directory(child, private=True)
+                expected = {path.split("/")[1]: data for path, data in payloads.items()
+                            if path.startswith(group + "/")}
+                require(set(os.listdir(child)) == set(expected), "Unexpected sudo payload files")
+                for name, data in expected.items():
+                    require(read_owned(child, name, len(data), mode=0o400) == data, "Staged sudo payload mismatch")
+            finally:
+                os.close(child)
+        notice = payloads["NOT_ENABLED.txt"]
+        require(read_owned(directory, "NOT_ENABLED.txt", len(notice), mode=0o400) == notice,
+                "Staged sudo notice mismatch")
+    finally:
+        os.close(directory)
+
+
 def trusted_directory(fd, private=False):
     info = os.fstat(fd)
     require(stat.S_ISDIR(info.st_mode), "Directory required")
@@ -150,8 +225,10 @@ def open_owned(directory, name):
     return fd
 
 
-def read_owned(directory, name, maximum):
+def read_owned(directory, name, maximum, mode=None):
     with os.fdopen(open_owned(directory, name), "rb") as source:
+        require(mode is None or stat.S_IMODE(os.fstat(source.fileno()).st_mode) == mode,
+                "Staged file mode mismatch")
         require(os.fstat(source.fileno()).st_mode & 0o222 == 0, "Writable staged manifest")
         require(os.fstat(source.fileno()).st_size <= maximum, "Stored JSON too large")
         raw = source.read(maximum + 1)
@@ -326,7 +403,8 @@ def inspect_slot(slots, artifact):
         require(raw == canonical, "Noncanonical staged manifest")
         files = native(manifest)["files"]
         groups = {name.split("/")[0] for name in files}
-        require(set(os.listdir(slot)) == {"manifest.json", "archive.tar.gz"} | groups,
+        companion = {"sudo"} if "sudo_native" in manifest else set()
+        require(set(os.listdir(slot)) == {"manifest.json", "archive.tar.gz"} | groups | companion,
                 "Unexpected slot contents")
         with os.fdopen(open_owned(slot, "archive.tar.gz"), "rb") as source:
             info = os.fstat(source.fileno())
@@ -356,6 +434,8 @@ def inspect_slot(slots, artifact):
                                 "Staged payload checksum mismatch")
             finally:
                 os.close(parent)
+        if companion:
+            inspect_sudo(slot, manifest)
         return manifest
     finally:
         os.close(slot)
@@ -377,6 +457,7 @@ def result_for(root, artifact, manifest, environment=None, revision=None):
     result = {"artifact_id": artifact, "archive_sha256": native(manifest)["sha256"],
               "image": manifest["image"], "slot": os.path.join(os.path.abspath(root), "slots", artifact),
               "prepared": True, "activation_performed": False, "manifest": manifest}
+    result["sudo_prepared"] = "sudo_native" in manifest
     if environment is not None:
         result.update({"environment": environment, "selected_revision": revision})
     return result
@@ -390,9 +471,7 @@ def remove_temporary(slot):
         if stat.S_ISDIR(info.st_mode):
             child = os.open(name, DIRECTORY, dir_fd=slot)
             try:
-                os.fchmod(child, 0o700)
-                for entry in os.listdir(child):
-                    os.unlink(entry, dir_fd=child)
+                remove_temporary(child)
             finally:
                 os.close(child)
             os.rmdir(name, dir_fd=slot)
@@ -400,8 +479,14 @@ def remove_temporary(slot):
             os.unlink(name, dir_fd=slot)
 
 
-def prepare(root, channels_path, environment, archive_path):
+def prepare(root, channels_path, environment, archive_path, sudo_archive_path=None):
     manifest, canonical, revision = selection_snapshot(channels_path, environment)
+    require((sudo_archive_path is not None) == ("sudo_native" in manifest),
+            "Sudo archive is required exactly when the catalog binds a companion")
+    sudo_raw = None
+    if sudo_archive_path is not None:
+        sudo_raw = read_source(sudo_archive_path, sudo_validator().MAX_TOTAL)
+        payloads = sudo_payloads(sudo_raw, manifest)
     artifact = hashlib.sha256(canonical).hexdigest()
     with locked_root(root) as directory:
         slots = slots_directory(directory, create=True)
@@ -422,6 +507,9 @@ def prepare(root, channels_path, environment, archive_path):
             with source_file(archive_path) as source:
                 checked_copy(source, slot, "archive.tar.gz", native(manifest)["sha256"])
             unpack_verified_archive(slot, manifest)
+            if sudo_raw is not None:
+                stage_sudo(slot, sudo_raw, payloads)
+                inspect_sudo(slot, manifest)
             os.fchmod(slot, 0o500)
             os.fsync(slot)
             os.rename(temporary, artifact, src_dir_fd=slots, dst_dir_fd=slots)
@@ -466,6 +554,7 @@ def main():
         command.add_argument("--environment", choices=("dev", "prod"), required=True)
         if command_name == "prepare":
             command.add_argument("--archive", required=True)
+            command.add_argument("--sudo-archive", help="required for catalogs with sudo_native; inactive bytes only")
         else:
             command.add_argument("--expected-revision", type=int)
     command = commands.add_parser("inspect")
@@ -473,7 +562,7 @@ def main():
     command.add_argument("--artifact", required=True)
     args = parser.parse_args()
     if args.command == "prepare":
-        result = prepare(args.root, args.channels, args.environment, args.archive)
+        result = prepare(args.root, args.channels, args.environment, args.archive, args.sudo_archive)
     elif args.command == "inspect":
         result = inspect(args.root, args.artifact)
     else:

@@ -98,6 +98,120 @@ class NativeStageTests(unittest.TestCase):
     def prepare(self):
         return stage.prepare(self.root, self.channels, "dev", self.archive)
 
+    def companion(self, provenance_patch=None):
+        artifact = self.bundle()
+        validator = stage.sudo_validator()
+        payloads = {"bin/local-sudo-v2": elf(4), "lib/quorum_v2_gate.so": elf(5),
+                    "NOT_ENABLED.txt": validator.NOTE}
+        provenance = {"source_commit": artifact["commit"], "source_dirty": False,
+                      "profile": "release", "ack_regression": "passed"}
+        provenance.update(provenance_patch or {})
+        metadata = validator.manifest_for(payloads, provenance, "linux-amd64")
+        raw = validator.encode_archive(payloads, metadata)
+        self.sudo_archive = self.temp / "sudo.tar.gz"
+        self.sudo_archive.write_bytes(raw)
+        artifact["sudo_native"] = {"linux-amd64": {
+            "asset": "heteronetwork-1.2.3-sudo-v2-linux-amd64.tar.gz", "sha256": digest(raw),
+            "source_commit": artifact["commit"], "profile": "release",
+            "plugin_header_sha256": validator.HEADER_SHA256, "files": metadata["files"]}}
+        self.state(artifact)
+        return artifact, payloads
+
+    def prepare_companion(self):
+        return stage.prepare(self.root, self.channels, "dev", self.archive, self.sudo_archive)
+
+    def test_sudo_companion_required_and_unbound_input_rejected(self):
+        self.companion()
+        with self.assertRaises(ValueError):
+            self.prepare()
+        self.assert_no_prepared()
+        self.bundle()
+        with self.assertRaises(ValueError):
+            self.prepare_companion()
+        self.assert_no_prepared()
+
+    def test_sudo_companion_complete_private_inactive_and_reselected(self):
+        artifact, payloads = self.companion()
+        result = self.prepare_companion()
+        self.assertTrue(result["sudo_prepared"])
+        self.assertFalse(result["activation_performed"])
+        slot = Path(result["slot"])
+        for path, data in payloads.items():
+            self.assertEqual((slot / "sudo" / path).read_bytes(), data)
+            self.assertEqual((slot / "sudo" / path).stat().st_mode & 0o777, 0o400)
+        self.assertEqual(self.prepare_companion()["artifact_id"], result["artifact_id"])
+        self.state(artifact, promote=True)
+        self.assertTrue(stage.select(self.root, self.channels, "prod", 2)["sudo_prepared"])
+        with self.assertRaises(ValueError):
+            self.prepare()  # Required even when the slot already exists.
+
+    def test_sudo_companion_archive_and_binding_mismatch(self):
+        artifact, _ = self.companion()
+        self.sudo_archive.write_bytes(b"altered")
+        with self.assertRaises(ValueError):
+            self.prepare_companion()
+        self.assert_no_prepared()
+        for field, value in (("sha256", "0" * 64), ("size", 511), ("mode", 0o4755)):
+            artifact, _ = self.companion()
+            artifact["sudo_native"]["linux-amd64"]["files"]["bin/local-sudo-v2"][field] = value
+            self.state(artifact)
+            with self.assertRaises(ValueError):
+                self.prepare_companion()
+            self.assert_no_prepared()
+
+    def test_sudo_companion_provenance_mismatch(self):
+        for patch in ({"source_commit": "3" * 40}, {"profile": "dev"},
+                      {"source_dirty": True}, {"ack_regression": "failed"}):
+            self.companion(patch)
+            with self.assertRaises(ValueError):
+                self.prepare_companion()
+            self.assert_no_prepared()
+
+    def test_sudo_tampering_prevents_select(self):
+        self.companion()
+        result = self.prepare_companion()
+        slot = Path(result["slot"]) / "sudo"
+        for path in ("archive.tar.gz", "bin/local-sudo-v2", "lib/quorum_v2_gate.so", "NOT_ENABLED.txt"):
+            target = slot / path
+            original = target.read_bytes()
+            target.chmod(0o600)
+            target.write_bytes(b"altered")
+            target.chmod(0o400)
+            with self.assertRaises(ValueError):
+                stage.select(self.root, self.channels, "dev", 1)
+            target.chmod(0o600)
+            target.write_bytes(original)
+            target.chmod(0o400)
+        slot.chmod(0o700)
+        (slot / "NOT_ENABLED.txt").unlink()
+        with self.assertRaises(ValueError):
+            stage.select(self.root, self.channels, "dev", 1)
+
+    def test_sudo_failed_publication_cleans_new_nested_slot(self):
+        self.companion()
+        with mock.patch.object(stage.os, "rename", side_effect=OSError("injected failure")):
+            with self.assertRaises(OSError):
+                self.prepare_companion()
+        self.assert_no_prepared()
+
+    def test_sudo_links_and_executable_staging_modes_rejected(self):
+        self.companion()
+        result = self.prepare_companion()
+        target = Path(result["slot"]) / "sudo/bin/local-sudo-v2"
+        target.chmod(0o500)
+        with self.assertRaises(ValueError):
+            stage.select(self.root, self.channels, "dev", 1)
+        target.chmod(0o400)
+        os.link(target, self.temp / "sudo-hardlink")
+        with self.assertRaises(ValueError):
+            stage.select(self.root, self.channels, "dev", 1)
+        (self.temp / "sudo-hardlink").unlink()
+        target.parent.chmod(0o700)
+        target.unlink()
+        target.symlink_to(self.sudo_archive)
+        with self.assertRaises(OSError):
+            stage.select(self.root, self.channels, "dev", 1)
+
     def assert_no_prepared(self):
         slots = self.root / "slots"
         self.assertFalse(slots.exists() and list(slots.iterdir()))
@@ -109,6 +223,7 @@ class NativeStageTests(unittest.TestCase):
         result = self.prepare()
         self.assertEqual(result["selected_revision"], 1)
         self.assertFalse(result["activation_performed"])
+        self.assertFalse(result["sudo_prepared"])
         slot = Path(result["slot"])
         for name, data in self.files.items():
             self.assertEqual((slot / name).read_bytes(), data)
