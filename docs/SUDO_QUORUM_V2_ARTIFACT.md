@@ -1,7 +1,8 @@
 # Disabled Sudo V2 Artifact
 
-This optional package is **not enabled** and is not part of the current release
-workflow or native channel artifact. It supplies only `local-sudo-v2`, the
+This package is **not enabled** by publication or staging. The release workflow
+publishes it as a digest-bound native companion; activation remains separate.
+It supplies only `local-sudo-v2`, the
 `quorum_v2_gate` approval plugin, a disabled-state notice, and integrity metadata.
 It contains no issuer shares, requester keys, host keys, policy, credentials,
 fixture binaries, service units, sudoers/PAM configuration, or live ledger.
