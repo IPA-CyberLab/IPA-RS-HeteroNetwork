@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ipars_control_plane::{
-    ensure_token_definition_matches, overlay_route_catalog_epoch, ControlPlaneError,
-    ControlPlaneStore, HeartbeatStoreUpdate, KeycloakCandidateLease, RejoinNodeStoreUpdate,
-    RemovedNode, TokenLedger,
+    ensure_token_definition_matches, overlay_route_catalog_epoch, AdminCapabilityRevocation,
+    AdminCapabilityUse, AdminQuorumManifestAnchor, ControlPlaneError, ControlPlaneStore,
+    HeartbeatStoreUpdate, KeycloakCandidateLease, RejoinNodeStoreUpdate, RemovedNode, TokenLedger,
+    ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS, MAX_ADMIN_CAPABILITY_LEDGER_RECORDS,
 };
 use ipars_types::api::ClientGatewaySelection;
 use ipars_types::{
@@ -17,6 +18,50 @@ use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
 
 const PATH_PAIR_QUERY_CHUNK_SIZE: usize = 200;
 const MAX_KEYCLOAK_CANDIDATE_QUERY_LIMIT: usize = 64;
+// Separate from membership and migration locks. Serializes the global capacity/GC gate.
+const ADMIN_CAPABILITY_LEDGER_LOCK_ID: i64 = 0x4950_4152_5341_444d;
+const ADMIN_CAPABILITY_SCHEMA: [&str; 3] = [
+    "CREATE TABLE IF NOT EXISTS admin_quorum_manifest_anchors (
+        cluster_id TEXT PRIMARY KEY NOT NULL,
+        manifest_epoch TEXT NOT NULL,
+        manifest_digest TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS admin_capability_ledger (
+        cluster_id TEXT NOT NULL,
+        manifest_epoch TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        manifest_digest TEXT NOT NULL,
+        claims_digest TEXT,
+        expires_at_millis BIGINT NOT NULL,
+        received_at_millis BIGINT NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        requester_public_key TEXT NOT NULL,
+        revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)),
+        PRIMARY KEY (cluster_id, manifest_epoch, request_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS admin_capability_expiry_idx
+        ON admin_capability_ledger(expires_at_millis)",
+];
+
+fn admin_anchor(
+    epoch: String,
+    digest: String,
+) -> Result<AdminQuorumManifestAnchor, ControlPlaneError> {
+    let manifest_epoch = epoch
+        .parse::<u64>()
+        .map_err(|_| ControlPlaneError::Store("invalid stored admin manifest epoch".to_string()))?;
+    let anchor = AdminQuorumManifestAnchor {
+        manifest_epoch,
+        manifest_digest: digest,
+    };
+    if !anchor.is_valid() || epoch != manifest_epoch.to_string() {
+        return Err(ControlPlaneError::Store(
+            "invalid stored admin manifest anchor".to_string(),
+        ));
+    }
+    Ok(anchor)
+}
 
 #[derive(Debug, Clone)]
 pub struct SqliteControlPlaneStore {
@@ -38,6 +83,9 @@ impl SqliteControlPlaneStore {
     }
 
     async fn migrate(&self) -> Result<(), ControlPlaneError> {
+        for statement in ADMIN_CAPABILITY_SCHEMA {
+            self.pool.execute(statement).await.map_err(sql_error)?;
+        }
         self.pool
             .execute(
                 r#"
@@ -270,8 +318,161 @@ impl SqliteControlPlaneStore {
     }
 }
 
+impl SqliteControlPlaneStore {
+    async fn insert_admin_capability(
+        &self,
+        record: AdminCapabilityUse,
+        revoked: bool,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let now = Utc::now();
+        if !record.validate_for_ledger(now) {
+            return Ok(false);
+        }
+        let anchor_matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_quorum_manifest_anchors
+             WHERE cluster_id = ?1 AND manifest_epoch = ?2 AND manifest_digest = ?3",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.manifest_epoch.to_string())
+        .bind(&record.manifest_digest)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if anchor_matches != 1 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM admin_capability_ledger WHERE expires_at_millis <= ?1")
+            .bind(
+                (now - chrono::Duration::seconds(ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS))
+                    .timestamp_millis(),
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let result = sqlx::query(
+            "INSERT INTO admin_capability_ledger
+             (cluster_id, manifest_epoch, request_id, manifest_digest, claims_digest,
+              expires_at_millis, received_at_millis, method, path, requester_public_key, revoked)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+             WHERE (SELECT COUNT(*) FROM admin_capability_ledger) < ?12
+             ON CONFLICT(cluster_id, manifest_epoch, request_id) DO NOTHING",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.manifest_epoch.to_string())
+        .bind(&record.request_id)
+        .bind(&record.manifest_digest)
+        .bind(if revoked {
+            None
+        } else {
+            Some(record.claims_digest.as_str())
+        })
+        .bind(record.expires_at.timestamp_millis())
+        .bind(record.received_at.timestamp_millis())
+        .bind(&record.method)
+        .bind(&record.path)
+        .bind(&record.requester_public_key)
+        .bind(i32::from(revoked))
+        .bind(MAX_ADMIN_CAPABILITY_LEDGER_RECORDS as i64)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+}
+
 #[async_trait]
 impl ControlPlaneStore for SqliteControlPlaneStore {
+    async fn bind_admin_quorum_manifest(
+        &self,
+        cluster_id: &ClusterId,
+        manifest_epoch: u64,
+        manifest_digest: &str,
+    ) -> Result<(), ControlPlaneError> {
+        let expected = admin_anchor(manifest_epoch.to_string(), manifest_digest.to_string())?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        // Do not implicitly bless legacy/unanchored replay records during opt-in.
+        sqlx::query(
+            "INSERT INTO admin_quorum_manifest_anchors (cluster_id, manifest_epoch, manifest_digest)
+             SELECT ?1, ?2, ?3 WHERE NOT EXISTS
+             (SELECT 1 FROM admin_capability_ledger WHERE cluster_id = ?1)
+             ON CONFLICT(cluster_id) DO NOTHING",
+        )
+        .bind(cluster_id.as_str()).bind(manifest_epoch.to_string()).bind(manifest_digest)
+        .execute(&mut *transaction).await.map_err(sql_error)?;
+        let row = sqlx::query(
+            "SELECT manifest_epoch, manifest_digest FROM admin_quorum_manifest_anchors WHERE cluster_id = ?1",
+        ).bind(cluster_id.as_str()).fetch_optional(&mut *transaction).await.map_err(sql_error)?;
+        let existing = row
+            .map(|row| {
+                admin_anchor(
+                    row.try_get("manifest_epoch").map_err(sql_error)?,
+                    row.try_get("manifest_digest").map_err(sql_error)?,
+                )
+            })
+            .transpose()?;
+        if existing.as_ref() != Some(&expected) {
+            return Err(ControlPlaneError::Store(
+                "admin manifest anchor mismatch or unanchored ledger".to_string(),
+            ));
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_admin_quorum_manifest_anchor(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifestAnchor>, ControlPlaneError> {
+        let row = sqlx::query("SELECT manifest_epoch, manifest_digest FROM admin_quorum_manifest_anchors WHERE cluster_id = ?1")
+            .bind(cluster_id.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
+        if row.is_none() {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM admin_capability_ledger WHERE cluster_id = ?1",
+            )
+            .bind(cluster_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(sql_error)?;
+            if count != 0 {
+                return Err(ControlPlaneError::Store(
+                    "unanchored admin capability ledger requires review".to_string(),
+                ));
+            }
+        }
+        row.map(|row| {
+            admin_anchor(
+                row.try_get("manifest_epoch").map_err(sql_error)?,
+                row.try_get("manifest_digest").map_err(sql_error)?,
+            )
+        })
+        .transpose()
+    }
+
+    async fn consume_admin_capability(
+        &self,
+        record: AdminCapabilityUse,
+    ) -> Result<bool, ControlPlaneError> {
+        self.insert_admin_capability(record, false).await
+    }
+
+    async fn revoke_admin_capability(
+        &self,
+        record: AdminCapabilityRevocation,
+    ) -> Result<bool, ControlPlaneError> {
+        self.insert_admin_capability(record.into_ledger_use(), true)
+            .await
+    }
+
     async fn get_cluster_policy(
         &self,
         cluster_id: &ClusterId,
@@ -1591,6 +1792,9 @@ impl PostgresControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        for statement in ADMIN_CAPABILITY_SCHEMA {
+            transaction.execute(statement).await.map_err(sql_error)?;
+        }
         transaction
             .execute(
                 r#"
@@ -1811,8 +2015,160 @@ impl PostgresControlPlaneStore {
     }
 }
 
+impl PostgresControlPlaneStore {
+    async fn insert_admin_capability(
+        &self,
+        record: AdminCapabilityUse,
+        revoked: bool,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ADMIN_CAPABILITY_LEDGER_LOCK_ID)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let now = Utc::now();
+        if !record.validate_for_ledger(now) {
+            return Ok(false);
+        }
+        let anchor_matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_quorum_manifest_anchors
+             WHERE cluster_id = $1 AND manifest_epoch = $2 AND manifest_digest = $3",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.manifest_epoch.to_string())
+        .bind(&record.manifest_digest)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if anchor_matches != 1 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM admin_capability_ledger WHERE expires_at_millis <= $1")
+            .bind(
+                (now - chrono::Duration::seconds(ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS))
+                    .timestamp_millis(),
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let result = sqlx::query(
+            "INSERT INTO admin_capability_ledger
+             (cluster_id, manifest_epoch, request_id, manifest_digest, claims_digest,
+              expires_at_millis, received_at_millis, method, path, requester_public_key, revoked)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+             WHERE (SELECT COUNT(*) FROM admin_capability_ledger) < $12
+             ON CONFLICT(cluster_id, manifest_epoch, request_id) DO NOTHING",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.manifest_epoch.to_string())
+        .bind(&record.request_id)
+        .bind(&record.manifest_digest)
+        .bind(if revoked {
+            None
+        } else {
+            Some(record.claims_digest.as_str())
+        })
+        .bind(record.expires_at.timestamp_millis())
+        .bind(record.received_at.timestamp_millis())
+        .bind(&record.method)
+        .bind(&record.path)
+        .bind(&record.requester_public_key)
+        .bind(i32::from(revoked))
+        .bind(MAX_ADMIN_CAPABILITY_LEDGER_RECORDS as i64)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+}
+
 #[async_trait]
 impl ControlPlaneStore for PostgresControlPlaneStore {
+    async fn bind_admin_quorum_manifest(
+        &self,
+        cluster_id: &ClusterId,
+        manifest_epoch: u64,
+        manifest_digest: &str,
+    ) -> Result<(), ControlPlaneError> {
+        let expected = admin_anchor(manifest_epoch.to_string(), manifest_digest.to_string())?;
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ADMIN_CAPABILITY_LEDGER_LOCK_ID)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query(
+            "INSERT INTO admin_quorum_manifest_anchors (cluster_id, manifest_epoch, manifest_digest)
+             SELECT $1, $2, $3 WHERE NOT EXISTS
+             (SELECT 1 FROM admin_capability_ledger WHERE cluster_id = $1)
+             ON CONFLICT(cluster_id) DO NOTHING",
+        ).bind(cluster_id.as_str()).bind(manifest_epoch.to_string()).bind(manifest_digest)
+            .execute(&mut *transaction).await.map_err(sql_error)?;
+        let row = sqlx::query("SELECT manifest_epoch, manifest_digest FROM admin_quorum_manifest_anchors WHERE cluster_id = $1")
+            .bind(cluster_id.as_str()).fetch_optional(&mut *transaction).await.map_err(sql_error)?;
+        let existing = row
+            .map(|row| {
+                admin_anchor(
+                    row.try_get("manifest_epoch").map_err(sql_error)?,
+                    row.try_get("manifest_digest").map_err(sql_error)?,
+                )
+            })
+            .transpose()?;
+        if existing.as_ref() != Some(&expected) {
+            return Err(ControlPlaneError::Store(
+                "admin manifest anchor mismatch or unanchored ledger".to_string(),
+            ));
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_admin_quorum_manifest_anchor(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifestAnchor>, ControlPlaneError> {
+        let row = sqlx::query("SELECT manifest_epoch, manifest_digest FROM admin_quorum_manifest_anchors WHERE cluster_id = $1")
+            .bind(cluster_id.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
+        if row.is_none() {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM admin_capability_ledger WHERE cluster_id = $1",
+            )
+            .bind(cluster_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(sql_error)?;
+            if count != 0 {
+                return Err(ControlPlaneError::Store(
+                    "unanchored admin capability ledger requires review".to_string(),
+                ));
+            }
+        }
+        row.map(|row| {
+            admin_anchor(
+                row.try_get("manifest_epoch").map_err(sql_error)?,
+                row.try_get("manifest_digest").map_err(sql_error)?,
+            )
+        })
+        .transpose()
+    }
+
+    async fn consume_admin_capability(
+        &self,
+        record: AdminCapabilityUse,
+    ) -> Result<bool, ControlPlaneError> {
+        self.insert_admin_capability(record, false).await
+    }
+
+    async fn revoke_admin_capability(
+        &self,
+        record: AdminCapabilityRevocation,
+    ) -> Result<bool, ControlPlaneError> {
+        self.insert_admin_capability(record.into_ledger_use(), true)
+            .await
+    }
+
     async fn get_cluster_policy(
         &self,
         cluster_id: &ClusterId,
@@ -3755,6 +4111,371 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         (format!("sqlite://{}?mode=rwc", path.display()), path)
+    }
+
+    fn admin_use(request_id: &str) -> AdminCapabilityUse {
+        let now = Utc::now();
+        AdminCapabilityUse {
+            cluster_id: ClusterId::from_string("admin-ledger-test"),
+            manifest_epoch: u64::MAX,
+            manifest_digest: "a".repeat(64),
+            request_id: request_id.to_string(),
+            claims_digest: "b".repeat(64),
+            expires_at: now + chrono::Duration::minutes(10),
+            received_at: now,
+            method: "POST".to_string(),
+            path: "/api/v1/admin/test".to_string(),
+            requester_public_key: "test-public-key".to_string(),
+        }
+    }
+
+    fn admin_revocation(record: &AdminCapabilityUse) -> AdminCapabilityRevocation {
+        AdminCapabilityRevocation {
+            cluster_id: record.cluster_id.clone(),
+            manifest_epoch: record.manifest_epoch,
+            manifest_digest: record.manifest_digest.clone(),
+            request_id: record.request_id.clone(),
+            expires_at: record.expires_at,
+            received_at: record.received_at,
+            method: record.method.clone(),
+            path: record.path.clone(),
+            requester_public_key: record.requester_public_key.clone(),
+        }
+    }
+
+    async fn bind_admin<S: ControlPlaneStore>(
+        store: &S,
+        record: &AdminCapabilityUse,
+    ) -> Result<(), ControlPlaneError> {
+        store
+            .bind_admin_quorum_manifest(
+                &record.cluster_id,
+                record.manifest_epoch,
+                &record.manifest_digest,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_capability_single_winner_across_pools(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (url, path) = temp_sqlite_url("admin-race");
+        let first = SqliteControlPlaneStore::connect(&url).await?;
+        let second = SqliteControlPlaneStore::connect(&url).await?;
+        let record = admin_use("same-request");
+        bind_admin(&first, &record).await?;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..16 {
+            let store = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let record = record.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store.consume_admin_capability(record).await
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            winners += usize::from(result??);
+        }
+        assert_eq!(winners, 1);
+        let audit = sqlx::query("SELECT * FROM admin_capability_ledger")
+            .fetch_one(&first.pool)
+            .await?;
+        assert_eq!(
+            audit.get::<String, _>("claims_digest"),
+            record.claims_digest
+        );
+        assert_eq!(
+            audit.get::<String, _>("requester_public_key"),
+            record.requester_public_key
+        );
+        assert_eq!(audit.get::<String, _>("method"), record.method);
+        assert_eq!(audit.get::<String, _>("path"), record.path);
+        assert_eq!(
+            audit.get::<i64, _>("received_at_millis"),
+            record.received_at.timestamp_millis()
+        );
+        let mut changed_claims = record.clone();
+        changed_claims.claims_digest = "c".repeat(64);
+        assert!(!second.consume_admin_capability(changed_claims).await?);
+        first.pool.close().await;
+        second.pool.close().await;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_capability_restart_and_preuse_revocation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (url, path) = temp_sqlite_url("admin-restart");
+        let store = SqliteControlPlaneStore::connect(&url).await?;
+        let used = admin_use("used");
+        let revoked = admin_use("revoked");
+        bind_admin(&store, &used).await?;
+        assert!(store.consume_admin_capability(used.clone()).await?);
+        assert!(
+            !store
+                .revoke_admin_capability(admin_revocation(&used))
+                .await?
+        );
+        assert!(
+            store
+                .revoke_admin_capability(admin_revocation(&revoked))
+                .await?
+        );
+        assert!(
+            !store
+                .revoke_admin_capability(admin_revocation(&revoked))
+                .await?
+        );
+        let digest: Option<String> = sqlx::query_scalar(
+            "SELECT claims_digest FROM admin_capability_ledger WHERE request_id = 'revoked'",
+        )
+        .fetch_one(&store.pool)
+        .await?;
+        assert!(digest.is_none());
+        store.pool.close().await;
+        let reopened = SqliteControlPlaneStore::connect(&url).await?;
+        assert_eq!(
+            reopened
+                .get_admin_quorum_manifest_anchor(&used.cluster_id)
+                .await?,
+            Some(AdminQuorumManifestAnchor {
+                manifest_epoch: used.manifest_epoch,
+                manifest_digest: used.manifest_digest.clone()
+            })
+        );
+        assert!(!reopened.consume_admin_capability(used).await?);
+        assert!(!reopened.consume_admin_capability(revoked).await?);
+        reopened.pool.close().await;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_capability_consume_revoke_race() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (url, path) = temp_sqlite_url("admin-revoke-race");
+        let first = SqliteControlPlaneStore::connect(&url).await?;
+        let second = SqliteControlPlaneStore::connect(&url).await?;
+        let record = admin_use("raced");
+        bind_admin(&first, &record).await?;
+        let (used, revoked) = tokio::join!(
+            first.consume_admin_capability(record.clone()),
+            second.revoke_admin_capability(admin_revocation(&record))
+        );
+        assert_ne!(used?, revoked?);
+        assert!(!first.consume_admin_capability(record).await?);
+        first.pool.close().await;
+        second.pool.close().await;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_manifest_anchor_is_immutable_and_required(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteControlPlaneStore::connect("sqlite::memory:").await?;
+        let record = admin_use("anchored");
+        assert!(store
+            .get_admin_quorum_manifest_anchor(&record.cluster_id)
+            .await?
+            .is_none());
+        assert!(!store.consume_admin_capability(record.clone()).await?);
+        assert!(
+            !store
+                .revoke_admin_capability(admin_revocation(&record))
+                .await?
+        );
+        bind_admin(&store, &record).await?;
+        bind_admin(&store, &record).await?;
+        assert!(store
+            .bind_admin_quorum_manifest(&record.cluster_id, 1, &record.manifest_digest)
+            .await
+            .is_err());
+        assert!(store
+            .bind_admin_quorum_manifest(&record.cluster_id, record.manifest_epoch, &"c".repeat(64))
+            .await
+            .is_err());
+        let mut stale = record.clone();
+        stale.manifest_epoch = 1;
+        assert!(!store.consume_admin_capability(stale).await?);
+        let mut mixed = record.clone();
+        mixed.manifest_digest = "c".repeat(64);
+        assert!(!store.consume_admin_capability(mixed).await?);
+        let mut other = record.clone();
+        other.cluster_id = ClusterId::from_string("another-cluster");
+        assert!(!store.consume_admin_capability(other.clone()).await?);
+        bind_admin(&store, &other).await?;
+        assert!(store.consume_admin_capability(other).await?);
+        assert!(store.consume_admin_capability(record).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_capability_expiry_capacity_and_gc_fail_closed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteControlPlaneStore::connect("sqlite::memory:").await?;
+        let record = admin_use("new");
+        bind_admin(&store, &record).await?;
+        let mut expired = record.clone();
+        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(!store.consume_admin_capability(expired).await?);
+        sqlx::query(
+            "WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < ?1)
+             INSERT INTO admin_capability_ledger
+             SELECT ?2, ?3, CAST(n AS TEXT), ?4, ?5, ?6, ?7, 'POST', '/audit', 'public-key', 0 FROM numbers",
+        ).bind(MAX_ADMIN_CAPABILITY_LEDGER_RECORDS as i64)
+            .bind(record.cluster_id.as_str()).bind(record.manifest_epoch.to_string())
+            .bind(&record.manifest_digest).bind(&record.claims_digest)
+            .bind(record.expires_at.timestamp_millis()).bind(record.received_at.timestamp_millis())
+            .execute(&store.pool).await?;
+        assert!(!store.consume_admin_capability(record.clone()).await?);
+        // A recently expired tombstone still counts during the skew grace period.
+        sqlx::query(
+            "UPDATE admin_capability_ledger SET expires_at_millis = ?1 WHERE request_id = '1'",
+        )
+        .bind((Utc::now() - chrono::Duration::seconds(1)).timestamp_millis())
+        .execute(&store.pool)
+        .await?;
+        assert!(!store.consume_admin_capability(record.clone()).await?);
+        sqlx::query(
+            "UPDATE admin_capability_ledger SET expires_at_millis = ?1 WHERE request_id = '1'",
+        )
+        .bind(
+            (Utc::now() - chrono::Duration::seconds(ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS + 10))
+                .timestamp_millis(),
+        )
+        .execute(&store.pool)
+        .await?;
+        assert!(store.consume_admin_capability(record).await?);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_capability_ledger")
+            .fetch_one(&store.pool)
+            .await?;
+        assert_eq!(count, MAX_ADMIN_CAPABILITY_LEDGER_RECORDS as i64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_manifest_does_not_adopt_unanchored_rows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteControlPlaneStore::connect("sqlite::memory:").await?;
+        let record = admin_use("legacy");
+        bind_admin(&store, &record).await?;
+        assert!(store.consume_admin_capability(record.clone()).await?);
+        // Simulate a pre-existing unanchored schema/data set, not a supported rotation.
+        sqlx::query("DELETE FROM admin_quorum_manifest_anchors")
+            .execute(&store.pool)
+            .await?;
+        assert!(bind_admin(&store, &record).await.is_err());
+        assert!(store
+            .get_admin_quorum_manifest_anchor(&record.cluster_id)
+            .await
+            .is_err());
+        assert!(!store.consume_admin_capability(record).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable ipars_admin_ledger_test PostgreSQL database"]
+    async fn postgres_admin_capability_ha_ledger() -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("IPARS_TEST_POSTGRES_URL")?;
+        let pool = PgPool::connect(&url).await?;
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            database, "ipars_admin_ledger_test",
+            "test refuses other databases"
+        );
+        let first = PostgresControlPlaneStore::from_pool(pool).await?;
+        let second = PostgresControlPlaneStore::connect(&url).await?;
+        let mut record = admin_use("postgres-race");
+        record.cluster_id = ClusterId::from_string(format!(
+            "admin-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        assert!(!first.consume_admin_capability(record.clone()).await?);
+        bind_admin(&first, &record).await?;
+        assert!(second
+            .bind_admin_quorum_manifest(&record.cluster_id, 1, &record.manifest_digest)
+            .await
+            .is_err());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..16 {
+            let store = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let record = record.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store.consume_admin_capability(record).await
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            winners += usize::from(result??);
+        }
+        assert_eq!(winners, 1);
+        let mut revoked = record.clone();
+        revoked.request_id = "postgres-preuse-revocation".to_string();
+        assert!(
+            first
+                .revoke_admin_capability(admin_revocation(&revoked))
+                .await?
+        );
+        assert!(!second.consume_admin_capability(revoked.clone()).await?);
+        let mut race = record.clone();
+        race.request_id = "postgres-use-revoke-race".to_string();
+        let (used, denied) = tokio::join!(
+            first.consume_admin_capability(race.clone()),
+            second.revoke_admin_capability(admin_revocation(&race))
+        );
+        assert_ne!(used?, denied?);
+        let audit = sqlx::query("SELECT claims_digest, method, path, requester_public_key, received_at_millis FROM admin_capability_ledger WHERE cluster_id = $1 AND request_id = $2")
+            .bind(record.cluster_id.as_str()).bind(&record.request_id).fetch_one(&first.pool).await?;
+        assert_eq!(
+            audit.get::<String, _>("claims_digest"),
+            record.claims_digest
+        );
+        assert_eq!(audit.get::<String, _>("method"), record.method);
+        assert_eq!(audit.get::<String, _>("path"), record.path);
+        assert_eq!(
+            audit.get::<String, _>("requester_public_key"),
+            record.requester_public_key
+        );
+        assert_eq!(
+            audit.get::<i64, _>("received_at_millis"),
+            record.received_at.timestamp_millis()
+        );
+        first.pool.close().await;
+        second.pool.close().await;
+        let reopened = PostgresControlPlaneStore::connect(&url).await?;
+        assert!(reopened
+            .get_admin_quorum_manifest_anchor(&record.cluster_id)
+            .await?
+            .is_some());
+        assert!(!reopened.consume_admin_capability(record.clone()).await?);
+        assert!(!reopened.consume_admin_capability(revoked).await?);
+        let mut wrong = record.clone();
+        wrong.request_id = "wrong-manifest".to_string();
+        wrong.manifest_digest = "c".repeat(64);
+        assert!(!reopened.consume_admin_capability(wrong).await?);
+        let mut expired = record;
+        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(!reopened.consume_admin_capability(expired).await?);
+        reopened.pool.close().await;
+        Ok(())
     }
 
     #[tokio::test]

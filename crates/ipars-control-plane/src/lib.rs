@@ -233,8 +233,149 @@ impl ControlPlaneConfig {
     }
 }
 
+/// Global per-store cap. Exhaustion denies new capabilities; live tombstones are never evicted.
+pub const MAX_ADMIN_CAPABILITY_LEDGER_RECORDS: usize = 65_536;
+/// Keep expired tombstones beyond the authorization validator's allowed clock skew.
+pub const ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS: i64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminQuorumManifestAnchor {
+    pub manifest_epoch: u64,
+    pub manifest_digest: String,
+}
+
+impl AdminQuorumManifestAnchor {
+    pub fn is_valid(&self) -> bool {
+        self.manifest_digest.len() == 64
+            && self
+                .manifest_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
+/// Audit metadata only: never include a bearer token, signature, body, or query string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCapabilityUse {
+    pub cluster_id: ClusterId,
+    pub manifest_epoch: u64,
+    pub manifest_digest: String,
+    pub request_id: String,
+    pub claims_digest: String,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub received_at: chrono::DateTime<Utc>,
+    pub method: String,
+    pub path: String,
+    pub requester_public_key: String,
+}
+
+/// A request-ID tombstone, including when the capability has not yet been consumed.
+/// `expires_at` must cover every remaining authorized use of this ID/epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCapabilityRevocation {
+    pub cluster_id: ClusterId,
+    pub manifest_epoch: u64,
+    pub manifest_digest: String,
+    pub request_id: String,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub received_at: chrono::DateTime<Utc>,
+    pub method: String,
+    pub path: String,
+    pub requester_public_key: String,
+}
+
+impl AdminCapabilityUse {
+    /// Storage validation is not authorization. FROST, binding, epoch, and freshness
+    /// validation must complete before calling consume; consume precedes the mutation.
+    pub fn validate_for_ledger(&self, now: chrono::DateTime<Utc>) -> bool {
+        let bounded = |value: &str, limit: usize| {
+            !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+        };
+        bounded(self.cluster_id.as_str(), 256)
+            && bounded(&self.request_id, 256)
+            && self.manifest_digest.len() == 64
+            && self
+                .manifest_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.claims_digest.len() == 64
+            && self
+                .claims_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.expires_at > now
+            && self.received_at < self.expires_at
+            && bounded(&self.method, 16)
+            && self.method.bytes().all(|byte| byte.is_ascii_uppercase())
+            && bounded(&self.path, 2048)
+            && self.path.starts_with('/')
+            && !self.path.contains(['?', '#'])
+            && bounded(&self.requester_public_key, 512)
+    }
+}
+
+impl AdminCapabilityRevocation {
+    /// Reuse the bounded audit shape without recording any capability claims.
+    pub fn into_ledger_use(self) -> AdminCapabilityUse {
+        AdminCapabilityUse {
+            cluster_id: self.cluster_id,
+            manifest_epoch: self.manifest_epoch,
+            manifest_digest: self.manifest_digest,
+            request_id: self.request_id,
+            claims_digest: "0".repeat(64),
+            expires_at: self.expires_at,
+            received_at: self.received_at,
+            method: self.method,
+            path: self.path,
+            requester_public_key: self.requester_public_key,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
+    /// Immutable opt-in anchor. An incompatible existing anchor must never be replaced.
+    async fn bind_admin_quorum_manifest(
+        &self,
+        _cluster_id: &ClusterId,
+        _manifest_epoch: u64,
+        _manifest_digest: &str,
+    ) -> Result<(), ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin quorum manifest anchor unsupported".to_string(),
+        ))
+    }
+
+    async fn get_admin_quorum_manifest_anchor(
+        &self,
+        _cluster_id: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifestAnchor>, ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin quorum manifest anchor unsupported".to_string(),
+        ))
+    }
+
+    /// Atomically insert a use tombstone. Existing consumed/revoked keys both deny.
+    /// Independent HA control planes must share the same durable store.
+    async fn consume_admin_capability(
+        &self,
+        _record: AdminCapabilityUse,
+    ) -> Result<bool, ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin capability ledger unsupported".to_string(),
+        ))
+    }
+
+    /// Returns true only when a new tombstone is inserted; never overwrites a use.
+    async fn revoke_admin_capability(
+        &self,
+        _record: AdminCapabilityRevocation,
+    ) -> Result<bool, ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "admin capability ledger unsupported".to_string(),
+        ))
+    }
+
     async fn get_cluster_policy(
         &self,
         cluster_id: &ClusterId,
@@ -536,6 +677,7 @@ pub trait TokenLedger: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
+    admin_capabilities: Mutex<AdminCapabilityLedgerState>,
     cluster_policies: RwLock<BTreeMap<ClusterId, ClusterPolicy>>,
     overlay_routing_epochs: RwLock<BTreeMap<ClusterId, u64>>,
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
@@ -546,6 +688,49 @@ pub struct InMemoryStore {
     service_instances: RwLock<BTreeMap<(ClusterId, String), ServiceInstance>>,
     keycloak_candidates: RwLock<BTreeMap<(ClusterId, NodeId), KeycloakCandidateLease>>,
     client_gateway_selections: RwLock<BTreeMap<NodeId, ClientGatewaySelection>>,
+}
+
+#[derive(Debug, Default)]
+struct AdminCapabilityLedgerState {
+    anchors: BTreeMap<ClusterId, AdminQuorumManifestAnchor>,
+    entries: BTreeMap<(ClusterId, u64, String), (AdminCapabilityUse, bool)>,
+}
+
+impl InMemoryStore {
+    async fn insert_admin_capability(
+        &self,
+        record: AdminCapabilityUse,
+        revoked: bool,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut ledger = self.admin_capabilities.lock().await;
+        let now = Utc::now();
+        if !record.validate_for_ledger(now) {
+            return Ok(false);
+        }
+        let anchor = AdminQuorumManifestAnchor {
+            manifest_epoch: record.manifest_epoch,
+            manifest_digest: record.manifest_digest.clone(),
+        };
+        if ledger.anchors.get(&record.cluster_id) != Some(&anchor) {
+            return Ok(false);
+        }
+        let cutoff = now - chrono::Duration::seconds(ADMIN_CAPABILITY_LEDGER_GC_GRACE_SECONDS);
+        ledger
+            .entries
+            .retain(|_, (entry, _)| entry.expires_at > cutoff);
+        let key = (
+            record.cluster_id.clone(),
+            record.manifest_epoch,
+            record.request_id.clone(),
+        );
+        if ledger.entries.contains_key(&key)
+            || ledger.entries.len() >= MAX_ADMIN_CAPABILITY_LEDGER_RECORDS
+        {
+            return Ok(false);
+        }
+        ledger.entries.insert(key, (record, revoked));
+        Ok(true)
+    }
 }
 
 fn advance_in_memory_overlay_routing_epoch(
@@ -563,6 +748,78 @@ fn advance_in_memory_overlay_routing_epoch(
 
 #[async_trait]
 impl ControlPlaneStore for InMemoryStore {
+    async fn bind_admin_quorum_manifest(
+        &self,
+        cluster_id: &ClusterId,
+        manifest_epoch: u64,
+        manifest_digest: &str,
+    ) -> Result<(), ControlPlaneError> {
+        let anchor = AdminQuorumManifestAnchor {
+            manifest_epoch,
+            manifest_digest: manifest_digest.to_string(),
+        };
+        if !anchor.is_valid() {
+            return Err(ControlPlaneError::Store(
+                "invalid admin quorum manifest anchor".to_string(),
+            ));
+        }
+        let mut ledger = self.admin_capabilities.lock().await;
+        if let Some(existing) = ledger.anchors.get(cluster_id) {
+            return if existing == &anchor {
+                Ok(())
+            } else {
+                Err(ControlPlaneError::Store(
+                    "admin quorum manifest anchor mismatch".to_string(),
+                ))
+            };
+        }
+        if ledger
+            .entries
+            .keys()
+            .any(|(cluster, _, _)| cluster == cluster_id)
+        {
+            return Err(ControlPlaneError::Store(
+                "unanchored admin capability ledger requires review".to_string(),
+            ));
+        }
+        ledger.anchors.insert(cluster_id.clone(), anchor);
+        Ok(())
+    }
+
+    async fn get_admin_quorum_manifest_anchor(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Option<AdminQuorumManifestAnchor>, ControlPlaneError> {
+        let ledger = self.admin_capabilities.lock().await;
+        let anchor = ledger.anchors.get(cluster_id).cloned();
+        if anchor.is_none()
+            && ledger
+                .entries
+                .keys()
+                .any(|(cluster, _, _)| cluster == cluster_id)
+        {
+            return Err(ControlPlaneError::Store(
+                "unanchored admin capability ledger requires review".to_string(),
+            ));
+        }
+        Ok(anchor)
+    }
+
+    async fn consume_admin_capability(
+        &self,
+        record: AdminCapabilityUse,
+    ) -> Result<bool, ControlPlaneError> {
+        self.insert_admin_capability(record, false).await
+    }
+
+    async fn revoke_admin_capability(
+        &self,
+        record: AdminCapabilityRevocation,
+    ) -> Result<bool, ControlPlaneError> {
+        self.insert_admin_capability(record.into_ledger_use(), true)
+            .await
+    }
+
     async fn get_cluster_policy(
         &self,
         cluster_id: &ClusterId,
@@ -1930,6 +2187,46 @@ impl<S> ControlPlane<S>
 where
     S: ControlPlaneStore,
 {
+    pub async fn bind_admin_quorum_manifest(
+        &self,
+        manifest_epoch: u64,
+        manifest_digest: &str,
+    ) -> Result<(), ControlPlaneError> {
+        self.store
+            .bind_admin_quorum_manifest(&self.config.cluster_id, manifest_epoch, manifest_digest)
+            .await
+    }
+
+    pub async fn get_admin_quorum_manifest_anchor(
+        &self,
+    ) -> Result<Option<AdminQuorumManifestAnchor>, ControlPlaneError> {
+        self.store
+            .get_admin_quorum_manifest_anchor(&self.config.cluster_id)
+            .await
+    }
+
+    /// Fail closed on a cluster mismatch or an unsupported store. This is the replay
+    /// gate only, not a substitute for majority signature and request validation.
+    pub async fn consume_admin_capability(
+        &self,
+        record: AdminCapabilityUse,
+    ) -> Result<bool, ControlPlaneError> {
+        if record.cluster_id != self.config.cluster_id {
+            return Ok(false);
+        }
+        self.store.consume_admin_capability(record).await
+    }
+
+    pub async fn revoke_admin_capability(
+        &self,
+        record: AdminCapabilityRevocation,
+    ) -> Result<bool, ControlPlaneError> {
+        if record.cluster_id != self.config.cluster_id {
+            return Ok(false);
+        }
+        self.store.revoke_admin_capability(record).await
+    }
+
     pub fn new(config: ControlPlaneConfig, store: Arc<S>) -> Self {
         let cluster_policy = config.cluster_policy.clone();
         Self {
@@ -7253,6 +7550,126 @@ mod tests {
     };
 
     use super::*;
+
+    fn admin_capability_fixture(request_id: &str) -> AdminCapabilityUse {
+        let now = Utc::now();
+        AdminCapabilityUse {
+            cluster_id: ClusterId::from_string("admin-test"),
+            manifest_epoch: 7,
+            manifest_digest: "a".repeat(64),
+            request_id: request_id.to_string(),
+            claims_digest: "b".repeat(64),
+            expires_at: now + chrono::Duration::minutes(2),
+            received_at: now,
+            method: "POST".to_string(),
+            path: "/admin/test".to_string(),
+            requester_public_key: "public-key".to_string(),
+        }
+    }
+
+    fn admin_capability_revocation(record: &AdminCapabilityUse) -> AdminCapabilityRevocation {
+        AdminCapabilityRevocation {
+            cluster_id: record.cluster_id.clone(),
+            manifest_epoch: record.manifest_epoch,
+            manifest_digest: record.manifest_digest.clone(),
+            request_id: record.request_id.clone(),
+            expires_at: record.expires_at,
+            received_at: record.received_at,
+            method: record.method.clone(),
+            path: record.path.clone(),
+            requester_public_key: record.requester_public_key.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_capability_in_memory_anchor_replay_and_revocation(
+    ) -> Result<(), ControlPlaneError> {
+        let store = Arc::new(InMemoryStore::default());
+        let record = admin_capability_fixture("consume");
+        assert!(!store.consume_admin_capability(record.clone()).await?);
+        store
+            .bind_admin_quorum_manifest(
+                &record.cluster_id,
+                record.manifest_epoch,
+                &record.manifest_digest,
+            )
+            .await?;
+        assert!(store
+            .bind_admin_quorum_manifest(&record.cluster_id, 8, &record.manifest_digest)
+            .await
+            .is_err());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let record = record.clone();
+            tasks.spawn(async move { store.consume_admin_capability(record).await });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            winners += usize::from(
+                result.map_err(|_| ControlPlaneError::Store("test task failed".to_string()))??,
+            );
+        }
+        assert_eq!(winners, 1);
+        assert!(
+            !store
+                .revoke_admin_capability(admin_capability_revocation(&record))
+                .await?
+        );
+        let revoked = admin_capability_fixture("revoke");
+        assert!(
+            store
+                .revoke_admin_capability(admin_capability_revocation(&revoked))
+                .await?
+        );
+        assert!(!store.consume_admin_capability(revoked).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_capability_custom_store_defaults_fail_closed() {
+        let store = RacingVpnIpStore::default();
+        let record = admin_capability_fixture("custom");
+        assert!(store
+            .consume_admin_capability(record.clone())
+            .await
+            .is_err());
+        assert!(store
+            .revoke_admin_capability(admin_capability_revocation(&record))
+            .await
+            .is_err());
+        assert!(store
+            .get_admin_quorum_manifest_anchor(&record.cluster_id)
+            .await
+            .is_err());
+        assert!(store
+            .bind_admin_quorum_manifest(
+                &record.cluster_id,
+                record.manifest_epoch,
+                &record.manifest_digest
+            )
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn admin_capability_audit_shape_and_expiry_validation() {
+        let record = admin_capability_fixture("shape");
+        assert!(record.validate_for_ledger(Utc::now()));
+        assert!(!record.validate_for_ledger(record.expires_at));
+        let mut invalid = record.clone();
+        invalid.path = "/admin?token=not-to-be-stored".to_string();
+        assert!(!invalid.validate_for_ledger(Utc::now()));
+        invalid = record.clone();
+        invalid.claims_digest = "not-a-digest".to_string();
+        assert!(!invalid.validate_for_ledger(Utc::now()));
+        invalid = record.clone();
+        invalid.method = "POST\n".to_string();
+        assert!(!invalid.validate_for_ledger(Utc::now()));
+        invalid = record;
+        invalid.requester_public_key = "x".repeat(513);
+        assert!(!invalid.validate_for_ledger(Utc::now()));
+    }
 
     fn claims(cluster_id: ClusterId) -> JoinTokenClaims {
         let mut tags = BTreeSet::new();

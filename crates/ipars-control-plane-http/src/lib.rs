@@ -52,6 +52,8 @@ use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use url::Url;
 
+pub mod quorum;
+
 const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
 const AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES: usize = 64;
 const MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 32;
@@ -448,6 +450,7 @@ pub struct ControlPlaneHttpState<S, L> {
     database_autopilot_bearer_token: Option<Arc<str>>,
     keycloak_autopilot_bearer_token: Option<Arc<str>>,
     web_ui_auth: Option<Arc<WebUiAuthConfig>>,
+    quorum_verifier: Option<Arc<quorum::QuorumVerifier>>,
     node_enrollment: Option<Arc<NodeEnrollmentConfig>>,
     dynamic_web_gateway: Option<Arc<DynamicWebGatewayConfig>>,
     database_autopilot_registry_cache: Arc<Mutex<Option<Arc<DatabaseAutopilotRegistrySnapshot>>>>,
@@ -509,6 +512,7 @@ impl<S, L> Clone for ControlPlaneHttpState<S, L> {
             database_autopilot_bearer_token: self.database_autopilot_bearer_token.clone(),
             keycloak_autopilot_bearer_token: self.keycloak_autopilot_bearer_token.clone(),
             web_ui_auth: self.web_ui_auth.clone(),
+            quorum_verifier: self.quorum_verifier.clone(),
             node_enrollment: self.node_enrollment.clone(),
             dynamic_web_gateway: self.dynamic_web_gateway.clone(),
             database_autopilot_registry_cache: self.database_autopilot_registry_cache.clone(),
@@ -528,6 +532,7 @@ impl<S, L> ControlPlaneHttpState<S, L> {
             database_autopilot_bearer_token: None,
             keycloak_autopilot_bearer_token: None,
             web_ui_auth: None,
+            quorum_verifier: None,
             node_enrollment: None,
             dynamic_web_gateway: None,
             database_autopilot_registry_cache: Arc::new(Mutex::new(None)),
@@ -560,6 +565,25 @@ impl<S, L> ControlPlaneHttpState<S, L> {
     pub fn enable_web_ui(mut self, auth: WebUiAuthConfig) -> Self {
         self.web_ui_auth = Some(Arc::new(auth));
         self
+    }
+
+    /// Require quorum authorization for every admin mutation, with no legacy fallback.
+    pub fn with_quorum_verifier(mut self, verifier: Arc<quorum::QuorumVerifier>) -> Self {
+        self.quorum_verifier = Some(verifier);
+        self
+    }
+
+    /// Parent startup must bind the immutable manifest anchor in the shared store first.
+    /// A missing or mismatched anchor causes every quorum mutation to fail closed.
+    pub fn with_admin_quorum_manifest(
+        self,
+        manifest: ipars_quorum::Manifest,
+    ) -> Result<Self, String>
+    where
+        S: ControlPlaneStore + 'static,
+    {
+        let verifier = quorum::QuorumVerifier::new(manifest, self.plane.clone())?;
+        Ok(self.with_quorum_verifier(Arc::new(verifier)))
     }
 
     pub fn enable_node_enrollment(mut self, config: NodeEnrollmentConfig) -> Self {
@@ -691,6 +715,8 @@ where
     let management_auth = Arc::new(ManagementAuth {
         operator_api_bearer_token: state.operator_api_bearer_token.clone(),
         web_ui_auth: state.web_ui_auth.clone(),
+        quorum_verifier: state.quorum_verifier.clone(),
+        quorum_anchor_probe: quorum::anchor_probe(state.plane.clone()),
     });
     let admin = Router::new()
         .route("/v1/admin/overview", get(admin_overview::<S, L>))
@@ -730,6 +756,7 @@ where
             "/v1/admin/paths/{local_node_id}/{remote_node_id}/pin",
             post(admin_pin_path::<S, L>),
         )
+        .route(quorum::REVOCATIONS_PATH, post(quorum::revoke::<S, L>))
         .route_layer(middleware::from_fn_with_state(
             management_auth,
             require_management_auth,
@@ -798,6 +825,7 @@ pub struct WebUiAuthConfig {
     scopes: String,
     device_verification_origin: String,
     required_email: Option<String>,
+    required_subject: Option<String>,
     public_url: Option<String>,
     authorization_endpoint: String,
     device_authorization_endpoint: Option<String>,
@@ -959,6 +987,7 @@ impl WebUiAuthConfig {
             scopes,
             device_verification_origin,
             required_email: None,
+            required_subject: None,
             public_url: None,
             authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
             device_authorization_endpoint: device_authorization_suffix
@@ -1004,6 +1033,19 @@ impl WebUiAuthConfig {
             return Err("OIDC required email is invalid".to_string());
         }
         self.required_email = Some(email);
+        Ok(self)
+    }
+
+    /// Pin the immutable, issuer-scoped OIDC subject without normalization.
+    pub fn with_required_subject(mut self, subject: String) -> Result<Self, String> {
+        if subject.is_empty()
+            || subject.len() > 256
+            || subject.trim() != subject
+            || subject.chars().any(char::is_control)
+        {
+            return Err("OIDC required subject is invalid".to_string());
+        }
+        self.required_subject = Some(subject);
         Ok(self)
     }
 
@@ -1089,10 +1131,17 @@ impl WebUiAuthConfig {
             if serde_json::from_slice::<Value>(&body)
                 .ok()
                 .is_some_and(|claims| {
-                    let subject_is_valid = claims
-                        .get("sub")
-                        .and_then(Value::as_str)
-                        .is_some_and(|subject| !subject.is_empty());
+                    let subject_is_valid =
+                        claims
+                            .get("sub")
+                            .and_then(Value::as_str)
+                            .is_some_and(|subject| {
+                                !subject.is_empty()
+                                    && self
+                                        .required_subject
+                                        .as_deref()
+                                        .is_none_or(|required| required == subject)
+                            });
                     let identity_is_allowed = self.required_email.as_ref().is_none_or(|required| {
                         claims
                             .get("email")
@@ -1103,6 +1152,9 @@ impl WebUiAuthConfig {
                 })
             {
                 return AccessTokenValidation::Valid;
+            }
+            if self.required_subject.is_some() {
+                rejected = true;
             }
         }
         if rejected {
@@ -1824,6 +1876,8 @@ struct WebUiPublicConfig {
 struct ManagementAuth {
     operator_api_bearer_token: Option<Arc<str>>,
     web_ui_auth: Option<Arc<WebUiAuthConfig>>,
+    quorum_verifier: Option<Arc<quorum::QuorumVerifier>>,
+    quorum_anchor_probe: quorum::AnchorProbe,
 }
 
 async fn require_management_auth(
@@ -1831,6 +1885,35 @@ async fn require_management_auth(
     request: Request,
     next: Next,
 ) -> Response {
+    if quorum::mutating(request.method()) {
+        if let Some(verifier) = &auth.quorum_verifier {
+            return match verifier.authorize(request).await {
+                Ok(request) => next.run(request).await,
+                Err(response) => response,
+            };
+        }
+        match (auth.quorum_anchor_probe)().await {
+            Ok(false) => {}
+            Ok(true) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "quorum manifest configuration reload required".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+            Err(()) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "quorum authorization store unavailable".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+    }
     let provided = bearer_token_from_headers(request.headers());
     let operator_authenticated = auth
         .operator_api_bearer_token
@@ -8018,6 +8101,8 @@ mod tests {
         let auth = Arc::new(ManagementAuth {
             operator_api_bearer_token: None,
             web_ui_auth: Some(Arc::new(config)),
+            quorum_verifier: None,
+            quorum_anchor_probe: Arc::new(|| Box::pin(async { Ok(false) })),
         });
         let app = Router::new()
             .route("/", get(|| async { StatusCode::OK }))

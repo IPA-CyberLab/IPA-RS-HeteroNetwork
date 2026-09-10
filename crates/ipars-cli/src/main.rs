@@ -46,6 +46,8 @@ use ipars_types::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+mod quorum;
+
 const MAX_ISSUER_PRIVATE_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
@@ -146,6 +148,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        hide_env_values = true,
         env = "HETERONETWORK_AGENT_API_BEARER_TOKEN",
         conflicts_with = "agent_api_bearer_token_path"
     )]
@@ -155,6 +158,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        hide_env_values = true,
         env = "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
         conflicts_with = "control_plane_operator_api_bearer_token_path"
     )]
@@ -304,6 +308,10 @@ impl ControlPlaneOperatorApiAuth {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Quorum {
+        #[command(subcommand)]
+        command: quorum::QuorumCommand,
+    },
     Init(Box<InitArgs>),
     Join(JoinArgs),
     Status(StatusArgs),
@@ -1451,6 +1459,7 @@ async fn main() -> anyhow::Result<()> {
         control_plane_operator_api_bearer_token_path,
     )?;
     match command {
+        Command::Quorum { command } => quorum::run(command).await?,
         Command::Init(args) => print_json(&init(*args)?)?,
         Command::Join(args) => print_json(&join(args, agent_state_path.as_deref()).await?)?,
         Command::Status(args) => {

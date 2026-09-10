@@ -15,18 +15,28 @@ anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
+ed25519-dalek.workspace = true
 ipars-agent = { path = "../ipars-agent" }
+ipars-control-plane-http = { path = "../ipars-control-plane-http" }
 ipars-crypto = { path = "../ipars-crypto" }
+ipars-quorum = { path = "../ipars-quorum" }
 ipars-relay = { path = "../ipars-relay" }
 ipars-stun = { path = "../ipars-stun" }
 ipars-types = { path = "../ipars-types" }
 ipnet.workspace = true
+nix.workspace = true
+rand_core.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+url.workspace = true
+zeroize = "1.8"
 
 [dev-dependencies]
+axum.workspace = true
+ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-route-manager = { path = "../ipars-route-manager" }
 
 [lints]

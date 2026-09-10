@@ -26,6 +26,7 @@ ipars-agent-http = { path = "../ipars-agent-http" }
 ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-control-plane-http = { path = "../ipars-control-plane-http" }
 ipars-crypto = { path = "../ipars-crypto" }
+ipars-quorum = { path = "../ipars-quorum" }
 ipars-relay = { path = "../ipars-relay" }
 ipars-relay-http = { path = "../ipars-relay-http" }
 ipars-route-manager = { path = "../ipars-route-manager" }
@@ -49,6 +50,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+zeroize = "1.8"
 
 [lints]
 workspace = true

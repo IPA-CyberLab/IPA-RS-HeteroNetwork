@@ -7,6 +7,7 @@ members = [
     "crates/ipars-control-plane",
     "crates/ipars-control-plane-http",
     "crates/ipars-crypto",
+    "crates/ipars-quorum",
     "crates/ipars-daemon",
     "crates/ipars-load",
     "crates/ipars-relay",

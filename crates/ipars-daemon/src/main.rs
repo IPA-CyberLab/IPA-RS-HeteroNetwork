@@ -1,3 +1,5 @@
+mod quorum;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
@@ -326,6 +328,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     ControlPlane(Box<ControlPlaneArgs>),
+    QuorumSigner(quorum::QuorumSignerArgs),
     Signal(SignalArgs),
     Stun(StunArgs),
     Relay(RelayArgs),
@@ -336,6 +339,7 @@ impl Command {
     fn component(&self) -> &'static str {
         match self {
             Self::ControlPlane(_) => "control-plane",
+            Self::QuorumSigner(_) => "quorum-signer",
             Self::Signal(_) => "signal",
             Self::Stun(_) => "stun",
             Self::Relay(_) => "relay",
@@ -482,6 +486,8 @@ fn validate_observability_config(args: &ObservabilityArgs) -> anyhow::Result<()>
 
 #[derive(Debug, Args, Clone)]
 struct ControlPlaneArgs {
+    #[arg(long, env = "HETERONETWORK_ADMIN_QUORUM_MANIFEST_PATH")]
+    admin_quorum_manifest_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_LISTEN", default_value = "0.0.0.0:8443")]
     listen: SocketAddr,
     #[arg(
@@ -4701,6 +4707,7 @@ async fn main() -> anyhow::Result<()> {
         "observability initialized"
     );
     match cli.command {
+        Command::QuorumSigner(args) => quorum::run_signer(args).await,
         Command::ControlPlane(args) => {
             run_control_plane(*args, otel_metrics_enabled, otel_metrics_interval).await
         }
@@ -4848,6 +4855,8 @@ where
     config.cluster_policy.path_state_ttl_seconds = args.path_state_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
+    let quorum_manifest =
+        quorum::configure_control_plane(&plane, args.admin_quorum_manifest_path.as_deref()).await?;
     plane
         .current_cluster_policy()
         .await
@@ -4899,6 +4908,11 @@ where
         )
     });
     let mut http_state = ControlPlaneHttpState::new(plane, join_service);
+    if let Some(manifest) = quorum_manifest {
+        http_state = http_state
+            .with_admin_quorum_manifest(manifest)
+            .map_err(anyhow::Error::msg)?;
+    }
     if let Some(token) = operator_api_bearer_token {
         http_state = http_state.require_operator_api_bearer_token(token);
     }
