@@ -6,6 +6,24 @@ It is separate from the read-only browser page-sweep runner. It does not test
 S3, change service specs, restart workloads, provision accounts, or touch
 another tenant. A P2P join response is not proof of WebRTC media delivery.
 
+Append `--webrtc` to verify actual DataChannel ping/pong between two Chromium
+peers, first with normal ICE and then diagnostic client-side relay-only ICE.
+Both modes reuse this run's single room, with fresh 180-second access contexts
+minted immediately before each mode. The signaling protocol follows sibling
+`HeteroCloud-Flow/scripts/flow-e2e.mjs`; its retrying room creator is not used.
+Relay-only is an `RTCPeerConnection` option, not an API feature or service edit.
+Before joins and WSS, the issued principal context must contain
+`flow.signal.connect`, match the dedicated scope, and have at least 45 seconds
+remaining. Missing permission fails explicitly with
+`webrtc_preflight_missing_flow_signal_connect`; server signature verification
+still authenticates the untouched context. Protocol failures record only an
+allowlisted error code and stage, never server messages or raw frames.
+Each mode must show exact payload receipt, nonzero DataChannel getStats counters,
+and a succeeded selected candidate pair. Relay mode requires both candidate
+types to be relay. This proves DataChannel delivery, not audio/video quality.
+Only sanitized counters, states and candidate types are recorded, never raw
+signaling, SDP, candidate addresses, TURN credentials or signed context headers.
+
 ## Inputs and Opt-In
 
 Use the repository's installed Playwright/Chromium dependencies. The default
@@ -69,8 +87,9 @@ rooms or repeating a create request.
 
 The deployed Flow contract has no room-delete endpoint. Its documented cleanup
 is expiry after ten minutes without participants, once join credentials expire.
-The script keeps no signaling/media connection open, waits 615 seconds after
-room creation/recovery, then uses a short-lived read-only context to verify
+The script closes both peer pages in each mode's `finally`, revokes its contexts,
+and waits 615 seconds after room creation/recovery or the last peer disconnect,
+whichever is later. It then uses a short-lived read-only context to verify
 `404` for that exact room and absence from its scoped list. It allows five
 bounded checks for the cleanup sweep and revokes the verification context too.
 Budget approximately 13 minutes. Do not terminate the process during cleanup;

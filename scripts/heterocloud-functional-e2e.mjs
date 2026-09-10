@@ -5,20 +5,24 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chromium } from "playwright";
+import { assertSignalingContext, connectFixturePeers } from "./heterocloud-webrtc-peer.mjs";
 
-const help = `Usage: node scripts/heterocloud-functional-e2e.mjs --allow-own-fixture-mutations
+const help = `Usage: node scripts/heterocloud-functional-e2e.mjs --allow-own-fixture-mutations [--webrtc]
 
 Required: HETEROCLOUD_FUNCTIONAL_E2E_ORGANIZATION_ID matching the private manifest.
 Optional: HETEROCLOUD_FUNCTIONAL_E2E_ENV_FILE, HETEROCLOUD_FUNCTIONAL_E2E_FIXTURES,
           HETEROCLOUD_FUNCTIONAL_E2E_ARTIFACT_DIR.
 Uses normal public DNS/TLS/login; no origin overrides or stored sessions.
 Creates one P2P room, joins once, runs Flash pwd, and waits for room idle cleanup.
+--webrtc also verifies DataChannel payload/getStats with normal and relay-only ICE.
 `;
 if (process.argv.includes("--help")) {
   console.log(help);
   process.exit(0);
 }
-if (process.argv.length !== 3 || process.argv[2] !== "--allow-own-fixture-mutations") {
+const args = process.argv.slice(2);
+if (!args.includes("--allow-own-fixture-mutations") || new Set(args).size !== args.length ||
+    args.some((arg) => !["--allow-own-fixture-mutations", "--webrtc"].includes(arg))) {
   console.error(help);
   process.exit(2);
 }
@@ -47,6 +51,7 @@ let flash;
 let project;
 let room;
 let roomCreatedAt;
+let lastPeerDisconnectAt = 0;
 let createAttempted = false;
 const issuedContexts = new Map();
 
@@ -205,6 +210,64 @@ async function testFlow() {
   await save();
 }
 
+async function testWebRTC() {
+  report.flow.webrtc = {};
+  for (const mode of ["all", "relay"]) {
+    report.phase = `flow_webrtc_${mode}`;
+    let peersContext;
+    try {
+      const credential = await issueContext(["flow.room.read", "flow.room.join", "flow.signal.connect"]);
+      const scope = { organization_id: organization, project_id: project.id, service_instance_id: flow.id };
+      assertSignalingContext(credential, scope);
+      const headers = Object.fromEntries(Object.entries(credential.headers).map(([key, value]) => [key.toLowerCase(), value]));
+      if (!["x-flow-principal", "x-flow-timestamp", "x-flow-signature"].every((key) => typeof headers[key] === "string")) {
+        fail("signed_context_headers_missing");
+      }
+      const connections = [];
+      for (const peer of ["a", "b"]) {
+        const response = await flowRequest(credential, "POST", `/v1/rooms/${room.id}/join`, {
+          display_name: `dedicated-e2e-${mode}-${peer}`,
+        });
+        if (response.status() !== 200) fail(`webrtc_join_http_${response.status()}`);
+        const join = await response.json();
+        if (join.mode !== "p2p" || join.connection?.protocol !== "flow-signaling.v1" ||
+            !join.connection.urls?.length || !join.connection.urls.every((value) => new URL(value).origin === flowBase.replace("https:", "wss:"))) {
+          fail("webrtc_public_connection_guard_failed");
+        }
+        const ice = (join.connection.ice?.ice_servers ?? []).flatMap((server) => [server.urls].flat());
+        if (!ice.some((url) => String(url).startsWith("stun:")) || !ice.some((url) => String(url).startsWith("turn:"))) {
+          fail("webrtc_ice_contract_missing");
+        }
+        connections.push(join.connection);
+      }
+      peersContext = await browser.newContext({ serviceWorkers: "block" });
+      peersContext.on("page", (page) => page.on("pageerror", () => report.browser_errors.push(`webrtc_${mode}_pageerror`)));
+      const pageA = await peersContext.newPage();
+      const pageB = await peersContext.newPage();
+      await sleep(1200);
+      assertSignalingContext(credential, scope);
+      const peers = await connectFixturePeers(pageA, pageB, connections, headers, mode);
+      report.flow.webrtc[mode] = { result: peers.every((peer) => peer.passed) ? "passed" : "failed", peers };
+      if (!peers.every((peer) => peer.passed)) fail(`webrtc_${mode}_payload_or_stats_failed`);
+    } catch (error) {
+      report.flow.webrtc[mode] ??= { result: "failed" };
+      recordError(error);
+    } finally {
+      if (peersContext) {
+        await peersContext.close();
+        lastPeerDisconnectAt = Date.now();
+        report.flow.last_peer_disconnected_at = new Date(lastPeerDisconnectAt).toISOString();
+      }
+      await revokeContexts();
+      await save();
+      console.log(JSON.stringify({ phase: report.phase, result: report.flow.webrtc[mode] }));
+    }
+  }
+  if (["all", "relay"].every((mode) => report.flow.webrtc[mode]?.result === "passed")) {
+    report.flow.result = "passed_create_join_readback_and_datachannel";
+  }
+}
+
 async function testFlash(page) {
   report.phase = "flash_shell";
   const errors = [];
@@ -260,7 +323,7 @@ async function cleanupRoom() {
   }
   await revokeContexts();
   if (!room) return;
-  const due = roomCreatedAt + idleCleanupDelay;
+  const due = Math.max(roomCreatedAt, lastPeerDisconnectAt) + idleCleanupDelay;
   report.flow.cleanup_check_at = new Date(due).toISOString();
   await save();
   console.log(`Functional checks finished; waiting for documented room expiry until ${report.flow.cleanup_check_at}`);
@@ -338,6 +401,7 @@ try {
   report.phase = "fixture_preflight";
   await checkFixtures();
   await testFlow();
+  if (args.includes("--webrtc")) await testWebRTC();
   await testFlash(page);
 } catch (error) {
   recordError(error);
@@ -354,6 +418,7 @@ try {
   if (browser) await browser.close().catch(() => {});
   report.finished_at = new Date().toISOString();
   report.result = report.errors.length === 0 && report.browser_errors.length === 0 && report.flow.result && report.flash.result === "passed" &&
+    (!args.includes("--webrtc") || ["all", "relay"].every((mode) => report.flow.webrtc?.[mode]?.result === "passed")) &&
     report.flow.cleanup === "verified_automatic_idle_expiry" && issuedContexts.size === 0 ? "passed" : "failed";
   await save();
   console.log(JSON.stringify({ result: report.result, phase: report.phase, errors: report.errors, private_artifacts: directory ?? null }));
