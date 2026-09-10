@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import hashlib
 import ipaddress
+import inspect
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,13 @@ class CommandFailure(Refusal):
         self.returncode = returncode
 
 
+class GuestRepairFailure(Refusal):
+    def __init__(self, stage):
+        super().__init__("Guest exact seed-clean validation refused; no general reset is permitted")
+        self.guest_stage = stage if stage in ("identity", "cloud-init-terminal", "pinned-host-keys",
+            "fresh-clean-scope", "exact-userdata", "plain-clean") else "unknown"
+
+
 def require(condition, message):
     if not condition:
         raise Refusal(message)
@@ -76,6 +84,8 @@ def failure_report(error):
               "next_action": "Inspect owned journal and local state; do not blindly retry or clear pending"}
     if isinstance(error, CommandFailure):
         report.update(tool=error.tool, exit_code=error.returncode)
+    if isinstance(error, GuestRepairFailure):
+        report["guest_stage"] = error.guest_stage
     if isinstance(error, OSError):
         report["errno"] = error.errno
     return report
@@ -808,11 +818,293 @@ def guest_seed(p, name, admin_public, host_private, host_public):
     outputs = render(p, admin_public)
     data = decode(outputs[name + "/user-data"].split("\n", 1)[1])
     data["users"][0]["sudo"] = ["ALL=(ALL) NOPASSWD:ALL"]
+    # Supplied ssh_keys bypass generation; keep a valid ed25519-only fallback.
     data["ssh_keys"] = {"ed25519_private": host_private, "ed25519_public": host_public.strip()}
-    data["ssh_genkeytypes"] = []
+    data["ssh_genkeytypes"] = ["ed25519"]
     data["ssh_publish_hostkeys"] = {"enabled": False}
     return {"user-data": "#cloud-config\n" + json.dumps(data) + "\n",
             "meta-data": outputs[name + "/meta-data"], "network-config": outputs[name + "/network-config"]}
+
+
+def guest_cloud_init_terminal(reader=None):
+    """No cache access while any cloud-init stage is still executing."""
+    import json
+    import os
+    import selectors
+    import subprocess
+    import time
+
+    def bounded(args):
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        output = bytearray()
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                deadline = time.monotonic() + 10
+                while selector.get_map():
+                    assert time.monotonic() < deadline
+                    for key, _ in selector.select(0.1):
+                        data = os.read(key.fileobj.fileno(), 16384)
+                        if not data:
+                            selector.unregister(key.fileobj)
+                        else:
+                            output.extend(data)
+                            assert len(output) <= 256 * 1024
+            return process.wait(timeout=2), output.decode()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+
+    reader = reader or bounded
+    rc, output = reader(["cloud-init", "status", "--format", "json"])
+    status = json.loads(output)
+    assert rc in (0, 2) and status.get("status") == "done"
+    assert status.get("extended_status") in ("done", "degraded done") and status.get("errors") == []
+    warnings = status.get("recoverable_errors", {})
+    assert isinstance(warnings, dict) and set(warnings) <= {"WARNING"}
+    known = ("cloud-config failed schema validation!",
+             "cloud-config failed schema validation! You may run 'sudo cloud-init schema --system' to check the details.")
+    assert all(item in known for item in warnings.get("WARNING", []))
+    rc, output = reader(["systemctl", "show", "cloud-init-local.service", "cloud-init.service",
+                         "cloud-init-network.service", "cloud-config.service", "cloud-final.service",
+                         "--property=SubState", "--value"])
+    states = output.split()
+    assert rc == 0 and len(states) == 5 and all(state in ("dead", "exited") for state in states)
+
+
+def guest_clean_main():
+    """Fixed plain-clean operation for a verified fresh owned guest only."""
+    import hashlib
+    import json
+    import os
+    import pathlib
+    import socket
+    import stat
+    import subprocess
+    import sys
+    import yaml
+    from cloudinit import settings
+    from cloudinit.stages import Init
+
+    stage = "identity"
+    try:
+        request = json.loads(sys.stdin.buffer.read(2 * 1024 * 1024 + 1))
+        name, instance = request["name"], request["instance"]
+        assert os.geteuid() == 0 and socket.gethostname() == name
+        assert name in ("hetero-dev-1", "hetero-dev-2", "hetero-dev-3")
+
+        def read_owned(path):
+            for ancestor in [*reversed(path.parents), path]:
+                info = ancestor.lstat()
+                assert info.st_uid == 0 and not stat.S_ISLNK(info.st_mode) and not info.st_mode & 0o022
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= 2 * 1024 * 1024
+                data = source.read(2 * 1024 * 1024 + 1)
+                assert len(data) <= 2 * 1024 * 1024
+                return data
+
+        protected = [pathlib.Path(path) for path in (
+            "/etc/machine-id", "/etc/ssh/ssh_host_ed25519_key", "/etc/ssh/ssh_host_ed25519_key.pub")]
+        before = {path: read_owned(path) for path in protected}
+        assert before[protected[0]].decode().strip() == instance.replace("-", "")
+        old = request["old"]
+        stage = "pinned-host-keys"
+        assert before[protected[1]].strip() == old["ssh_keys"]["ed25519_private"].encode().strip()
+        assert before[protected[2]].decode().split()[:2] == old["ssh_keys"]["ed25519_public"].split()[:2]
+
+        stage = "cloud-init-terminal"
+        guest_cloud_init_terminal()
+        stage = "fresh-clean-scope"
+        init = Init(ds_deps=[])
+        init.read_cfg()
+        assert str(init.paths.cloud_dir) == "/var/lib/cloud"
+        assert str(settings.CLEAN_RUNPARTS_DIR) == "/etc/cloud/clean.d"
+        hooks = pathlib.Path("/etc/cloud/clean.d")
+        assert not hooks.is_symlink() and (not hooks.exists() or not list(hooks.iterdir()))
+        for path in ("/etc/heteronetwork", "/var/lib/heteronetwork", "/etc/kubernetes", "/var/lib/kubelet",
+                     "/var/lib/rancher", "/var/lib/docker", "/var/lib/heterocloud"):
+            assert not os.path.lexists(path)
+        cloud = pathlib.Path("/var/lib/cloud")
+        assert cloud.resolve() == cloud and cloud.stat().st_uid == 0 and not cloud.stat().st_mode & 0o022
+        directory = cloud / "instances" / instance
+        assert pathlib.Path("/var/lib/cloud/instance").resolve() == directory
+        assert sorted(path.name for path in (cloud / "instances").iterdir()) == [instance]
+        seed = cloud / "seed"
+        assert not seed.is_symlink()
+        if seed.exists():
+            for directory_name, directories, files in os.walk(seed, followlinks=False):
+                assert not files
+                assert all(not (pathlib.Path(directory_name) / child).is_symlink() for child in directories)
+        stage = "exact-userdata"
+        original = read_owned(directory / "user-data.txt")
+        assert old["ssh_genkeytypes"] == [] and yaml.safe_load(original) == old
+        fingerprint = hashlib.sha256(original).hexdigest()
+        assert request["phase"] in ("inspect", "clean")
+        if request["phase"] == "clean":
+            assert request["expected_userdata_hash"] == fingerprint and request["fresh_unenrolled"] is True
+            stage = "cloud-init-terminal"
+            guest_cloud_init_terminal()
+            stage = "plain-clean"
+            # No flags: preserve machine-id, logs, seed, SSH/network/fstab config.
+            result = subprocess.run(["cloud-init", "clean"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            assert result.returncode == 0
+            assert all(read_owned(path) == data for path, data in before.items())
+            assert not (cloud / "instance").exists()
+        print(json.dumps({"ok": True, "userdata_hash": fingerprint, "host_keys_unchanged": True,
+                          "machine_id_unchanged": True, "plain_clean": request["phase"] == "clean"}))
+    except Exception:
+        print(json.dumps({"ok": False, "stage": stage}))
+
+
+def repair_ssh(p, name):
+    address = p["addresses"][p["vms"].index(name)]
+    return ["ssh", "-F", "/dev/null", "-i", str(STATE / "admin_ed25519"),
+            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ForwardAgent=no",
+            "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
+            "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
+            "-o", "HostKeyAlgorithms=ssh-ed25519", "-o", "ConnectTimeout=5",
+            "-o", "ConnectionAttempts=1", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+            "-o", "UserKnownHostsFile=" + str(STATE / "known_hosts"), "devadmin@" + address]
+
+
+def repair_guest_clean(p, name, old, phase, expected=None):
+    import shlex
+    code = inspect.getsource(guest_cloud_init_terminal) + "\n" + inspect.getsource(guest_clean_main) + "\nguest_clean_main()\n"
+    request = {"name": name, "instance": identity(p, "domain", name), "old": old,
+               "phase": phase, "expected_userdata_hash": expected, "fresh_unenrolled": phase == "clean"}
+    result = decode(run(repair_ssh(p, name) + ["sudo -n python3 -c " + shlex.quote(code)],
+                        json.dumps(request), timeout=30))
+    if result.get("ok") is not True or result.get("host_keys_unchanged") is not True:
+        raise GuestRepairFailure(result.get("stage"))
+    return result["userdata_hash"]
+
+
+def repaired_seed(p, name, old_text, admin_public, host_private, host_public):
+    expected = guest_seed(p, name, admin_public, host_private, host_public)["user-data"]
+    desired = decode(expected.split("\n", 1)[1])
+    old = decode(old_text.split("\n", 1)[1])
+    require(old_text.startswith("#cloud-config\n") and old == dict(desired, ssh_genkeytypes=[]),
+            "Seed repair requires exactly the known empty ssh_genkeytypes defect")
+    return old, expected
+
+
+def repair_seed(p, name, expected_userdata_sha256, inspect_only=False, fresh_unenrolled=False):
+    require(name in p["vms"], "Explicit owned VM is required")
+    require(inspect_only or fresh_unenrolled, "Explicit fresh never-enrolled guest confirmation is required")
+    with locked_journal(p) as journal:
+        require(set(journal.value["resources"]) == {"pool:" + p["name"], "network:" + p["name"],
+                *("domain:" + vm for vm in p["vms"])}, "Seed repair requires the complete owned resource set")
+        verify_files(journal.value)
+        verify_resources(p, journal.value, allow_running=True)
+        verify_guard(journal.value)
+        preflight(p, journal.value)
+        initial_state = resource_info(p, "domain", name).get("State")
+        require(initial_state in ("running", "shut off"), "Selected guest is not in a repairable state")
+        source = STATE / (name + "-user-data")
+        seed = Path(p["pool_path"]) / (name + "-seed.iso")
+        require(str(source) in journal.value["files"] and str(seed) in journal.value["files"], "Seed files must be journaled")
+        require(expected_userdata_sha256 == journal.value["files"][str(source)]["sha256"], "Explicit old userdata hash required")
+        old, replacement = repaired_seed(p, name, read(source).decode(), read(STATE / "admin_ed25519.pub").decode(),
+                                        read(STATE / (name + "-host-ed25519")).decode(),
+                                        read(STATE / (name + "-host-ed25519.pub")).decode())
+        if inspect_only:
+            require(initial_state == "running", "Inspect-only requires the selected guest already running")
+            guest_hash = repair_guest_clean(p, name, old, "inspect")
+            return {"seed_repair_inspected": name, "mutation_performed": False, "guest_userdata_sha256": guest_hash}
+        pool = root_directory(p["pool_path"])
+        complete = False
+        try:
+            backup_source, backup_seed = source.name + ".before-schema-repair", seed.name + ".before-schema-repair"
+            new_source, new_seed = source.name + ".schema-repair", seed.name + ".schema-repair"
+            require(not any((STATE / filename).exists() for filename in (backup_source, new_source))
+                    and not any((seed.parent / filename).exists() for filename in (backup_seed, new_seed)),
+                    "Seed repair artifacts already exist; inspect pending state")
+            journal.intent({"operation": "repair-seed-schema", "vm": name, "old_userdata_sha256": expected_userdata_sha256})
+            if initial_state == "shut off":
+                verify_guard(journal.value)
+                run(["virsh", "-c", p["connection"], "start", identity(p, "domain", name)])
+            deadline = time.monotonic() + 90
+            while True:
+                require(time.monotonic() < deadline, "Selected guest SSH readiness deadline expired")
+                verify_guard(journal.value)
+                try:
+                    require(run(repair_ssh(p, name) + ["hostname"], timeout=10).strip() == name, "Selected guest identity differs")
+                    break
+                except (Refusal, subprocess.SubprocessError):
+                    time.sleep(1)
+            guest_hash = repair_guest_clean(p, name, old, "inspect")
+            journal.value["pending"]["guest_userdata_sha256"] = guest_hash
+            journal.save()
+            exclusive(journal.fd, new_source, replacement)
+            exclusive(pool, new_seed, b"")
+            run(["cloud-localds", "--network-config=" + str(STATE / (name + "-network-config")),
+                 str(seed.parent / new_seed), str(STATE / new_source), str(STATE / (name + "-meta-data"))], timeout=60)
+            staged = os.open(new_seed, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=pool)
+            try:
+                os.fchmod(staged, 0o600)
+                os.fsync(staged)
+            finally:
+                os.close(staged)
+            os.fsync(pool)
+            repair_guest_clean(p, name, old, "clean", guest_hash)
+            verify_guard(journal.value)
+            run(["virsh", "-c", p["connection"], "shutdown", identity(p, "domain", name)])
+            deadline = time.monotonic() + 90
+            while resource_info(p, "domain", name).get("State") != "shut off":
+                require(time.monotonic() < deadline, "Selected guest shutdown deadline expired")
+                time.sleep(1)
+            verify_files(journal.value)
+            for directory, original, backup, new in ((journal.fd, source.name, backup_source, new_source),
+                                                    (pool, seed.name, backup_seed, new_seed)):
+                os.rename(original, backup, src_dir_fd=directory, dst_dir_fd=directory)
+                os.fsync(directory)
+                os.rename(new, original, src_dir_fd=directory, dst_dir_fd=directory)
+                fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+                try:
+                    os.fchmod(fd, 0o600)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.fsync(directory)
+            for path in (source, seed, STATE / backup_source, seed.parent / backup_seed):
+                record_file(journal, path)
+            journal.save()
+            verify_guard(journal.value)
+            run(["virsh", "-c", p["connection"], "start", identity(p, "domain", name)])
+            deadline = time.monotonic() + 180
+            while True:
+                require(time.monotonic() < deadline, "Repaired guest boot deadline expired")
+                verify_guard(journal.value)
+                try:
+                    require(run(repair_ssh(p, name) + ["hostname"], timeout=10).strip() == name, "Repaired guest identity differs")
+                    run(repair_ssh(p, name) + ["sudo", "-n", "cloud-init", "schema", "--system"], timeout=20)
+                    run(repair_ssh(p, name) + ["sudo", "-n", "cloud-init", "status", "--wait"], timeout=20)
+                    break
+                except (Refusal, subprocess.SubprocessError):
+                    time.sleep(1)
+            verify_files(journal.value)
+            verify_resources(p, journal.value, allow_running=True)
+            verify_guard(journal.value)
+            journal.value.setdefault("seed_schema_repairs", {})[name] = {"old_userdata_sha256": expected_userdata_sha256,
+                                                                        "boot_verified": True}
+            journal.done()
+            complete = True
+            return {"seed_repaired": name, "cloud_init_verified": True, "keys_rotated": False}
+        finally:
+            if not complete and initial_state == "shut off":
+                try:
+                    require(ET.fromstring(resource_xml(p, "domain", name)).findtext("uuid") == identity(p, "domain", name),
+                            "Repair cleanup identity differs")
+                    if resource_info(p, "domain", name).get("State") == "running":
+                        run(["virsh", "-c", p["connection"], "destroy", identity(p, "domain", name)])
+                except (ValueError, OSError, subprocess.SubprocessError):
+                    print("Selected repair guest stop could not be confirmed; inspect local journal.", file=sys.stderr)
+            os.close(pool)
 
 
 def validate_base_header(path):
@@ -1024,16 +1316,29 @@ def first_boot(p, journal):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "render", "preflight", "verify-image", "apply", "recover-guard"))
+    parser.add_argument("command", choices=("plan", "render", "preflight", "verify-image", "apply", "recover-guard", "repair-seed"))
     parser.add_argument("--profile", type=Path, default=PROFILE)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--ssh-public-key", type=Path)
     parser.add_argument("--image-directory", type=Path)
     parser.add_argument("--confirm-create", choices=("hetero-dev",))
     parser.add_argument("--expected-batch-sha256")
+    parser.add_argument("--vm", choices=("hetero-dev-1", "hetero-dev-2", "hetero-dev-3"))
+    parser.add_argument("--expected-userdata-sha256")
+    parser.add_argument("--confirm-repair", choices=("hetero-dev",))
+    parser.add_argument("--inspect-only", action="store_true")
+    parser.add_argument("--confirm-fresh-unenrolled", action="store_true")
     args = parser.parse_args()
     p = profile(args.profile)
-    if args.command == "recover-guard":
+    if args.command == "repair-seed":
+        require(args.inspect_only or args.confirm_repair == "hetero-dev", "Explicit --confirm-repair hetero-dev is required")
+        old_umask = os.umask(0o077)
+        try:
+            result = repair_seed(p, args.vm, args.expected_userdata_sha256, inspect_only=args.inspect_only,
+                                 fresh_unenrolled=args.confirm_fresh_unenrolled)
+        finally:
+            os.umask(old_umask)
+    elif args.command == "recover-guard":
         result = recover_guard(p, args.expected_batch_sha256)
     elif args.command == "apply":
         require(args.confirm_create == "hetero-dev", "Explicit --confirm-create hetero-dev is required")

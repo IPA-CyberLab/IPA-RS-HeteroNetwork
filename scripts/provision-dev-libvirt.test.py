@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import importlib.util
 import ipaddress
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
@@ -234,8 +236,253 @@ class DevPlanTests(unittest.TestCase):
         data = json.loads(seed["user-data"].split("\n", 1)[1])
         self.assertEqual(data["users"][0]["sudo"], ["ALL=(ALL) NOPASSWD:ALL"])
         self.assertEqual(data["ssh_keys"]["ed25519_private"], "TEST PRIVATE HOST KEY")
-        self.assertEqual(data["ssh_genkeytypes"], [])
+        self.assertEqual(data["ssh_genkeytypes"], ["ed25519"])
+        self.assertEqual(set(data["ssh_keys"]), {"ed25519_private", "ed25519_public"})
         self.assertFalse(data["ssh_pwauth"])
+
+    def test_repaired_seed_accepts_only_exact_known_defect_and_preserves_keys(self):
+        args = (self.p, self.p["vms"][0], "ssh-ed25519 TEST_PUBLIC", "TEST PRIVATE HOST KEY", "ssh-ed25519 HOST_PUBLIC")
+        desired = dev.guest_seed(*args)["user-data"]
+        data = json.loads(desired.split("\n", 1)[1])
+        old = dict(data, ssh_genkeytypes=[])
+        old_text = "#cloud-config\n" + json.dumps(old)
+        result, repaired = dev.repaired_seed(args[0], args[1], old_text, *args[2:])
+        self.assertEqual(result, old)
+        self.assertEqual(repaired, desired)
+        for invalid in (data, dict(old, ssh_pwauth=True), dict(old, unexpected="value")):
+            with self.assertRaises(ValueError):
+                dev.repaired_seed(args[0], args[1], "#cloud-config\n" + json.dumps(invalid), *args[2:])
+        compile(dev.inspect.getsource(dev.guest_clean_main), "fixed-guest-repair", "exec")
+
+    def test_plain_clean_helper_inspection_scope_and_exact_no_flags_command(self):
+        import socket
+        import pathlib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = self.p["vms"][0]
+            instance = dev.identity(self.p, "domain", name)
+            old = json.loads(dev.guest_seed(self.p, name, "ssh-ed25519 TEST_PUBLIC", "TEST_PRIVATE",
+                                           "ssh-ed25519 HOST_PUBLIC")["user-data"].split("\n", 1)[1])
+            old["ssh_genkeytypes"] = []
+            old_text = "#cloud-config\n" + json.dumps(old)
+            cloud = root / "var/lib/cloud"
+            cache = cloud / "instances" / instance
+            cache.mkdir(parents=True)
+            (cloud / "instance").symlink_to(cache)
+            (cache / "user-data.txt").write_text(old_text)
+            (cloud / "seed").mkdir()
+            (root / "etc/ssh").mkdir(parents=True)
+            hooks = root / "etc/cloud/clean.d"
+            hooks.mkdir(parents=True)
+            (root / "etc/machine-id").write_text(instance.replace("-", ""))
+            (root / "etc/ssh/ssh_host_ed25519_key").write_text("TEST_PRIVATE")
+            (root / "etc/ssh/ssh_host_ed25519_key.pub").write_text("ssh-ed25519 HOST_PUBLIC")
+            real_path, real_lstat, real_stat = pathlib.Path, pathlib.Path.lstat, pathlib.Path.stat
+            actual_lexists = os.path.lexists
+            cloud_dir = "/var/lib/cloud"
+
+            def mapped(path):
+                value = str(path)
+                return root / value.lstrip("/") if value.startswith(("/etc/", "/var/")) else real_path(path)
+
+            def rooted(info):
+                fields = list(info)
+                fields[0] &= ~0o022
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            def clean(args, **kwargs):
+                self.assertEqual(args, ["cloud-init", "clean"])
+                self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["timeout"], 30)
+                (cloud / "instance").unlink()
+                return types.SimpleNamespace(returncode=0)
+
+            request = {"name": name, "instance": instance, "old": old, "phase": "inspect"}
+            fake_settings = types.SimpleNamespace(CLEAN_RUNPARTS_DIR="/etc/cloud/clean.d")
+            fake_init = lambda **kwargs: types.SimpleNamespace(
+                read_cfg=lambda: None, paths=types.SimpleNamespace(cloud_dir=cloud_dir))
+
+            def invoke():
+                output = io.StringIO()
+                stdin = types.SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()))
+                with patch.object(pathlib, "Path", mapped), \
+                     patch.object(real_path, "lstat", lambda path: rooted(real_lstat(path))), \
+                     patch.object(real_path, "stat", lambda path, **kwargs: rooted(real_stat(path, **kwargs))), \
+                     patch.object(os.path, "lexists", lambda path: actual_lexists(mapped(path))), \
+                     patch.object(os, "geteuid", return_value=0), patch.object(socket, "gethostname", return_value=name), \
+                     patch.object(dev, "guest_cloud_init_terminal"), patch.object(subprocess, "run", side_effect=clean) as runner, \
+                     patch.dict(sys.modules, {
+                         "yaml": types.SimpleNamespace(safe_load=lambda data: json.loads(data.decode().removeprefix("#cloud-config\n"))),
+                         "cloudinit": types.SimpleNamespace(settings=fake_settings),
+                         "cloudinit.stages": types.SimpleNamespace(Init=fake_init)}), \
+                     patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", output):
+                    dev.guest_clean_main()
+                self.assertNotIn("TEST_PRIVATE", output.getvalue())
+                return json.loads(output.getvalue()), runner
+
+            inspected, runner = invoke()
+            self.assertTrue(inspected["ok"])
+            runner.assert_not_called()
+            for blocker in ("hook", "seed", "workload", "cloud-dir", "hook-dir"):
+                if blocker == "hook":
+                    (hooks / "unreviewed").write_text("test")
+                elif blocker == "seed":
+                    (cloud / "seed/alternate").write_text("test")
+                elif blocker == "workload":
+                    (root / "etc/kubernetes").mkdir()
+                elif blocker == "cloud-dir":
+                    cloud_dir = "/elsewhere"
+                else:
+                    fake_settings.CLEAN_RUNPARTS_DIR = "/elsewhere"
+                refused, runner = invoke()
+                self.assertFalse(refused["ok"])
+                runner.assert_not_called()
+                if blocker == "hook":
+                    (hooks / "unreviewed").unlink()
+                elif blocker == "seed":
+                    (cloud / "seed/alternate").unlink()
+                elif blocker == "workload":
+                    (root / "etc/kubernetes").rmdir()
+                cloud_dir = "/var/lib/cloud"
+                fake_settings.CLEAN_RUNPARTS_DIR = "/etc/cloud/clean.d"
+            request.update(phase="clean", expected_userdata_hash="wrong", fresh_unenrolled=True)
+            refused, runner = invoke()
+            self.assertFalse(refused["ok"])
+            runner.assert_not_called()
+            request["expected_userdata_hash"] = inspected["userdata_hash"]
+            repaired, runner = invoke()
+            self.assertTrue(repaired["ok"])
+            self.assertTrue(repaired["plain_clean"])
+            runner.assert_called_once()
+            self.assertEqual((root / "etc/machine-id").read_text(), instance.replace("-", ""))
+            self.assertEqual((root / "etc/ssh/ssh_host_ed25519_key").read_text(), "TEST_PRIVATE")
+
+    def test_guest_cache_requires_terminal_cloud_init_and_no_running_units(self):
+        terminal = {"status": "done", "extended_status": "degraded done", "errors": [],
+                    "recoverable_errors": {"WARNING": ["cloud-config failed schema validation! You may run 'sudo cloud-init schema --system' to check the details."]}}
+        for invalid in (dict(terminal, status="running"), dict(terminal, errors=["fatal"]),
+                        dict(terminal, recoverable_errors={"WARNING": ["unrelated warning"]})):
+            with self.assertRaises(AssertionError):
+                dev.guest_cloud_init_terminal(lambda args: (2, json.dumps(invalid)))
+        for units in ("exited\nexited\ndead\nexited\nrunning", "exited\nexited\ndead\nexited\nexited"):
+            reader = lambda args: (2, json.dumps(terminal)) if args[0] == "cloud-init" else (0, units)
+            if units.endswith("running"):
+                with self.assertRaises(AssertionError):
+                    dev.guest_cloud_init_terminal(reader)
+            else:
+                dev.guest_cloud_init_terminal(reader)
+        extra = dict(terminal, recoverable_errors={"WARNING": [terminal["recoverable_errors"]["WARNING"][0] + " unexpected"]})
+        with self.assertRaises(AssertionError):
+            dev.guest_cloud_init_terminal(lambda args: (2, json.dumps(extra)))
+
+    def test_seed_repair_inspection_and_transport_preserve_other_vms_and_keys(self):
+        self.exercise_seed_transport(fail_clean=False)
+
+    def test_failed_plain_clean_keeps_old_seeds_and_pending_intent(self):
+        self.exercise_seed_transport(fail_clean=True)
+
+    def exercise_seed_transport(self, fail_clean):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state, pool = root / "state", root / "pool"
+            state.mkdir()
+            pool.mkdir()
+            p = copy.deepcopy(self.p)
+            p["pool_path"] = str(pool)
+            name = p["vms"][0]
+            source = state / (name + "-user-data")
+            seed = pool / (name + "-seed.iso")
+            keys = {"admin_ed25519.pub": "ssh-ed25519 TEST_PUBLIC", name + "-host-ed25519": "TEST PRIVATE HOST KEY",
+                    name + "-host-ed25519.pub": "ssh-ed25519 HOST_PUBLIC"}
+            for filename, data in keys.items():
+                (state / filename).write_text(data)
+            desired = dev.guest_seed(p, name, *keys.values())["user-data"]
+            old = dict(json.loads(desired.split("\n", 1)[1]), ssh_genkeytypes=[])
+            source.write_text("#cloud-config\n" + json.dumps(old))
+            seed.write_bytes(b"OLD OWNED SEED")
+            old_hash = dev.digest_file(source)
+            resources = {"pool:" + p["name"]: {}, "network:" + p["name"]: {},
+                         **{"domain:" + vm: {} for vm in p["vms"]}}
+            fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+            journal = dev.Journal(fd, {"pending": None, "resources": resources,
+                                      "files": {str(source): {"sha256": old_hash}, str(seed): {}}})
+            journal.save()
+            initial_journal = (state / "journal.json").read_bytes()
+            active = {name}
+            calls, phases = [], []
+
+            @contextlib.contextmanager
+            def locked(*args, **kwargs):
+                yield journal
+
+            def guest(p, selected, old_config, phase, expected=None):
+                self.assertEqual(selected, name)
+                self.assertEqual(old_config, old)
+                phases.append(phase)
+                if phase == "clean":
+                    self.assertEqual(expected, "userdata-hash")
+                    if fail_clean:
+                        raise dev.GuestRepairFailure("plain-clean")
+                return "userdata-hash"
+
+            def transport(args, *unused, **kwargs):
+                calls.append(args)
+                if args[0] == "cloud-localds":
+                    Path(args[2]).write_bytes(b"REPAIRED OWNED SEED")
+                elif args[0] == "virsh":
+                    self.assertEqual(args[-1], dev.identity(p, "domain", name))
+                    if args[3] in ("shutdown", "destroy"):
+                        active.discard(name)
+                    elif args[3] == "start":
+                        active.add(name)
+                    else:
+                        self.fail("Unexpected VM mutation")
+                elif args[0] == "ssh":
+                    self.assertIn("StrictHostKeyChecking=yes", args)
+                    self.assertIn("devadmin@" + p["addresses"][0], args)
+                    return name if args[-1] == "hostname" else ""
+                else:
+                    self.fail("Unexpected transport")
+                return ""
+
+            try:
+                with patch.object(dev, "STATE", state), patch.object(dev, "locked_journal", locked), \
+                     patch.object(dev, "verify_files"), patch.object(dev, "verify_resources"), patch.object(dev, "verify_guard"), \
+                     patch.object(dev, "preflight"), patch.object(dev, "repair_guest_clean", guest), patch.object(dev, "run", transport), \
+                     patch.object(dev, "resource_xml", side_effect=lambda p, kind, selected: dev.domain_xml(p, selected)), \
+                     patch.object(dev, "resource_info", side_effect=lambda p, kind, selected: {"State": "running" if selected in active else "shut off"}), \
+                     patch.object(dev, "root_directory", side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY)):
+                    inspected = dev.repair_seed(p, name, old_hash, inspect_only=True)
+                    self.assertFalse(inspected["mutation_performed"])
+                    self.assertEqual(calls, [])
+                    self.assertEqual((state / "journal.json").read_bytes(), initial_journal)
+                    active.clear()
+                    with self.assertRaises(ValueError):
+                        dev.repair_seed(p, name, old_hash, inspect_only=True)
+                    self.assertEqual(calls, [])
+                    if fail_clean:
+                        with self.assertRaises(dev.GuestRepairFailure):
+                            dev.repair_seed(p, name, old_hash, fresh_unenrolled=True)
+                        self.assertEqual(dev.digest_file(source), old_hash)
+                        self.assertEqual(seed.read_bytes(), b"OLD OWNED SEED")
+                        self.assertEqual(journal.value["pending"]["operation"], "repair-seed-schema")
+                        self.assertEqual(active, set())
+                        self.assertFalse(any(call[0] == "virsh" and call[3] == "shutdown" for call in calls))
+                        return
+                    result = dev.repair_seed(p, name, old_hash, fresh_unenrolled=True)
+                    self.assertEqual(result["seed_repaired"], name)
+                    self.assertEqual(active, {name})
+                    self.assertEqual(source.read_text(), desired)
+                    self.assertEqual(seed.read_bytes(), b"REPAIRED OWNED SEED")
+                    self.assertEqual((pool / (seed.name + ".before-schema-repair")).read_bytes(), b"OLD OWNED SEED")
+                    self.assertIsNone(journal.value["pending"])
+                    self.assertEqual(phases, ["inspect", "inspect", "clean"])
+                    for filename, data in keys.items():
+                        self.assertEqual((state / filename).read_text(), data)
+            finally:
+                os.close(fd)
 
     def test_journal_pending_intent_is_durable(self):
         with tempfile.TemporaryDirectory() as directory:

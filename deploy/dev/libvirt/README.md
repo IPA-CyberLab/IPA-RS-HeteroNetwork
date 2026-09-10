@@ -170,7 +170,7 @@ a separate reviewed action. Any mismatch requires investigation, not blind clear
 python3 scripts/provision-dev-libvirt.test.py
 ```
 
-31 tests cover policy modeling, XML/budgets, collisions, exclusive writes,
+36 tests cover policy modeling, XML/budgets, collisions, exclusive writes,
 durable intent, guard readback/drift, QCOW2 rejection, pinned bootstrap identity,
 bounded subprocesses, partial boot cleanup, and complete mocked first/warm/cold
 apply, real nft readback normalization and tightly gated guard recovery. They use
@@ -207,3 +207,109 @@ refusal reason, and a whitelisted command tool/exit code or numeric OS errno
 where available. Raw subprocess output, command arguments, parser exception
 text and credential paths are not included. Source-literal reason checks and
 synthetic secret-bearing failure tests enforce this reporting boundary.
+
+## Exact Seed Schema Repair
+
+The first boots retained supplied host identities but cloud-init reported
+terminal degraded status because `ssh_genkeytypes: []` violates its schema.
+New seeds use `["ed25519"]`; supplied `ssh_keys` cause cloud-init to install the
+same pinned pair instead of generating replacements. Normal apply never silently
+rewrites existing journal-owned seeds.
+
+This repair is only for these fresh, never-enrolled development guests. It is
+not a general cloud-init reset or a procedure for workload-bearing VMs. The
+parent inspected the installed plain-clean implementation: without flags it
+removes cloud-init instance state under its configured cloud directory, preserves
+the seed directory, machine ID, logs, SSH/network/fstab configuration, and invokes
+the configured clean-hook directory. The command below verifies that directory
+is empty before allowing clean. See [Canonical's clean implementation](https://raw.githubusercontent.com/canonical/cloud-init/main/cloudinit/cmd/clean.py).
+
+### Inspect First
+
+After reviewer clearance and installation of the pinned source, inspect one
+explicitly selected guest. It must already be running under the verified guard;
+other guests may remain off. Read only the existing journal SHA-256 for that
+guest's `/var/lib/hetero-dev-provisioner/hetero-dev-1-user-data` entry.
+Do not print userdata or private keys.
+
+```sh
+sudo python3 scripts/provision-dev-libvirt.py repair-seed \
+  --vm hetero-dev-1 --expected-userdata-sha256 OLD_JOURNALED_SHA256 --inspect-only
+```
+
+Inspection performs no starts, shutdowns, journal updates, clean or seed writes.
+It verifies journal/file/resource ownership, guard, preflight, pinned SSH
+identity, machine ID equal to the guest UUID without hyphens, and installed host
+keys. Guest checks require:
+
+- Terminal cloud-init `done`, no fatal errors, and only either exact observed
+  schema warning (short form or the full schema-command suggestion). Unrelated
+  warnings are refused. All cloud-init stage units must be dead or exited.
+- Configured `init.paths.cloud_dir == /var/lib/cloud` and
+  `settings.CLEAN_RUNPARTS_DIR == /etc/cloud/clean.d`, with no clean hooks.
+- No alternate nonempty seed directory; only empty directories may exist below
+  `/var/lib/cloud/seed`. Symlinks are rejected.
+- No HeteroNetwork, Kubernetes, kubelet, Rancher, Docker or HeteroCloud state
+  markers checked by the fixed helper. The instance directory must contain only
+  this guest's instance ID.
+- Exact original userdata, differing from the corrected host seed only at
+  `ssh_genkeytypes`, and unchanged supplied private/public host keys.
+
+Fixed `guest_stage` refusals and hashes contain no private configuration.
+These checks supplement, not replace, the operator's fresh/no-workload
+attestation. They cannot prove the absence of arbitrary software installed by
+a trusted administrator.
+
+### Repair One Guest
+
+```sh
+sudo python3 scripts/provision-dev-libvirt.py repair-seed \
+  --vm hetero-dev-1 --expected-userdata-sha256 OLD_JOURNALED_SHA256 \
+  --confirm-repair hetero-dev --confirm-fresh-unenrolled
+```
+
+Repeat separately for dev-2 and dev-3 using each guest's own old userdata hash.
+Repair may start only its selected stopped VM; inspection never starts one.
+No other VM, including `vercel-research`, is changed.
+
+1. Verify exact old seed hash/contents, all recorded resources/files, private
+   keys, guard and preflight. Require the complete owned three-guest resource
+   set. Write durable repair intent before any guest start or repair.
+2. Inspect the selected guest; if started by this command, allow at most 90
+   seconds for pinned SSH readiness. Stage corrected userdata and a replacement
+   ISO using unchanged metadata, network data and keys, and fsync staging.
+3. Recheck guest preconditions and its inspected userdata hash. Invoke exactly
+   `cloud-init clean` with **no flags** and a 30-second timeout. Never pass
+   `--machine-id`, `--logs`, `--configs`, `--seed` or `--reboot`. Suppress
+   command output, require exit zero, and immediately verify machine ID and SSH
+   key files are byte-for-byte unchanged. No pickle is loaded or rewritten;
+   no private cache format or semaphore is edited by this tool.
+4. Gracefully shut down only the selected guest, with a 90-second bound, and
+   reverify host files. Preserve private `.before-schema-repair` originals,
+   fsync their directory entries, replace only the owned userdata/ISO, and record
+   hashes/inodes. Guest disks, UUIDs, network data and definitions are unchanged.
+   Stopping QEMU ensures the corrected ISO is reopened on next start.
+5. Restart that guest under the guard. Require pinned hostname, successful
+   `cloud-init schema --system` and actual status exit zero within the bounded
+   180-second boot-check window. Reverify all ownership and record completion
+   before clearing repair intent. Existing first_boot behavior is unchanged.
+
+Clean deliberately lets cloud-init perform its supported first-instance setup
+again from the corrected ISO. The exact seed contains no workload bootstrap,
+and the same supplied host pair is reinstalled. No machine-ID change or disk
+recreation is requested. A degraded exit 2 is never accepted as final success.
+
+Failure leaves pending intent, staged files and any preserved originals for
+reviewed diagnosis; there is no automatic partial-repair adoption or retry.
+If the command originally started a stopped guest, it attempts to stop only that
+guest after UUID verification. A guest already running on entry is not forcibly
+stopped during failure cleanup. If clean succeeded but a later step fails, its
+old instance cache may already be gone: do not rerun blindly or clear pending.
+Inspect the recorded phase and owned files before recovery.
+
+Focused tests cover exact seed transitions, terminal/unit gating, both exact
+warning forms, inspect-only nonmutation, configured clean paths/hooks/seed/state
+refusals, invocation of plain clean without flags, preserved identities, and
+successful/failed simulated selected-guest transport. No remote inspection,
+clean, guest boot or live repair is executed by the tests. Live inspection is
+the first step after the parent/reviewer approves and pins the source.
