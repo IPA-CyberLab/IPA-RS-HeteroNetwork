@@ -52,6 +52,7 @@ agent_state_path="${HETERONETWORK_AGENT_STATE_PATH:-$DEFAULT_AGENT_STATE_PATH}"
 agent_api_token_path="${HETERONETWORK_KUBEADM_AGENT_API_TOKEN_PATH:-$state_dir/agent-api-token}"
 agent_status_url="${HETERONETWORK_AGENT_STATUS_URL:-$DEFAULT_AGENT_STATUS_URL}"
 agent_peers_url="${HETERONETWORK_AGENT_PEERS_URL:-$DEFAULT_AGENT_PEERS_URL}"
+profile="${HETERONETWORK_KUBEADM_PROFILE:-standard}"
 
 usage() {
   cat <<'EOF'
@@ -95,6 +96,9 @@ Required environment for prepare/init/join:
   HETERONETWORK_KUBEADM_CONTROL_PLANES   Comma-separated HeteroNetwork IPv4 addresses
 
 Optional environment:
+  HETERONETWORK_KUBEADM_PROFILE          standard (default) or fresh-dev
+                                         fresh-dev requires explicit dev networking;
+                                         no split DNS or discovery/public timers
   HETERONETWORK_KUBEADM_INTERFACE        Default: heteronetwork0
   HETERONETWORK_KUBEADM_NODE_NAME        Default: normalized short hostname
   HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE
@@ -335,6 +339,7 @@ select_healthy_apiserver_etcd_backends() {
 }
 
 validate_common_config() {
+  validate_profile
   validate_interface_name "$interface"
   validate_ipv4 "$node_ip"
   validate_dns_name "$api_name"
@@ -355,6 +360,61 @@ validate_common_config() {
     backend_addresses | grep -Fx "$preferred_control_plane" >/dev/null \
       || die "preferred control plane is not present in the backend list: $preferred_control_plane"
   fi
+}
+
+validate_profile() {
+  case "$profile" in
+    standard) return ;;
+    fresh-dev) ;;
+    *) die "unknown Kubernetes preparation profile" ;;
+  esac
+  [[ "$node_name" =~ ^hetero-dev-[123]$ && "$(hostname -s)" == "$node_name" ]] \
+    || die "fresh-dev requires the matching explicit dev guest name"
+  [[ "$interface" == heteronetwork0 && "$state_dir" == "$DEFAULT_STATE_DIR" \
+    && "$agent_state_path" == "$DEFAULT_AGENT_STATE_PATH" \
+    && "$agent_api_token_path" == "$state_dir/agent-api-token" \
+    && "$agent_status_url" == "$DEFAULT_AGENT_STATUS_URL" \
+    && "$agent_peers_url" == "$DEFAULT_AGENT_PEERS_URL" ]] \
+    || die "fresh-dev requires canonical local agent paths and endpoints"
+  [[ "$pod_cidr" == 172.29.0.0/16 && "$service_cidr" == 172.30.0.0/16 \
+    && "$api_name" == k8s-api.hetero-dev.internal ]] \
+    || die "fresh-dev requires explicit dev API name and pod/service CIDRs"
+  local address
+  for address in "$node_ip" ${control_plane_backends//,/ } ${apiserver_etcd_backends//,/ }; do
+    validate_ipv4 "$address"
+    [[ "$address" =~ ^10\.251\.0\.([0-9]+)$ ]] \
+      || die "fresh-dev requires exclusively dev VPN addresses"
+    ((10#${BASH_REMATCH[1]} >= 1 && 10#${BASH_REMATCH[1]} <= 254)) \
+      || die "fresh-dev VPN address is not a host address"
+  done
+  [[ -n "$control_plane_backends" ]] || die "fresh-dev requires explicit control planes"
+}
+
+prepare_preflight() {
+  if [[ "$profile" == standard ]]; then
+    [[ -f "$SCRIPT_DIR/public-services-bootstrap.sh" \
+      && -f "$SCRIPT_DIR/../deploy/systemd/heteronetwork-public-services-bootstrap.service" \
+      && -f "$SCRIPT_DIR/../deploy/systemd/heteronetwork-public-services-bootstrap.timer" ]] \
+      || die "public-services bootstrap dependencies missing; no host changes made"
+    return
+  fi
+  local path unit loaded
+  for path in /etc/kubernetes /var/lib/etcd /var/lib/kubelet; do
+    [[ ! -e "$path" && ! -L "$path" ]] || die "fresh-dev refuses existing Kubernetes state: $path"
+  done
+  for unit in heteronetwork-public-services-bootstrap heteronetwork-public-services-autopilot \
+    heteronetwork-kubeadm-backend-autopilot heteronetwork-kubeadm-autopilot heteronetwork-overlay-dns; do
+    local suffix
+    for suffix in service timer; do
+      loaded="$(systemctl show "$unit.$suffix" --property=LoadState --value)" \
+        || die "cannot inspect existing dev host units"
+      [[ "$loaded" == not-found ]] || die "fresh-dev refuses existing $unit.$suffix"
+    done
+  done
+  systemctl is-active --quiet heteronetwork-agent.service \
+    || die "start and validate the dev VPN before Kubernetes preparation"
+  [[ -f "$agent_api_token_path" && ! -L "$agent_api_token_path" ]] \
+    || die "fresh-dev requires the existing bootstrap agent token"
 }
 
 validate_overlay_dns_config() {
@@ -981,6 +1041,7 @@ load_local_node_state() {
     || die "local Kubernetes node state is missing or insecure: $node_state"
 
   unset \
+    HETERONETWORK_KUBEADM_PROFILE \
     HETERONETWORK_KUBEADM_INTERFACE \
     HETERONETWORK_KUBEADM_NODE_IP \
     HETERONETWORK_KUBEADM_NODE_NAME \
@@ -997,6 +1058,7 @@ load_local_node_state() {
   # shellcheck disable=SC1090
   source "$node_state"
 
+  profile="${HETERONETWORK_KUBEADM_PROFILE:-standard}"
   interface="${HETERONETWORK_KUBEADM_INTERFACE:-}"
   node_ip="${HETERONETWORK_KUBEADM_NODE_IP:-}"
   node_name="${HETERONETWORK_KUBEADM_NODE_NAME:-}"
@@ -1200,6 +1262,8 @@ configure_nss_resolve() {
 }
 
 configure_overlay_dns() {
+  validate_profile
+  [[ "$profile" != fresh-dev ]] || return 0
   require_root
   validate_overlay_dns_config
   verify_interface_address
@@ -1509,6 +1573,8 @@ configure_haproxy() {
 }
 
 install_api_backend_autopilot() {
+  validate_profile
+  [[ "$profile" != fresh-dev ]] || return 0
   require_root
   local installed_script source_script service_path timer_path service_temporary timer_temporary changed=0
   installed_script=/opt/heteronetwork/libexec/kubeadm-ha-node.sh
@@ -1694,6 +1760,7 @@ reconcile_etcd_resources() {
 configure_local_state() {
   cat <<EOF | install_from_stdin "$state_dir/node.env" 0600
 HETERONETWORK_KUBEADM_INTERFACE=${interface}
+HETERONETWORK_KUBEADM_PROFILE=${profile}
 HETERONETWORK_KUBEADM_NODE_IP=${node_ip}
 HETERONETWORK_KUBEADM_NODE_NAME=${node_name}
 HETERONETWORK_KUBEADM_CONTROL_PLANES=${control_plane_backends}
@@ -1728,6 +1795,8 @@ ensure_agent_api_token() {
 }
 
 install_public_services_bootstrap_autopilot() {
+  validate_profile
+  [[ "$profile" != fresh-dev ]] || return 0
   local helper="${SCRIPT_DIR}/public-services-bootstrap.sh"
   local service="${SCRIPT_DIR}/../deploy/systemd/heteronetwork-public-services-bootstrap.service"
   local timer="${SCRIPT_DIR}/../deploy/systemd/heteronetwork-public-services-bootstrap.timer"
@@ -1804,6 +1873,7 @@ prepare_host() {
   validate_common_config
   verify_interface_address
   require_command systemctl
+  prepare_preflight
   install -d -o root -g root -m 0700 "$state_dir"
   install_kubernetes_packages
   configure_kernel
@@ -1840,6 +1910,8 @@ reconcile_control_plane_backends() {
 
 reconcile_discovered_control_plane_backends() {
   require_root
+  load_local_node_state
+  [[ "$profile" != fresh-dev ]] || die "backend discovery is disabled for fresh-dev"
   require_command curl
   require_command flock
   require_command jq
@@ -1848,6 +1920,7 @@ reconcile_discovered_control_plane_backends() {
   flock -n 9 || return 0
 
   load_local_node_state
+  [[ "$profile" != fresh-dev ]] || die "backend discovery is disabled for fresh-dev"
   verify_interface_address
   systemctl is-active --quiet heteronetwork-agent.service \
     || die "HeteroNetwork Agent is inactive"
