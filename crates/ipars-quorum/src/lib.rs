@@ -6,6 +6,7 @@ pub use frost_ed25519 as frost;
 pub use frost_ed25519::keys::dkg;
 mod rotation;
 pub use rotation::{verify_rotation, ManifestRotation, ManifestTransition, VerifiedRotation};
+pub mod sudo;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};

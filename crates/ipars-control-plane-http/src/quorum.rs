@@ -3,11 +3,13 @@
 //! This cannot constrain old binaries, a rogue root, or the database owner.
 
 mod rotation;
+pub mod sudo;
 pub(super) use rotation::{active_manifest, apply_rotation};
 pub use rotation::{
     signer_router_with_rotation_anchor, RotationRound1Request, RotationRound2Request,
     MANIFEST_PATH, ROTATION_PATH,
 };
+pub use sudo::sudo_signer_router;
 
 use axum::body::{to_bytes, Bytes};
 use axum::extract::Request;
