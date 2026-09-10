@@ -1,8 +1,9 @@
 # Guarded Dev Libvirt Provisioning
 
 The provisioner implements local root-only creation and bounded first-boot
-verification. **Awaiting parent/Kepler review; no remote apply has occurred.**
-Root access and the prepared image are available, not implementation blockers.
+verification. The reviewed first apply installed the guard but stopped before
+any pool/guest creation. The normalization/recovery fix below requires fresh
+parent/reviewer clearance before any further host action.
 
 ## Fixed Allocation
 
@@ -127,9 +128,41 @@ disks, pool, network and guard remain for inspection; there is no automatic dele
 
 **Crash recovery is not automatic.** Nonempty journal `pending` blocks subsequent
 apply until an operator reviews the exact operation and actual owned resources.
-Never clear it blindly. There is no recovery/adoption command. Interruption
+Never clear it blindly. There is no general recovery/adoption command. Interruption
 between guest start and recording normalized XML can also require manual review.
 The lifetime lock serializes this script, not unrelated trusted administrators.
+
+### Exact Guard-Only Recovery
+
+The 2026-09-10 nft 1.0.9 live readback is preserved in
+`testdata/nft-1.0.9-live-guard.json` (only the two scoped guard tables, no secrets).
+Its only semantic-printing differences from the original batch are three omitted
+redundant `meta l4proto` matches before same-protocol DHCP/DNS port matches.
+Normalization removes only those implied checks in pure match/verdict rules;
+conflicting protocol checks, rule order and other predicates remain intact.
+The original committed/root-installed c5f850 tool reproduced the failure on
+ichikawap1 in a temporary `unshare --net` namespace: echo and live readback each
+had 12 groups, but original canonical comparison failed only for these inet
+input rules. The probe completed and the namespace was removed; host rules were
+unchanged. This verifies the original readback-comparison failure, not merely
+an inferred normalization difference.
+
+After review, the explicit local-root recovery command is:
+
+```sh
+sudo python3 scripts/provision-dev-libvirt.py recover-guard \
+  --expected-batch-sha256 339f000d6e74f479d30bb01c04053631d7c3176d1abe25d80a074d4a76b12e73
+```
+
+It takes the existing lifetime lock and requires the host/profile binding, exact
+pending `install-guard` operation and original batch hash, empty resource/file
+records, no recorded guard/pool directory/readiness, and only lock/journal files
+in private state. Fresh preflight must reject any resource/pool-path collision.
+Two scoped live reads must equal the full normalized expected batch, not merely
+counts or comments. Only then does one durable journal update record the verified
+guard and clear this specific pending operation. It does not delete, reinstall,
+modify firewall rules, create resources, or continue into apply. A later apply is
+a separate reviewed action. Any mismatch requires investigation, not blind clear.
 
 ## Focused Verification
 
@@ -137,15 +170,17 @@ The lifetime lock serializes this script, not unrelated trusted administrators.
 python3 scripts/provision-dev-libvirt.test.py
 ```
 
-21 tests cover policy modeling, XML/budgets, collisions, exclusive writes,
+25 tests cover policy modeling, XML/budgets, collisions, exclusive writes,
 durable intent, guard readback/drift, QCOW2 rejection, pinned bootstrap identity,
 bounded subprocesses, partial boot cleanup, and complete mocked first/warm/cold
-apply. They use temporary fixtures and synthetic subprocesses, not real libvirt,
+apply, real nft readback normalization and tightly gated guard recovery. They use
+temporary fixtures and synthetic subprocesses, not real libvirt,
 nft mutations, SSH or guest creation.
 
-Kepler review precedes live apply. Local unprivileged kernel nft validation was
-unavailable: no live firewall, NAT, guest boot, isolation or Internet pass is
-claimed. Apply checks kernel readback and boot, not a packet reachability matrix.
+Review precedes recovery or another apply. Host preflight and privileged nft
+check passed; both scoped tables were installed by the failed first apply. No
+NAT, guest boot, packet isolation or Internet pass is claimed. Apply checks kernel
+readback and boot, not a packet reachability matrix.
 After reviewed creation, separately verify DHCP/DNS, public egress, denied
 host/production destinations and IPv6 using only these guests. Kubernetes and
 application bootstrap remain separate.

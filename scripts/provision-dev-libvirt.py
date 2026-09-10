@@ -482,7 +482,7 @@ class Journal:
 
 
 @contextlib.contextmanager
-def locked_journal(p, create=False):
+def locked_journal(p, create=False, allow_pending_guard=False):
     require(os.geteuid() == 0, "Apply requires local root")
     require(run(["hostname"]).strip() == p["host"], "Wrong hypervisor")
     parent = root_directory(STATE.parent)
@@ -518,7 +518,8 @@ def locked_journal(p, create=False):
                 value = decode(source.read(2 * 1024 * 1024 + 1))
         require(value.get("schema_version") == 1 and value.get("host") == p["host"]
                 and value.get("profile_sha256") == plan(p)["profile_sha256"], "Host/profile journal mismatch")
-        require(not value.get("pending"), "Interrupted operation: inspect pending journal; no automatic adoption")
+        require(not value.get("pending") or allow_pending_guard,
+                "Interrupted operation: inspect pending journal; no automatic adoption")
         yield Journal(directory, value)
     finally:
         if lock is not None:
@@ -580,6 +581,38 @@ def verify_resources(p, journal, allow_running=False):
             require(info.get("State") in states, "Unexpected owned guest state for guard lifecycle")
 
 
+def canonical_rule_expressions(expressions):
+    # nft 1.0.9 readback omits explicit l4proto when a later port match implies
+    # the same protocol. Only normalize pure match rules ending in a verdict.
+    if not expressions or expressions[-1] not in ({"accept": None}, {"drop": None}):
+        return expressions
+    if not all(set(item) == {"match"} for item in expressions[:-1]):
+        return expressions
+    result = []
+    for index, item in enumerate(expressions):
+        condition = item.get("match", {})
+        protocol = condition.get("right")
+        if (condition == {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": protocol}
+                and protocol in ("tcp", "udp")):
+            conflicting = any(
+                (other.get("left") == {"meta": {"key": "l4proto"}} and other != condition)
+                or (other.get("left", {}).get("payload", {}).get("protocol") in ("tcp", "udp")
+                    and other["left"]["payload"]["protocol"] != protocol)
+                for other in (part["match"] for part in expressions[:-1]))
+            if conflicting:
+                result.append(item)
+                continue
+            implied = any(later.get("match", {}).get("op") == "=="
+                          and later["match"].get("left") in (
+                              {"payload": {"protocol": protocol, "field": "sport"}},
+                              {"payload": {"protocol": protocol, "field": "dport"}})
+                          for later in expressions[index + 1:])
+            if implied:
+                continue
+        result.append(item)
+    return result
+
+
 def canonical_guard(document):
     """Preserve rule order within each chain; ignore only kernel object handles."""
     groups = {}
@@ -592,6 +625,8 @@ def canonical_guard(document):
         kind, item = next(iter(entry.items()))
         require(kind in ("table", "chain", "rule"), "Unexpected firewall object type")
         item = {key: value for key, value in item.items() if key not in ("handle", "index")}
+        if kind == "rule":
+            item["expr"] = canonical_rule_expressions(item["expr"])
         require(item.get("family") in ("inet", "bridge") and item.get("table", item.get("name")) == TABLE,
                 "Unexpected firewall scope")
         key = (item["family"], kind, item.get("chain", item.get("name", "")))
@@ -627,12 +662,34 @@ def ensure_guard(p, journal):
     echo = decode(run(["nft", "--echo", "--json", "--file", "-"], batch))
     compiled = canonical_guard(echo)
     expected = canonical_guard(firewall(p))
-    require([(item["key"], len(item["objects"])) for item in compiled] ==
-            [(item["key"], len(item["objects"])) for item in expected], "Incomplete kernel guard acknowledgement")
+    require(compiled == expected, "Kernel guard acknowledgement differs from requested batch")
     require(live_guard() == compiled, "Kernel guard readback differs from acknowledged transaction")
     # JSON makes tuple group keys into lists; canonicalize before storing/comparing.
     journal.value["guard"] = decode(json.dumps(compiled))
     journal.done()
+
+
+def recover_guard(p, expected_batch_sha256):
+    """Record only the exact installed guard from an otherwise empty failed apply."""
+    batch_sha256 = hashlib.sha256(json.dumps(firewall(p)).encode()).hexdigest()
+    require(expected_batch_sha256 == batch_sha256, "Explicit exact batch hash required")
+    with locked_journal(p, allow_pending_guard=True) as journal:
+        require(journal.value.get("pending") == {"operation": "install-guard", "batch_sha256": batch_sha256},
+                "Recovery only accepts the exact pending install-guard operation")
+        require(journal.value.get("resources") == {} and journal.value.get("files") == {}
+                and not any(journal.value.get(key) for key in ("guard", "pool_directory", "ready", "boot_verified")),
+                "Recovery requires no owned resources, files, storage or completed guard")
+        require(set(os.listdir(journal.fd)) == {"lock", "journal.json"}, "Recovery state directory is not empty")
+        preflight(p)
+        expected = canonical_guard(firewall(p))
+        actual = live_guard()
+        require(actual == expected, "Installed guard does not exactly match pending batch semantics")
+        require(live_guard() == actual, "Guard changed during recovery verification")
+        journal.value["guard"] = actual
+        journal.value["guard_recovery"] = {"batch_sha256": batch_sha256, "verified_existing_only": True}
+        journal.done()
+        return {"guard_recovered": True, "firewall_modified": False, "resources_created": False,
+                "journal": str(STATE / "journal.json")}
 
 
 def ensure_resource(p, journal, kind, name, text):
@@ -880,15 +937,18 @@ def first_boot(p, journal):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "render", "preflight", "verify-image", "apply"))
+    parser.add_argument("command", choices=("plan", "render", "preflight", "verify-image", "apply", "recover-guard"))
     parser.add_argument("--profile", type=Path, default=PROFILE)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--ssh-public-key", type=Path)
     parser.add_argument("--image-directory", type=Path)
     parser.add_argument("--confirm-create", choices=("hetero-dev",))
+    parser.add_argument("--expected-batch-sha256")
     args = parser.parse_args()
     p = profile(args.profile)
-    if args.command == "apply":
+    if args.command == "recover-guard":
+        result = recover_guard(p, args.expected_batch_sha256)
+    elif args.command == "apply":
         require(args.confirm_create == "hetero-dev", "Explicit --confirm-create hetero-dev is required")
         old_umask = os.umask(0o077)
         try:

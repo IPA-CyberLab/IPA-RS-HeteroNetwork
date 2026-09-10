@@ -438,6 +438,118 @@ class DevPlanTests(unittest.TestCase):
             finally:
                 os.close(fd)
 
+    def live_guard_fixture(self):
+        data = json.loads((dev.ROOT / "deploy/dev/libvirt/testdata/nft-1.0.9-live-guard.json").read_text())
+        return {"nftables": data["inet"]["nftables"] + data["bridge"]["nftables"]}
+
+    def test_actual_nft_109_readback_matches_exact_original_batch(self):
+        batch = dev.firewall(self.p)
+        self.assertEqual(hashlib.sha256(json.dumps(batch).encode()).hexdigest(),
+                         "339f000d6e74f479d30bb01c04053631d7c3176d1abe25d80a074d4a76b12e73")
+        self.assertEqual(dev.canonical_guard(batch), dev.canonical_guard(self.live_guard_fixture()))
+        changed = self.live_guard_fixture()
+        rule = next(entry["rule"] for entry in changed["nftables"] if "rule" in entry)
+        rule["expr"][-1] = {"accept": None}
+        self.assertNotEqual(dev.canonical_guard(batch), dev.canonical_guard(changed))
+
+    def test_l4_normalization_preserves_conflicts_order_and_predicates(self):
+        tcp = dev.match(dev.meta("l4proto"), "tcp")
+        udp = dev.match(dev.meta("l4proto"), "udp")
+        port = dev.match(dev.payload("tcp", "dport"), 53)
+        source = dev.match(dev.payload("ip", "saddr"), "172.28.240.11")
+        good = [source, tcp, port, {"accept": None}]
+        self.assertEqual(dev.canonical_rule_expressions(good), [source, port, {"accept": None}])
+        for expressions in ([tcp, udp, port, {"accept": None}],
+                            [udp, port, {"accept": None}],
+                            [port, tcp, {"accept": None}],
+                            [tcp, source, {"accept": None}],
+                            [tcp, {"counter": None}, port, {"accept": None}],
+                            [tcp, dev.match(dev.payload("tcp", "dport"), 53, "!="), {"drop": None}]):
+            self.assertEqual(dev.canonical_rule_expressions(expressions), expressions)
+
+    def test_install_echo_with_explicit_protocol_matches_actual_readback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                journal = dev.Journal(fd, {"pending": None})
+                calls = []
+
+                def transport(args, input_data=None, **kwargs):
+                    calls.append(args)
+                    if "tables" in args:
+                        return '{"nftables": []}'
+                    return input_data if "--echo" in args else ""
+
+                with patch.object(dev, "run", transport), patch.object(dev, "live_guard",
+                        return_value=dev.canonical_guard(self.live_guard_fixture())):
+                    dev.ensure_guard(self.p, journal)
+                self.assertIsNone(journal.value["pending"])
+                self.assertEqual(journal.value["guard"], dev.canonical_guard(self.live_guard_fixture()))
+            finally:
+                os.close(fd)
+
+    def test_recovery_exact_pending_empty_state_and_no_firewall_writes(self):
+        batch_hash = hashlib.sha256(json.dumps(dev.firewall(self.p)).encode()).hexdigest()
+        initial = {"pending": {"operation": "install-guard", "batch_sha256": batch_hash},
+                   "resources": {}, "files": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                dev.exclusive(fd, "lock", b"")
+                journal = dev.Journal(fd, copy.deepcopy(initial))
+                journal.save()
+
+                @contextlib.contextmanager
+                def locked(*args, **kwargs):
+                    self.assertTrue(kwargs.get("allow_pending_guard"))
+                    self.assertFalse(kwargs.get("create", False))
+                    yield journal
+
+                live = dev.canonical_guard(self.live_guard_fixture())
+                with patch.object(dev, "locked_journal", locked), patch.object(dev, "preflight") as preflight, \
+                     patch.object(dev, "live_guard", return_value=live) as guard, patch.object(dev, "run") as runner:
+                    bad_states = [dict(initial, pending=None),
+                                  dict(initial, pending={"operation": "install-guard", "batch_sha256": "wrong"}),
+                                  dict(initial, resources={"domain:hetero-dev-1": {}}),
+                                  dict(initial, files={"unexpected": {}}), dict(initial, pool_directory=[1, 2]),
+                                  dict(initial, guard=live), dict(initial, ready=True)]
+                    for state in bad_states:
+                        journal.value = copy.deepcopy(state)
+                        with self.assertRaises(ValueError):
+                            dev.recover_guard(self.p, batch_hash)
+                        self.assertEqual(journal.value, state)
+                    journal.value = copy.deepcopy(initial)
+                    with self.assertRaises(ValueError):
+                        dev.recover_guard(self.p, "wrong")
+                    dev.exclusive(fd, "unexpected", b"")
+                    with self.assertRaises(ValueError):
+                        dev.recover_guard(self.p, batch_hash)
+                    os.unlink("unexpected", dir_fd=fd)
+                    preflight.side_effect = ValueError("pool exists or inventory conflict")
+                    with self.assertRaises(ValueError):
+                        dev.recover_guard(self.p, batch_hash)
+                    preflight.side_effect = None
+                    guard.return_value = []
+                    with self.assertRaises(ValueError):
+                        dev.recover_guard(self.p, batch_hash)
+                    guard.return_value = live
+                    guard.side_effect = [live, []]
+                    with self.assertRaises(ValueError):
+                        dev.recover_guard(self.p, batch_hash)
+                    self.assertEqual(journal.value, initial)
+                    guard.side_effect = None
+                    result = dev.recover_guard(self.p, batch_hash)
+                    runner.assert_not_called()
+                    self.assertFalse(result["firewall_modified"])
+                    self.assertEqual(journal.value["guard"], live)
+                    self.assertIsNone(journal.value["pending"])
+                    saved = json.loads((Path(directory) / "journal.json").read_text())
+                    self.assertEqual(saved, journal.value)
+                    with self.assertRaises(ValueError):
+                        dev.recover_guard(self.p, batch_hash)
+            finally:
+                os.close(fd)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,1628 @@
+{
+  "inet": {
+    "nftables": [
+      {
+        "metainfo": {
+          "version": "1.0.9",
+          "release_name": "Old Doc Yak #3",
+          "json_schema_version": 1
+        }
+      },
+      {
+        "table": {
+          "family": "inet",
+          "name": "hetero_dev",
+          "handle": 156317
+        }
+      },
+      {
+        "chain": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "name": "input",
+          "handle": 1,
+          "type": "filter",
+          "hook": "input",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "name": "forward",
+          "handle": 3,
+          "type": "filter",
+          "hook": "forward",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 2,
+          "comment": "hetero-dev: deny guest IPv6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "right": "ipv6"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 7,
+          "comment": "hetero-dev: DHCP only",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "udp",
+                    "field": "sport"
+                  }
+                },
+                "right": 68
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "udp",
+                    "field": "dport"
+                  }
+                },
+                "right": 67
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "0.0.0.0",
+                    {
+                      "prefix": {
+                        "addr": "172.28.240.0",
+                        "len": 24
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "172.28.240.1",
+                    "255.255.255.255"
+                  ]
+                }
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 8,
+          "comment": "hetero-dev: deny spoofed source",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "!=",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 9,
+          "comment": "hetero-dev: host-initiated management replies",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "established"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "reply"
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 10,
+          "comment": "hetero-dev: DNS to own gateway only",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": "172.28.240.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "udp",
+                    "field": "dport"
+                  }
+                },
+                "right": 53
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 11,
+          "comment": "hetero-dev: DNS to own gateway only",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": "172.28.240.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 53
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 12,
+          "comment": "hetero-dev: deny other host services",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 4,
+          "comment": "hetero-dev: deny guest IPv6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "right": "ipv6"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 13,
+          "comment": "hetero-dev: deny inbound IPv6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "right": "ipv6"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 14,
+          "comment": "hetero-dev: deny spoofed source",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "!=",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 15,
+          "comment": "hetero-dev: own subnet only",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 16,
+          "comment": "hetero-dev: deny destination 0.0.0.0/8",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "0.0.0.0",
+                    "len": 8
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 17,
+          "comment": "hetero-dev: deny destination 10.0.0.0/8",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "10.0.0.0",
+                    "len": 8
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 18,
+          "comment": "hetero-dev: deny destination 100.64.0.0/10",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "100.64.0.0",
+                    "len": 10
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 19,
+          "comment": "hetero-dev: deny destination 127.0.0.0/8",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "127.0.0.0",
+                    "len": 8
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 20,
+          "comment": "hetero-dev: deny destination 169.254.0.0/16",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "169.254.0.0",
+                    "len": 16
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 21,
+          "comment": "hetero-dev: deny destination 172.16.0.0/12",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.16.0.0",
+                    "len": 12
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 22,
+          "comment": "hetero-dev: deny destination 192.0.0.0/24",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "192.0.0.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 23,
+          "comment": "hetero-dev: deny destination 192.0.2.0/24",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "192.0.2.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 24,
+          "comment": "hetero-dev: deny destination 192.88.99.0/24",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "192.88.99.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 25,
+          "comment": "hetero-dev: deny destination 192.168.0.0/16",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "192.168.0.0",
+                    "len": 16
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 26,
+          "comment": "hetero-dev: deny destination 198.18.0.0/15",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "198.18.0.0",
+                    "len": 15
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 27,
+          "comment": "hetero-dev: deny destination 198.51.100.0/24",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "198.51.100.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 28,
+          "comment": "hetero-dev: deny destination 203.0.113.0/24",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "203.0.113.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 29,
+          "comment": "hetero-dev: deny destination 224.0.0.0/4",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "224.0.0.0",
+                    "len": 4
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 30,
+          "comment": "hetero-dev: deny destination 240.0.0.0/4",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "240.0.0.0",
+                    "len": 4
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 31,
+          "comment": "hetero-dev: deny destination 163.220.236.0/23",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "163.220.236.0",
+                    "len": 23
+                  }
+                }
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 32,
+          "comment": "hetero-dev: public IPv4 Internet after exclusions",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.28.240.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 33,
+          "comment": "hetero-dev: deny other guest forwarding",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 34,
+          "comment": "hetero-dev: Internet replies only",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "established"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "reply"
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 35,
+          "comment": "hetero-dev: deny unsolicited forwarded ingress",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "bridge": {
+    "nftables": [
+      {
+        "metainfo": {
+          "version": "1.0.9",
+          "release_name": "Old Doc Yak #3",
+          "json_schema_version": 1
+        }
+      },
+      {
+        "table": {
+          "family": "bridge",
+          "name": "hetero_dev",
+          "handle": 156318
+        }
+      },
+      {
+        "chain": {
+          "family": "bridge",
+          "table": "hetero_dev",
+          "name": "input",
+          "handle": 1,
+          "type": "filter",
+          "hook": "input",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "bridge",
+          "table": "hetero_dev",
+          "name": "forward",
+          "handle": 3,
+          "type": "filter",
+          "hook": "forward",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "bridge",
+          "table": "hetero_dev",
+          "name": "output",
+          "handle": 6,
+          "type": "filter",
+          "hook": "output",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "hetero_dev",
+          "chain": "input",
+          "handle": 2,
+          "comment": "hetero-dev: deny L2 IPv6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": "ip6"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 4,
+          "comment": "hetero-dev: deny L2 IPv6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": "ip6"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "hetero_dev",
+          "chain": "forward",
+          "handle": 5,
+          "comment": "hetero-dev: deny L2 IPv6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "obrname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": "ip6"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "hetero_dev",
+          "chain": "output",
+          "handle": 7,
+          "comment": "hetero-dev: deny L2 IPv6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "obrname"
+                  }
+                },
+                "right": "virbr-hdev"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": "ip6"
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
