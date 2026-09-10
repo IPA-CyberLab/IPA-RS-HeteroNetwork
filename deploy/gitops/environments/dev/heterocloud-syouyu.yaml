@@ -46,6 +46,7 @@ networkPolicy:
   database:
     sameNamespace: true
     podSelector:
-      app.kubernetes.io/name: dev-postgres
+      matchLabels:
+        app.kubernetes.io/name: dev-postgres
     peers: []
     externalCidrs: []

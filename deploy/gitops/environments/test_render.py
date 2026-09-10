@@ -1,8 +1,13 @@
 """Offline tests. Synthetic digests are fixtures only, never deployment pins."""
 import copy
+import json
 import os
+from pathlib import Path
 import shutil
+import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import render
 
@@ -35,6 +40,7 @@ def fixtures():
             "oidc_client_id": "heterocloud-dev-web", "owner_email": "owner@dev.example.invalid",
             "storage_class": "dev-storage", "pod_cidrs": ["172.20.0.0/16"],
             "service_cidrs": ["172.21.0.0/16"], "dns_cidrs": ["172.21.0.10/32"],
+            "kubernetes_api_backend_cidrs": ["10.251.0.1/32", "10.251.0.2/32", "10.251.0.3/32"],
             "auxiliary_images": {name: pin(name) for name in
                                  ("postgres", "redis", "coturn", "garage")}}
     site["auxiliary_images"]["garage"]["version"] = "v2.3.0"
@@ -134,6 +140,89 @@ class RendererTests(unittest.TestCase):
                 self.assertNotIn("volumeName", claim["spec"])
                 self.assertEqual(claim["spec"]["storageClassName"], "dev-storage")
 
+    def test_syouyu_selector_and_explicit_api_backends(self):
+        state, site = fixtures()
+        site["kubernetes_api_backend_cidrs"] += [site["service_cidrs"][0], "10.251.0.1/32"]
+        app = next(app for app in render.render(state, "dev", site)
+                   if app["metadata"]["name"] == "heterocloud-syouyu-dev")
+        policy = app["spec"]["source"]["helm"]["valuesObject"]["networkPolicy"]
+        self.assertEqual(policy["database"]["podSelector"],
+                         {"matchLabels": {"app.kubernetes.io/name": "dev-postgres"}})
+        self.assertEqual(policy["kubernetesApiCidrs"],
+                         ["172.21.0.0/16", "10.251.0.1/32", "10.251.0.2/32", "10.251.0.3/32"])
+        for bad in (None, [], "10.251.0.1/32", ["0.0.0.0/0"], ["::/0"], ["invalid"], [True], [1]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                render.render(state, "dev", {**site, "kubernetes_api_backend_cidrs": bad})
+        del site["kubernetes_api_backend_cidrs"]
+        with self.assertRaises(ValueError):
+            render.render(state, "dev", site)
+
+    def test_checkout_commit_and_cleanliness(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            def git(*args):
+                return subprocess.run(["git", "-C", str(repository), *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+            git("init", "--quiet")
+            chart = repository / "deploy/helm/test"
+            chart.mkdir(parents=True)
+            source = chart / "Chart.yaml"
+            source.write_text("apiVersion: v2\nname: test\nversion: 1.0.0\n")
+            (repository / ".gitignore").write_text("charts/\n")
+            git("add", ".")
+            git("-c", "user.name=Renderer Test", "-c", "user.email=renderer@example.invalid",
+                "commit", "--quiet", "-m", "fixture")
+            revision = git("rev-parse", "HEAD")
+            render.check_checkout(repository, revision, "deploy/helm/test")
+            with self.assertRaisesRegex(ValueError, "HEAD differs"):
+                render.check_checkout(repository, "a" * 40, "deploy/helm/test")
+            original = source.read_text()
+            source.write_text(original + "description: changed\n")
+            with self.assertRaisesRegex(ValueError, "must be clean"):
+                render.check_checkout(repository, revision, "deploy/helm/test")
+            git("add", ".")
+            with self.assertRaisesRegex(ValueError, "must be clean"):
+                render.check_checkout(repository, revision, "deploy/helm/test")
+            source.write_text(original)
+            git("add", ".")
+            extra = repository / "untracked"
+            extra.write_text("not selected")
+            with self.assertRaisesRegex(ValueError, "must be clean"):
+                render.check_checkout(repository, revision, "deploy/helm/test")
+            extra.unlink()
+            (chart / "charts").mkdir()
+            (chart / "charts/unpinned.tgz").write_bytes(b"not selected")
+            with self.assertRaisesRegex(ValueError, "ignored chart files"):
+                render.check_checkout(repository, revision, "deploy/helm/test")
+
+    def test_helm_checks_checkout_before_and_after_render(self):
+        state, site = fixtures()
+        app = render.render(state, "dev", site)[0]
+        helm_calls = []
+        real_run = subprocess.run
+        def run(args, **kwargs):
+            if args[0] == "helm":
+                helm_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return real_run(args, **kwargs)
+        with patch.object(Path, "is_dir", return_value=True), \
+             patch.object(render.subprocess, "run", side_effect=run):
+            with patch.object(render, "check_checkout", side_effect=ValueError("dirty")):
+                with self.assertRaisesRegex(ValueError, "dirty"):
+                    render.check_helm([app], state, "dev", site, render.ROOT.parent)
+                self.assertFalse(helm_calls)
+            with patch.object(render, "check_checkout", side_effect=[None, ValueError("changed")]) as check:
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    render.check_helm([app], state, "dev", site, render.ROOT.parent)
+                self.assertEqual(check.call_count, 2)
+                self.assertEqual(len(helm_calls), 1)
+            bad_app = copy.deepcopy(app)
+            bad_app["spec"]["source"]["targetRevision"] = "f" * 40
+            with patch.object(render, "check_checkout") as check:
+                with self.assertRaisesRegex(ValueError, "revision differs"):
+                    render.check_helm([bad_app], state, "dev", site, render.ROOT.parent)
+                check.assert_not_called()
+
     def test_project_has_only_dev_destinations(self):
         _, site = fixtures()
         project = render.dev_project(site)
@@ -144,7 +233,9 @@ class RendererTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("HELM_CHANNEL_TESTS") == "1" and shutil.which("helm"), "opt-in local Helm check")
     def test_local_helm_all_dev_charts(self):
-        state, site = fixtures()
+        _, site = fixtures()
+        # Use actual selections; supplied repositories must be clean exact checkouts.
+        state = json.loads((render.ROOT / "deploy/releases/channels.json").read_text())
 
         def inspect(app, documents):
             if app["metadata"]["name"] == "heterocloud-syouyu-dev":
@@ -154,6 +245,10 @@ class RendererTests(unittest.TestCase):
                     if container["name"] == "garage"]
                 self.assertEqual(len(garage_images), 1)
                 self.assertEqual(render.canonical_image(garage_images[0]), site["auxiliary_images"]["garage"]["image"])
+                policy = next(d for d in documents if d and d.get("kind") == "NetworkPolicy"
+                              and d["metadata"]["name"] == "heterocloud-syouyu-dev-api")
+                self.assertIn({"podSelector": {"matchLabels": {"app.kubernetes.io/name": "dev-postgres"}}},
+                              [peer for rule in policy["spec"]["egress"] for peer in rule.get("to", [])])
             if app["metadata"]["name"] != "heterocloud-dev":
                 return
             policies = [d for d in documents if d and d.get("kind") == "NetworkPolicy"]
@@ -166,7 +261,8 @@ class RendererTests(unittest.TestCase):
 
         apps = render.render(state, "dev", site)
         counts = render.check_helm(apps, state, "dev", site,
-                                   render.ROOT.parent, inspect_documents=inspect)
+                                   Path(os.environ.get("HELM_CHANNEL_REPOSITORY_ROOT", render.ROOT.parent)),
+                                   inspect_documents=inspect)
         self.assertEqual(len(counts), 4)
         print("Local Helm resource counts:", counts)
 

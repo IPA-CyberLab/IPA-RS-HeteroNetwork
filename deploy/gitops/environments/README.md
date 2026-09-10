@@ -84,12 +84,18 @@ Provide private operator JSON, not production values copied into a dev overlay:
 | `owner_email` | Dedicated dev owner's email |
 | `storage_class` | Fresh-storage class in the dedicated cluster |
 | `pod_cidrs`, `service_cidrs`, `dns_cidrs` | Nonempty dedicated-cluster CIDR lists, no catch-all ranges |
+| `kubernetes_api_backend_cidrs` | Required nonempty explicit dev API backend CIDRs, no catch-all ranges; use observed backend addresses, not inferred Service IPs |
 | `auxiliary_images` | Map of `{version, image}` with exact `repository@sha256:<digest>` |
 
 Dev HCloud database, provider, registry, owner ingress, and proxy trust ranges
 are explicitly derived from this site, not chart production CIDR defaults.
 Public OIDC HTTPS egress remains enabled. The chart's namespace-based DNS policy
 is retained. This is not a general cross-cluster firewall generator.
+Syouyu API egress merges the service CIDRs with `kubernetes_api_backend_cidrs`,
+normalizing and deduplicating exact CIDRs in stable order. Include the actual
+dev control-plane backend addresses used after Service DNAT and verify policy
+enforcement with the chosen CNI. Production rendering does not require this field.
+Syouyu's namespace-local database selector uses `matchLabels` for `dev-postgres`.
 
 Flow LiveKit is taken from `companions.livekit.image` in the selected Flow
 release, not a site-specific override. Its digest is preserved through promotion.
@@ -127,20 +133,39 @@ server-side apply, using the appropriate explicitly verified context for each
 bundle. Review the diff and cluster identity before any operator apply/sync.
 Do not enable pruning against a partial channel selection.
 
-`--helm-check` uses sibling **local working-tree charts**, including their local
-dependencies, with a 90-second bound per chart; it does not fetch or attest the
-catalog's remote commits. For release validation use clean checkouts at the exact
-artifact commits under `--repository-root`, independently verify each HEAD and
-chart/dependency provenance, and repeat the check. No chart dependency downloads
-or Kubernetes API calls are performed by the renderer.
+`--helm-check` requires local Git checkouts at the **exact selected artifact
+commits** under `--repository-root`. It checks HEAD and repository cleanliness
+before and after each bounded Helm invocation. Tracked/staged changes, untracked
+files, dirty submodules, and ignored files inside the chart (including downloaded
+`charts/` dependencies) cause refusal. Supply separate clean checkouts; the
+renderer never checks out commits, cleans repositories, downloads dependencies,
+or calls Kubernetes. A chart requiring absent dependencies cannot pass until
+those dependencies are supplied through a reviewed commit-bound packaging path.
+Git checks have a 30-second bound and Helm a 90-second bound per chart. These
+checks assume a trusted local checkout with no concurrent writers; they are not
+an adversarial filesystem snapshot or remote provenance attestation.
 
 ```sh
-HELM_CHANNEL_TESTS=1 python -m unittest discover \
+HELM_CHANNEL_TESTS=1 HELM_CHANNEL_REPOSITORY_ROOT=/private/clean-checkouts \
+  python -m unittest discover \
   -s deploy/gitops/environments -p test_render.py -v
 ```
 
-Tests use clearly synthetic artifact digests only in memory, check replay-chain
-rejection, production setting preservation, fresh dev storage, explicit CIDR
-overrides, and actual local Helm output for all four services, including exact
-Garage digest preservation. These local render tests do not attest remote chart
-commits or runtime image availability.
+Default focused tests use synthetic digests and disposable Git repositories to
+check replay rejection, production preservation, fresh storage, selector shape,
+explicit API CIDRs, and wrong-commit/dirty/staged/untracked/ignored-file refusal.
+The opt-in Helm test reads the actual tracked channel selections and requires
+matching clean checkouts; auxiliary image values remain synthetic test fixtures,
+not deployment pins. It checks rendered selectors and image preservation, not
+runtime image availability or Kubernetes admission.
+
+## Remaining Deployment Blockers
+
+These renderer fixes do not make the current dev configuration deployment-ready.
+The selected HCloud chart hardcodes insecure cookies for the enabled HTTPS owner
+console: explicitly disable that console for initial dev deployment or select a
+later reviewed release supporting secure cookies. Flow's host-network Coturn
+default port 3478 overlaps the native STUN listener on dev guest 1; resolve its
+dev port and media/NAT configuration before deployment. Neither setting is
+silently changed here. Fresh secrets, dev IdP, DNS/TLS/edge resources, verified
+cluster destinations, and runtime/network prerequisites above remain required.

@@ -3,6 +3,7 @@
 import argparse
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
 import string
@@ -119,9 +120,10 @@ def validate_site(site, channel):
     require(site.get("oidc_client_id") == "heterocloud-dev-web", "dev must not reuse the production OIDC client")
     require(isinstance(site.get("owner_email"), str) and "@" in site["owner_email"], "dev owner email is required")
     require(re.fullmatch(r"[a-z0-9][a-z0-9.-]*", site.get("storage_class", "")), "dev storage class is required")
-    for field in ("pod_cidrs", "service_cidrs", "dns_cidrs"):
+    for field in ("pod_cidrs", "service_cidrs", "dns_cidrs", "kubernetes_api_backend_cidrs"):
         require(isinstance(site.get(field), list) and site[field], "dev network ranges are required")
         for value in site[field]:
+            require(isinstance(value, str), "dev network ranges must be CIDR strings")
             require(ipaddress.ip_network(value).prefixlen > 0, "dev network ranges must not be catch-all routes")
 
 
@@ -146,7 +148,9 @@ def dev_values(app, site):
         values["networkPolicy"] = {"dnsCidrs": site["dns_cidrs"]}
     elif app == "heterocloud-syouyu":
         values["networkPolicy"]["s3IngressCidrs"] = site["pod_cidrs"]
-        values["networkPolicy"]["kubernetesApiCidrs"] = site["service_cidrs"]
+        values["networkPolicy"]["kubernetesApiCidrs"] = list(dict.fromkeys(
+            str(ipaddress.ip_network(cidr))
+            for cidr in site["service_cidrs"] + site["kubernetes_api_backend_cidrs"]))
     return values
 
 
@@ -259,8 +263,26 @@ def dev_project(site):
         }}
 
 
+def check_checkout(repository, revision, chart_path):
+    """Require an unchanged checkout at the selected commit without writing Git state."""
+    def git(*arguments):
+        result = subprocess.run(["git", "-C", str(repository), *arguments],
+                                capture_output=True, text=True, timeout=30,
+                                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+        require(result.returncode == 0, "Cannot verify chart checkout")
+        return result.stdout
+
+    require(git("rev-parse", "HEAD").strip() == revision,
+            "Chart checkout HEAD differs from selected immutable commit")
+    require(not git("status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"),
+            "Chart checkout must be clean, including untracked files and submodules")
+    # Helm reads ignored files too (notably downloaded charts/ dependencies).
+    require(not git("ls-files", "--others", "--ignored", "--exclude-standard", "--", chart_path),
+            "Chart checkout contains ignored chart files not bound to the selected commit")
+
+
 def check_helm(applications, state, channel, site, repository_root, inspect_documents=None):
-    """Validate local chart working trees, not remote catalog commit contents."""
+    """Check clean local checkouts at the exact selected immutable chart commits."""
     releases = selected(state, channel)
     allowed = {value["image"] for value in releases.values()}
     allowed.update(companion["image"] for value in releases.values()
@@ -272,6 +294,11 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
         repository = repository_root / source["repoURL"].rsplit("/", 1)[1].removesuffix(".git")
         chart = repository / source["path"]
         require(chart.is_dir(), "local chart checkout is required for Helm validation")
+        component = next(name for name, (app_name, _) in COMPONENTS.items()
+                         if source["path"] == "deploy/helm/" + app_name)
+        require(source["targetRevision"] == releases[component]["commit"],
+                "Application chart revision differs from selected artifact")
+        check_checkout(repository, source["targetRevision"], source["path"])
         helm = source["helm"]
         with tempfile.TemporaryDirectory(prefix="hetero-channel-helm-") as temporary:
             args = ["helm", "template", helm["releaseName"], str(chart), "--namespace", app["spec"]["destination"]["namespace"], "--include-crds"]
@@ -284,6 +311,7 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
             for parameter in helm.get("parameters", []):
                 args.extend(["--set-string", parameter["name"] + "=" + parameter["value"]])
             result = subprocess.run(args, check=False, capture_output=True, text=True, timeout=90)
+            check_checkout(repository, source["targetRevision"], source["path"])
             require(result.returncode == 0, f"Helm render failed for {app['metadata']['name']}: {result.stderr[-2000:]}")
             documents = list(yaml.safe_load_all(result.stdout))
             if inspect_documents:
@@ -326,7 +354,7 @@ def main():
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--infrastructure-output", type=Path)
-    parser.add_argument("--helm-check", action="store_true", help="validate local chart working trees, not remote commit contents")
+    parser.add_argument("--helm-check", action="store_true", help="require clean local checkouts at selected immutable chart commits")
     parser.add_argument("--repository-root", type=Path, default=ROOT.parent)
     args = parser.parse_args()
     state, site = read(args.channels), read(args.site)
