@@ -1022,6 +1022,33 @@ impl Drop for OverlayShortcutGenerationUpdate<'_> {
     }
 }
 
+pub struct WireGuardEndpointUpdateGuard<'a> {
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+    revision: Arc<AtomicU64>,
+}
+
+fn advance_transport_revision(revision: &AtomicU64, delta: u64) {
+    let _ = revision.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_add(delta))
+    });
+}
+
+impl<'a> WireGuardEndpointUpdateGuard<'a> {
+    fn new(guard: tokio::sync::MutexGuard<'a, ()>, revision: Arc<AtomicU64>) -> Self {
+        advance_transport_revision(&revision, 1);
+        Self {
+            _guard: guard,
+            revision,
+        }
+    }
+}
+
+impl Drop for WireGuardEndpointUpdateGuard<'_> {
+    fn drop(&mut self) {
+        advance_transport_revision(&self.revision, 1);
+    }
+}
+
 #[derive(Debug)]
 pub struct AgentRuntime {
     state: RwLock<AgentNodeState>,
@@ -1041,6 +1068,8 @@ pub struct AgentRuntime {
     heartbeat_report_notify: Arc<tokio::sync::Notify>,
     signal_path_notify: Arc<tokio::sync::Notify>,
     wireguard_endpoint_update: tokio::sync::Mutex<()>,
+    wireguard_endpoint_revision: Arc<AtomicU64>,
+    peer_transport_revisions: tokio::sync::RwLock<BTreeMap<NodeId, Arc<AtomicU64>>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
     direct_path_probe_retry_after: tokio::sync::RwLock<BTreeMap<NodeId, DateTime<Utc>>>,
@@ -1052,6 +1081,8 @@ pub struct AgentRuntime {
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
     overlay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
+    overlay_forwarder_stats:
+        tokio::sync::RwLock<BTreeMap<NodeId, overlay_transit::OverlayWireGuardPeerForwarderStats>>,
     userspace_wireguard_process: tokio::sync::RwLock<Option<AgentManagedProcessStatus>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
     internal_packet_flow_udp_ports: tokio::sync::RwLock<BTreeSet<u16>>,
@@ -1827,6 +1858,8 @@ impl AgentRuntime {
             heartbeat_report_notify: Arc::new(tokio::sync::Notify::new()),
             signal_path_notify: Arc::new(tokio::sync::Notify::new()),
             wireguard_endpoint_update: tokio::sync::Mutex::new(()),
+            wireguard_endpoint_revision: Arc::new(AtomicU64::new(0)),
+            peer_transport_revisions: tokio::sync::RwLock::new(BTreeMap::new()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
             direct_path_probe_retry_after: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -1838,6 +1871,7 @@ impl AgentRuntime {
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
             overlay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
+            overlay_forwarder_stats: tokio::sync::RwLock::new(BTreeMap::new()),
             userspace_wireguard_process: tokio::sync::RwLock::new(None),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
             internal_packet_flow_udp_ports: tokio::sync::RwLock::new(BTreeSet::new()),
@@ -2695,8 +2729,44 @@ impl AgentRuntime {
             .cloned()
     }
 
-    pub async fn wireguard_endpoint_update_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.wireguard_endpoint_update.lock().await
+    pub async fn wireguard_endpoint_update_guard(&self) -> WireGuardEndpointUpdateGuard<'_> {
+        let guard = self.wireguard_endpoint_update.lock().await;
+        WireGuardEndpointUpdateGuard::new(guard, self.wireguard_endpoint_revision.clone())
+    }
+
+    /// Optimistic proof token; never waits behind endpoint application/restoration.
+    pub fn wireguard_endpoint_revision(&self) -> Option<u64> {
+        let revision = self.wireguard_endpoint_revision.load(Ordering::Acquire);
+        (revision & 1 == 0).then_some(revision)
+    }
+
+    pub async fn wireguard_peer_endpoint_update_guard(
+        &self,
+        peer: &NodeId,
+    ) -> WireGuardEndpointUpdateGuard<'_> {
+        let guard = self.wireguard_endpoint_update.lock().await;
+        let revision = self.peer_transport_revision_counter(peer).await;
+        WireGuardEndpointUpdateGuard::new(guard, revision)
+    }
+
+    async fn peer_transport_revision_counter(&self, peer: &NodeId) -> Arc<AtomicU64> {
+        let mut revisions = self.peer_transport_revisions.write().await;
+        revisions.entry(peer.clone()).or_default().clone()
+    }
+
+    async fn bump_peer_transport_revision(&self, peer: &NodeId) {
+        let revision = self.peer_transport_revision_counter(peer).await;
+        advance_transport_revision(&revision, 2);
+    }
+
+    pub fn peer_transport_revision(&self, peer: &NodeId) -> Option<(u64, u64)> {
+        let global = self.wireguard_endpoint_revision()?;
+        let revisions = self.peer_transport_revisions.try_read().ok()?;
+        let revision = revisions
+            .get(peer)
+            .map(|revision| revision.load(Ordering::Acquire))
+            .unwrap_or_default();
+        (revision & 1 == 0).then_some((global, revision))
     }
 
     pub fn peer_map_sync_notifier(&self) -> Arc<tokio::sync::Notify> {
@@ -3003,7 +3073,9 @@ impl AgentRuntime {
     }
 
     pub async fn upsert_path_state(&self, record: PathRecord) -> Result<(), AgentError> {
-        let _endpoint_update_guard = self.wireguard_endpoint_update_guard().await;
+        let _endpoint_update_guard = self
+            .wireguard_peer_endpoint_update_guard(&record.key.remote)
+            .await;
         let local_node = self.state().node_id;
         validate_path_record(&record, &local_node)?;
         let remote = record.key.remote.clone();
@@ -3134,14 +3206,16 @@ impl AgentRuntime {
             .relay_forwarder_endpoints
             .write()
             .await
-            .insert(peer, endpoint)
+            .insert(peer.clone(), endpoint)
             != Some(endpoint);
         if endpoint_changed {
+            self.bump_peer_transport_revision(&peer).await;
             self.request_peer_map_sync();
         }
     }
 
     pub async fn register_relay_forwarder_metrics(&self, metrics: Arc<RelayForwarderStats>) {
+        self.bump_peer_transport_revision(metrics.peer()).await;
         self.relay_forwarder_metrics
             .write()
             .await
@@ -3168,6 +3242,7 @@ impl AgentRuntime {
     }
 
     pub async fn remove_relay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
+        self.bump_peer_transport_revision(peer).await;
         self.relay_forwarder_metrics.write().await.remove(peer);
         let removed = self.relay_forwarder_endpoints.write().await.remove(peer);
         if removed.is_some() {
@@ -3185,9 +3260,10 @@ impl AgentRuntime {
             .overlay_forwarder_endpoints
             .write()
             .await
-            .insert(peer, endpoint)
+            .insert(peer.clone(), endpoint)
             != Some(endpoint);
         if endpoint_changed {
+            self.bump_peer_transport_revision(&peer).await;
             self.request_peer_map_sync();
         }
     }
@@ -3201,6 +3277,8 @@ impl AgentRuntime {
     }
 
     pub async fn remove_overlay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
+        self.bump_peer_transport_revision(peer).await;
+        self.overlay_forwarder_stats.write().await.remove(peer);
         let removed = self.overlay_forwarder_endpoints.write().await.remove(peer);
         if removed.is_some() {
             self.request_peer_map_sync();
@@ -3210,6 +3288,29 @@ impl AgentRuntime {
 
     pub async fn overlay_forwarder_endpoints(&self) -> BTreeMap<NodeId, SocketAddr> {
         self.overlay_forwarder_endpoints.read().await.clone()
+    }
+
+    pub async fn register_overlay_forwarder_stats(
+        &self,
+        peer: NodeId,
+        stats: overlay_transit::OverlayWireGuardPeerForwarderStats,
+    ) {
+        self.bump_peer_transport_revision(&peer).await;
+        self.overlay_forwarder_stats
+            .write()
+            .await
+            .insert(peer, stats);
+    }
+
+    pub async fn overlay_forwarder_stats_for_peer(
+        &self,
+        peer: &NodeId,
+    ) -> Option<overlay_transit::OverlayWireGuardPeerForwarderStatsSnapshot> {
+        self.overlay_forwarder_stats
+            .read()
+            .await
+            .get(peer)
+            .map(|stats| stats.snapshot())
     }
 
     pub async fn relay_session_needs_renewal(
@@ -7846,7 +7947,11 @@ where
 
         for peer in desired_active_peers {
             let _endpoint_update_guard = if let Some(runtime) = self.lazy_runtime.as_ref() {
-                Some(runtime.wireguard_endpoint_update_guard().await)
+                Some(
+                    runtime
+                        .wireguard_peer_endpoint_update_guard(&peer.node_id)
+                        .await,
+                )
             } else {
                 None
             };

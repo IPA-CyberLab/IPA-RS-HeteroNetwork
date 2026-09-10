@@ -238,6 +238,7 @@ const POLL_JITTER_MIN_BASIS_POINTS: u64 = 8_000;
 const POLL_JITTER_MAX_BASIS_POINTS: u64 = 12_000;
 const MAX_INITIAL_POLL_SPREAD: Duration = Duration::from_secs(5);
 const DIRECT_PATH_DATA_PLANE_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DIRECT_PATH_PROOF_DEADLINE: Duration = Duration::from_secs(1);
 const DIRECT_PATH_ENDPOINT_APPLY_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
@@ -13347,6 +13348,9 @@ impl ActiveBoundedOverlayTransit {
             path_rx,
         )
         .context("failed to initialize bounded overlay peer proxy")?;
+        runtime
+            .register_overlay_forwarder_stats(peer.clone(), proxy.stats())
+            .await;
         let task = tokio::spawn(proxy.serve(socket, delivery_rx, shutdown_rx));
         self.delivery_routes
             .write()
@@ -13377,13 +13381,13 @@ impl ActiveBoundedOverlayTransit {
 
     async fn remove_peer(&mut self, runtime: &AgentRuntime, peer: &NodeId) {
         self.delivery_routes.write().await.remove(peer);
-        runtime.remove_overlay_forwarder_endpoint(peer).await;
-        let Some(task) = self.peer_tasks.remove(peer) else {
-            return;
-        };
-        if let Err(error) = task.stop().await {
-            tracing::warn!(%error, %peer, "failed to stop bounded overlay peer proxy");
+        if let Some(task) = self.peer_tasks.remove(peer) {
+            if let Err(error) = task.stop().await {
+                tracing::warn!(%error, %peer, "failed to stop bounded overlay peer proxy");
+            }
         }
+        // Keep activity visible until the proxy can no longer inject into WG.
+        runtime.remove_overlay_forwarder_endpoint(peer).await;
     }
 
     async fn stop(&mut self, runtime: &AgentRuntime) {
@@ -15896,6 +15900,7 @@ struct DirectPathVerificationEvidence<'a> {
     relay_forwarder_metrics: Option<&'a AgentRelayForwarderMetrics>,
     data_plane_probe: Option<&'a UdpPeerProbe>,
     peer_vpn_ip: Option<VpnIp>,
+    telemetry_source: Option<&'a dyn WireGuardPeerTelemetrySource>,
 }
 
 #[cfg(test)]
@@ -15919,6 +15924,7 @@ async fn direct_path_verification_decision(
             relay_forwarder_metrics,
             data_plane_probe: None,
             peer_vpn_ip: None,
+            telemetry_source: None,
         },
     )
     .await
@@ -16019,11 +16025,9 @@ async fn direct_path_verification_decision_with_data_plane_probe(
                     if direct_path_overlay_probe_confirmed(
                         runtime,
                         &direct.key.remote,
-                        &pending,
-                        telemetry,
-                        evidence.relay_forwarder_metrics,
-                        evidence.data_plane_probe,
-                        evidence.peer_vpn_ip,
+                        candidate,
+                        peer_public_key,
+                        evidence,
                     )
                     .await
                     {
@@ -16071,25 +16075,52 @@ async fn direct_path_verification_decision_with_data_plane_probe(
     });
     if current_direct_matches
         && direct_path_telemetry_is_recent(candidate, telemetry, now, config.handshake_max_age)
+        && (!overlay_probe_required
+            || direct_path_overlay_probe_confirmed(
+                runtime,
+                &direct.key.remote,
+                candidate,
+                peer_public_key,
+                evidence,
+            )
+            .await)
     {
         runtime
             .clear_direct_path_probe_retry(&direct.key.remote)
             .await;
         return Ok(DirectPathVerificationDecision::Confirmed(
-            "recent_wireguard_handshake",
+            if overlay_probe_required {
+                "wireguard_overlay_probe"
+            } else {
+                "recent_wireguard_handshake"
+            },
         ));
     }
     if let Some(current) = current_path
         .as_ref()
-        .filter(|current| current.selected_state.is_direct())
+        .filter(|current| !current_direct_matches && current.selected_state.is_direct())
         .and_then(|current| current.selected_candidate.as_ref())
     {
-        if direct_path_telemetry_is_recent(current, telemetry, now, config.handshake_max_age) {
+        if direct_path_telemetry_is_recent(current, telemetry, now, config.handshake_max_age)
+            && (!overlay_probe_required
+                || direct_path_overlay_probe_confirmed(
+                    runtime,
+                    &direct.key.remote,
+                    current,
+                    peer_public_key,
+                    evidence,
+                )
+                .await)
+        {
             runtime
                 .clear_direct_path_probe_retry(&direct.key.remote)
                 .await;
             return Ok(DirectPathVerificationDecision::RetainCurrent(
-                "recent_wireguard_handshake",
+                if overlay_probe_required {
+                    "wireguard_overlay_probe"
+                } else {
+                    "recent_wireguard_handshake"
+                },
             ));
         }
     }
@@ -16129,22 +16160,55 @@ async fn direct_path_verification_decision_with_data_plane_probe(
 async fn direct_path_overlay_probe_confirmed(
     runtime: &AgentRuntime,
     peer: &NodeId,
-    pending: &PendingDirectPathProbe,
-    telemetry: &WireGuardPeerTelemetry,
-    relay_forwarder_metrics: Option<&AgentRelayForwarderMetrics>,
-    data_plane_probe: Option<&UdpPeerProbe>,
-    peer_vpn_ip: Option<VpnIp>,
+    candidate: &EndpointCandidate,
+    peer_public_key: &str,
+    evidence: DirectPathVerificationEvidence<'_>,
 ) -> bool {
-    let Some(data_plane_probe) = data_plane_probe else {
+    tokio::time::timeout(
+        DIRECT_PATH_PROOF_DEADLINE,
+        direct_path_overlay_probe_evidence(runtime, peer, candidate, peer_public_key, evidence),
+    )
+    .await
+    .unwrap_or(false)
+}
+
+// This is bounded, sampled transport evidence, not packet-level attestation:
+// kernel endpoint roaming between snapshots is not observable here. Reject any
+// observed application revision or relay/overlay activity, including ABA roaming
+// through a registered forwarder. No global lock is held across I/O.
+async fn direct_path_overlay_probe_evidence(
+    runtime: &AgentRuntime,
+    peer: &NodeId,
+    candidate: &EndpointCandidate,
+    peer_public_key: &str,
+    evidence: DirectPathVerificationEvidence<'_>,
+) -> bool {
+    let Some(data_plane_probe) = evidence.data_plane_probe else {
         return false;
     };
-    let Some(peer_vpn_ip) = peer_vpn_ip else {
+    let Some(peer_vpn_ip) = evidence.peer_vpn_ip else {
         return false;
     };
-    let relay_metrics_before = runtime
-        .relay_forwarder_metrics_for_peer(peer)
-        .await
-        .or_else(|| relay_forwarder_metrics.cloned());
+    let Some(source) = evidence.telemetry_source else {
+        return false;
+    };
+    let Some(revision) = runtime.peer_transport_revision(peer) else {
+        return false;
+    };
+    let overlay_before = runtime.overlay_forwarder_stats_for_peer(peer).await;
+    if runtime.overlay_forwarder_endpoint(peer).await.is_some() && overlay_before.is_none() {
+        return false;
+    }
+    let Ok(before) = source.snapshot().await else {
+        return false;
+    };
+    let Some(before) = before.get(peer_public_key) else {
+        return false;
+    };
+    if !direct_probe_endpoint_is_transport_scoped(runtime, candidate, before).await {
+        return false;
+    };
+    let relay_metrics_before = runtime.relay_forwarder_metrics_for_peer(peer).await;
     let wake_passive_peer = runtime
         .recent_local_peer_activity(peer, chrono::Utc::now())
         .await
@@ -16157,7 +16221,22 @@ async fn direct_path_overlay_probe_confirmed(
     match measurement {
         Ok(measurement) => {
             let successful_samples = measurement.successful_sample_count();
+            let Ok(after) = source.snapshot().await else {
+                return false;
+            };
+            let Some(after) = after.get(peer_public_key) else {
+                return false;
+            };
+            if !direct_probe_endpoint_is_transport_scoped(runtime, candidate, after).await {
+                return false;
+            }
             let relay_metrics_after = runtime.relay_forwarder_metrics_for_peer(peer).await;
+            let overlay_after = runtime.overlay_forwarder_stats_for_peer(peer).await;
+            if !direct_probe_overlay_is_quiet(overlay_before, overlay_after)
+                || runtime.peer_transport_revision(peer) != Some(revision)
+            {
+                return false;
+            }
             let (relay_inbound_delta, relay_outbound_delta) =
                 match (relay_metrics_before.as_ref(), relay_metrics_after.as_ref()) {
                     (Some(before), Some(after)) => (
@@ -16172,13 +16251,20 @@ async fn direct_path_overlay_probe_confirmed(
                                 .saturating_sub(before.outbound_payload_bytes),
                         ),
                     ),
-                    _ => (None, None),
+                    (None, None) => (None, None),
+                    _ => return false,
                 };
+            let relay_counters_reset = match (&relay_metrics_before, &relay_metrics_after) {
+                (Some(before), Some(after)) => {
+                    after.inbound_payload_bytes < before.inbound_payload_bytes
+                        || after.outbound_payload_bytes < before.outbound_payload_bytes
+                }
+                _ => false,
+            };
             let relay_payload_increased = relay_inbound_delta.is_some_and(|delta| delta > 0)
                 || relay_outbound_delta.is_some_and(|delta| delta > 0);
-            let wireguard_rx_delta = pending
-                .baseline_rx_bytes
-                .map(|baseline| telemetry.rx_bytes.saturating_sub(baseline));
+            let wireguard_rx_delta = after.rx_bytes.saturating_sub(before.rx_bytes);
+            let wireguard_tx_delta = after.tx_bytes.saturating_sub(before.tx_bytes);
             tracing::debug!(
                 peer = %peer,
                 successful_samples,
@@ -16189,7 +16275,11 @@ async fn direct_path_overlay_probe_confirmed(
                 relay_outbound_delta = ?relay_outbound_delta,
                 "completed direct WireGuard overlay probe"
             );
-            successful_samples > 0 && !relay_payload_increased
+            successful_samples > 0
+                && wireguard_rx_delta > 0
+                && wireguard_tx_delta > 0
+                && !relay_payload_increased
+                && !relay_counters_reset
         }
         Err(error) => {
             tracing::debug!(
@@ -16200,6 +16290,42 @@ async fn direct_path_overlay_probe_confirmed(
             false
         }
     }
+}
+
+fn direct_probe_overlay_is_quiet(
+    before: Option<ipars_agent::overlay_transit::OverlayWireGuardPeerForwarderStatsSnapshot>,
+    after: Option<ipars_agent::overlay_transit::OverlayWireGuardPeerForwarderStatsSnapshot>,
+) -> bool {
+    // Compare the complete snapshot: even failed/queued forwarding attempts or
+    // path updates make this interval unsuitable for direct-path evidence.
+    before == after
+}
+
+async fn direct_probe_endpoint_is_transport_scoped(
+    runtime: &AgentRuntime,
+    candidate: &EndpointCandidate,
+    telemetry: &WireGuardPeerTelemetry,
+) -> bool {
+    if !direct_path_endpoint_matches(candidate, telemetry) {
+        return false;
+    }
+    let Some(endpoint) = telemetry
+        .endpoint
+        .as_ref()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+    else {
+        return false;
+    };
+    !runtime
+        .relay_forwarder_endpoints()
+        .await
+        .values()
+        .any(|value| *value == endpoint)
+        && !runtime
+            .overlay_forwarder_endpoints()
+            .await
+            .values()
+            .any(|value| *value == endpoint)
 }
 
 async fn wait_for_direct_wireguard_endpoint(
@@ -16376,7 +16502,7 @@ async fn restore_relay_after_direct_path_probe_timeout(
     now: chrono::DateTime<chrono::Utc>,
     retry_delay: Duration,
 ) -> Result<(), AgentError> {
-    let _endpoint_update_guard = runtime.wireguard_endpoint_update_guard().await;
+    let _endpoint_update_guard = runtime.wireguard_peer_endpoint_update_guard(peer).await;
     set_direct_path_relay_forwarding(runtime, supervisor, peer, true).await;
     defer_direct_path_probe_retry(runtime, peer, now, retry_delay).await?;
     if runtime
@@ -16707,6 +16833,7 @@ async fn negotiate_signal_paths(
                     relay_forwarder_metrics: relay_forwarder_metrics.as_ref(),
                     data_plane_probe: options.direct_path_data_plane_probe.as_ref(),
                     peer_vpn_ip: Some(peer.vpn_ip),
+                    telemetry_source: options.wireguard_peer_telemetry_source.as_deref(),
                 },
             )
             .await?;
@@ -16820,7 +16947,13 @@ async fn negotiate_signal_paths(
                         if let Some(data_plane_probe) =
                             options.direct_path_data_plane_probe.as_ref()
                         {
-                            let measurement = data_plane_probe.measure(peer.vpn_ip).await;
+                            let measurement = tokio::time::timeout(
+                                DIRECT_PATH_PROOF_DEADLINE,
+                                data_plane_probe.measure(peer.vpn_ip),
+                            )
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
                             tracing::debug!(
                                 peer = %verification_record.key.remote,
                                 successful_samples = measurement
@@ -17386,7 +17519,7 @@ async fn remove_relay_session_for_peer(
     selected_state: Option<PathState>,
     message: &'static str,
 ) {
-    let _endpoint_update_guard = runtime.wireguard_endpoint_update_guard().await;
+    let _endpoint_update_guard = runtime.wireguard_peer_endpoint_update_guard(peer).await;
     let removed = runtime.remove_relay_session(peer).await;
     if let Some(session) = removed {
         if let Some(supervisor) = relay_forwarder_supervisor {
@@ -42085,7 +42218,7 @@ exec sleep 60
     }
 
     #[tokio::test]
-    async fn direct_path_verification_requires_and_accepts_overlay_probe_response(
+    async fn direct_path_verification_requires_transport_scoped_overlay_probe_response(
     ) -> anyhow::Result<()> {
         let now = Utc
             .timestamp_opt(1_710_000_000, 0)
@@ -42162,12 +42295,207 @@ exec sleep 60
                 tx_bytes: 200,
             },
         )]);
+        struct ProbeTelemetry {
+            snapshots: std::sync::Mutex<
+                std::collections::VecDeque<BTreeMap<String, WireGuardPeerTelemetry>>,
+            >,
+            activity: Option<(
+                Arc<AgentRuntime>,
+                NodeId,
+                ipars_agent::overlay_transit::OverlayWireGuardPeerForwarderStats,
+            )>,
+        }
+        #[async_trait]
+        impl WireGuardPeerTelemetrySource for ProbeTelemetry {
+            async fn snapshot(
+                &self,
+            ) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+                let (snapshot, last) = {
+                    let mut snapshots = self.snapshots.lock().map_err(|error| {
+                        AgentError::WireGuard(format!("probe fixture lock poisoned: {error}"))
+                    })?;
+                    let snapshot = snapshots.pop_front().unwrap_or_default();
+                    (snapshot, snapshots.is_empty())
+                };
+                if last {
+                    if let Some((_, _, stats)) = &self.activity {
+                        stats.record_wireguard_injection_attempt();
+                    }
+                }
+                Ok(snapshot)
+            }
+        }
+        // The responder really answers, but only synthetic telemetry ties that
+        // response to WireGuard. Loopback/another overlay must not prove direct.
+        assert_eq!(
+            probe
+                .measure(VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+                .await?
+                .successful_sample_count(),
+            1
+        );
+        let pending = runtime
+            .pending_direct_path_probe(&peer_node_id)
+            .await
+            .context("pending fixture probe")?;
+        for (label, endpoint, rx, tx, accepted) in [
+            ("other-overlay", candidate.addr.to_string(), 100, 200, false),
+            ("outbound-only", candidate.addr.to_string(), 100, 300, false),
+            ("inbound-only", candidate.addr.to_string(), 200, 200, false),
+            (
+                "roamed-relay",
+                "127.0.0.9:40000".to_string(),
+                200,
+                300,
+                false,
+            ),
+            ("counter-reset", candidate.addr.to_string(), 1, 2, false),
+            (
+                "target-overlay",
+                candidate.addr.to_string(),
+                200,
+                300,
+                false,
+            ),
+            (
+                "unrelated-overlay",
+                candidate.addr.to_string(),
+                200,
+                300,
+                true,
+            ),
+            ("direct", candidate.addr.to_string(), 200, 300, true),
+        ] {
+            runtime
+                .upsert_pending_direct_path_probe(pending.clone())
+                .await?;
+            let mut after = telemetry.clone();
+            let sample = after
+                .get_mut("wg-peer-a")
+                .context("probe fixture peer telemetry")?;
+            sample.endpoint = Some(endpoint);
+            sample.rx_bytes = rx;
+            sample.tx_bytes = tx;
+            let activity = match label {
+                "target-overlay" => Some(peer_node_id.clone()),
+                "unrelated-overlay" => Some(NodeId::from_string("unrelated-busy-peer")),
+                _ => None,
+            };
+            let mut activity_state = None;
+            if let Some(peer) = activity.as_ref() {
+                let stats =
+                    ipars_agent::overlay_transit::OverlayWireGuardPeerForwarderStats::default();
+                runtime
+                    .register_overlay_forwarder_stats(peer.clone(), stats.clone())
+                    .await;
+                activity_state = Some((runtime.clone(), peer.clone(), stats));
+            }
+            let source = ProbeTelemetry {
+                snapshots: std::sync::Mutex::new([telemetry.clone(), after.clone()].into()),
+                activity: activity_state,
+            };
+            let unrelated_peer = NodeId::from_string("unrelated-busy-peer");
+            let busy_update = if label == "unrelated-overlay" {
+                Some(
+                    runtime
+                        .wireguard_peer_endpoint_update_guard(&unrelated_peer)
+                        .await,
+                )
+            } else {
+                None
+            };
+            let decision = direct_path_verification_decision_with_data_plane_probe(
+                &runtime,
+                &direct,
+                Some(&telemetry),
+                "wg-peer-a",
+                now + ChronoDuration::seconds(1),
+                DirectPathVerificationConfig {
+                    required: true,
+                    probe_timeout: Duration::from_secs(120),
+                    handshake_max_age: Duration::from_secs(180),
+                },
+                DirectPathVerificationEvidence {
+                    relay_forwarder_metrics: None,
+                    data_plane_probe: Some(&probe),
+                    peer_vpn_ip: Some(VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+                    telemetry_source: Some(&source),
+                },
+            )
+            .await?;
+
+            drop(busy_update);
+
+            assert_eq!(
+                decision,
+                if accepted {
+                    DirectPathVerificationDecision::Confirmed("wireguard_overlay_probe")
+                } else {
+                    DirectPathVerificationDecision::Pending
+                },
+                "{label}"
+            );
+            if label == "unrelated-overlay" {
+                runtime.upsert_path_state(direct.clone()).await?;
+                let mut recent = telemetry.clone();
+                recent
+                    .get_mut("wg-peer-a")
+                    .context("recent fixture")?
+                    .latest_handshake_at = Some(now);
+                *source
+                    .snapshots
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("fixture lock: {error}"))? =
+                    [telemetry.clone(), after].into();
+                let _busy_update = runtime
+                    .wireguard_peer_endpoint_update_guard(&unrelated_peer)
+                    .await;
+                assert_eq!(
+                    direct_path_verification_decision_with_data_plane_probe(
+                        &runtime,
+                        &direct,
+                        Some(&recent),
+                        "wg-peer-a",
+                        now,
+                        DirectPathVerificationConfig {
+                            required: true,
+                            probe_timeout: Duration::from_secs(120),
+                            handshake_max_age: Duration::from_secs(180)
+                        },
+                        DirectPathVerificationEvidence {
+                            relay_forwarder_metrics: None,
+                            data_plane_probe: Some(&probe),
+                            peer_vpn_ip: Some(VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+                            telemetry_source: Some(&source)
+                        },
+                    )
+                    .await?,
+                    DirectPathVerificationDecision::Confirmed("wireguard_overlay_probe"),
+                    "unrelated busy overlay must not invalidate an established direct path"
+                );
+            }
+            if let Some(peer) = activity {
+                runtime.remove_overlay_forwarder_endpoint(&peer).await;
+            }
+        }
+        responder_task.abort();
+        let _ = responder_task.await;
+        assert!(runtime
+            .pending_direct_path_probe(&peer_node_id)
+            .await
+            .is_none());
+        runtime.upsert_path_state(direct.clone()).await?;
+        let mut recent_telemetry = telemetry;
+        recent_telemetry
+            .get_mut("wg-peer-a")
+            .context("recent probe fixture telemetry")?
+            .latest_handshake_at = Some(now);
         let decision = direct_path_verification_decision_with_data_plane_probe(
             &runtime,
             &direct,
-            Some(&telemetry),
+            Some(&recent_telemetry),
             "wg-peer-a",
-            now + ChronoDuration::seconds(1),
+            now,
             DirectPathVerificationConfig {
                 required: true,
                 probe_timeout: Duration::from_secs(120),
@@ -42177,19 +42505,128 @@ exec sleep 60
                 relay_forwarder_metrics: None,
                 data_plane_probe: Some(&probe),
                 peer_vpn_ip: Some(VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+                telemetry_source: Some(&EmptyWireGuardPeerTelemetrySource),
             },
         )
         .await?;
-
-        responder_task.abort();
-        assert_eq!(
-            decision,
-            DirectPathVerificationDecision::Confirmed("wireguard_overlay_probe")
+        assert!(
+            matches!(decision, DirectPathVerificationDecision::Start(_)),
+            "a recent handshake cannot replace missing transport evidence"
         );
-        assert!(runtime
-            .pending_direct_path_probe(&peer_node_id)
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_probe_rejects_same_address_forwarder_endpoints() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let mut endpoint = candidate.addr;
+        endpoint.set_port(endpoint.port() + 1);
+        let telemetry = WireGuardPeerTelemetry {
+            public_key_b64: "wg-peer-a".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            latest_handshake_at: Some(Utc::now()),
+            rx_bytes: 200,
+            tx_bytes: 300,
+        };
+        assert!(direct_path_endpoint_matches(&candidate, &telemetry));
+        runtime
+            .upsert_relay_forwarder_endpoint(NodeId::from_string("other-peer"), endpoint)
+            .await;
+        assert!(!direct_probe_endpoint_is_transport_scoped(&runtime, &candidate, &telemetry).await);
+        runtime
+            .remove_relay_forwarder_endpoint(&NodeId::from_string("other-peer"))
+            .await;
+        runtime
+            .upsert_overlay_forwarder_endpoint(NodeId::from_string("other-peer"), endpoint)
+            .await;
+        assert!(!direct_probe_endpoint_is_transport_scoped(&runtime, &candidate, &telemetry).await);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_probe_rejects_overlay_activity_even_when_endpoints_return_to_direct() {
+        use ipars_agent::overlay_transit::OverlayWireGuardPeerForwarderStatsSnapshot;
+        let before = Some(OverlayWireGuardPeerForwarderStatsSnapshot::default());
+        assert!(direct_probe_overlay_is_quiet(before, before));
+        // Endpoint snapshots and target WG counters cannot distinguish this
+        // interval from a direct exchange: the proxy injected then WG roamed back.
+        let after = Some(OverlayWireGuardPeerForwarderStatsSnapshot {
+            wireguard_injection_attempts: 1,
+            ..Default::default()
+        });
+        assert!(!direct_probe_overlay_is_quiet(before, after));
+        let after = Some(OverlayWireGuardPeerForwarderStatsSnapshot {
+            received_datagrams: 1,
+            ..Default::default()
+        });
+        assert!(!direct_probe_overlay_is_quiet(before, after));
+        assert!(!direct_probe_overlay_is_quiet(before, None));
+        assert!(!direct_probe_overlay_is_quiet(None, before));
+    }
+
+    #[tokio::test]
+    async fn direct_probe_deadline_does_not_lock_unrelated_endpoint_updates() -> anyhow::Result<()>
+    {
+        struct StalledTelemetry(Arc<tokio::sync::Notify>);
+        #[async_trait]
+        impl WireGuardPeerTelemetrySource for StalledTelemetry {
+            async fn snapshot(
+                &self,
+            ) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let source = StalledTelemetry(started.clone());
+        let probe = UdpPeerProbe::new(
+            VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None,
+            PeerProbeConfig::default(),
+        )?;
+        let proof_runtime = runtime.clone();
+        let proof = tokio::spawn(async move {
+            let peer = NodeId::from_string("peer-a");
+            direct_path_overlay_probe_confirmed(
+                &proof_runtime,
+                &peer,
+                &candidate("peer-a", EndpointCandidateKind::PublicUdp, 10),
+                "wg-peer-a",
+                DirectPathVerificationEvidence {
+                    relay_forwarder_metrics: None,
+                    data_plane_probe: Some(&probe),
+                    peer_vpn_ip: Some(VpnIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))),
+                    telemetry_source: Some(&source),
+                },
+            )
             .await
-            .is_none());
+        });
+        started.notified().await;
+        let revision = runtime
+            .wireguard_endpoint_revision()
+            .context("unlocked before update")?;
+        {
+            let _update = tokio::time::timeout(
+                Duration::from_millis(100),
+                runtime.wireguard_endpoint_update_guard(),
+            )
+            .await
+            .context("proof must not block another peer or relay restoration")?;
+            assert!(runtime.wireguard_endpoint_revision().is_none());
+        }
+        assert_ne!(runtime.wireguard_endpoint_revision(), Some(revision));
+        assert!(
+            !tokio::time::timeout(DIRECT_PATH_PROOF_DEADLINE + Duration::from_secs(1), proof)
+                .await??
+        );
         Ok(())
     }
 

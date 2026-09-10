@@ -1180,6 +1180,7 @@ impl OverlayWireGuardPeerForwarderConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OverlayWireGuardPeerForwarderStatsSnapshot {
+    pub wireguard_injection_attempts: u64,
     pub received_datagrams: u64,
     pub overlay_datagrams_sent: u64,
     pub secondary_failovers: u64,
@@ -1195,8 +1196,9 @@ pub struct OverlayWireGuardPeerForwarderStatsSnapshot {
     pub sequence_overflows: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct OverlayWireGuardPeerForwarderStatsInner {
+    wireguard_injection_attempts: AtomicU64,
     received_datagrams: AtomicU64,
     overlay_datagrams_sent: AtomicU64,
     secondary_failovers: AtomicU64,
@@ -1212,14 +1214,24 @@ struct OverlayWireGuardPeerForwarderStatsInner {
     sequence_overflows: AtomicU64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OverlayWireGuardPeerForwarderStats {
     inner: Arc<OverlayWireGuardPeerForwarderStatsInner>,
 }
 
 impl OverlayWireGuardPeerForwarderStats {
+    pub fn record_wireguard_injection_attempt(&self) {
+        self.inner
+            .wireguard_injection_attempts
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
     pub fn snapshot(&self) -> OverlayWireGuardPeerForwarderStatsSnapshot {
         OverlayWireGuardPeerForwarderStatsSnapshot {
+            wireguard_injection_attempts: self
+                .inner
+                .wireguard_injection_attempts
+                .load(Ordering::Acquire),
             received_datagrams: self.inner.received_datagrams.load(Ordering::Relaxed),
             overlay_datagrams_sent: self.inner.overlay_datagrams_sent.load(Ordering::Relaxed),
             secondary_failovers: self.inner.secondary_failovers.load(Ordering::Relaxed),
@@ -1393,6 +1405,8 @@ impl OverlayWireGuardPeerForwarder {
                             .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    // Count before the send can wake a probe responder on another task.
+                    self.stats.record_wireguard_injection_attempt();
                     match socket
                         .send_to(&delivery.payload, self.config.wireguard_endpoint)
                         .await
@@ -2550,6 +2564,7 @@ mod tests {
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.overlay_datagrams_sent, 1);
         assert_eq!(snapshot.wireguard_datagrams_injected, 1);
+        assert_eq!(snapshot.wireguard_injection_attempts, 1);
         assert_eq!(snapshot.accepted_path_updates, 1);
         assert_eq!(transit.stats().snapshot().acknowledgements_sent, 1);
 
