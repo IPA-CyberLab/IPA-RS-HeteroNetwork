@@ -210,6 +210,9 @@ try {
           else if (detail) await page.goto(new URL(routePath, baseUrl).href, { waitUntil: "domcontentloaded" });
           else throw new Error("Console navigation link missing or hidden");
           await page.waitForURL((url) => url.origin === baseUrl.origin && url.pathname === routePath);
+          // A route change mounts queries asynchronously. Do not abort those reads
+          // with the cache-validation reload before they have settled.
+          await page.waitForLoadState("networkidle", { timeout: timeoutMs });
           // Reload forces the UI to load its read models rather than reuse Query cache.
           for (const endpoint of endpoints) readModels.delete(endpoint);
           await page.reload({ waitUntil: "domcontentloaded" });
@@ -234,6 +237,14 @@ try {
           entry.error = sanitize(error.message);
         }
         entry.screenshot = await capture(page, attempt, `page-${record.pages.length}`).catch(() => null);
+        try {
+          // Includes secondary queries and response bodies, also on failed pages.
+          // A bounded timeout fails the check; network errors remain recorded.
+          await page.waitForLoadState("networkidle", { timeout: timeoutMs });
+        } catch (error) {
+          entry.result = "failed";
+          entry.error = [entry.error, sanitize(error.message)].filter(Boolean).join("; ");
+        }
       }
       const maxDetails = parseBoundedInteger(process.env.HETEROCLOUD_BROWSER_E2E_MAX_DETAILS_PER_SERVICE ?? "20", "MAX_DETAILS_PER_SERVICE", 1, 100);
       for (const [routePath, title, suffixes, collection] of routes) {
@@ -249,7 +260,13 @@ try {
         if (items.length === 0 || items.length > maxDetails) record.errors.push(`Detail coverage incomplete: ${collection}, available=${items.length}, limit=${maxDetails}`);
         for (const item of items.slice(0, maxDetails)) {
           if (typeof item.id !== "string" || !/^[A-Za-z0-9-]+$/.test(item.id)) throw new Error("Invalid resource ID in read model");
-          await visit(`${routePath}/${item.id}`, collection === "syouyu/buckets" ? item.spec.bucket_name : item.name, [org + collection + "/" + item.id], true);
+          const detailEndpoints = [org + collection + "/" + item.id];
+          if (collection === "realtime/services" && item.state === "ready") {
+            if (typeof item.project_id !== "string" || !item.project_id) throw new Error("Ready Flow read model has no project ID for metrics history");
+            detailEndpoints.push(`${org}realtime/services/${item.id}/metrics`,
+              `${org}projects/${encodeURIComponent(item.project_id)}/realtime/services/${item.id}/metrics/history`);
+          }
+          await visit(`${routePath}/${item.id}`, collection === "syouyu/buckets" ? item.spec.bucket_name : item.name, detailEndpoints, true);
         }
       }
       if (record.pages.some((entry) => entry.result !== "passed") || record.errors.length) throw new Error("Page coverage or browser errors detected; see private report");

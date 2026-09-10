@@ -498,7 +498,11 @@ must render its expected heading and load the actual UI's HTTP-200 JSON read mod
 after reload; merely rendering the application shell is insufficient. Existing
 Flow/Flash/Syouyu details are discovered from that account's list responses and
 visited read-only. Detail checks require the base service/bucket read model and
-rendered resource heading; they do not certify metrics, credential operations,
+rendered resource heading; Ready Flow details also require HTTP-200 JSON from the
+current metrics and project-scoped metrics history reads. The runner waits for
+bounded network settling before reload and departure to avoid cancelling its own
+page queries. Abort errors, settling timeouts and API errors still fail the run.
+These checks do not certify metric correctness, credential operations,
 provider health, or full backend functionality. Detail resources must nevertheless
 report API state `ready`: provisioning or failed fixtures fail the sweep even
 when their pages render successfully. Registry has no separate detail route. Detail navigation clicks
