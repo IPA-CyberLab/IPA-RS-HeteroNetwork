@@ -110,6 +110,22 @@ class ProvisionDevSudoActiveTests(unittest.TestCase):
         self.assertTrue(result["services_active"])
         sleep.assert_called_once_with(0.05)
 
+    def test_known_replacement_requires_pinned_previous_hash(self):
+        old, new = b"old helper", b"new helper"
+        with patch.object(module.os.path, "lexists", return_value=True), \
+                patch.object(module, "read", side_effect=[old, new]), \
+                patch.object(module, "atomic_replace") as replace:
+            module.install_known_replacement(Path("/trusted/helper"), new, 0o555,
+                                             module.sha(old))
+        replace.assert_called_once_with(Path("/trusted/helper"), new, 0o555)
+
+        with patch.object(module.os.path, "lexists", return_value=True), \
+                patch.object(module, "read", return_value=old), \
+                patch.object(module, "atomic_replace"), \
+                self.assertRaisesRegex(ValueError, "unknown_existing_file"):
+            module.install_known_replacement(Path("/trusted/helper"), new, 0o555,
+                                             "0" * 64)
+
 
 if __name__ == "__main__":
     unittest.main()

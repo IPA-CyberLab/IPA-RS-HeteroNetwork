@@ -17,7 +17,7 @@ import time
 import urllib.request
 
 
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v5")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v6")
 VERSION = "0.1.15-dev.8"
 SOURCE_COMMIT = "04ec0371dae8efad1b24efac192e016b0f8a14b1"
 RELEASE_DOCUMENT_SHA256 = "69cca7eaeaf594478b96bcbaa11a66c534237ac6db477ea8842fbb228d36bef6"
@@ -29,6 +29,7 @@ LOCAL_UNIT_SHA256 = "1a7c9f32574555230056389d2b413e9db57f13a7dc4ccca3236a3735a22
 SIGNER_UNIT_SHA256 = "15cebfc09eb6934138230ba8d783aa9c1ab1208d89759b353aea68f4a9fc1662"
 PREVIOUS_SIGNER_UNIT_SHA256 = "a7c966d14295d62ff14f645092a161b846f7b6a8b993a9d686cc8fa8849a8328"
 LOGIN_HELPER_SHA256 = "412c8f5f409fbc51356627a363466983c8c9bc869fd5861105ef7c857c87c120"
+PREVIOUS_LOGIN_HELPER_SHA256 = "6f3d60c30ba6bb2e0a626f864f4f8bc9a71e4e6962766b59c2c48d47ff6d784c"
 APPROVE_HELPER_SHA256 = "405800c59902ea8bee15375657f65ce0d1d2496ffab3a6340ea65cc920b20787"
 CLUSTER = "02282a57-784b-4269-90a0-8fda47ee62ec"
 ISSUER = "https://heterocloud.mizuame.app/id/realms/heterocloud"
@@ -378,7 +379,8 @@ def prepare():
     install(LOCAL_CONFIG, config_raw, 0o600)
     install(LOCAL_UNIT, local_unit, 0o644)
     install_known_replacement(SIGNER_UNIT, signer_unit, 0o644, PREVIOUS_SIGNER_UNIT_SHA256)
-    install("/usr/local/bin/heteronetwork-sudo-login", login, 0o555)
+    install_known_replacement(Path("/usr/local/bin/heteronetwork-sudo-login"), login, 0o555,
+                              PREVIOUS_LOGIN_HELPER_SHA256)
     install("/usr/local/bin/heteronetwork-sudo-approve", approve, 0o555)
     systemctl("daemon-reload")
 
