@@ -62,6 +62,7 @@ class XMLTests(unittest.TestCase):
         d = root.findall('devices/disk')[-1]
         ET.SubElement(d, 'alias', name='virtio-disk1')
         ET.SubElement(d, 'backingStore')
+        d.find('source').set('index', '3')
         ET.indent(root)
         app.verify_addition(self.before, ET.tostring(root, encoding='unicode'), self.p, self.name)
         self.assertEqual(d.findtext('serial'), 'hnapp-' + app.dev.identity(
@@ -70,6 +71,8 @@ class XMLTests(unittest.TestCase):
 
     def test_foreign_mapping_and_other_changes_refused(self):
         for xpath, attribute, value in [('devices/disk[last()]/source', 'file', '/foreign.qcow2'),
+                                         ('devices/disk[last()]/source', 'index', 'invalid'),
+                                         ('devices/disk[last()]/source', 'unknown', '3'),
                                          ('devices/disk[last()]/driver', 'type', 'raw'),
                                          ('devices/disk[last()]/target', 'bus', 'sata'),
                                          ('devices/controller', 'model', 'pcie-root')]:
@@ -199,6 +202,28 @@ class PoolFileTests(unittest.TestCase):
             self.assertEqual(app.file_info(path, 42, seen), 4096)
             with self.assertRaises(app.dev.Refusal):
                 app.file_info(path, 42, seen)
+
+
+class InventoryDirectoryTests(unittest.TestCase):
+    def test_unrelated_owner_is_only_root_or_libvirt(self):
+        path = Path('/var/lib/libvirt/images/vercel-research/cloud-init')
+        for owner, mode, accepted in ((0, 0o700, True), (64055, 0o750, True),
+                                      (1000, 0o700, False), (64055, 0o770, False)):
+            with patch.object(app.dev, 'root_directory', return_value=99), \
+                    patch.object(app.os, 'close'), \
+                    patch.object(app.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=64055)), \
+                    patch.object(Path, 'lstat', return_value=SimpleNamespace(
+                        st_uid=owner, st_mode=stat.S_IFDIR | mode)):
+                if accepted:
+                    app.inventory_directory(path, other=True)
+                else:
+                    with self.assertRaises(app.dev.Refusal):
+                        app.inventory_directory(path, other=True)
+
+    def test_other_directory_name_is_not_allowed(self):
+        with patch.object(app.dev, 'root_directory', side_effect=AssertionError('No access')):
+            with self.assertRaises(app.dev.Refusal):
+                app.inventory_directory(Path('/var/lib/libvirt/images/foreign'), other=True)
 
 
 class PreallocationTests(unittest.TestCase):

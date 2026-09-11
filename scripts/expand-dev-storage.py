@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import stat
 import uuid
 import xml.etree.ElementTree as ET
@@ -76,7 +77,10 @@ def app_disk(root, p, name):
     dev.require(d.get('type') == 'file' and d.get('device') == 'disk'
                 and len(d.findall('source')) == len(d.findall('target')) == len(d.findall('driver')) == 1
                 and len(d.findall('serial')) == 1
-                and d.find('source').attrib == {'file': str(disk_path(p, name))}
+                and d.find('source').get('file') == str(disk_path(p, name))
+                and set(d.find('source').attrib) <= {'file', 'index'}
+                and ('index' not in d.find('source').attrib
+                     or d.find('source').get('index', '').isdigit())
                 and d.find('target').attrib == {'dev': 'vdb', 'bus': 'virtio'}
                 and d.find('driver').get('name') == 'qemu' and d.find('driver').get('type') == 'qcow2'
                 and d.findtext('serial') == serial(p, name)
@@ -205,6 +209,23 @@ def pool_file(p, value, pool_name, path, filesystem, seen):
         image_info(path, info['virtual-size'])
 
 
+def inventory_directory(path, other=False):
+    if not other:
+        fd = dev.root_directory(path)
+        os.close(fd)
+        return
+    base = Path('/var/lib/libvirt/images')
+    dev.require(path in {base / OTHER, base / OTHER / 'cloud-init'},
+                'Unexpected unrelated pool directory')
+    fd = dev.root_directory(base)
+    os.close(fd)
+    owner = pwd.getpwnam('libvirt-qemu').pw_uid
+    for candidate in [base / OTHER, path]:
+        info = candidate.lstat()
+        dev.require(stat.S_ISDIR(info.st_mode) and info.st_uid in {0, owner}
+                    and not info.st_mode & 0o022, 'Untrusted unrelated inventory directory')
+
+
 def inventory(p, value):
     records = completed_records(p, value)
     dev.require(set(virsh(p, 'list', '--all', '--name').split()) == set(GUESTS + [OTHER]),
@@ -218,8 +239,7 @@ def inventory(p, value):
         dev.require(root.get('type') == 'dir' and root.findtext('name') == name
                     and len(root.findall('target/path')) == 1, 'Unreviewed pool')
         path = dev.checked_path(root.findtext('target/path'))
-        fd = dev.root_directory(path)
-        os.close(fd)
+        inventory_directory(path, other=name == OTHER)
         dev.require(path.stat().st_dev == fs, 'Pools differ in filesystem')
         verify_ext4(path)
         pools[name] = path
@@ -274,8 +294,7 @@ def inventory(p, value):
             if path.name in allowed[name]:
                 continue
             if path.name == 'cloud-init' and name == OTHER:
-                fd = dev.root_directory(path)
-                os.close(fd)
+                inventory_directory(path, other=True)
                 dev.require(path.stat().st_dev == fs, 'Cloud-init directory filesystem differs')
                 # No credential content reads; reject nested allocations and special files.
                 for entry in path.iterdir():
@@ -378,9 +397,63 @@ def apply(p, name):
                 'guest_formatted': False, 'ha_verified': False}
 
 
+def inspect(p):
+    with dev.locked_journal(p) as journal:
+        prerequisites(p, journal.value)
+        health.cluster_ready(p, GUESTS[0])
+        for name in GUESTS:
+            health.guest_state(p, name)
+        budget, xmls = inventory(p, journal.value)
+        completed = completed_records(p, journal.value)
+        for name in GUESTS:
+            if name not in completed:
+                persistent, live = xmls[name]
+                dev.require(disk_xml(persistent, p, name) == disk_xml(live, p, name),
+                            'Live and persistent free controller slots differ')
+        return {'read_only': True, 'capacity': budget, 'completed_guests': sorted(completed),
+                'three_guest_readiness_verified': True, 'ha_verified': False}
+
+
+def complete_readback(p, name):
+    """Acknowledge only an already fully attached, journal-owned disk; never retry mutations."""
+    with dev.locked_journal(p, allow_pending_guard=True) as journal:
+        pending = journal.value.get('pending') or {}
+        dev.require(set(pending) == {'operation', 'guest', 'path', 'serial',
+                                    'persistent_before', 'live_before'}
+                    and pending['operation'] == 'dev-app-storage' and pending['guest'] == name
+                    and pending['path'] == str(disk_path(p, name))
+                    and pending['serial'] == serial(p, name), 'Unreviewed interrupted operation')
+        dev.verify_files(journal.value)
+        dev.verify_guard(journal.value)
+        record = journal.value['resources']['domain:' + name]
+        dev.require(record['definition_sha256'] == dev.definition_hash(pending['persistent_before']),
+                    'Original domain ownership does not match pending operation')
+        request_path = dev.STATE / (name + '-apps-attach.xml')
+        dev.require(str(request_path) in journal.value['files']
+                    and request_path.read_text() == disk_xml(pending['live_before'], p, name),
+                    'Owned attachment request differs')
+        actual = dev.resource_xml(p, 'domain', name)
+        verify_addition(pending['persistent_before'], actual, p, name)
+        verify_addition(pending['live_before'], virsh(p, 'dumpxml', name), p, name)
+        dev.require(name not in journal.value.get('app_storage', {}), 'Unexpected completed entry')
+        # Validate a candidate state fully before writing a single completion record.
+        record['definition_sha256'] = dev.definition_hash(actual)
+        journal.value.setdefault('app_storage', {})[name] = {
+            'completed': True, 'path': str(disk_path(p, name)),
+            'serial': serial(p, name), 'size_bytes': 64 * GIB}
+        prerequisites(p, journal.value)
+        inventory(p, journal.value)
+        health.cluster_ready(p, name)
+        for guest in GUESTS:
+            health.guest_state(p, guest)
+        journal.done()
+        return {'guest': name, 'completed_readback': True, 'hypervisor_mutations': False,
+                'guest_formatted': False, 'ha_verified': False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['plan', 'apply'])
+    parser.add_argument('command', choices=['plan', 'inspect', 'complete-readback', 'apply'])
     parser.add_argument('--guest', choices=GUESTS)
     parser.add_argument('--probe-readiness', action='store_true', help='Permit bounded pinned SSH read-only health probes')
     args = parser.parse_args()
@@ -393,9 +466,13 @@ def main():
                   'disks': [{'guest': n, 'uuid': dev.identity(p, 'domain', n), 'path': str(disk_path(p, n)),
                              'serial': serial(p, n), 'size_bytes': 64 * GIB, 'target': 'vdb'}
                             for n in ([args.guest] if args.guest else GUESTS)]}
+    elif args.command == 'inspect':
+        dev.require(args.probe_readiness and not args.guest,
+                    'Inspect requires --probe-readiness and no --guest')
+        result = inspect(p)
     else:
         dev.require(args.guest and args.probe_readiness, 'Apply requires --guest and --probe-readiness')
-        result = apply(p, args.guest)
+        result = (complete_readback if args.command == 'complete-readback' else apply)(p, args.guest)
     print(json.dumps(result, indent=2))
 
 

@@ -88,8 +88,9 @@ class DeviceTests(unittest.TestCase):
     def test_inspect_mocked_commands_and_udev_agreement(self):
         answers = {"lsblk": json.dumps({"blockdevices": [disk()]}),
                    "udevadm": f"ID_SERIAL={SERIAL}\nDEVTYPE=disk\n",
-                   "swapon": '{"swapdevices": []}', "wipefs": '{"signatures": []}'}
+                   "wipefs": '{"signatures": []}'}
         with patch.object(s, "run", side_effect=lambda *a: answers[a[0]]) as run, \
+                patch.object(s, "require_no_swap"), \
                 patch.object(s, "mount_inventory", return_value=[]), \
                 patch.object(Path, "stat", return_value=SimpleNamespace(
                     st_mode=stat.S_IFBLK, st_rdev=s.os.makedev(252, 32))), \
@@ -99,6 +100,34 @@ class DeviceTests(unittest.TestCase):
             answers["udevadm"] = "ID_SERIAL=other\nDEVTYPE=disk\n"
             with self.assertRaises(ValueError):
                 s.inspect(SERIAL)
+
+
+class HostPrerequisiteTests(unittest.TestCase):
+    def test_proc_swaps_requires_exact_header_and_no_entries(self):
+        for text, valid in (("Filename\tType\tSize\tUsed\tPriority\n", True),
+                            ("", False), ("unknown\n", False),
+                            ("Filename Type Size Used Priority\n/swap file 1024 0 -2\n", False)):
+            with patch.object(Path, 'read_text', return_value=text):
+                if valid:
+                    s.require_no_swap()
+                else:
+                    with self.assertRaises(ValueError):
+                        s.require_no_swap()
+
+    def test_only_known_root_directory_mode_is_tightened(self):
+        for uid, mode, valid in ((0, 0o775, True), (0, 0o755, True),
+                                 (1000, 0o775, False), (0, 0o777, False)):
+            with patch.object(s, 'root_path'), patch.object(s, 'sync_dir'), \
+                    patch.object(s.os, 'chmod') as chmod, \
+                    patch.object(Path, 'lstat', return_value=SimpleNamespace(
+                        st_uid=uid, st_gid=0, st_mode=stat.S_IFDIR | mode)):
+                if valid:
+                    s.secure_kubeconfig_directory()
+                    self.assertEqual(chmod.call_count, int(mode == 0o775))
+                else:
+                    with self.assertRaises(ValueError):
+                        s.secure_kubeconfig_directory()
+                    chmod.assert_not_called()
 
 
 class TransactionTests(unittest.TestCase):

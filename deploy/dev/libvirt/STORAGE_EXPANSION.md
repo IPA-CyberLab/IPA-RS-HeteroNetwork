@@ -58,11 +58,21 @@ reject mounted/root/identity devices and existing signatures, and record the
 filesystem UUID. Mount only at a separate app-storage path, with fail-closed
 consumer ordering so missing storage cannot fall back onto the boot disk.
 The host helper is `scripts/expand-dev-storage.py`; its offline `plan` command
-does not admit capacity or make mutations. The one-guest `apply` path uses
+does not admit capacity or make mutations. Root-only `inspect --probe-readiness`
+checks the live inventory and all three guests before any disk operation.
+The one-guest `apply` path uses
 verified ext4 preallocation and live/persistent hotplug without guest restart.
 The guest helper is `deploy/dev/apps/prepare-storage.py`, which verifies the
 native identity and live Kubernetes UID before formatting a fresh serial-pinned
-disk. Neither helper has been applied to the live guests yet.
+disk.
+
+`complete-readback --guest NAME --probe-readiness` is only for an inspected
+interruption after both live and persistent attachment completed. It checks the
+original journaled domain hash, exact unchanged preexisting XML, owned request
+and disk inode, allocated capacity, all resource definitions, firewall, guest
+identities and cluster readiness. It acknowledges completion but cannot create,
+attach, detach, format or adopt an unowned disk. Preserve incomplete journals;
+do not delete them to retry.
 
 Guest preparation deliberately does not restart consumers or activate the
 kubelet mount dependency after installing it. It reports app provisioning as
@@ -76,3 +86,47 @@ must cover filesystem overhead and operational/replacement volumes. PVC sizes
 do not enforce directory quotas. Fresh retained PVs, exact claim reservations,
 correct service ownership and actual recovery checks remain required. The
 three guests still share one physical host and storage failure domain.
+
+## Actual Deployment: 2026-09-11
+
+All three new standalone 64GiB qcow2 disks were preallocated and attached to
+running guests, with live and persistent definitions verified. No shutdown,
+reboot, detach, or root-disk change was issued. The unrelated Vercel VM remained
+running and was included in every capacity calculation.
+
+The first attachment stopped at readback because live libvirt XML added a
+numeric source `index`. Inspection confirmed the correct source/serial and
+unchanged existing devices. The scoped `complete-readback` operation then
+acknowledged that already-completed attachment, without repeating it. The next
+two attachments completed normally with the corrected validation.
+
+The active host bundle is `/opt/heteronetwork-dev-storage-6bf26b81`:
+
+- Bundle SHA-256: `6bf26b81eecfa993f655d1f9a01ae6be879bd144559742093a0494af3b855c59`
+- Host helper SHA-256: `4c5760fe39eab786888325e939296b903bc63fd46ddaf9e50d0ca6dcf5f7ff1d`
+
+Each guest uses `/opt/heteronetwork-dev-app-storage-a349cce2/prepare-storage.py`,
+SHA-256 `a349cce218e84713e8967f96c3a9fee740b5441cf79819c9e0f1eb8e5ba80afe`.
+The guest helper now reads `/proc/swaps`, since the installed `swapon` has no
+JSON option. It tightens only the known root:root `/etc/kubernetes` directory
+from mode 0775 to 0755 before the private admin.conf path checks. No credential
+contents were exported. An earlier attempt stopped before format intent.
+
+All app disks are mounted as ext4 at
+`/var/lib/heteronetwork-dev-app-storage`, separate from identity data:
+
+| Guest | Disk Serial | Filesystem UUID |
+| --- | --- | --- |
+| hetero-dev-1 | hnapp-381d1ae16f55 | 17138c6e-6b4d-4751-be77-d543492b0b76 |
+| hetero-dev-2 | hnapp-acc5151b6b24 | e57ca4f8-930c-4c23-9830-951a563fef09 |
+| hetero-dev-3 | hnapp-165a6e8acc3a | 21469bc7-98b6-420e-9850-67582114c05f |
+
+Repeat preparation returned `created: false` on every guest and verified each
+mount/UUID. All kubelets were active, all three Kubernetes nodes Ready, and all
+three identity database instances Ready. Post-format host inventory still
+verified allocated blocks, with 308095922176 available bytes versus a remaining
+admission budget of 286759317504 bytes. These are point-in-time observations.
+
+The kubelet guard is installed but activation and consumer failure behavior
+remain unverified. No app directories, PVs or workloads have been provisioned
+on these filesystems yet. No storage-loss or physical-host HA test was run.

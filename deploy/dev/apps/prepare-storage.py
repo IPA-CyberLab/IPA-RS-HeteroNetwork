@@ -130,6 +130,23 @@ def verify_cluster():
         require(len(ready) == 1 and ready[0]["status"] == "True")
 
 
+def secure_kubeconfig_directory():
+    root_path(KUBECONFIG.parent.parent, directory=True, private=False)
+    info = KUBECONFIG.parent.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and info.st_gid == 0
+            and stat.S_IMODE(info.st_mode) in (0o755, 0o775))
+    if stat.S_IMODE(info.st_mode) == 0o775:
+        os.chmod(KUBECONFIG.parent, 0o755, follow_symlinks=False)
+        sync_dir(KUBECONFIG.parent)
+    root_path(KUBECONFIG)
+
+
+def require_no_swap():
+    lines = Path('/proc/swaps').read_text().splitlines()
+    require(len(lines) == 1 and lines[0].split() ==
+            ['Filename', 'Type', 'Size', 'Used', 'Priority'])
+
+
 def flatten(nodes):
     for node in nodes:
         yield node
@@ -182,9 +199,8 @@ def inspect(serial, fresh=True):
     info = Path(disk["path"]).stat()
     require(stat.S_ISBLK(info.st_mode) and f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}" == disk["maj:min"])
     holders = list((Path("/sys/dev/block") / disk["maj:min"] / "holders").iterdir())
-    swaps = json.loads(run("swapon", "--show", "--json", "--output", "NAME"))["swapdevices"]
     # A swapfile can hide storage ancestry; no active swap is allowed in this workflow.
-    require(not swaps)
+    require_no_swap()
     signatures = json.loads(run("wipefs", "--no-act", "--json", "--output", "TYPE,UUID",
                                 disk["path"]))["signatures"]
     return validate_device(inventory, serial, mount_inventory(), [], holders, signatures, fresh)
@@ -320,6 +336,7 @@ def transaction(who):
 
 def prepare():
     who = identity()
+    secure_kubeconfig_directory()
     mkdir(STATE)
     fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
