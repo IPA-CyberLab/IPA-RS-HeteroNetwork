@@ -176,11 +176,13 @@ read-only socket inspection found 13478 unused on all three DEV guests and
 3478/3479 in use on guest 1. This observation is not a port reservation.
 DEV media/NAT mappings and access to the TURN listener and relay range still
 need provisioning and live validation; no public TURN reachability is claimed.
-The focused port-value regression passed on 2026-09-11. The full immutable Helm
-check refused the current Flow checkout before templating because its
-`charts/redis-23.1.1.tgz` and `charts/postgresql-ha-16.3.2.tgz` are ignored files,
-not selected-commit content. The new rendered listener/URL regression is therefore
-not yet verified. Preserve the checkout guard: dependency packaging must be
-reviewed and bound to a release before this is considered deployable.
+The initial immutable Helm check refused untracked Flow dependency archives.
+Flow dev.4 now vendors both archives in its selected source commit and verifies
+their checksums during release CI. On 2026-09-11, channel revision 10 passed the
+four-chart offline check with clean selected checkouts: Flash 12 resources,
+Flow 22, HCloud 12, Syouyu 21. The rendered TURN listener/URL and cloud/Flash
+replica, anti-affinity and PDB checks passed. These tests use a synthetic site
+and auxiliary image fixtures; they do not attest actual site identities,
+auxiliary image availability, live traffic or Kubernetes deployment.
 Fresh secrets, dev IdP, DNS/TLS/edge resources, verified
 cluster destinations, and runtime/network prerequisites above remain required.

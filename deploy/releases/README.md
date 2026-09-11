@@ -1,5 +1,24 @@
 # Reviewed Release Selections
 
+## Flow DEV Selection: 2026-09-11
+
+Revision 10 selects Flow `0.1.21-dev.4`, source
+`b618852726ff5ffff1ed0386bad86b437ebface5`. Release workflow run `34546024819`
+completed successfully, including verification and both image publications.
+The uploaded `flow-release-artifact.json` binds:
+
+- Flow: `sha256:02b3216210130fe51dce6331c88285c91e573d670811badcf0ae99fe1400a45e`
+- LiveKit: `sha256:ce0f07783028d390752961a0247480adc840f6918fb870752d48b902dcb5694c`
+
+The source commit includes checksum-verified Redis/PostgreSQL Helm dependency
+archives, resolving the ignored-dependency checkout failure without bypassing
+the immutable-source guard. The four-chart offline render and focused TURN
+port/URL and redundant-placement regressions passed against selected checkouts.
+Site and auxiliary-image inputs in those tests remain fixtures, not operational
+deployment data. No cloud workload was deployed or promoted to production.
+
+## Catalog Contract
+
 `channels.json` is desired release state, not deployment evidence. It is updated
 through `scripts/release-channels.mjs` with an expected revision. Do not reset its
 history or edit digests manually. No existing production Application consumes
