@@ -2,6 +2,7 @@
 """Render the public, exact DEV sudo policy from reviewed repository inputs."""
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -34,7 +35,10 @@ def load(path):
 
 
 def render():
-    manifest = load(NATIVE / "sudo-manifest.json")
+    manifest_raw = (NATIVE / "sudo-manifest.json").read_bytes()
+    require(manifest_raw.endswith(b"\n") and not manifest_raw.endswith(b"\n\n"),
+            "invalid_repository_manifest_terminator")
+    manifest = json.loads(manifest_raw, object_pairs_hook=unique_object)
     roster = load(NATIVE / "sudo-roster.json")
     hosts = load(NATIVE / "sudo-hosts.json")
     owner = load(NATIVE / "sudo-owner.json")
@@ -60,6 +64,8 @@ def render():
     require(set(hosts) == {"schema_version", "cluster_id", "manifest_file_sha256", "hosts"}
             and hosts["schema_version"] == 1 and hosts["cluster_id"] == manifest["cluster_id"],
             "invalid_host_document")
+    require(hashlib.sha256(manifest_raw[:-1]).hexdigest() == hosts["manifest_file_sha256"],
+            "dkg_manifest_byte_pin_mismatch")
     require(len(hosts["hosts"]) == 3
             and {host["guest"] for host in hosts["hosts"]} == GUESTS,
             "invalid_host_inventory")

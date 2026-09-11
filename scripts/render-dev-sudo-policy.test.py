@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -24,6 +25,14 @@ class RenderDevSudoPolicyTests(unittest.TestCase):
                 "issuer": "https://heterocloud.mizuame.app/id/realms/heterocloud",
                 "subject": "4daa569e-635c-49ed-bb17-5fe0a07581b2",
             }})
+
+    def test_dkg_manifest_byte_pin_excludes_only_repository_newline(self):
+        raw = (ROOT / "deploy/dev/native/sudo-manifest.json").read_bytes()
+        hosts = json.loads((ROOT / "deploy/dev/native/sudo-hosts.json").read_text())
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertFalse(raw.endswith(b"\n\n"))
+        self.assertEqual(hashlib.sha256(raw[:-1]).hexdigest(),
+                         hosts["manifest_file_sha256"])
 
     def test_renderer_is_deterministic_and_checkable(self):
         first = module.encoded()

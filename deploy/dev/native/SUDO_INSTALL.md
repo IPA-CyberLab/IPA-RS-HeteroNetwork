@@ -133,10 +133,58 @@ The installed signer binary SHA256 is
 `dd26e9907c426fe1f2b628a5010441a4127ef26ab763195c353a8c7e09cf05bb`.
 
 Both `heteronetwork-sudo-local.service` and
-`heteronetwork-quorum-signer.service` reported `inactive`, `dead` and
+`heteronetwork-sudo-quorum-signer.service` reported `inactive`, `dead` and
 `disabled` on every guest after deployment. No policy, daemon configuration,
 runtime socket, ledger, sudo plugin setting, service start or service enable was
 created. An immediate second coordinator run installed no files and changed no
 symlink or unit, while returning the same inactive state on all three guests.
 The active sudo path is therefore unchanged; this is staged runtime material,
 not majority-sudo enforcement.
+
+## Active DEV Rollout Contract
+
+The active rollout is split into explicit `prepare`, `check`, `start` and
+`activate` phases. `scripts/build-dev-sudo-active-bundle.py` accepts only the
+immutable dev7 release metadata and its two hash-bound archives. The resulting
+root-only bundle contains the exact public DEV policy, service definitions,
+native CLI, signer, local verifier and approval plugin. The bundle builder does
+not install or start anything.
+
+On `ichikawap1`, `scripts/deploy-dev-sudo-active.py` uses only the fixed
+root-owned DEV SSH key, strict known-host pins and the three fixed guest machine
+identities. It can distribute the bundle and invoke `prepare`, `check`, `start`
+or `status`; it deliberately has no `activate` phase. Preparation copies each
+guest's existing local DKG share into a systemd credential source without
+exporting it, installs the exact owner policy, runs both native configuration
+checkers and creates a requester key owned by UID 1000. Start enables the local
+verifier and signer for boot only after those checks pass.
+
+Activation appends the one reviewed approval-plugin directive to
+`/etc/sudo.conf`. It must be invoked separately inside an already-open root
+session on each guest, after all three signer health endpoints are reachable.
+Keep those three sessions open until an actual non-root `sudo` command has
+completed through the 2-of-3 path. The `rollback` phase removes only that exact
+directive and refuses unknown plugin configuration.
+
+The operator workflow uses two terminals on the target host. In the first,
+`sudo` prints a 64-hex invocation handle and waits. In the second:
+
+```text
+heteronetwork-sudo-login
+heteronetwork-sudo-approve <64-hex-handle>
+```
+
+Login uses the pinned HeteroCloud Keycloak issuer, public `ipars-web` device
+client and exact owner subject. It verifies the returned identity through
+userinfo and writes only the access token to the caller's private config
+directory. Approval obtains a FROST majority over the HeteroNetwork overlay and
+submits the result directly to the root-owned local verifier. The resulting
+grant is bound to the host, caller UID, run-as UID and pending invocation; it
+expires within 60 seconds and is durably single-use. It is intentionally not a
+reusable root bearer credential.
+
+All three DEV voters currently share one physical host. This validates protocol,
+service and sudo integration behavior but does not prove physical fault-domain
+availability. Production enrollment requires a separate DKG and independently
+pinned host key for every production machine; DEV shares and policies must never
+be copied into production.
