@@ -23,6 +23,13 @@ Supply the public `sudo_plugin.h` from sudo v1.9.17p2 at immutable upstream
 revision `d1b48c651cec19fe37d1f0d3299d2283fb0f88e4`. Its required SHA256 is
 `11234d6e47e6da95adcb3ace71dc93f1d94b759aeca4cd938d829c076adfb35f`.
 The helper does not download headers or inspect production sudo configuration.
+The resulting approval plugin declares sudo API 1.22 and accepts only runtime
+API 1.21 or 1.22. Major-version mismatches, API 1.20 and older, and runtime
+minor versions newer than the build input fail closed. API 1.21 corresponds to
+the separately pinned upstream sudo 1.9.15p5 header SHA256
+`4536934f28bc5a816ab7101d33fd78f5128f3e554c29d6e4cc9e5d0ea05b8f05`.
+Deployment must verify the installed header/runtime version is in that tested
+range before adding the plugin to `sudo.conf`.
 
 ```bash
 bash scripts/package-sudo-quorum-v2.sh \

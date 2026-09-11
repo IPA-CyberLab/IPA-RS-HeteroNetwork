@@ -42,6 +42,12 @@ static int buffered_ack(int resume_expired)
 
 int main(void)
 {
+    assert(compatible_sudo_api_version(SUDO_API_VERSION));
+    assert(compatible_sudo_api_version(SUDO_API_MKVERSION(1, 21)));
+    assert(!compatible_sudo_api_version(SUDO_API_MKVERSION(1, 20)));
+    assert(!compatible_sudo_api_version(SUDO_API_MKVERSION(2, 21)));
+    assert(!compatible_sudo_api_version(
+        SUDO_API_MKVERSION(1, SUDO_API_VERSION_MINOR + 1)));
     assert(buffered_ack(0));
     /* Already-buffered success must not admit a reader resumed at expiry. */
     assert(!buffered_ack(1));

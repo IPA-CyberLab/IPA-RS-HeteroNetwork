@@ -26,6 +26,15 @@ static sudo_printf_t report;
 static uid_t caller;
 static int initialized;
 
+#define QUORUM_MIN_SUDO_API_MINOR 21U
+
+static int compatible_sudo_api_version(unsigned int version)
+{
+    return SUDO_API_VERSION_GET_MAJOR(version) == SUDO_API_VERSION_MAJOR
+        && SUDO_API_VERSION_GET_MINOR(version) >= QUORUM_MIN_SUDO_API_MINOR
+        && SUDO_API_VERSION_GET_MINOR(version) <= SUDO_API_VERSION_MINOR;
+}
+
 static int valid_fields(char * const entries[])
 {
     if (entries == NULL) return 0;
@@ -83,7 +92,7 @@ static int gate_open(unsigned int version, sudo_conv_t conversation,
     (void)submit_envp; (void)plugin_options; (void)errstr;
     initialized = 0;
     uint32_t uid;
-    if (version != SUDO_API_VERSION || plugin_printf == NULL || geteuid() != 0 || !valid_fields(user_info)
+    if (!compatible_sudo_api_version(version) || plugin_printf == NULL || geteuid() != 0 || !valid_fields(user_info)
         || !number(field(user_info, "uid"), &uid) || uid != getuid() || uid == 0)
         return -1; /* Zero would disable this gate. */
     caller = uid;
