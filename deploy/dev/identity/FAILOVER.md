@@ -55,3 +55,43 @@ or verification of existing user-session continuity.
 The DEV environment remains entirely on one physical machine and must not be
 described as physically highly available. Production promotion remains blocked
 on the broader application and identity verification requirements.
+
+## Observed Execution: 2026-09-11 UTC
+
+The transaction timeout update was applied to DEV and repeated with `changed:
+false`. All three pods of ReplicaSet `dev-keycloak-86b7f67fdc` became ready.
+The source helper deployed under `/opt/heteronetwork-dev-db-timeouts-a0697d2f`
+has SHA256 `a0697d2f20e4b196adf5f7e4901662077a664d4151b776c3e2a3300d82ff695b`.
+No production resources or secrets were changed.
+
+The real probe at `/opt/heteronetwork-dev-device-probe-00f7b03e` has SHA256
+`00f7b03ec16cbaa99c32c2931d297fcf7e9b2867c70323c56ee7be8f0d8660b6`.
+Both executions ended with exit status zero and final admission passed:
+
+| Run | Measured Requests After Baseline | Failures | Maximum Request Time |
+| --- | --- | --- | --- |
+| Normal operation,30 seconds | 15 | 0 | 55ms |
+| DB primary pod crash-restart,180 seconds | 88 | 2 | 91ms |
+
+Each run also required five successful baseline requests before measurement or
+disruption. Those baseline requests are not included in the table.
+The DB restart was requested at05:37:51. Connection refused was observed at
+05:38:09 and05:38:11; success resumed at05:38:13 and continued through05:40:50.
+Approximately two-second sampling does not establish the exact outage duration;
+four seconds between first observed failure and next success is not zero downtime.
+
+The primary changed from `dev-identity-postgres-2` to `dev-identity-postgres-1`.
+The original pod UID was replaced. All three DB instances and all three updated
+Keycloak replicas were ready at final admission. No manual Keycloak recovery
+or additional workload restart was used. Local focused tests passed: two
+Keycloak manifest contract cases and three response/redaction probe cases.
+
+Root-only records on DEV1:
+
+- `7f365134-79de-4c89-b9c6-184c737f1777.jsonl` (normal)
+- `29d55787-c40f-4e9c-bf67-fe757c1bad11.jsonl` (DB restart)
+
+This was not the same fault as the earlier whole-VM restart, so it does not
+prove that whole-VM recovery improved from minutes to seconds. Browser login,
+token exchange/refresh, existing sessions, VM loss and sustained load still need
+separate verification. No production promotion followed this test.
