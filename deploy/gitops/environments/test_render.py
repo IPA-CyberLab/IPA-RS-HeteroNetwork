@@ -48,6 +48,18 @@ def fixtures():
 
 
 class RendererTests(unittest.TestCase):
+    def test_dev_keeps_redundant_cloud_and_flash_replicas(self):
+        _, site = fixtures()
+        cloud = render.dev_values("heterocloud", site)
+        self.assertEqual(cloud["replicaCount"], 3)
+        self.assertEqual(cloud["worker"]["replicaCount"], 3)
+        self.assertEqual(cloud["ownerConsole"]["replicaCount"], 3)
+        self.assertEqual(cloud["podDisruptionBudget"]["minAvailable"], 2)
+        self.assertEqual(cloud["ownerConsole"]["podDisruptionBudget"]["minAvailable"], 2)
+        flash = render.dev_values("heterocloud-flash", site)
+        self.assertEqual(flash["api"]["replicaCount"], 3)
+        self.assertEqual(flash["controller"]["replicaCount"], 2)
+
     def test_rendered_dev_owner_requires_secure_cookies(self):
         _, site = fixtures()
         owner = render.dev_values("heterocloud", site)["ownerConsole"]
@@ -247,6 +259,45 @@ class RendererTests(unittest.TestCase):
         for destination in project["spec"]["destinations"]:
             self.assertEqual(destination["server"], site["destination_server"])
             self.assertIn("-dev", destination["namespace"])
+
+    @unittest.skipUnless(os.environ.get("HELM_CHANNEL_TESTS") == "1" and shutil.which("helm"), "opt-in local Helm check")
+    def test_local_helm_cloud_flash_redundancy(self):
+        _, site = fixtures()
+        state = render.read(render.ROOT / "deploy/releases/channels.json")
+        expected = {
+            "heterocloud-dev": (3, 2),
+            "heterocloud-dev-worker": (3, 2),
+            "heterocloud-dev-owner-console": (3, 2),
+            "heterocloud-flash-dev-api": (3, 2),
+            "heterocloud-flash-dev-controller": (2, 1),
+        }
+        deployments, budgets = {}, {}
+
+        def inspect(app, documents):
+            for document in documents:
+                if not document:
+                    continue
+                name = document["metadata"]["name"]
+                if document["kind"] == "Deployment":
+                    spec = document["spec"]
+                    pod = spec["template"]["spec"]
+                    terms = pod["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+                    labels = spec["template"]["metadata"]["labels"]
+                    self.assertTrue(any(term["topologyKey"] == "kubernetes.io/hostname"
+                        and term["labelSelector"]["matchLabels"]
+                        and all(labels.get(k) == v for k, v in term["labelSelector"]["matchLabels"].items())
+                        for term in terms))
+                    deployments[name] = spec["replicas"]
+                elif document["kind"] == "PodDisruptionBudget":
+                    budgets[name] = document["spec"]["minAvailable"]
+
+        apps = [app for app in render.render(state, "dev", site)
+                if app["metadata"]["name"] in ("heterocloud-dev", "heterocloud-flash-dev")]
+        render.check_helm(apps, state, "dev", site,
+                          Path(os.environ.get("HELM_CHANNEL_REPOSITORY_ROOT", render.ROOT.parent)),
+                          inspect_documents=inspect)
+        self.assertEqual(deployments, {name: values[0] for name, values in expected.items()})
+        self.assertEqual(budgets, {name: values[1] for name, values in expected.items()})
 
     @unittest.skipUnless(os.environ.get("HELM_CHANNEL_TESTS") == "1" and shutil.which("helm"), "opt-in local Helm check")
     def test_local_helm_all_dev_charts(self):

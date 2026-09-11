@@ -1,8 +1,8 @@
 fullnameOverride: heterocloud-flash-dev
 api:
-  replicaCount: 1
+  replicaCount: 3
 controller:
-  replicaCount: 1
+  replicaCount: 2
 publicDomain: flash.${domain}
 workloadNamespace: heterocloud-flash-dev-workloads
 runtimeClass:

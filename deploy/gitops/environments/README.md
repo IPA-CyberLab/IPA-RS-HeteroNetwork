@@ -162,9 +162,14 @@ runtime image availability or Kubernetes admission.
 ## Remaining Deployment Blockers
 
 These renderer fixes do not make the current dev configuration deployment-ready.
-The selected HCloud chart hardcodes insecure cookies for the enabled HTTPS owner
-console: explicitly disable that console for initial dev deployment or select a
-later reviewed release supporting secure cookies. Flow's host-network Coturn
+The selected HCloud dev.2 chart supports secure owner cookies and the DEV values
+explicitly enable them. The rendered-owner check still rejects an insecure
+HTTPS owner deployment. HCloud API, worker and owner each request three replicas
+with PDB minimum availability two. Flash requests three API replicas and two
+controllers, matching its chart's redundant defaults. The selected charts supply
+required hostname anti-affinity; these settings are not observed runtime HA.
+Fresh database redundancy and actual failure recovery remain separate requirements.
+Flow's host-network Coturn
 default port 3478 overlaps the native STUN listener on dev guest 1; resolve its
 dev port and media/NAT configuration before deployment. Neither setting is
 silently changed here. Fresh secrets, dev IdP, DNS/TLS/edge resources, verified
