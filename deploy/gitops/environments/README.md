@@ -46,7 +46,8 @@ Provision independently, without copying production user state:
 - Dev namespaces, storage class and fresh volumes; never restored production
   snapshots or existing production claims. Optional generated database/Redis
   infrastructure uses three-instance CNPG clusters for application Postgres.
-  Redis remains a single-instance intermediate configuration, not HA.
+  Flow's release-bound Redis subchart supplies three authenticated Redis/Sentinel
+  pods. Neither configuration alone proves runtime HA.
 - Dev edge/TLS/DNS, Flow forwarding infrastructure, and Flash's own
   `heterocloud-edge/heterocloud-edge` Gateway and gVisor runtime in the dev cluster.
 - A separate dev OIDC realm and `heterocloud-dev-web` client. Its only console
@@ -89,10 +90,17 @@ capacity and app-only PV reservations before apply. There is no automatic
 migration or removal of older StatefulSets/Services: verify this is a fresh
 application namespace before provisioning. This generator is not a DB migration.
 
-Flow's intermediate standalone `redis` Service still uses the Flow secret's
-`redis-password`. Its direct connection uses a full `redis://` URL. Authenticated
-Redis/Sentinel, live failover, credential provisioning, and storage admission
-remain required before calling the app infrastructure deployment-ready or HA.
+Flow now owns Redis through its bundled, release-bound chart; the infrastructure
+bundle no longer emits the old standalone `redis` StatefulSet or Service.
+Redis and Sentinel share `heterocloud-flow-dev-secrets[redis-password]` and use
+three pods, quorum two, required hostname anti-affinity, PDB minimum two and
+three fresh 8Gi PVCs. The two immutable auxiliary image pins are mandatory.
+The API/signaling clients discover primary through the three pod-specific
+Sentinel addresses under `heterocloud-flow-dev-redis-headless`, master `flowmaster`.
+The protected LiveKit config Secret must use those same addresses and credentials.
+Ingress is restricted to Redis peers and same-namespace Flow pods (6379/26379);
+unrestricted external egress is disabled. Live failover, credential provisioning,
+storage admission and CNI enforcement still require actual verification.
 
 ## Site Configuration
 
@@ -127,8 +135,9 @@ Flow LiveKit is taken from `companions.livekit.image` in the selected Flow
 release, not a site-specific override. Its digest is preserved through promotion.
 Auxiliary image bindings: `coturn`, `garage`, `redis`,
 `redis-sentinel`, `prometheus`, `prometheus-init`, `grafana`, `busybox`, `haproxy`.
-Optional dev infrastructure also needs CNPG-compatible `postgres` and
-Redis-compatible `redis` images. Disabled components do not need image
+Optional dev infrastructure needs a CNPG-compatible `postgres` pin. Enabled
+bundled Redis requires Bitnami-compatible `redis` and `redis-sentinel` pins.
+Disabled components do not need image
 pins. `--helm-check` rejects any emitted container image absent from the selected
 artifacts or supplied auxiliary pins, including mutable chart defaults.
 

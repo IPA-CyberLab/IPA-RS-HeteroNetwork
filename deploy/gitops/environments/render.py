@@ -138,6 +138,10 @@ def substitute(value, site):
 
 def dev_values(app, site):
     values = substitute(read(HERE / "dev" / (app + ".yaml")), site)
+    if app == "heterocloud-flow":
+        require(site["storage_class"] != "dev-identity-local", "app storage must not reuse identity storage")
+        for name in ("redis", "redis-sentinel"):
+            require(name in site.get("auxiliary_images", {}), "DEV Redis and Sentinel require immutable image pins")
     if app == "heterocloud":
         values["trustedProxyNetworks"] = site["pod_cidrs"]
         values["ownerConsole"]["allowedNetworks"] = site["pod_cidrs"]
@@ -227,28 +231,6 @@ def infrastructure(state, site, applications):
         require("postgres" in pins and IMAGE.fullmatch(pins["postgres"].get("image", "")),
                 "dev CNPG image needs an immutable auxiliary pin")
         resources.extend(app_postgres.resources(databases, site, pins["postgres"]["image"]))
-    for ns in namespaces:
-        services = []
-        if ns == "heterocloud-flow-dev":
-            services.append(("redis", "redis", 6379, "1Gi"))
-        for name, image, port, size in services:
-            require(image in pins and IMAGE.fullmatch(pins[image].get("image", "")), "dev database/Redis images need immutable auxiliary pins")
-            labels = {"app.kubernetes.io/name": name, "release.heteronetwork.io/channel": "dev"}
-            env = []
-            container = {"name": name, "image": pins[image]["image"], "ports": [{"containerPort": port}], "env": env,
-                         "volumeMounts": [{"name": "data", "mountPath": "/data"}]}
-            env.append({"name": "REDIS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "heterocloud-flow-dev-secrets", "key": "redis-password"}}})
-            container["args"] = ["--appendonly", "yes", "--requirepass", "$(REDIS_PASSWORD)"]
-            resources.extend([
-                {"apiVersion": "v1", "kind": "Service", "metadata": {"name": name, "namespace": ns}, "spec": {"selector": labels, "ports": [{"port": port, "targetPort": port}]}},
-                {"apiVersion": "apps/v1", "kind": "StatefulSet", "metadata": {"name": name, "namespace": ns}, "spec": {
-                    "serviceName": name, "replicas": 1, "selector": {"matchLabels": labels},
-                    "template": {"metadata": {"labels": labels}, "spec": {"automountServiceAccountToken": False, "containers": [container]}},
-                    "volumeClaimTemplates": [{"metadata": {"name": "data"}, "spec": {"accessModes": ["ReadWriteOnce"],
-                        "storageClassName": site["storage_class"], "resources": {"requests": {"storage": size}}}}]}},
-                {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy", "metadata": {"name": name, "namespace": ns},
-                 "spec": {"podSelector": {"matchLabels": labels}, "policyTypes": ["Ingress"], "ingress": [{"from": [{"podSelector": {}}], "ports": [{"port": port, "protocol": "TCP"}]}]}},
-            ])
     return resources
 
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 10,
+  "revision": 11,
   "dev": {
     "heteronetwork": {
       "schema_version": 1,
@@ -79,12 +79,12 @@
     "flow": {
       "schema_version": 1,
       "component": "flow",
-      "version": "0.1.21-dev.4",
-      "commit": "b618852726ff5ffff1ed0386bad86b437ebface5",
-      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:02b3216210130fe51dce6331c88285c91e573d670811badcf0ae99fe1400a45e",
+      "version": "0.1.21-dev.5",
+      "commit": "411361c1551118d37ae70bee3306865093434000",
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:5043adf20f75bf9a013b8c2a73cf611ac8145b6ee6f73c31c1320680f8b1ff08",
       "companions": {
         "livekit": {
-          "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:ce0f07783028d390752961a0247480adc840f6918fb870752d48b902dcb5694c"
+          "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:614c169bce49531838c0177f3698b280fbdafe66306db59c0e1721e6b17936f2"
         }
       }
     }
@@ -555,6 +555,37 @@
         }
       },
       "at": "2026-09-11T00:31:45.064Z"
+    },
+    {
+      "revision": 11,
+      "command": "stage",
+      "channel": "dev",
+      "component": "flow",
+      "before": {
+        "schema_version": 1,
+        "component": "flow",
+        "version": "0.1.21-dev.4",
+        "commit": "b618852726ff5ffff1ed0386bad86b437ebface5",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:02b3216210130fe51dce6331c88285c91e573d670811badcf0ae99fe1400a45e",
+        "companions": {
+          "livekit": {
+            "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:ce0f07783028d390752961a0247480adc840f6918fb870752d48b902dcb5694c"
+          }
+        }
+      },
+      "after": {
+        "schema_version": 1,
+        "component": "flow",
+        "version": "0.1.21-dev.5",
+        "commit": "411361c1551118d37ae70bee3306865093434000",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:5043adf20f75bf9a013b8c2a73cf611ac8145b6ee6f73c31c1320680f8b1ff08",
+        "companions": {
+          "livekit": {
+            "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:614c169bce49531838c0177f3698b280fbdafe66306db59c0e1721e6b17936f2"
+          }
+        }
+      },
+      "at": "2026-09-11T00:55:21.897Z"
     }
   ]
 }

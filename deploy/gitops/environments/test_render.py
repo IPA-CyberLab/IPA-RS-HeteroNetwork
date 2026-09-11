@@ -42,7 +42,9 @@ def fixtures():
             "service_cidrs": ["172.21.0.0/16"], "dns_cidrs": ["172.21.0.10/32"],
             "kubernetes_api_backend_cidrs": ["10.251.0.1/32", "10.251.0.2/32", "10.251.0.3/32"],
             "auxiliary_images": {name: pin(name) for name in
-                                 ("postgres", "redis", "coturn", "garage")}}
+                                 ("postgres", "redis", "redis-sentinel", "coturn", "garage")}}
+    for name in ("redis", "redis-sentinel"):
+        site["auxiliary_images"][name]["image"] = "docker.io/bitnami/" + name + "@sha256:" + "b" * 64
     site["auxiliary_images"]["garage"]["version"] = "v2.3.0"
     return state, site
 
@@ -79,14 +81,21 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn(turn["servicePort"], (3478, 3479))
         self.assertEqual(turn["additionalPools"], [])
 
-    def test_dev_direct_redis_address_is_a_url(self):
+    def test_dev_redis_uses_authenticated_sentinel(self):
         _, site = fixtures()
-        address = render.dev_values("heterocloud-flow", site)["externalRedis"]["address"]
-        parsed = render.urlsplit(address)
-        self.assertEqual(parsed.scheme, "redis")
-        self.assertEqual(parsed.hostname, "redis.heterocloud-flow-dev.svc.cluster.local")
-        self.assertEqual(parsed.port, 6379)
-        self.assertIsNone(parsed.password)
+        values = render.dev_values("heterocloud-flow", site)
+        redis = values["redis"]
+        self.assertTrue(redis["enabled"])
+        self.assertTrue(redis["auth"]["enabled"])
+        self.assertTrue(redis["auth"]["sentinel"])
+        self.assertEqual(redis["sentinel"]["quorum"], 2)
+        self.assertEqual(redis["replica"]["replicaCount"], 3)
+        self.assertEqual(redis["replica"]["persistence"]["storageClass"], "dev-storage")
+        self.assertFalse(redis["networkPolicy"]["allowExternal"])
+        self.assertEqual(values["externalRedis"]["address"], "")
+        del site["auxiliary_images"]["redis-sentinel"]
+        with self.assertRaisesRegex(ValueError, "Sentinel require"):
+            render.dev_values("heterocloud-flow", site)
 
     def test_rendered_dev_owner_requires_secure_cookies(self):
         _, site = fixtures()
@@ -188,7 +197,7 @@ class RendererTests(unittest.TestCase):
         state, site = fixtures()
         resources = render.infrastructure(state, site, render.render(state, "dev", site))
         sets = [r for r in resources if r["kind"] == "StatefulSet"]
-        self.assertEqual(len(sets), 1)  # Redis is not yet migrated to Sentinel.
+        self.assertEqual(len(sets), 0)  # Redis/Sentinel belongs to the Flow chart.
         clusters = [r for r in resources if r["kind"] == "Cluster"]
         self.assertEqual({r["metadata"]["namespace"] for r in clusters},
                          {"heterocloud-dev", "heterocloud-flow-dev", "heterocloud-syouyu-dev"})
@@ -210,12 +219,6 @@ class RendererTests(unittest.TestCase):
                          {c["metadata"]["namespace"] for c in clusters})
         self.assertNotIn("hetero-dev-identity", str(resources))
         self.assertFalse(any(r["kind"] == "Secret" for r in resources))
-        for resource in sets:
-            self.assertTrue(resource["metadata"]["namespace"].endswith("-dev"))
-            for claim in resource["spec"]["volumeClaimTemplates"]:
-                self.assertNotIn("dataSource", claim["spec"])
-                self.assertNotIn("volumeName", claim["spec"])
-                self.assertEqual(claim["spec"]["storageClassName"], "dev-storage")
         site["storage_class"] = "dev-identity-local"
         with self.assertRaisesRegex(ValueError, "identity storage"):
             render.infrastructure(state, site, render.render(state, "dev", site))
@@ -358,6 +361,33 @@ class RendererTests(unittest.TestCase):
 
         def inspect(app, documents):
             if app["metadata"]["name"] == "heterocloud-flow-dev":
+                redis = next(d for d in documents if d and d.get("kind") == "StatefulSet"
+                             and d["metadata"]["name"] == "heterocloud-flow-dev-redis-node")
+                self.assertEqual(redis["spec"]["replicas"], 3)
+                redis_pod = redis["spec"]["template"]["spec"]
+                self.assertTrue(redis_pod["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"])
+                claim = redis["spec"]["volumeClaimTemplates"][0]["spec"]
+                self.assertEqual(claim["storageClassName"], "dev-storage")
+                self.assertEqual(claim["resources"]["requests"]["storage"], "8Gi")
+                self.assertNotIn("dataSource", claim)
+                self.assertNotIn("volumeName", claim)
+                budget = next(d for d in documents if d and d.get("kind") == "PodDisruptionBudget"
+                              and d["metadata"]["name"] == "heterocloud-flow-dev-redis-node")
+                self.assertEqual(budget["spec"]["minAvailable"], 2)
+                policy = next(d for d in documents if d and d.get("kind") == "NetworkPolicy"
+                              and d["metadata"]["name"] == "heterocloud-flow-dev-redis")
+                self.assertTrue(all(rule.get("from") for rule in policy["spec"]["ingress"]))
+                self.assertNotIn({}, policy["spec"]["egress"])
+                clients = [c for d in documents if d and d.get("kind") == "Deployment"
+                           for c in d["spec"]["template"]["spec"]["containers"] if c["name"] in ("api", "signaling")]
+                self.assertEqual(len(clients), 2)
+                for client in clients:
+                    env = {e["name"]: e for e in client["env"]}
+                    for key in ("REDIS_PASSWORD", "REDIS_SENTINEL_PASSWORD"):
+                        self.assertEqual(env[key]["valueFrom"]["secretKeyRef"],
+                                         {"name": "heterocloud-flow-dev-secrets", "key": "redis-password"})
+                    self.assertNotIn("REDIS_URL", env)
+                    self.assertEqual(len(env["REDIS_SENTINEL_URLS"]["value"].split(",")), 3)
                 turn = next(d for d in documents if d and d.get("kind") == "Deployment"
                             and d["metadata"]["name"] == "heterocloud-flow-dev-coturn")
                 pod = turn["spec"]["template"]["spec"]

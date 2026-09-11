@@ -25,7 +25,8 @@ Redis/Sentinel pods, required host anti-affinity and a new PVC template, with
 both container image references exactly matching the pins. This was not the
 selected-release deployment check and did not contact Kubernetes.
 
-Still required: authenticated three-pod Sentinel values, fresh Secret and
+Authenticated three-pod Sentinel values are now in the DEV Flow overlay, using
+the published dev.5 authentication support. Still required: fresh Secret and
 LiveKit configuration provisioning, app-only storage capacity and reservations,
 actual pull/startup checks, writable-primary discovery and node-loss recovery.
 Existing Keycloak identity state must not be reused for application data.

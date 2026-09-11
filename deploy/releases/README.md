@@ -1,5 +1,21 @@
 # Reviewed Release Selections
 
+## Flow DEV Selection: Authenticated Redis
+
+On 2026-09-11, revision 11 selects Flow `0.1.21-dev.5`, source
+`411361c1551118d37ae70bee3306865093434000`. Workflow `34547624248` completed
+successfully, including Redis authentication template checks and both image
+publications. The release artifact binds:
+
+- Flow: `sha256:5043adf20f75bf9a013b8c2a73cf611ac8145b6ee6f73c31c1320680f8b1ff08`
+- LiveKit: `sha256:614c169bce49531838c0177f3698b280fbdafe66306db59c0e1721e6b17936f2`
+
+DEV enables the bundled three-pod authenticated Redis/Sentinel configuration
+and removes the separate single-instance Redis generator. The four-chart
+offline check passed: Flash 12 resources, Flow 31, HCloud 12, Syouyu 21.
+Site and auxiliary image fixtures are not operational provisioning evidence.
+No application deployment or production promotion was performed.
+
 ## Flow DEV Selection: 2026-09-11
 
 Revision 10 selects Flow `0.1.21-dev.4`, source
