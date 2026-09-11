@@ -115,7 +115,8 @@ Provide private operator JSON, not production values copied into a dev overlay:
 | `oidc_issuer` | `https://id.<domain>/realms/heterocloud-dev` |
 | `oidc_client_id` | `heterocloud-dev-web` |
 | `owner_email` | Dedicated dev owner's email |
-| `storage_class` | Fresh-storage class in the dedicated cluster |
+| `storage_class` | Dedicated local class for database, Redis and Garage storage |
+| `flash_storage_class` | Separate shared filesystem class for Flash RWX home claims; must be provisioned and verified before tenant execution |
 | `pod_cidrs`, `service_cidrs`, `dns_cidrs` | Nonempty dedicated-cluster CIDR lists, no catch-all ranges |
 | `kubernetes_api_backend_cidrs` | Required nonempty explicit dev API backend CIDRs, no catch-all ranges; use observed backend addresses, not inferred Service IPs |
 | `auxiliary_images` | Map of `{version, image}` with exact `repository@sha256:<digest>` |

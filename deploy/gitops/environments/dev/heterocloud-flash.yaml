@@ -10,7 +10,7 @@ runtimeClass:
   name: gvisor
 persistence:
   enabled: true
-  storageClass: ${storage_class}
+  storageClass: ${flash_storage_class}
 adminVolumeClaims: []
 adminVolumeMounts: {}
 providerAuth:

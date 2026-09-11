@@ -121,6 +121,13 @@ def validate_site(site, channel):
     require(site.get("oidc_client_id") == "heterocloud-dev-web", "dev must not reuse the production OIDC client")
     require(isinstance(site.get("owner_email"), str) and "@" in site["owner_email"], "dev owner email is required")
     require(re.fullmatch(r"[a-z0-9][a-z0-9.-]*", site.get("storage_class", "")), "dev storage class is required")
+    flash_storage = site.get("flash_storage_class")
+    require(isinstance(flash_storage, str) and len(flash_storage) <= 253
+            and all(len(label) <= 63 and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                    for label in flash_storage.split('.')),
+            "dev Flash shared storage class is required")
+    require(flash_storage not in (site["storage_class"], "dev-identity-local", "dev-app-local"),
+            "Flash shared storage must not reuse a local storage class")
     for field in ("pod_cidrs", "service_cidrs", "dns_cidrs", "kubernetes_api_backend_cidrs"):
         require(isinstance(site.get(field), list) and site[field], "dev network ranges are required")
         for value in site[field]:

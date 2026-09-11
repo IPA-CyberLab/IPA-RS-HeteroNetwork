@@ -39,7 +39,8 @@ def fixtures():
             "production_cluster_uid": "22222222-2222-2222-2222-222222222222",
             "domain": "dev.example.invalid", "oidc_issuer": "https://id.dev.example.invalid/realms/heterocloud-dev",
             "oidc_client_id": "heterocloud-dev-web", "owner_email": "owner@dev.example.invalid",
-            "storage_class": "dev-storage", "pod_cidrs": ["172.20.0.0/16"],
+            "storage_class": "dev-storage", "flash_storage_class": "dev-flash-rwx",
+            "pod_cidrs": ["172.20.0.0/16"],
             "service_cidrs": ["172.21.0.0/16"], "dns_cidrs": ["172.21.0.10/32"],
             "kubernetes_api_backend_cidrs": ["10.251.0.1/32", "10.251.0.2/32", "10.251.0.3/32"],
             "auxiliary_images": {name: pin(name) for name in
@@ -51,6 +52,23 @@ def fixtures():
 
 
 class RendererTests(unittest.TestCase):
+    def test_flash_shared_storage_is_separate_from_local_dependencies(self):
+        _, site = fixtures()
+        render.validate_site(site, "dev")
+        self.assertEqual(render.dev_values("heterocloud-flash", site)["persistence"],
+                         {"enabled": True, "storageClass": "dev-flash-rwx"})
+        self.assertEqual(site["storage_class"], "dev-storage")
+
+    def test_flash_storage_rejects_missing_invalid_or_local_class(self):
+        for value in (None, "", False, [], "Uppercase", "../local", "x" * 254,
+                      "-invalid", "invalid-", "invalid..name", "x" * 64, "name.-invalid",
+                      "dev-storage", "dev-app-local", "dev-identity-local"):
+            with self.subTest(value=value):
+                _, site = fixtures()
+                site["flash_storage_class"] = value
+                with self.assertRaises(ValueError):
+                    render.validate_site(site, "dev")
+
     def test_dev_oidc_egress_uses_private_backend_port(self):
         _, site = fixtures()
         values = render.dev_values("heterocloud", site)["networkPolicy"]

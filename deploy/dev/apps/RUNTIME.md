@@ -423,6 +423,55 @@ space alone is insufficient admission because those directories lack quotas.
 Longhorn must not enroll root disks or consume capacity committed to local PVs.
 No Longhorn or CSI-S3 resources were installed during this control-plane step.
 
+The next desired site configuration separates `flash_storage_class=dev-flash-rwx`
+from `storage_class=dev-app-local`. This changes future renders only; the immutable
+revision16 runtime bundle above remains unchanged and still points Flash at the
+old class until a reviewed transition after shared storage verification.
+The renderer rejects missing, invalid or local Flash class names. A class name
+alone does not establish a provisioner or prove RWX support.
+
+Fresh inspection after Flash startup found CPU request headroom of550m on DEV1,
+550m on DEV2 and650m on DEV3, and memory request headroom of approximately1.55,
+1.55 and1.68GiB respectively. All three app disks were mounted by their expected
+UUIDs; all three guests lacked `mount.nfs`. Longhorn installation is therefore
+preceded by capacity expansion and NFS prerequisite installation, not an
+unbudgeted deployment into the remaining space. Longhorn uses NFS share-manager
+Pods for shared filesystem access, as described in its
+[RWX documentation](https://longhorn.io/docs/1.12.1/nodes-and-volumes/volumes/rwx-volumes/).
+
+### Pinned Longhorn Preparation
+
+`prepare-longhorn.py` verifies the Longhorn1.12.1 chart hash before offline Helm
+rendering for the actual Kubernetes1.36.4 version. It accepts only the reviewed
+`longhorn-values.yaml` profile and exact image inventory. Missing digest pins
+produce an inventory but no manifest; complete pins produce a review-only bundle
+in a new exclusive directory with provenance and content hashes. Preparation
+does not install resources, grant deployment approval or enroll disks.
+
+`longhorn-images.json` records all13 upstream image indexes inspected through
+`docker buildx imagetools inspect` on2026-09-11. Each returned index included a
+linux/amd64 manifest. The offline preparer deliberately reports that it has not
+independently contacted the registry; that provenance field is not substituted
+with an unsupported runtime or supply-chain trust claim.
+
+The profile keeps three storage replicas and three replicas for every CSI
+controller, hard CSI anti-affinity, two UI replicas and an explicit UI PDB.
+Only V1 is enabled. It disables default-class creation, requires explicit labels
+before default disk enrollment, and creates only the non-default `dev-flash-rwx`
+class with Retain, ext4 and non-migratable filesystem semantics. The install
+phase must still confirm that no disk-enrollment labels already exist. No root
+disk or app data path is selected by this preparation.
+
+Actual generated review bundle: `/tmp/hetero-dev-longhorn-k136-prepared`.
+Chart SHA256: `c8cf4b35a9d872cd5f7e44fd26d8e6ac7c2abaee42f4e2f2a0b0ebbc6e3a6116`.
+Manifest SHA256: `ddb9c51aa1968c1dce643bd2fff8146cc9711f212ca144d882f4f028213ec567`.
+Provenance SHA256: `51f734f70c6dac6ee34ce058247e095104f231ba55addddf3d8fa47210367dcf`.
+Nine focused preparation tests passed. The chart's advertised UI PDB values are
+not consumed by a template, so the PDB is explicitly supplied as an extra object.
+Longhorn resource sizing, privileged host prerequisites, scoped network access,
+disk reservations, actual cross-node writes and failure recovery remain required
+before Flash tenant storage can be considered available.
+
 ## Remaining Deployment
 
 Flash tenant execution/storage, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash

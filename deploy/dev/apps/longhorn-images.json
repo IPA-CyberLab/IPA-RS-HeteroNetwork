@@ -1,0 +1,15 @@
+{
+  "longhorn.engine": "docker.io/longhornio/longhorn-engine:v1.12.1@sha256:9b1b720b56df6612c9589cbc156acbca6419fa61de818d05db7226b0722f2868",
+  "longhorn.manager": "docker.io/longhornio/longhorn-manager:v1.12.1@sha256:83b79f57043fe1405e68bc0d4c7987accbc6bb512def3e0db12b31966c070801",
+  "longhorn.ui": "docker.io/longhornio/longhorn-ui:v1.12.1@sha256:03a3ce6673df6e948c261fe978a695adaa8fb190d68bfe5c358af8ee3d3fbef5",
+  "longhorn.instanceManager": "docker.io/longhornio/longhorn-instance-manager:v1.12.1@sha256:b255f3279dd9d830ea153e9369928646dee519fd853036388926dddb5c66094b",
+  "longhorn.shareManager": "docker.io/longhornio/longhorn-share-manager:v1.12.1@sha256:efaf47aeb4e8615e312f0880df860bf2e5b9fa53006fe075f057c6dd4089f47d",
+  "longhorn.backingImageManager": "docker.io/longhornio/backing-image-manager:v1.12.1@sha256:dfb9452e4190fb80e39c7976a0036ac0ca314c05328b67952f8c165cbb4dabf3",
+  "longhorn.supportBundleKit": "docker.io/longhornio/support-bundle-kit:v0.0.92@sha256:02baa824d9a4174747ab9db2635ae000b1198d2d5ed3a4c69caf28724224e783",
+  "csi.attacher": "docker.io/longhornio/csi-attacher:v4.12.0@sha256:a814aa4784197116983ea13e376fc691e000a390de9d0b9fca2bc4a2fb7c4a1f",
+  "csi.provisioner": "docker.io/longhornio/csi-provisioner:v5.3.0@sha256:1bbb7b11d8087130e722e3249f364d0ab49ee3545e847c2f299e87b7e1ce5c4f",
+  "csi.nodeDriverRegistrar": "docker.io/longhornio/csi-node-driver-registrar:v2.17.0@sha256:29f7cfd519008fe8f8dff5e79db43f70d65c43a89c08f1bafbb199ca90df79f0",
+  "csi.resizer": "docker.io/longhornio/csi-resizer:v2.2.1@sha256:63d0aef25114d4a682b25afa6d9623a3cfcc19aca910269124408476bbe2c6fd",
+  "csi.snapshotter": "docker.io/longhornio/csi-snapshotter:v8.6.0@sha256:2bca9ac55170efa61dc50e5cc8d9550373db2e3e5161d82d3fdaac5c25150360",
+  "csi.livenessProbe": "docker.io/longhornio/livenessprobe:v2.19.0@sha256:d0cb76b565ba9d36da0dc2b38e2b6a49a0ae4fe067b03086110682f32c600318"
+}

@@ -8,6 +8,7 @@
   "oidc_client_id": "heterocloud-dev-web",
   "owner_email": "fasutotesuto@gmail.com",
   "storage_class": "dev-app-local",
+  "flash_storage_class": "dev-flash-rwx",
   "pod_cidrs": ["172.29.0.0/16"],
   "service_cidrs": ["172.30.0.0/16"],
   "dns_cidrs": ["172.30.0.10/32"],

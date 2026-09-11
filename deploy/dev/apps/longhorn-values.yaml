@@ -1,0 +1,66 @@
+# Bounded DEV preparation only; dedicated DEV cluster, never PROD.
+# No node labels, disks, or disk paths are assigned here. Existing app disks
+# retain their 35 GiB reservation each; that is not a percentage setting.
+namespaceOverride: longhorn-system
+persistence:
+  createStorageClass: false
+  defaultClass: false
+  defaultClassReplicaCount: 3
+defaultSettings:
+  createDefaultDiskLabeledNodes: true
+  defaultReplicaCount: '{"v1":"3","v2":"3"}'
+  replicaSoftAntiAffinity: false
+  v1DataEngine: true
+  v2DataEngine: false
+  upgradeChecker: false
+  allowCollectingLonghornUsageMetrics: false
+longhornManager:
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+csi:
+  podAntiAffinityPreset: hard
+  attacherReplicaCount: 3
+  provisionerReplicaCount: 3
+  resizerReplicaCount: 3
+  snapshotterReplicaCount: 3
+longhornUI:
+  replicas: 2
+service:
+  ui:
+    type: ClusterIP
+  manager:
+    type: ClusterIP
+ingress:
+  enabled: false
+httproute:
+  enabled: false
+preUpgradeChecker:
+  jobEnabled: false
+extraObjects:
+  # 1.12.1 advertises a UI PDB value but has no template consuming it.
+  - apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata:
+      name: longhorn-ui
+      namespace: longhorn-system
+    spec:
+      minAvailable: 1
+      selector:
+        matchLabels:
+          app: longhorn-ui
+  - apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: dev-flash-rwx
+      annotations:
+        storageclass.kubernetes.io/is-default-class: "false"
+    provisioner: driver.longhorn.io
+    allowVolumeExpansion: true
+    reclaimPolicy: Retain
+    volumeBindingMode: Immediate
+    parameters:
+      numberOfReplicas: "3"
+      fsType: ext4
+      migratable: "false"
+      dataEngine: v1
