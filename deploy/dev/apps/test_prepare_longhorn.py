@@ -18,6 +18,19 @@ HELM = Path('/home/coder/.local/bin/helm')
 
 
 class PolicyTests(unittest.TestCase):
+    def test_installation_excludes_lifecycle_hooks_and_crd_status(self):
+        documents = [
+            {'kind': 'Job', 'metadata': {'name': 'longhorn-uninstall', 'annotations': {'helm.sh/hook': 'pre-delete'}}},
+            {'kind': 'Job', 'metadata': {'name': 'longhorn-post-upgrade', 'annotations': {'helm.sh/hook': 'post-upgrade'}}},
+            {'kind': 'CustomResourceDefinition', 'metadata': {'name': 'volumes.longhorn.io'}, 'status': {}},
+        ]
+        before = copy.deepcopy(documents)
+        result = lh.installation_objects(documents)
+        self.assertEqual(result['items'], [{'kind': 'CustomResourceDefinition', 'metadata': {'name': 'volumes.longhorn.io'}}])
+        self.assertEqual(documents, before)
+        with self.assertRaises(ValueError):
+            lh.installation_objects([{'kind': 'Job', 'metadata': {'name': 'unexpected'}}])
+
     def test_chart_hash_fails_before_parsing(self):
         with self.assertRaisesRegex(ValueError, 'chart SHA256'):
             lh.chart_inputs(b'not a chart', lh.VALUES.read_bytes())

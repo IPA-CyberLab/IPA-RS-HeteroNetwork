@@ -472,6 +472,38 @@ Longhorn resource sizing, privileged host prerequisites, scoped network access,
 disk reservations, actual cross-node writes and failure recovery remain required
 before Flash tenant storage can be considered available.
 
+## Longhorn Controller Installation (2026-09-11)
+
+All three DEV guests now have pinned `nfs-common=1:2.6.4-3ubuntu5.1`,
+enabled iscsid and persistent iscsi_tcp loading. The guarded
+`install-storage-prerequisites.py` changes only the two validated Ubuntu APT
+source URIs from HTTP to HTTPS; HTTP fetches were slow or failed, while the
+HTTPS package downloads completed in three to four seconds. Repeated apply
+passed on all three guests without restarting containerd or removing existing
+containers (28, 28 and 27 checked respectively). It does not format disks.
+
+The preparer now emits `install-objects.json`, excluding every Helm hook,
+including the destructive uninstall Job. Its SHA256 is
+`e6a10cc588f2d97c82af3f98bf9981d2e5b43441d5be58fb37fe5950d873d7b2`.
+`apply-longhorn.py` enforces DEV identity, explicit ownership, input hashes,
+capacity admission, no disk enrollment and server-side readback. Kubernetes
+omits the default PriorityClass globalDefault=false field; only that omission
+is normalized for comparison. A true value still fails comparison.
+
+Actual controller installation succeeded using
+`/opt/heteronetwork-dev-longhorn-0a84b2e7` on DEV1. Subsequent verification
+passed: six Deployments, three DaemonSets, 27 Ready Pods, pinned images, and
+successful manager API requests from all three nodes. Each CSI controller has
+three replicas; UI has two and the driver deployer has one. The initial
+verification ran before dynamically created CSI Deployments existed; the
+source apply helper now waits for their creation and rollout explicitly.
+That additional wait has not yet been deployed to the recorded bundle.
+
+No disks are enrolled and no tenant PVC has been provisioned. Three replicas
+in the StorageClass do not yet establish working shared storage or HA.
+Disk capacity reservations, actual gVisor cross-node RWX writes and recovery
+remain unverified. All DEV VMs still share one physical host. PROD is unchanged.
+
 ## Remaining Deployment
 
 Flash tenant execution/storage, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash

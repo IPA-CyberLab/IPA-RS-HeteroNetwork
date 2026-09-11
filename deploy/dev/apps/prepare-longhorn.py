@@ -112,6 +112,22 @@ def validate_render(raw, pins):
     return documents
 
 
+def installation_objects(documents):
+    # Helm hooks are lifecycle commands, not regular desired-state objects.
+    # In particular, applying the rendered pre-delete Job would uninstall Longhorn.
+    items = []
+    for original in documents:
+        if original.get('metadata', {}).get('annotations', {}).get('helm.sh/hook'):
+            continue
+        item = json.loads(json.dumps(original))
+        if item['kind'] == 'CustomResourceDefinition':
+            item.pop('status', None)
+        items.append(item)
+    if any(item['kind'] == 'Job' for item in items):
+        raise ValueError('Unexpected non-hook Longhorn Job')
+    return {'apiVersion': 'v1', 'kind': 'List', 'items': items}
+
+
 def prepare(chart, output, pins_path=None, helm='helm', values_path=VALUES):
     if output.exists() or output.is_symlink():
         raise ValueError('Output directory must not exist')
@@ -154,8 +170,9 @@ def prepare(chart, output, pins_path=None, helm='helm', values_path=VALUES):
                        '--namespace', NAMESPACE, '--kube-version', KUBE_VERSION,
                        '--include-crds', '--values', str(root / 'values.json')]
             raw = subprocess.run(command, check=True, capture_output=True, timeout=120).stdout
-            validate_render(raw, pins)
+            documents = validate_render(raw, pins)
             files['review-only.yaml'] = raw
+            files['install-objects.json'] = encoded(installation_objects(documents))
             report['helm_version'] = subprocess.run(
                 [str(helm), 'version', '--short'], check=True, capture_output=True,
                 text=True, timeout=10).stdout.strip()
