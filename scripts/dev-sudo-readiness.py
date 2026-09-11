@@ -135,6 +135,53 @@ def native_check(installed, config, verified_binary):
     require(result.returncode == 0, "native_configuration_rejected")
 
 
+def validate_inactive_unit(properties, unit):
+    require(set(properties) == {"LoadState", "ActiveState", "SubState", "FragmentPath",
+                                "DropInPaths", "UnitFileState", "NeedDaemonReload"},
+            "unexpected_unit_properties")
+    require(properties["LoadState"] == "loaded"
+            and properties["FragmentPath"] == str(unit), "effective_unit_path_mismatch")
+    require(not properties["DropInPaths"] and properties["NeedDaemonReload"] == "no",
+            "effective_unit_overridden_or_stale")
+    require(properties["ActiveState"] == "inactive" and properties["SubState"] == "dead"
+            and properties["UnitFileState"] == "disabled", "service_not_disabled_and_stopped")
+
+
+def validate_inactive_plugins(data):
+    # This inactive-only check refuses even legitimate explicit plugins for review.
+    for line in data.decode("utf-8").splitlines():
+        directive = line.split("#", 1)[0].strip()
+        require(not directive.endswith("\\"), "sudo_config_continuation_requires_review")
+        require(not directive or directive.split()[0].lower() != "plugin",
+                "explicit_sudo_plugin_requires_review")
+
+
+def inactive_runtime_check(service_unit):
+    unit = Path(service_unit)
+    require(unit.is_absolute() and re.fullmatch(r"[A-Za-z0-9_.-]+\.service", unit.name)
+            and not unit.name.startswith("-"), "invalid_service_unit_path")
+    fields = ("LoadState", "ActiveState", "SubState", "FragmentPath", "DropInPaths",
+              "UnitFileState", "NeedDaemonReload")
+    result = subprocess.run(
+        ["/usr/bin/systemctl", "show", "--no-pager", "--property=" + ",".join(fields), unit.name],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"},
+        cwd="/", timeout=15, check=False,
+    )
+    require(result.returncode == 0 and len(result.stdout) <= 65536, "unit_inspection_failed")
+    pairs = []
+    for line in result.stdout.decode("utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        require(separator, "invalid_unit_property")
+        pairs.append((key, value))
+    validate_inactive_unit(unique_object(pairs), unit)
+    try:
+        config = read("/etc/sudo.conf", 65536)
+    except FileNotFoundError:
+        config = b""  # sudo's compiled defaults apply when the config is absent.
+    validate_inactive_plugins(config)
+
+
 def verify(args):
     require(os.geteuid() == 0, "root_readonly_required")
     expected = document(args.expected)
@@ -159,7 +206,13 @@ def verify(args):
     require(hashlib.sha256(unit).hexdigest() == expected["service_sha256"], "service_definition_pin_mismatch")
     checks = ["exact_dev_guest", "public_policy_and_owner_pins", "installed_companion_integrity",
               "reviewed_service_definition_hash"]
-    blockers = ["effective_service_dropins_and_plugin_disabled_state_not_verified"]
+    blockers = ["sudoers_and_other_root_access_bypasses_not_audited",
+                "authenticated_quorum_issuance_and_enforcement_not_verified"]
+    if args.inactive_runtime_check:
+        inactive_runtime_check(args.service_unit)
+        checks.append("effective_unit_disabled_without_overrides_and_no_explicit_sudo_plugins")
+    else:
+        blockers.insert(0, "effective_service_dropins_and_plugin_disabled_state_not_verified")
     if args.native_check:
         native_check(args.installed, args.config, payloads["bin/local-sudo-v2"])
         checks.append("native_readonly_policy_and_host_key_check")
@@ -177,6 +230,8 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--native-check", action="store_true",
                         help="Run the verified native read-only checker; never grants activation clearance")
+    parser.add_argument("--inactive-runtime-check", action="store_true",
+                        help="Inspect systemd and sudo.conf without starting or enabling anything")
     args = parser.parse_args()
     try:
         print(json.dumps(verify(args), sort_keys=True))

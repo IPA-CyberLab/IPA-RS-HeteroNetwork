@@ -28,6 +28,50 @@ def fixture():
 
 
 class Tests(unittest.TestCase):
+    def test_inactive_unit_rejects_overrides_and_activation(self):
+        unit = "/etc/systemd/system/local-sudo-v2.service"
+        properties = dict(LoadState="loaded", ActiveState="inactive", SubState="dead",
+                          FragmentPath=unit, DropInPaths="", UnitFileState="disabled",
+                          NeedDaemonReload="no")
+        module.validate_inactive_unit(properties, unit)
+        for key, value in (("LoadState", "not-found"), ("ActiveState", "active"),
+                           ("SubState", "running"), ("UnitFileState", "enabled"),
+                           ("UnitFileState", "enabled-runtime"), ("NeedDaemonReload", "yes"),
+                           ("FragmentPath", "/run/systemd/system/local-sudo-v2.service"),
+                           ("DropInPaths", "/etc/systemd/system/local-sudo-v2.service.d/override.conf")):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                module.validate_inactive_unit({**properties, key: value}, unit)
+        with self.assertRaises(ValueError):
+            module.validate_inactive_unit({**properties, "Unknown": "x"}, unit)
+
+    def test_inactive_plugins_fail_closed(self):
+        module.validate_inactive_plugins(b"# Plugin example module.so\nDebug sudo /var/log/sudo debug\n")
+        for value in (b"Plugin quorum_v2_gate /opt/gate.so", b" Plugin sudoers_policy sudoers.so",
+                      b"plugin unknown /tmp/gate.so", b"Plugin\\\n gate /opt/gate.so"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                module.validate_inactive_plugins(value)
+
+    def test_runtime_inspection_is_read_only(self):
+        output = (b"LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+                  b"FragmentPath=/etc/systemd/system/local-sudo-v2.service\n"
+                  b"DropInPaths=\nUnitFileState=disabled\nNeedDaemonReload=no\n")
+        with patch.object(module.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=output)) as run, patch.object(module, "read", return_value=b""):
+            module.inactive_runtime_check("/etc/systemd/system/local-sudo-v2.service")
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["/usr/bin/systemctl", "show", "--no-pager"])
+        self.assertEqual(command[-1], "local-sudo-v2.service")
+        self.assertEqual(run.call_args.kwargs["timeout"], 15)
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_runtime_inspection_refuses_failure_and_duplicate_properties(self):
+        for result in (SimpleNamespace(returncode=1, stdout=b""),
+                       SimpleNamespace(returncode=0, stdout=b"LoadState=loaded\nLoadState=loaded\n")):
+            with patch.object(module.subprocess, "run", return_value=result), \
+                    patch.object(module, "read") as read, self.assertRaises(ValueError):
+                module.inactive_runtime_check("/etc/systemd/system/local-sudo-v2.service")
+            read.assert_not_called()
+
     def test_native_check_uses_only_fixed_flag_and_clean_environment(self):
         with patch.object(module, "read", return_value=b"verified") as read, \
                 patch.object(module.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:

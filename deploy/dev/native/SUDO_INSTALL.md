@@ -65,6 +65,16 @@ Success still returns exit 2 and `ready_to_enable: false`: service configuration
 authenticated quorum issuance and effective enforcement remain separate checks.
 This option has not been run on the DEV guests with a provisioned owner policy.
 
+The optional `--inactive-runtime-check` inspects systemd's loaded fragment path,
+drop-ins, daemon reload requirement and disabled/inactive/dead state. It rejects
+unit overrides and any explicit `Plugin` directive in `/etc/sudo.conf`, including
+legitimate explicit stock plugins, which require separate review. Continuations
+are rejected rather than interpreted. This is an inactive-state preflight, not
+an active plugin audit; it issues only `systemctl show` and reads configuration.
+It does not audit sudoers, PAM, direct root access or other privilege bypasses.
+Those remain explicit blockers even when both optional checks pass. This runtime
+inspection has not yet been executed against provisioned DEV owner policy/units.
+
 ## Admission Boundary
 
 The public preflight also rejects duplicate host attestation keys, root or
