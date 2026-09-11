@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Verify DEV Longhorn controllers without creating or enrolling storage."""
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -13,6 +14,9 @@ PINS_SHA = '7bc1cc23c0f257b70ebace5ff69388daec260faa71c4d13c0608609b3444e918'
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--enrolled', action='store_true', help='Require the three explicitly reserved DEV disks')
+    args = parser.parse_args()
     path = Path('/opt/heteronetwork-dev-identity/apply.py')
     if hashlib.sha256(path.read_bytes()).hexdigest() != '0b396e7873f6970433b893c6ab04ea33bddc84bb6bfa02f0e129343dc16ae006':
         raise ValueError('Unreviewed DEV guard')
@@ -45,8 +49,26 @@ def main():
                        and all(d['status'].get(field) == 3 for field in
                                ('desiredNumberScheduled', 'updatedNumberScheduled', 'numberReady')))
     nodes = get('nodes.longhorn.io')['items']
-    helper.require({n['metadata']['name'] for n in nodes} == NODES
-                   and all(not n['spec'].get('disks') for n in nodes))
+    helper.require({n['metadata']['name'] for n in nodes} == NODES)
+    for node in nodes:
+        disks = node['spec'].get('disks', {})
+        if not args.enrolled:
+            helper.require(not disks)
+            continue
+        helper.require(set(disks) == {'dev-app-filesystem'})
+        disk = disks['dev-app-filesystem']
+        helper.require(disk['path'] == '/var/lib/heteronetwork-dev-app-storage/longhorn'
+                       and disk['storageReserved'] == 43 * 1024**3
+                       and disk['diskType'] == 'filesystem' and disk['allowScheduling']
+                       and not disk['evictionRequested'])
+        conditions = {c['type']: c['status'] for c in
+                      node['status']['diskStatus']['dev-app-filesystem']['conditions']}
+        helper.require(conditions.get('Ready') == 'True' and conditions.get('Schedulable') == 'True')
+    if args.enrolled:
+        for name, value in [('storage-over-provisioning-percentage', '100'),
+                            ('storage-minimal-available-percentage', '25'),
+                            ('allow-volume-creation-with-degraded-availability', 'false')]:
+            helper.require(get('settings.longhorn.io', name)['value'] == value)
     storage = get('storageclass', 'dev-flash-rwx')
     helper.require(storage['provisioner'] == 'driver.longhorn.io'
                    and storage['parameters']['numberOfReplicas'] == '3'
@@ -67,7 +89,7 @@ def main():
     helper.require(not helper.run(['get', 'job', 'longhorn-uninstall', '-n', NS, '--ignore-not-found', '-o', 'name']).strip())
     print(json.dumps({'ready_deployments': counts, 'ready_daemonsets': sorted(names),
                       'ready_pods': len(pods), 'manager_api_checks': 3,
-                      'all_pod_images_pinned': True, 'disks_enrolled': False,
+                      'all_pod_images_pinned': True, 'disks_enrolled': args.enrolled,
                       'rwx_verified': False, 'ha_verified': False}), flush=True)
 
 

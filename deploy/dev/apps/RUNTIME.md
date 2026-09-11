@@ -504,6 +504,54 @@ in the StorageClass do not yet establish working shared storage or HA.
 Disk capacity reservations, actual gVisor cross-node RWX writes and recovery
 remain unverified. All DEV VMs still share one physical host. PROD is unchanged.
 
+## DEV RWX Disk Enrollment and Runtime Check (2026-09-11)
+
+All three app filesystems were inspected through the guests: `/dev/vdb`, ext4,
+67,049,664,512 bytes each, and the previously recorded filesystem UUIDs.
+`prepare-longhorn-disk.py` rejects foreign mounts, insufficient capacity and
+existing multipath mappings before disabling unused multipathd service/socket.
+This follows the [upstream multipath guidance](https://longhorn.io/kb/troubleshooting-volume-with-multipath/).
+Only the DEV guests were changed. Repeated apply passed on all three guests;
+40, 40 and 39 existing containers were preserved, with no containerd restart.
+The helper creates only the root-owned `longhorn` directory on the existing
+filesystem. It does not format, remount or repartition anything.
+
+`enroll-longhorn-disk.py` performs UID/resourceVersion-checked updates to the
+local Longhorn Node. Each filesystem reserves 43 GiB: the existing 35 GiB of
+app local-PV commitments plus 8 GiB headroom. Overprovisioning remains 100%,
+minimum available percentage remains 25%, and degraded new-volume creation
+is disabled. These are scheduling reservations, **not filesystem quotas**;
+existing local directories and Longhorn snapshots can still grow. The
+resulting nominal schedulable capacity is approximately 19.44 GiB per node,
+before additional usage. Three-way replication does not triple logical capacity.
+
+Actual root-owned guest helpers:
+
+- `/opt/heteronetwork-dev-disk-4bcac59d/prepare.py`
+- `/opt/heteronetwork-dev-enroll-a495ef50/enroll.py`
+
+Enrollment and immediate repeated apply passed on every node, with the same
+disk definitions. `verify-longhorn.py --enrolled` passed on DEV1 from
+`/opt/heteronetwork-dev-rwx-e23f97e6`; it requires the explicit reserved disks,
+Ready/Schedulable status and the admission settings, rather than ignoring disks.
+The earlier controller-only verifier requires zero disks and is historical.
+
+`verify-longhorn-rwx.py` then created one retained 1 GiB RWX fixture in
+`hetero-dev-rwx-check`. Its three non-root, no-token, restricted gVisor Pods
+were pinned to distinct DEV nodes, with deny-all Pod ingress/egress. All three
+wrote unique values and all nine cross-node reads matched. One Pod was deleted
+and recreated with a different UID; its three reads still matched. The Longhorn
+volume was healthy with three running replicas on three distinct nodes.
+All probe Pods were cleaned up; the fixture namespace, deny-all policy and PVC
+remain for repeat verification. No warning events were present after the run.
+PVC `shared` is Bound to PV `pvc-ca40fa77-68d3-4971-85d9-70011081bf70`.
+
+This verifies actual gVisor RWX and Pod replacement persistence, not VM failure
+recovery. The Flash controller still uses its earlier immutable runtime bundle
+with `dev-app-local`; transition to `dev-flash-rwx` and a real signed tenant
+operation remain required. Encryption/module readiness, snapshot space bounds,
+node failure testing and physical-host HA are not established by this check.
+
 ## Remaining Deployment
 
 Flash tenant execution/storage, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
