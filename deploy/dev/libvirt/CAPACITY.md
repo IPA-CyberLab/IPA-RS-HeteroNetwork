@@ -64,8 +64,8 @@ memory would total 46GiB; including the unchanged 24GiB host reserve gives
 Fresh available memory, outstanding allocations, other host workloads and
 guest/database health must be admitted immediately before any change.
 
-Changing the current maximums requires a separately approved DEV rolling
-restart. Approval was requested; no restart or resize has been performed.
+Changing these original maximums required a separately approved DEV rolling
+restart. The following planning constraints preceded the approved execution below.
 Do not touch production VMs or user Flash containers. The eventual operation
 must preserve the existing provisioner journal and disks, update only validated
 resource hashes, handle one guest at a time and verify all four database
@@ -104,4 +104,32 @@ verify-full TLS. Its rollout is a prerequisite for continuing DEV3 and DEV1.
 Current reviewed execution bundle:
 `/opt/heteronetwork-dev-capacity-e3bc8132`, archive SHA256
 `e3bc813240f8cd8f43f1d4d8706cb9853fc8a32d10d5ebc45f058dc290661664`.
-DEV3/DEV1 completion must be recorded separately after actual verification.
+All three guests subsequently completed the capacity operation. Actual guest
+CPU counts are 8 each; MemTotal is 10182476KiB on DEV1/DEV2 and10182468KiB on
+DEV3. Each kubelet is active and the dedicated ext4 app disk remains mounted.
+The provisioner records all three completed capacity changes and `pending: null`.
+The original operation observed all four DB clusters and all three Keycloak
+replicas ready before recording each completion.
+
+DEV1 restart nevertheless exposed another identity availability interruption:
+all twelve DB instances recovered while all three Keycloak pods were initially
+unready. DEV1's new process recovered first. A thread dump on DEV2 showed the
+database readiness worker and JDBC discovery threads in PostgreSQL connection
+abort, waiting inside `SSLSocketInputRecord.deplete` during TLS socket close.
+The readiness executor reported `No executor queue space remaining`. This
+observation does not prove why TLS close exceeded the intended JDBC wait bounds.
+
+The remaining replicas recovered naturally before the explicit recovery helper
+ran. No Keycloak pod was deleted. Repeated capacity admission was a no-op on
+DEV1 and DEV2; DEV3's subsequent admission refused because cluster health was
+not fully ready at that instant. This refusal did not undo or repeat the resize.
+Capacity completion is not evidence of uninterrupted identity HA or sustained
+stability, and is not approval to promote the DEV applications to production.
+
+`../identity/recover-keycloak-replicas.py` is an explicit DEV-only recovery tool,
+not an automatic failover controller. It defaults to inspection, verifies the
+live DEV cluster, Deployment/ReplicaSet ownership and image, retains at least
+one ready replica, and uses UID/resourceVersion delete preconditions. With
+`--apply`, it replaces only currently unready replicas sequentially and waits
+for readiness to increase. Its actual invocation found zero candidates and
+made no changes; the pod deletion/replacement path is not yet runtime-tested.
