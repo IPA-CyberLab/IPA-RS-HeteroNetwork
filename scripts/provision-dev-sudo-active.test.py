@@ -2,6 +2,8 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+import stat
+from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 
@@ -91,6 +93,22 @@ class ProvisionDevSudoActiveTests(unittest.TestCase):
                 patch.object(module, "bundle", side_effect=fake_bundle), \
                 self.assertRaisesRegex(ValueError, "incompatible"):
             module.release_payloads()
+
+    def test_active_check_waits_for_local_sockets(self):
+        state = {"ActiveState": "active", "SubState": "running", "UnitFileState": "enabled"}
+        adapter = SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=0)
+        submit = SimpleNamespace(st_mode=stat.S_IFSOCK | 0o666, st_uid=0)
+        with patch.object(module, "identity",
+                          return_value=("hetero-dev-1", "machine", "node", 1, "10.251.0.1")), \
+                patch.object(module, "unit_state", return_value=state), \
+                patch.object(module, "wait_http"), \
+                patch.object(module.Path, "lstat",
+                             side_effect=[FileNotFoundError(), adapter, submit]), \
+                patch.object(module.time, "monotonic", side_effect=[0, 1]), \
+                patch.object(module.time, "sleep") as sleep:
+            result = module.require_active()
+        self.assertTrue(result["services_active"])
+        sleep.assert_called_once_with(0.05)
 
 
 if __name__ == "__main__":

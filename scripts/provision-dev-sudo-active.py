@@ -17,7 +17,7 @@ import time
 import urllib.request
 
 
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v3")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v4")
 VERSION = "0.1.15-dev.8"
 SOURCE_COMMIT = "04ec0371dae8efad1b24efac192e016b0f8a14b1"
 RELEASE_DOCUMENT_SHA256 = "69cca7eaeaf594478b96bcbaa11a66c534237ac6db477ea8842fbb228d36bef6"
@@ -456,10 +456,22 @@ def require_active():
         require(state["ActiveState"] == "active" and state["SubState"] == "running"
                 and state["UnitFileState"] == "enabled", "service_not_active")
     wait_http(f"http://{vpn_ip}:8981/healthz", 2)
-    for name, mode in (("adapter.sock", 0o600), ("submit.sock", 0o666)):
-        info = (Path("/run/ipars-sudo-v2") / name).lstat()
-        require(stat.S_ISSOCK(info.st_mode) and info.st_uid == 0
-                and stat.S_IMODE(info.st_mode) == mode, "invalid_local_socket")
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            sockets = [
+                ((Path("/run/ipars-sudo-v2") / name).lstat(), mode)
+                for name, mode in (("adapter.sock", 0o600), ("submit.sock", 0o666))
+            ]
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise ValueError("local_socket_readiness_timeout")
+            time.sleep(0.05)
+            continue
+        require(all(stat.S_ISSOCK(info.st_mode) and info.st_uid == 0
+                    and stat.S_IMODE(info.st_mode) == mode for info, mode in sockets),
+                "invalid_local_socket")
+        break
     return {"guest": hostname, "member": member, "services_active": True}
 
 

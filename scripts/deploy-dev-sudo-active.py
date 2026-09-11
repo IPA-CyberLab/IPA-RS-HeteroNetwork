@@ -16,7 +16,7 @@ import sys
 import time
 
 
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v3")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v4")
 FILES = {
     "release.json": 2 * 1024 * 1024,
     "native/ipars": 128 * 1024 * 1024,
@@ -117,7 +117,7 @@ limits=%s
 machines={"hetero-dev-1":"381d1ae16f555c59b738d8d01dd14c94","hetero-dev-2":"acc5151b6b245b63864372933dab97da","hetero-dev-3":"165a6e8acc3a56fdbf9bef8c90d6cf4d"}
 name=sys.argv[1];limit=limits[name];host=socket.gethostname();assert os.geteuid()==0 and host in machines
 assert pathlib.Path("/etc/machine-id").read_text().strip()==machines[host]
-root=pathlib.Path("/opt/heteronetwork-dev-sudo-active-v3");path=root/name
+root=pathlib.Path("/opt/heteronetwork-dev-sudo-active-v4");path=root/name
 for directory in [root,*reversed(path.parents[:-3])]:
  if not os.path.lexists(directory):directory.mkdir(mode=0o700)
  info=directory.lstat();assert stat.S_ISDIR(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o700
