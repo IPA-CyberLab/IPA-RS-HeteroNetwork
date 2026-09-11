@@ -677,6 +677,29 @@ Flash dev.2 is now published and staged at channel revision17; release identity,
 digest verification and selected-source rendering are recorded in
 [FLASH_CANDIDATE.md](FLASH_CANDIDATE.md). The new image is not yet deployed.
 
+## Flash dev.2 Runtime Activation (2026-09-11)
+
+`upgrade-flash-dev2.py` applied the reviewed revision17 Flash image delta in DEV.
+It hash-checks the old/new inputs, rejects any additional resource/spec change,
+requires the already-applied shared-storage configuration, and uses
+UID/resourceVersion preconditions for each Deployment patch. No image change
+occurred on immediate repeated apply. The source includes a focused delta test.
+
+Actual bundle: `/opt/heteronetwork-dev-flash-upgrade-bbb4faac` on DEV1.
+All three API Pods and both controller Pods now use
+`ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.30-dev.2@sha256:191c9c68251f7b578490b12fb18797f5f364b1124ae80fd14f457c42eb252cb2`.
+The revised Flash verifier passed six health checks, three unauthenticated
+rejections and six RBAC checks. Runtime placement and release provenance are
+recorded in [FLASH_CANDIDATE.md](FLASH_CANDIDATE.md).
+
+A fresh full lifecycle run on the new image succeeded: creation, signed Web
+Shell write/read, generation update, replacement-Pod data readback, deletion,
+idempotent repeated deletion and volume cleanup. The final result reported
+three WebSocket checks, `retained_pv=null` and `volume_cleanup_verified=true`.
+No existing DEV tenant Pods were present during the upgrade. This does not
+prove uninterrupted updates of existing tenants, browser behavior or node-loss
+HA. No PROD resources were changed.
+
 ## Remaining Deployment
 
 Flash browser Web Shell and failure recovery, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash

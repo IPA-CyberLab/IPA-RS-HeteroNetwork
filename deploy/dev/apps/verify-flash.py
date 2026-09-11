@@ -9,7 +9,7 @@ import urllib.request
 
 sys.dont_write_bytecode = True
 NS = 'heterocloud-flash-dev'
-IMAGE = 'ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.30-dev.1@sha256:cd4150194ff1133ec6faf04567110dab14e905cd436744b02a4892ee1809357b'
+IMAGE = 'ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.30-dev.2@sha256:191c9c68251f7b578490b12fb18797f5f364b1124ae80fd14f457c42eb252cb2'
 
 
 def main():

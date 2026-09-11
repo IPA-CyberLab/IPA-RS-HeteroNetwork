@@ -27,9 +27,21 @@ Flash resources SHA256: `99388dcf194b5a53b09b8d1e4976f2757a83c436da0773e2eee6a3a
 The Flash-only render diff changes the two Deployment images and the controller
 storage class (already migrated live to dev-flash-rwx). Chart sources are unchanged.
 
-Still required: guarded DEV rollout, pending-generation response checks on the
-new image, provider lifecycle verification and unrelated workload preservation.
-Do not substitute mutable architecture/source tags for the published digest.
+Guarded DEV rollout and provider lifecycle verification completed on2026-09-11.
+`upgrade-flash-dev2.py` validates both immutable bundles and permits only the
+reviewed image/storage delta. It requires the shared-storage migration already
+present live, patches only the two Deployment images and provenance annotations,
+and waits for each rollout. Repeated apply made no image changes.
 
-No DEV runtime image or PROD channel has changed yet. Live DEV Flash still runs
-0.1.30-dev.1 with its separate shared-storage migration on revision16.
+Actual helper bundle: `/opt/heteronetwork-dev-flash-upgrade-bbb4faac` on DEV1.
+API ReplicaSet `568cbd6585` has three Ready Pods, one per DEV node; controller
+ReplicaSet `76db9f7d96` has two Ready Pods on DEV1/DEV2. Image verification,
+six health checks, three unauthenticated 401 checks and six RBAC checks passed.
+There were zero DEV tenant Pods at upgrade time. No PROD resources were mutated.
+
+The complete signed lifecycle also passed on dev.2: service creation, three
+WebSocket shell checks, generation1-to2 update, replacement-Pod data recovery,
+service/Pod/PVC deletion, repeated deletion acceptance and CSI volume reclamation.
+No fixture PV remained. Browser OIDC/UI checks and node-failure HA remain
+unfinished. The lagging-generation HTTP response itself was covered by source
+unit tests, not deterministically forced/observed by this live lifecycle test.
