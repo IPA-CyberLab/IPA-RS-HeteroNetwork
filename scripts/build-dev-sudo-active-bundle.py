@@ -14,8 +14,8 @@ import tarfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.15-dev.7"
-SOURCE_COMMIT = "215680843f6df04e919c19f98cad05554d73c2d9"
+VERSION = "0.1.15-dev.8"
+SOURCE_COMMIT = "04ec0371dae8efad1b24efac192e016b0f8a14b1"
 MAX_FILE = 256 * 1024 * 1024
 FILES = {
     "sudo-manifest.json": ROOT / "deploy/dev/native/sudo-manifest.json",

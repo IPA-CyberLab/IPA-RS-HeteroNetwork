@@ -17,10 +17,10 @@ import time
 import urllib.request
 
 
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v2")
-VERSION = "0.1.15-dev.7"
-SOURCE_COMMIT = "215680843f6df04e919c19f98cad05554d73c2d9"
-RELEASE_DOCUMENT_SHA256 = "9625d5223dd88e3ff3f68a7937bccf89fad88f229db751a8901cd66668f36bc1"
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v3")
+VERSION = "0.1.15-dev.8"
+SOURCE_COMMIT = "04ec0371dae8efad1b24efac192e016b0f8a14b1"
+RELEASE_DOCUMENT_SHA256 = "69cca7eaeaf594478b96bcbaa11a66c534237ac6db477ea8842fbb228d36bef6"
 PLUGIN_HEADER_SHA256 = "11234d6e47e6da95adcb3ace71dc93f1d94b759aeca4cd938d829c076adfb35f"
 OLD_INCOMPATIBLE_PLUGIN_SHA256 = "b835943bb34931f785518073814b666fa2eaf9d3ee3fdf7538706954ff9a2b7e"
 MANIFEST_SHA256 = "60302d9b06bd7300ecf6547bdd1b266c47dd3760b4c7e892fce9eaab1c8718b5"
@@ -256,7 +256,8 @@ def select(root):
     if os.path.lexists(current):
         info = current.lstat()
         require(stat.S_ISLNK(info.st_mode) and info.st_uid == 0
-                and os.readlink(current) in ("0.1.15-dev.6", VERSION), "unexpected_active_slot")
+                and os.readlink(current) in ("0.1.15-dev.6", "0.1.15-dev.7", VERSION),
+                "unexpected_active_slot")
         if os.readlink(current) == VERSION:
             return False
     temporary = root / f".current-{os.getpid()}"
