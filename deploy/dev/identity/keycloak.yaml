@@ -61,6 +61,7 @@ spec:
             - {name: KC_DB_POOL_INITIAL_SIZE, value: '2'}
             - {name: KC_DB_POOL_MIN_SIZE, value: '2'}
             - {name: KC_DB_POOL_MAX_SIZE, value: '15'}
+            - {name: KC_TRANSACTION_DEFAULT_TIMEOUT, value: '30s'}
             - name: KC_HOSTNAME
               valueFrom:
                 configMapKeyRef: {name: dev-keycloak-site, key: origin}

@@ -31,6 +31,7 @@ class KeycloakContract(unittest.TestCase):
         self.assertIn("@sha256:", container["image"])
         env = {item["name"]: item for item in container["env"]}
         self.assertEqual(env["KC_HTTP_ENABLED"]["value"], "false")
+        self.assertEqual(env["KC_TRANSACTION_DEFAULT_TIMEOUT"]["value"], "30s")
         self.assertIn("sslmode=verify-full", env["KC_DB_URL"]["value"])
         params = parse_qs(urlsplit(env["KC_DB_URL"]["value"].removeprefix("jdbc:")).query)
         self.assertEqual(params, {"sslmode": ["verify-full"], "sslrootcert": ["/var/run/postgres-ca/ca.crt"],

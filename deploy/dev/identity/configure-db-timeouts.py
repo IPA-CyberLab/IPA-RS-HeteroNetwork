@@ -29,13 +29,21 @@ def main():
     matches = [(i, e) for i, e in enumerate(containers[0]['env']) if e['name'] == 'KC_DB_URL']
     helper.require(len(matches) == 1 and matches[0][1].get('value') in (OLD, NEW))
     index, entry = matches[0]
-    changed = entry['value'] == OLD
+    env = containers[0]['env']
+    transactions = [e for e in env if e['name'] == 'KC_TRANSACTION_DEFAULT_TIMEOUT']
+    helper.require(not transactions or transactions == [{'name': 'KC_TRANSACTION_DEFAULT_TIMEOUT', 'value': '30s'}])
+    changed = entry['value'] == OLD or not transactions
     if changed:
-        pointer = f'/spec/template/spec/containers/0/env/{index}/value'
+        # Keycloak 26.7 overrides the JDBC socket timeout when acquiring a connection.
+        desired = [dict(e) for e in env]
+        desired[index]['value'] = NEW
+        if not transactions:
+            desired.append({'name': 'KC_TRANSACTION_DEFAULT_TIMEOUT', 'value': '30s'})
+        pointer = '/spec/template/spec/containers/0/env'
         patch = [{'op': 'test', 'path': '/metadata/uid', 'value': document['metadata']['uid']},
                  {'op': 'test', 'path': '/metadata/resourceVersion', 'value': document['metadata']['resourceVersion']},
-                 {'op': 'test', 'path': pointer, 'value': OLD},
-                 {'op': 'replace', 'path': pointer, 'value': NEW}]
+                 {'op': 'test', 'path': pointer, 'value': env},
+                 {'op': 'replace', 'path': pointer, 'value': desired}]
         command = ['patch', 'deployment', 'dev-keycloak', '-n', 'hetero-dev-identity',
                    '--type=json', '--patch', json.dumps(patch)]
         helper.run([*command, '--dry-run=server'])
@@ -43,6 +51,8 @@ def main():
         helper.run(command)
     after = json.loads(helper.run(get))
     helper.require(after['spec']['template']['spec']['containers'][0]['env'][index]['value'] == NEW)
+    helper.require({'name': 'KC_TRANSACTION_DEFAULT_TIMEOUT', 'value': '30s'}
+                   in after['spec']['template']['spec']['containers'][0]['env'])
     print(json.dumps({'changed': changed, 'tls_verification': 'verify-full',
                       'rollout_complete': False, 'secrets_changed': False}))
 
