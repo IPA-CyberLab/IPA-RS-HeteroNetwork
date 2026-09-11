@@ -1,5 +1,6 @@
 """Offline tests. Synthetic digests are fixtures only, never deployment pins."""
 import copy
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -313,6 +314,40 @@ class RendererTests(unittest.TestCase):
         for destination in project["spec"]["destinations"]:
             self.assertEqual(destination["server"], site["destination_server"])
             self.assertIn("-dev", destination["namespace"])
+
+    @unittest.skipUnless(os.environ.get("HELM_CHANNEL_TESTS") == "1" and shutil.which("helm"), "opt-in local Helm check")
+    def test_local_helm_storage_reservations(self):
+        _, site = fixtures()
+        source = render.ROOT / "deploy/dev/apps/storage_plan.py"
+        module_spec = importlib.util.spec_from_file_location("app_storage_plan", source)
+        plan = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(plan)
+        site["storage_class"] = plan.CLASS
+        state = render.read(render.ROOT / "deploy/releases/channels.json")
+        applications = render.render(state, "dev", site)
+        claims = {}
+
+        def inspect(app, documents):
+            for d in documents:
+                if not d or d.get("kind") != "StatefulSet":
+                    continue
+                ns = app["spec"]["destination"]["namespace"]
+                for i in range(d["spec"]["replicas"]):
+                    for claim in d["spec"].get("volumeClaimTemplates", []):
+                        name = claim["metadata"]["name"] + "-" + d["metadata"]["name"] + "-" + str(i)
+                        self.assertEqual(claim["spec"]["storageClassName"], plan.CLASS)
+                        claims[(ns, name)] = claim["spec"]["resources"]["requests"]["storage"]
+
+        render.check_helm(applications, state, "dev", site,
+                          Path(os.environ.get("HELM_CHANNEL_REPOSITORY_ROOT", render.ROOT.parent)), inspect)
+        for d in render.infrastructure(state, site, applications):
+            if d["kind"] == "Cluster":
+                for i in range(1, d["spec"]["instances"] + 1):
+                    claims[(d["metadata"]["namespace"], d["metadata"]["name"] + "-" + str(i))] = d["spec"]["storage"]["size"]
+        reserved = {(p["spec"]["claimRef"]["namespace"], p["spec"]["claimRef"]["name"]):
+                    p["spec"]["capacity"]["storage"] for p in plan.manifest()["items"] if p["kind"] == "PersistentVolume"}
+        self.assertEqual(claims, reserved)
+        self.assertEqual(len(claims), 18)
 
     @unittest.skipUnless(os.environ.get("HELM_CHANNEL_TESTS") == "1" and shutil.which("helm"), "opt-in local Helm check")
     def test_local_helm_cloud_flash_redundancy(self):

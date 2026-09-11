@@ -30,3 +30,24 @@ the published dev.5 authentication support. Still required: fresh Secret and
 LiveKit configuration provisioning, app-only storage capacity and reservations,
 actual pull/startup checks, writable-primary discovery and node-loss recovery.
 Existing Keycloak identity state must not be reused for application data.
+
+## Storage Reservations
+
+`storage_plan.py` renders an offline, fixed list of 18 local PV reservations and
+the non-default `dev-app-local` StorageClass. It does not create directories,
+format disks, apply Kubernetes resources, or validate a live cluster identity.
+The UID annotation is descriptive, not an admission guard.
+
+Each DEV guest reserves 35 GiB: three 5 GiB application PostgreSQL volumes,
+8 GiB for Redis, and separate 2 GiB metadata / 10 GiB data volumes for Garage.
+Reservations use exact PVC names and hostname affinity, with `Retain` reclaim
+policy. They never reference the existing identity storage paths or class.
+The optional Helm contract test compares the reservations with the selected
+release charts' StatefulSet claims and the application database renderer.
+
+PV capacity declarations do not impose filesystem quotas. The proposed 64 GiB
+guest disks provide a shared filesystem; enforcing individual volume limits
+requires an additional quota mechanism. Three guests on one physical host are
+not physical-host HA. These manifests must not be applied until dedicated
+mounts, directory ownership, cluster identity, and consumer mount dependencies
+have been verified operationally.
