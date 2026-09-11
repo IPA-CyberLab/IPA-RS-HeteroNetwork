@@ -54,6 +54,17 @@ end-to-end validation remain required. Installed bytes and a disabled notice are
 not proof that majority approval is enforced. Do not enable the plugin until the
 complete local and remote approval path is provisioned and verified.
 
+The public preflight supports an explicit `--native-check` after installation of
+the real owner policy and host key. After archive, installed-byte, policy and unit
+hash checks pass, it runs only `bin/local-sudo-v2 --check-config`, with a clean
+environment, suppressed output and a 15-second timeout. The config argument must
+be `/etc/ipars-sudo-v2/config.json`, matching the native checker's fixed path.
+The native process reads the host key to validate its public pin, but does not
+start a service or open runtime state. Without the flag, no binary is executed.
+Success still returns exit 2 and `ready_to_enable: false`: service configuration,
+authenticated quorum issuance and effective enforcement remain separate checks.
+This option has not been run on the DEV guests with a provisioned owner policy.
+
 ## Admission Boundary
 
 The public preflight also rejects duplicate host attestation keys, root or

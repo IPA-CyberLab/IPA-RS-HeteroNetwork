@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only preflight, NOT activation clearance. Never executes sudo companions.
+"""Read-only preflight, NOT activation clearance. Never starts sudo services.
 
 Expected JSON: {policy: <exact public SudoPolicy>, guests: {hetero-dev-1:
 {node_id, voter_identifier, endpoint, machine_id}, ...}, service_sha256: <reviewed hash>}.
 All three guests and their exact public policy pins are required. No private inputs
 belong in this expectation file. Missing native read-only validation is reported
-as a blocker; this tool never opens the ledger or reads host.key contents.
+as a blocker unless --native-check is selected. The native checker reads host.key
+but never opens the ledger. This Python wrapper never reads the key contents.
 """
 import argparse
 import hashlib
@@ -16,12 +17,14 @@ from pathlib import Path
 import re
 import socket
 import stat
+import subprocess
 import sys
 from urllib.parse import urlsplit
 
 sys.dont_write_bytecode = True
 
 GUESTS = {f"hetero-dev-{i}" for i in range(1, 4)}
+NATIVE_CONFIG = "/etc/ipars-sudo-v2/config.json"
 
 
 def require(value, reason):
@@ -117,6 +120,21 @@ def validate_expected(expected, cluster, hostname, machine_id):
     require(re.fullmatch(r"[0-9a-f]{64}", expected["service_sha256"]), "missing_service_pin")
 
 
+def native_check(installed, config, verified_binary):
+    # The native CLI deliberately has no path overrides; check the policy we inspected.
+    require(str(config) == NATIVE_CONFIG, "native_check_requires_fixed_config_path")
+    binary = Path(installed) / "bin/local-sudo-v2"
+    require(read(binary, len(verified_binary), 0o755) == verified_binary,
+            "native_checker_changed")
+    result = subprocess.run(
+        [str(binary), "--check-config"], stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"},
+        cwd="/", timeout=15, check=False,
+    )
+    require(result.returncode == 0, "native_configuration_rejected")
+
+
 def verify(args):
     require(os.geteuid() == 0, "root_readonly_required")
     expected = document(args.expected)
@@ -139,18 +157,26 @@ def verify(args):
     require(document(Path(args.installed) / artifact.MANIFEST) == manifest, "installed_manifest_mismatch")
     unit = read(args.service_unit, 65536)
     require(hashlib.sha256(unit).hexdigest() == expected["service_sha256"], "service_definition_pin_mismatch")
+    checks = ["exact_dev_guest", "public_policy_and_owner_pins", "installed_companion_integrity",
+              "reviewed_service_definition_hash"]
+    blockers = ["effective_service_dropins_and_plugin_disabled_state_not_verified"]
+    if args.native_check:
+        native_check(args.installed, args.config, payloads["bin/local-sudo-v2"])
+        checks.append("native_readonly_policy_and_host_key_check")
+    else:
+        blockers.insert(0, "native_readonly_policy_and_host_key_check_not_performed")
     return {"static_checks_passed": True, "ready_to_enable": False,
-            "checks": ["exact_dev_guest", "public_policy_and_owner_pins", "installed_companion_integrity",
-                       "reviewed_service_definition_hash"],
-            "blockers": ["native_readonly_policy_and_host_key_check_not_performed",
-                         "effective_service_dropins_and_plugin_disabled_state_not_verified"],
-            "private_keys_read": False, "services_executed": False}
+            "checks": checks, "blockers": blockers,
+            "private_keys_read": args.native_check, "native_checker_executed": args.native_check,
+            "services_executed": False}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("expected", "expected-cluster-id", "config", "archive", "archive-sha256", "installed", "service-unit"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--native-check", action="store_true",
+                        help="Run the verified native read-only checker; never grants activation clearance")
     args = parser.parse_args()
     try:
         print(json.dumps(verify(args), sort_keys=True))
