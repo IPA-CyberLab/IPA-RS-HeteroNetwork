@@ -112,11 +112,23 @@ pub fn read_config<T: DeserializeOwned>(path: &Path, secret: bool) -> anyhow::Re
         metadata.uid() == 0 || metadata.uid() == uid,
         "quorum configuration has an untrusted owner"
     );
-    let forbidden = if secret { 0o077 } else { 0o022 };
-    ensure!(
-        metadata.mode() & forbidden == 0,
-        "quorum configuration permissions are too broad"
-    );
+    let systemd_credential = secret && is_systemd_credential_path(&absolute);
+    if systemd_credential {
+        ensure!(
+            systemd_credential_permissions_are_secure(
+                metadata.mode(),
+                metadata.uid(),
+                metadata.gid(),
+            ),
+            "quorum systemd credential permissions or ownership are invalid"
+        );
+    } else {
+        let forbidden = if secret { 0o077 } else { 0o022 };
+        ensure!(
+            metadata.mode() & forbidden == 0,
+            "quorum configuration permissions are too broad"
+        );
+    }
     ensure!(
         metadata.len() <= MAX_CONFIG_BYTES,
         "quorum configuration is too large"
@@ -129,6 +141,26 @@ pub fn read_config<T: DeserializeOwned>(path: &Path, secret: bool) -> anyhow::Re
     );
     // Serde errors can include secret values. Do not forward them to logs.
     serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid quorum configuration JSON"))
+}
+
+fn is_systemd_credential_path(path: &Path) -> bool {
+    let Some(directory) = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from)
+    else {
+        return false;
+    };
+    path_is_systemd_credential(path, &directory)
+}
+
+fn path_is_systemd_credential(path: &Path, directory: &Path) -> bool {
+    directory.is_absolute()
+        && directory.parent() == Some(Path::new("/run/credentials"))
+        && path.parent() == Some(directory)
+}
+
+fn systemd_credential_permissions_are_secure(mode: u32, uid: u32, gid: u32) -> bool {
+    mode & 0o7777 == 0o440 && uid == 0 && gid == 0
 }
 
 fn validate_listen(args: &QuorumSignerArgs) -> anyhow::Result<()> {
@@ -435,6 +467,35 @@ mod tests {
         assert!(read_config::<serde_json::Value>(&path, false).is_ok());
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn systemd_credential_detection_is_exact_and_service_scoped() {
+        let directory = Path::new("/run/credentials/heteronetwork-sudo-quorum-signer.service");
+        assert!(path_is_systemd_credential(
+            Path::new(
+                "/run/credentials/heteronetwork-sudo-quorum-signer.service/quorum-share.json"
+            ),
+            directory,
+        ));
+        assert!(!path_is_systemd_credential(
+            Path::new("/run/credentials/other.service/quorum-share.json"),
+            directory,
+        ));
+        assert!(!path_is_systemd_credential(
+            Path::new(
+                "/run/credentials/heteronetwork-sudo-quorum-signer.service/nested/quorum-share.json"
+            ),
+            directory,
+        ));
+        assert!(!path_is_systemd_credential(
+            Path::new("/tmp/credentials/service/quorum-share.json"),
+            Path::new("/tmp/credentials/service"),
+        ));
+        assert!(systemd_credential_permissions_are_secure(0o100440, 0, 0));
+        for (mode, uid, gid) in [(0o100400, 0, 0), (0o100444, 0, 0), (0o100440, 1, 0)] {
+            assert!(!systemd_credential_permissions_are_secure(mode, uid, gid));
+        }
     }
 
     fn uuid_for_test() -> String {
