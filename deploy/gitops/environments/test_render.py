@@ -51,6 +51,36 @@ def fixtures():
 
 
 class RendererTests(unittest.TestCase):
+    def test_oidc_ca_wiring_rejects_missing_or_optional_trust(self):
+        _, site = fixtures()
+        settings = render.dev_values("heterocloud", site)["oidc"]
+        self.assertEqual(settings["rootCaSecretName"], "heterocloud-dev-identity-ca")
+        pod = {"containers": [{"name": "api", "args": [
+            "--oidc-issuer-url=https://id.dev.example.invalid",
+            "--oidc-root-ca-file=/var/run/secrets/oidc-ca/ca.crt"],
+            "volumeMounts": [{"name": "oidc-ca", "mountPath": "/var/run/secrets/oidc-ca", "readOnly": True}]}],
+            "volumes": [{"name": "oidc-ca", "secret": {
+                "secretName": settings["rootCaSecretName"], "defaultMode": 0o444,
+                "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]}
+        documents = [{"kind": "Deployment", "spec": {"template": {"spec": copy.deepcopy(pod)}}}
+                     for _ in range(2)]
+        render.check_oidc_ca(documents, settings)
+        for change in ("argument", "mount", "optional", "secret", "consumer"):
+            changed = copy.deepcopy(documents)
+            spec = changed[0]["spec"]["template"]["spec"]
+            if change == "argument":
+                spec["containers"][0]["args"].pop()
+            elif change == "mount":
+                spec["containers"][0]["volumeMounts"][0]["readOnly"] = False
+            elif change == "optional":
+                spec["volumes"][0]["secret"]["optional"] = True
+            elif change == "secret":
+                spec["volumes"][0]["secret"]["secretName"] = "unrelated-ca"
+            else:
+                changed.pop()
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                render.check_oidc_ca(changed, settings)
+
     def test_redis_image_registry_is_not_duplicated(self):
         for name, prefix in (("redis", "redis.image"), ("redis-sentinel", "redis.sentinel.image")):
             image = {"version": "8.10.1", "image": "docker.io/bitnami/" + name + "@sha256:" + "a" * 64}

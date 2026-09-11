@@ -306,6 +306,7 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
                 check_database_ca(documents, database_tls)
             if channel == "dev" and component == "heterocloud":
                 check_dev_owner_cookies(documents, helm["valuesObject"]["ownerConsole"])
+                check_oidc_ca(documents, helm["valuesObject"]["oidc"])
             if inspect_documents:
                 inspect_documents(app, documents)
             counts[app["metadata"]["name"]] = sum(document is not None for document in documents)
@@ -313,6 +314,32 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
                 for image in container_images(document):
                     require(canonical_image(image) in allowed, f"rendered image lacks a selected or auxiliary immutable pin: {image}")
     return counts
+
+
+def check_oidc_ca(documents, settings):
+    """Check API/owner CA wiring; does not prove an OIDC login succeeds."""
+    clients = []
+    for document in documents:
+        if not isinstance(document, dict) or document.get("kind") != "Deployment":
+            continue
+        pod = document.get("spec", {}).get("template", {}).get("spec", {})
+        for container in pod.get("containers", []):
+            args = container.get("args", [])
+            if not any(arg.startswith("--oidc-issuer-url=") for arg in args):
+                continue
+            clients.append(container)
+            require([arg for arg in args if arg.startswith("--oidc-root-ca-file")] ==
+                    ["--oidc-root-ca-file=/var/run/secrets/oidc-ca/ca.crt"],
+                    "rendered OIDC client lacks the configured CA argument")
+            require([mount for mount in container.get("volumeMounts", []) if mount.get("name") == "oidc-ca"] ==
+                    [{"name": "oidc-ca", "mountPath": "/var/run/secrets/oidc-ca", "readOnly": True}],
+                    "rendered OIDC CA mount must be read-only")
+            expected = {"name": "oidc-ca", "secret": {
+                "secretName": settings["rootCaSecretName"], "defaultMode": 0o444,
+                "items": [{"key": settings.get("rootCaSecretKey", "ca.crt"), "path": "ca.crt"}]}}
+            require([volume for volume in pod.get("volumes", []) if volume.get("name") == "oidc-ca"] == [expected],
+                    "rendered OIDC CA must reference the required public CA Secret")
+    require(len(clients) == 2, "dev requires API and owner OIDC CA consumers")
 
 
 def check_database_ca(documents, settings):

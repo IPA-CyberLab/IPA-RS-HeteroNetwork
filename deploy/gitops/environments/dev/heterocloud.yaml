@@ -9,6 +9,8 @@ publicOrigin: https://${domain}
 additionalOrigins: []
 oidc:
   enabled: true
+  rootCaSecretName: heterocloud-dev-identity-ca
+  rootCaSecretKey: ca.crt
   issuerUrl: ${oidc_issuer}
   backchannelIssuerUrl: ""
   clientId: ${oidc_client_id}
