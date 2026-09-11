@@ -44,7 +44,7 @@ from either calculation. Refresh and validate the complete inventory under the
 provisioner lock immediately before any allocation. Unknown allocations,
 backing chains, snapshots or concurrent provisioning require investigation.
 
-## Required Implementation
+## Implementation And Deployment Gates
 
 Add a separate, identity-pinned expansion operation using the existing journal
 lock and resource/file/firewall checks. Create only a new app disk for each DEV
@@ -57,7 +57,18 @@ Guest formatting must select a verified unique disk serial and expected size,
 reject mounted/root/identity devices and existing signatures, and record the
 filesystem UUID. Mount only at a separate app-storage path, with fail-closed
 consumer ordering so missing storage cannot fall back onto the boot disk.
-These operations have not been implemented or performed by this inspection.
+The host helper is `scripts/expand-dev-storage.py`; its offline `plan` command
+does not admit capacity or make mutations. The one-guest `apply` path uses
+verified ext4 preallocation and live/persistent hotplug without guest restart.
+The guest helper is `deploy/dev/apps/prepare-storage.py`, which verifies the
+native identity and live Kubernetes UID before formatting a fresh serial-pinned
+disk. Neither helper has been applied to the live guests yet.
+
+Guest preparation deliberately does not restart consumers or activate the
+kubelet mount dependency after installing it. It reports app provisioning as
+not ready pending a planned activation and operational verification. The mount
+guard alone does not stop existing containers. Do not deploy app workloads on
+the new paths merely because formatting and mounting succeeded.
 
 Per guest, current requested app storage is approximately 35GiB: 15GiB for
 three app databases, 8GiB Redis and 12GiB Garage. Remaining nominal capacity
