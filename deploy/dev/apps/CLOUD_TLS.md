@@ -42,10 +42,10 @@ Provisioner SHA256:
 
 ## Remaining Trust Work
 
-This is private-CA certificate provisioning, not publicly trusted HTTPS or a
-successful server handshake. Cloud is not yet deployed. Its OIDC HTTP client
-must trust this CA and resolve/reach the DEV Keycloak issuer. The current chart
-does not yet consume `heterocloud-dev-identity-ca`; creating it alone changes no
-client trust. Owner/edge TLS, public DNS, browser trust, client authentication,
+Cloud has since been deployed from0.1.71-dev.5, and its chart consumes the
+identity CA for OIDC. The runtime verifier passed private-CA hostname-validated
+TLS connections and OIDC initiation on all3 API Pods; see [RUNTIME.md](RUNTIME.md).
+This is not publicly trusted HTTPS or a completed authenticated login.
+Owner/edge TLS, public DNS, browser trust, client authentication,
 certificate renewal and rollout remain separate work. The helper refuses a
 certificate with less than one day remaining rather than silently rotating it.

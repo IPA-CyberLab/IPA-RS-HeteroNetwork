@@ -295,9 +295,54 @@ This establishes internal startup only, not authenticated TURN allocations,
 WebRTC data transport, public ingress, owner login or physical-host HA.
 All three DEV guests still share one physical host. Production was unchanged.
 
+## Cloud Actual Startup (2026-09-11)
+
+`apply-cloud.py` admitted and applied the12 Cloud resources from the same
+revision16 bundle. The selected Cloud release is0.1.71-dev.5, commit
+`c81681b89b2151a9ae3214d045c938d38b8f74df`, image digest
+`70a41870b9e5c986512f2665bceb5a4d079dd7e1e0958ac36751b95e7928b9b3`.
+API, owner-console and worker each run3 replicas, one per DEV node. The API
+rollout completes before the other two Deployments are applied.
+
+The applicator verifies the exact bundle hash,12 resource identities, DEV
+namespace, image pins, required anti-affinity, nonroot/tokenless pods, Secrets,
+database target and per-node remaining requests. Unknown existing ownership or
+spec changes are rejected. Kubernetes omits `hostNetwork: false` on readback;
+only that specific default is normalized, not privileged flags or token mounts.
+The first attempt stopped before any resources because the TLS volume mounts
+all Secret keys rather than declaring items. That check now requires exactly
+`tls.crt` and `tls.key` for that specific Secret.
+
+Before application, the existing credential provisioner verified all7 Secrets
+against retained seeds: zero created, no rotation and no seed regeneration.
+Inspection of both senders and receivers confirmed all provider/principal
+issuer and audience settings agree. Syouyu's provider audience is intentionally
+`heterocloud-syouyu` on both sides, separate from its DEV principal audience.
+
+`verify-cloud.py` passed15 HTTPS requests across the three API Pods, including
+live/ready, login HTML, unauthenticated session rejection and OIDC initiation.
+It validates the private CA chain and hostname while dialing each selected Pod,
+then checks the exact DEV issuer/client/callback, S256 PKCE, state/nonce and
+Secure/HttpOnly/SameSite transaction cookie. Owner readiness passed from a
+different node's Flow Pod, without widening the owner ingress policy.
+All15 SQL migrations succeeded and DB connections from all9 Cloud Pods use TLS.
+Repeat application preserved all9 Cloud Pod UIDs and the verifier passed again.
+
+Installed DEV1 runtime bundle: `/opt/heteronetwork-dev-cloud-e255a8c3`, archive
+SHA256 `e255a8c36799c9ac26a092648493e00bcc7646ac4a4c39338afd846b3b87c25d`.
+Verifier: `/opt/heteronetwork-dev-cloud-verify-c205e497/verify-cloud.py`, SHA256
+`c205e497365e717c96e1d8c24cce5b30b6eecbce7c80d607eee7d58d21a2e50f`.
+Fourteen focused applicator tests and four redirect-validation tests passed.
+
+These are internal startup and OIDC initiation checks, not a completed owner
+login or browser E2E. Worker readiness alone does not prove provider operations.
+Flash is still undeployed, registry integration disabled, and external DEV
+DNS/edge/owner TLS unfinished. No owner identity was fabricated or inferred
+from its configured email; no sudo approval policy was activated.
+
 ## Remaining Deployment
 
-Cloud/Flash APIs/controllers/workers, Flow authenticated E2E, complete Syouyu integration, Flash gVisor and
+Flash APIs/controllers/workers, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash gVisor and
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that
