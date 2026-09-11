@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-runtime-v2")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-runtime-v3")
 VERSION = "0.1.15-dev.6"
 IPARSD_SHA = "dd26e9907c426fe1f2b628a5010441a4127ef26ab763195c353a8c7e09cf05bb"
 HOSTS_SHA = "c28d3c1fe54d7016752bad8f3fb92652f3f1dd96b81a9271ac6b9aac95b688c8"
@@ -66,9 +66,26 @@ def load(path, digest, name):
     return module
 
 
-def mkdir(path, mode):
-    if not os.path.lexists(path):
-        path.mkdir(mode=mode)
+def mkdir(path, mode, repair_empty_private=False):
+    created = not os.path.lexists(path)
+    if created:
+        path.mkdir(mode=0o700)
+    info = path.lstat()
+    repair = (repair_empty_private and not created and stat.S_ISDIR(info.st_mode)
+              and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700
+              and not any(path.iterdir()))
+    if created or repair:
+        directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(directory, mode)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     trusted(path, directory=True, mode=mode)
 
 
@@ -145,7 +162,7 @@ def main():
             and hashlib.sha256(signer_unit).hexdigest() == SIGNER_UNIT_SHA)
     require(iparsd[:7] == b"\x7fELF\x02\x01\x01")
 
-    mkdir(RUNTIME, 0o755)
+    mkdir(RUNTIME, 0o755, repair_empty_private=True)
     version = RUNTIME / VERSION
     mkdir(version, 0o755)
     mkdir(version / "bin", 0o755)
