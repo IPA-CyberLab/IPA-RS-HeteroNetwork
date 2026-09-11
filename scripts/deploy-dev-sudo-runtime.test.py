@@ -26,7 +26,6 @@ class Tests(unittest.TestCase):
             "provision-dev-sudo-runtime.py": ROOT / "scripts/provision-dev-sudo-runtime.py",
             "sudo-hosts.json": ROOT / "deploy/dev/native/sudo-hosts.json",
             "heteronetwork-sudo-local.service": ROOT / "deploy/systemd/heteronetwork-sudo-local.service",
-            "heteronetwork-sudo-quorum-signer.service": ROOT / "deploy/systemd/heteronetwork-sudo-quorum-signer.service",
         }
         for name, path in sources.items():
             digest, size = module.FILES[name]

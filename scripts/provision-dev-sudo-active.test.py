@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -20,6 +21,19 @@ class ProvisionDevSudoActiveTests(unittest.TestCase):
                          {"10.251.0.1", "10.251.0.2", "10.251.0.3"})
         self.assertEqual(len({value[0] for value in module.GUESTS.values()}), 3)
         self.assertEqual(len({value[1] for value in module.GUESTS.values()}), 3)
+
+    def test_signer_unit_uses_systemd_credentials_for_private_parent(self):
+        raw = (ROOT / "deploy/systemd/heteronetwork-sudo-quorum-signer.service").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), module.SIGNER_UNIT_SHA256)
+        text = raw.decode()
+        for value in (
+            "LoadCredential=quorum-manifest.json:/etc/heteronetwork/sudo-quorum/manifest.json",
+            "LoadCredential=sudo-policy.json:/etc/heteronetwork/sudo-quorum/policy.json",
+            "LoadCredential=quorum-share.json:/etc/credstore/heteronetwork-sudo-quorum-share.json",
+            "HETERONETWORK_ADMIN_QUORUM_MANIFEST_PATH=%d/quorum-manifest.json",
+            "HETERONETWORK_SUDO_QUORUM_POLICY_PATH=%d/sudo-policy.json",
+        ):
+            self.assertIn(value, text)
 
     def test_sudo_plugin_parser_fails_closed(self):
         self.assertEqual(module.plugin_directives(b"# Plugin fake /tmp/fake\nDebug sudo /tmp/log all@debug\n"), [])

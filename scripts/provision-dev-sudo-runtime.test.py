@@ -13,11 +13,10 @@ spec.loader.exec_module(module)
 
 
 class Tests(unittest.TestCase):
-    def test_public_inputs_and_units_match_pins(self):
+    def test_historical_public_inputs_and_local_unit_match_pins(self):
         values = (
             (ROOT / "deploy/dev/native/sudo-hosts.json", module.HOSTS_SHA),
             (ROOT / "deploy/systemd/heteronetwork-sudo-local.service", module.LOCAL_UNIT_SHA),
-            (ROOT / "deploy/systemd/heteronetwork-sudo-quorum-signer.service", module.SIGNER_UNIT_SHA),
         )
         for path, digest in values:
             with self.subTest(path=path):

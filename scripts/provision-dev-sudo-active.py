@@ -17,7 +17,7 @@ import time
 import urllib.request
 
 
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v1")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v2")
 VERSION = "0.1.15-dev.7"
 SOURCE_COMMIT = "215680843f6df04e919c19f98cad05554d73c2d9"
 RELEASE_DOCUMENT_SHA256 = "9625d5223dd88e3ff3f68a7937bccf89fad88f229db751a8901cd66668f36bc1"
@@ -26,7 +26,8 @@ OLD_INCOMPATIBLE_PLUGIN_SHA256 = "b835943bb34931f785518073814b666fa2eaf9d3ee3fdf
 MANIFEST_SHA256 = "60302d9b06bd7300ecf6547bdd1b266c47dd3760b4c7e892fce9eaab1c8718b5"
 POLICY_SHA256 = "9f322e6d2a9203fdd6b6faa7d175a8a7ae9616d29b234818f2bb8dde06a366d6"
 LOCAL_UNIT_SHA256 = "1a7c9f32574555230056389d2b413e9db57f13a7dc4ccca3236a3735a229853d"
-SIGNER_UNIT_SHA256 = "a7c966d14295d62ff14f645092a161b846f7b6a8b993a9d686cc8fa8849a8328"
+SIGNER_UNIT_SHA256 = "15cebfc09eb6934138230ba8d783aa9c1ab1208d89759b353aea68f4a9fc1662"
+PREVIOUS_SIGNER_UNIT_SHA256 = "a7c966d14295d62ff14f645092a161b846f7b6a8b993a9d686cc8fa8849a8328"
 LOGIN_HELPER_SHA256 = "6f3d60c30ba6bb2e0a626f864f4f8bc9a71e4e6962766b59c2c48d47ff6d784c"
 APPROVE_HELPER_SHA256 = "405800c59902ea8bee15375657f65ce0d1d2496ffab3a6340ea65cc920b20787"
 CLUSTER = "02282a57-784b-4269-90a0-8fda47ee62ec"
@@ -214,6 +215,18 @@ def install(path, raw, mode):
     require(read(path, len(raw), mode=mode) == raw, "installed_file_mismatch")
 
 
+def install_known_replacement(path, raw, mode, previous_sha):
+    path = Path(path)
+    if os.path.lexists(path):
+        current = read(path, max(len(raw), 65536), mode=mode)
+        if current != raw:
+            require(sha(current) == previous_sha, "unknown_existing_file")
+            atomic_replace(path, raw, mode)
+    else:
+        install(path, raw, mode)
+    require(read(path, len(raw), mode=mode) == raw, "replacement_file_mismatch")
+
+
 def atomic_replace(path, raw, mode):
     path = Path(path)
     temporary = path.parent / f".{path.name}.sudo-v2-{os.getpid()}"
@@ -347,7 +360,7 @@ def prepare():
     selected = {"runtime": select(RUNTIME), "artifacts": select(ARTIFACTS)}
 
     mkdir(MANIFEST.parent, 0o755)
-    mkdir(SERVICE_SHARE.parent, 0o755)
+    mkdir(SERVICE_SHARE.parent, 0o700)
     install(MANIFEST, manifest_raw, 0o644)
     install(POLICY, policy_raw, 0o644)
     install(SERVICE_SHARE, share, 0o600)
@@ -363,7 +376,7 @@ def prepare():
                              sort_keys=True, indent=2) + "\n").encode()
     install(LOCAL_CONFIG, config_raw, 0o600)
     install(LOCAL_UNIT, local_unit, 0o644)
-    install(SIGNER_UNIT, signer_unit, 0o644)
+    install_known_replacement(SIGNER_UNIT, signer_unit, 0o644, PREVIOUS_SIGNER_UNIT_SHA256)
     install("/usr/local/bin/heteronetwork-sudo-login", login, 0o555)
     install("/usr/local/bin/heteronetwork-sudo-approve", approve, 0o555)
     systemctl("daemon-reload")
