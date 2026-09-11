@@ -552,9 +552,50 @@ with `dev-app-local`; transition to `dev-flash-rwx` and a real signed tenant
 operation remain required. Encryption/module readiness, snapshot space bounds,
 node failure testing and physical-host HA are not established by this check.
 
+## Flash Shared Storage Transition and Signed Creation (2026-09-11)
+
+`migrate-flash-storage.py` verifies the immutable revision16 input hashes,
+the complete original controller configuration, the DEV cluster identity and
+three Ready/Schedulable reserved Longhorn disks. It changes exactly the
+controller's `FLASH_PERSISTENT_STORAGE_CLASS` value using UID/resourceVersion
+preconditions, from `dev-app-local` to `dev-flash-rwx`. It accepts repeated
+execution only when the live controller still matches the reviewed old or new
+configuration. The original bundle remains unchanged; for revision16 replay,
+the storage migration follows control-plane bootstrap.
+
+Actual helper: `/opt/heteronetwork-dev-flash-storage-12438bc6` on DEV1.
+Initial apply changed the controller; repeated apply reported no change.
+All three API Pod UIDs stayed unchanged. No tenant Pods or PVCs existed before
+the transition. Controller ReplicaSet is now `656f9b5456`, with two Ready Pods
+on DEV2 and DEV3. The existing Flash verifier passed six health checks, three
+unauthenticated 401 checks and six RBAC checks after the transition.
+
+`verify-flash-provider.py` then exercised the real Ed25519-signed provider API,
+using only the DEV signer Secret in guest memory. It validates the matching
+public key and restricts the request destination to the DEV ClusterIP range;
+tokens are neither written to disk nor printed. The test service is private,
+has no ports, disables workload egress, and requests one 100m CPU /128MiB
+gVisor replica with a 2GiB image-inclusive disk budget.
+
+Actual helper: `/opt/heteronetwork-dev-flash-provider-46c23bbb/verify.py`.
+Service ID: `da8841e7-5621-4a8f-8730-8754cb321c79`.
+The initial signed PUT returned the documented asynchronous operation-in-progress
+503 and created the FlashService. Signed status polling then returned Ready with
+runtime_class=gvisor, and the signed containers API returned one Running/Ready
+Pod: `flash-da8841e7-5621-4a8f-8730-8754cb321c79-8696645b5c-p57hl`.
+Its command checks the actual gVisor startup marker before sleeping.
+
+This service is intentionally retained for subsequent Web Shell, generation
+update, persistence and deletion checks. The current creation verifier refuses
+an existing service ID rather than overwriting it; continuing the retained
+fixture requires explicit identity/spec verification. The sleep command is
+bounded to one hour, so readiness must be rechecked before further operations.
+This does not establish browser login, user-facing Web Shell, public endpoints,
+full CRUD or node-failure HA. No PROD resources were changed.
+
 ## Remaining Deployment
 
-Flash tenant execution/storage, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
+Flash tenant Web Shell/update/delete and failure recovery, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that
