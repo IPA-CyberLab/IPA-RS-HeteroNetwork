@@ -249,9 +249,55 @@ apply Kubernetes resources, validate live ownership or authorize production.
 It has not yet admitted actual dev7 artifacts; their release build was still
 running when this transition check was added.
 
+## Flow dev7 Actual Startup (2026-09-11)
+
+The later release workflow34580135357 completed successfully. Channel revision16
+selects Flow0.1.21-dev.7 at commit38d5c8805e4b477af3efd9090eaab2a49e53fded.
+The previous section records the earlier failed attempt, not the current state.
+The actual revision16 bundle passed the constrained transition checker; manifest
+SHA256 is `3a6fb8239f19638765825c6363d5553beb317ebbf68ce88ed72faf30aa846011`.
+
+The applicator replaced only the previously identified suspended migration Job,
+with UID/resourceVersion preconditions. The new migration completed. Readback
+now handles Kubernetes omitting empty EnvVar.value without accepting valueFrom
+substitutions. All five runtime Deployments have3 Ready replicas, one per DEV
+node: API, matchmaker, signaling, LiveKit and Coturn.
+
+LiveKit initially failed because `turn.dev.heterocloud.mizuame.app` did not
+resolve. `deploy/dev/identity/configure-dns.py --flow --apply` adds a DEV-only
+CoreDNS rewrite to the existing TURN Service, preserving the Keycloak rewrite.
+The update checks the exact CoreDNS identity/content and uses compare-and-swap;
+repeat identity-only runs preserve the Flow rewrite. No public DNS change or
+workload restart was used. LiveKit recovered through its existing restart loop.
+
+`verify-flow.py` passed12 HTTP checks,3 TURN TCP listener checks, all6 successful
+migrations, and TLS for all observed application DB connections, including all9
+Rust API/worker/signaling Pod addresses. Matchmaker health is checked from a
+LiveKit Pod on a different node: its policy admits cluster Pods, not remote
+node hosts. A preliminary Syouyu-origin probe was rejected; no network policy
+was widened to make the checks pass.
+
+Repeat runtime/DNS apply succeeded and the verifier passed again. All15 runtime
+Pod UIDs matched the first successful verification; DNS reported no change.
+The namespace-wide UID assertion did not pass because the completed migration
+Job had expired and was recreated by apply. The new migration also completed;
+this is not a claim that ephemeral Job identities remain stable.
+
+Installed root-only DEV1 helpers:
+- Runtime: `/opt/heteronetwork-dev-flow-50eb6221/apply-flow.py`, archive SHA256
+  `50eb6221bd379d10014cf7229465052f9763218ca8c6d01f3286ef8cab76b18f`.
+- DNS: `/opt/heteronetwork-dev-flow-dns-87c9746c/configure-dns.py`, source SHA256
+  `87c9746ce44a317f825c2af4beb3d5428ac579a855934aad914cd7d51f5124cd`.
+- Verifier: `/opt/heteronetwork-dev-flow-verify-a59af1bb/verify-flow.py`, SHA256
+  `a59af1bb9a3466bceafdcf9ba0b52d516b43672386e806643a154e7e1b2789a5`.
+
+This establishes internal startup only, not authenticated TURN allocations,
+WebRTC data transport, public ingress, owner login or physical-host HA.
+All three DEV guests still share one physical host. Production was unchanged.
+
 ## Remaining Deployment
 
-Cloud/Flow/Flash APIs/controllers/workers, complete Syouyu integration, Flash gVisor and
+Cloud/Flash APIs/controllers/workers, Flow authenticated E2E, complete Syouyu integration, Flash gVisor and
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that

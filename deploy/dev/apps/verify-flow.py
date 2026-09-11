@@ -28,6 +28,15 @@ def main():
 
     results = {}
     db_clients = set()
+    source_namespace = NS
+    sources = json.loads(helper.run(['get', 'pods', '-n', source_namespace, '-l',
+        f'app.kubernetes.io/instance={NS},app.kubernetes.io/component=livekit', '-o', 'json']))['items']
+    helper.require(len(sources) == 3)
+    for source in sources:
+        helper.require(not source['metadata'].get('deletionTimestamp')
+                       and any(c['type'] == 'Ready' and c['status'] == 'True' for c in source['status']['conditions'])
+                       and any(c['name'] == 'livekit' and c['image'].endswith('@sha256:6f532540530d5673f4030dc5a29bde5f0d4511261d1b1e2caab28aead3529db0')
+                               for c in source['spec']['containers']))
     for component, port in PORTS.items():
         deployment = get('deployment', NS + '-' + component)
         helper.require(deployment['status'].get('availableReplicas') == 3
@@ -47,10 +56,17 @@ def main():
                     pass
             else:
                 suffix = '/' if component == 'livekit' else '/health/ready'
-                with opener.open(f'http://{address}:{port}{suffix}', timeout=10) as response:
-                    helper.require(response.status == 200)
-                    body = response.read(4097)
-                    helper.require(len(body) <= 4096)
+                url = f'http://{address}:{port}{suffix}'
+                if component == 'matchmaker':
+                    # Its health port admits cluster pods, not remote node hosts.
+                    source = next(p for p in sources if p['spec']['nodeName'] != pod['spec']['nodeName'])
+                    body = helper.run(['exec', '-n', source_namespace, source['metadata']['name'], '-c', 'livekit', '--',
+                        'wget', '-Y', 'off', '-q', '-T', '10', '-O', '-', url])
+                else:
+                    with opener.open(url, timeout=10) as response:
+                        helper.require(response.status == 200)
+                        body = response.read(4097)
+                helper.require(len(body) <= 4096)
                 if component != 'livekit':
                     helper.require(json.loads(body) == {'status': 'ready'})
                     db_clients.add(address)

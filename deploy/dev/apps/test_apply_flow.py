@@ -9,6 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'gitops/environment
 spec = importlib.util.spec_from_file_location('apply_flow', Path(__file__).with_name('apply-flow.py'))
 app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)
+garage_spec = importlib.util.spec_from_file_location(
+    'apply_garage', Path(__file__).with_name('apply-garage.py'))
+garage = importlib.util.module_from_spec(garage_spec)
+garage_spec.loader.exec_module(garage)
 
 NS = 'heterocloud-flow-dev'
 COMPONENTS = ('api', 'matchmaker', 'signaling', 'livekit', 'coturn')
@@ -230,6 +234,19 @@ class FlowAdmission(unittest.TestCase):
 
 
 class FlowAnnotations(unittest.TestCase):
+    def test_custom_stamp_preserves_annotations_and_is_idempotent(self):
+        for annotations in (None, {}, {'helm.sh/hook': 'pre-install',
+                                       app.ANNOTATION: app.STAMP}):
+            with self.subTest(annotations=annotations):
+                item = {'kind': 'Job', 'metadata': {'name': NS + '-migrate',
+                                                   'annotations': annotations}}
+                expected = copy.deepcopy(item)
+                expected['metadata']['annotations'] = {
+                    **(annotations or {}), app.ANNOTATION: 'new-release-stamp'}
+                for _ in range(2):
+                    app.annotate(item, 'new-release-stamp')
+                    self.assertEqual(item, expected)
+
     def test_missing_null_or_empty_annotations_normalized(self):
         for metadata in ({'name': NS}, {'name': NS, 'annotations': None},
                          {'name': NS, 'annotations': {}}):
@@ -263,6 +280,143 @@ class FlowAnnotations(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     app.annotate(item)
                 self.assertEqual(item, before)
+
+
+class FlowExistingState(unittest.TestCase):
+    STAMP = 'new-release-stamp'
+    LEGACY_UID = 'b8f31a23-d5b8-4a27-bcd0-e3af56c552b1'
+
+    def objects(self, key, legacy=False):
+        old = copy.deepcopy(resource(fixture(), key))
+        app.annotate(old)
+        desired = copy.deepcopy(old)
+        app.annotate(desired, self.STAMP)
+        if key[0] in ('Job', 'Deployment'):
+            desired['spec']['template']['spec']['containers'][0]['image'] = (
+                'example.invalid/flow:new@sha256:' + '1' * 64)
+        actual = copy.deepcopy(old if legacy else desired)
+        actual['metadata'].update({
+            'uid': self.LEGACY_UID if legacy else 'new-resource-uid',
+            'resourceVersion': '123',
+            'managedFields': [{'manager': 'kube-controller-manager'},
+                              {'manager': app.MANAGER}],
+        })
+        if legacy and key[0] == 'Job':
+            actual['spec']['suspend'] = True
+        return actual, desired, old
+
+    def check_state(self, expected, actual, desired, old):
+        before = copy.deepcopy((actual, desired, old))
+        if expected is None:
+            with self.assertRaises(ValueError):
+                app.existing_state(actual, desired, old, self.STAMP, garage.contains)
+        else:
+            self.assertEqual(
+                app.existing_state(actual, desired, old, self.STAMP, garage.contains),
+                expected)
+        self.assertEqual((actual, desired, old), before)
+
+    def test_new_matching_resources_present_without_previous_bundle(self):
+        for key in sorted(INVENTORY):
+            with self.subTest(resource=key):
+                actual, desired, _ = self.objects(key)
+                self.check_state('present', actual, desired, None)
+
+    def test_old_support_resources_restamp(self):
+        for key in sorted(INVENTORY):
+            if key[0] not in ('Job', 'Deployment'):
+                with self.subTest(resource=key):
+                    self.check_state('restamp', *self.objects(key, legacy=True))
+
+    def test_exact_suspended_legacy_job_replaced(self):
+        for status in (None, {}, {'active': 0, 'succeeded': 0}):
+            with self.subTest(status=status):
+                actual, desired, old = self.objects(('Job', NS + '-migrate'), legacy=True)
+                if status is not None:
+                    actual['status'] = status
+                self.check_state('replace', actual, desired, old)
+
+    def test_legacy_job_replacement_guards(self):
+        for change in ('active', 'succeeded', 'unsuspended', 'missing-suspend',
+                       'nonboolean-suspend', 'wrong-uid', 'manifest-drift', 'no-old'):
+            with self.subTest(change=change):
+                actual, desired, old = self.objects(('Job', NS + '-migrate'), legacy=True)
+                if change in ('active', 'succeeded'):
+                    actual['status'] = {change: 1}
+                elif change == 'unsuspended':
+                    actual['spec']['suspend'] = False
+                elif change == 'missing-suspend':
+                    actual['spec'].pop('suspend')
+                elif change == 'nonboolean-suspend':
+                    actual['spec']['suspend'] = 1
+                elif change == 'wrong-uid':
+                    actual['metadata']['uid'] = 'other-job-uid'
+                elif change == 'manifest-drift':
+                    actual['spec']['template']['spec']['containers'][0]['image'] = 'wrong'
+                else:
+                    old = None
+                self.check_state(None, actual, desired, old)
+
+    def test_ownership_deletion_and_stamp_guards_for_all_states(self):
+        for key in (('ServiceAccount', NS), ('Job', NS + '-migrate'),
+                    ('Deployment', NS + '-api')):
+            for legacy in (False, True):
+                for change in ('wrong-manager', 'missing-manager', 'deleting',
+                               'foreign-stamp', 'missing-stamp'):
+                    with self.subTest(resource=key, legacy=legacy, change=change):
+                        actual, desired, old = self.objects(key, legacy=legacy)
+                        metadata = actual['metadata']
+                        if change == 'wrong-manager':
+                            metadata['managedFields'] = [{'manager': 'foreign-manager'}]
+                        elif change == 'missing-manager':
+                            metadata.pop('managedFields')
+                        elif change == 'deleting':
+                            metadata['deletionTimestamp'] = '2026-09-11T00:00:00Z'
+                        elif change == 'foreign-stamp':
+                            metadata['annotations'][app.ANNOTATION] = 'foreign-stamp'
+                        else:
+                            metadata.pop('annotations')
+                        self.check_state(None, actual, desired, old)
+
+    def test_manifest_drift_rejected_for_new_and_old_support(self):
+        for key in sorted(INVENTORY):
+            for legacy in (False, True):
+                with self.subTest(resource=key, legacy=legacy):
+                    actual, desired, old = self.objects(key, legacy=legacy)
+                    actual['metadata']['namespace'] = 'foreign-namespace'
+                    self.check_state(None, actual, desired, old)
+
+    def test_old_support_without_previous_manifest_rejected(self):
+        actual, desired, _ = self.objects(('ServiceAccount', NS), legacy=True)
+        self.check_state(None, actual, desired, None)
+
+    def test_new_suspended_job_rejected(self):
+        actual, desired, old = self.objects(('Job', NS + '-migrate'))
+        actual['spec']['suspend'] = True
+        self.check_state(None, actual, desired, old)
+
+    def test_old_deployments_rejected(self):
+        for component in COMPONENTS:
+            with self.subTest(component=component):
+                self.check_state(None, *self.objects(
+                    ('Deployment', NS + '-' + component), legacy=True))
+
+
+class RuntimeReadback(unittest.TestCase):
+    def test_empty_env_default_only(self):
+        desired = {'kind': 'Deployment', 'spec': {'template': {'spec': {'containers': [
+            {'name': 'api', 'env': [{'name': 'METRICS_URL', 'value': ''}]}]}}}}
+        actual = copy.deepcopy(desired)
+        entry = actual['spec']['template']['spec']['containers'][0]['env'][0]
+        del entry['value']
+        comparator = lambda a, d: a == d
+        self.assertTrue(app.runtime_contains(actual, desired, comparator))
+        self.assertNotIn('value', entry)
+        entry['valueFrom'] = {'secretKeyRef': {'name': 'unexpected', 'key': 'value'}}
+        self.assertFalse(app.runtime_contains(actual, desired, comparator))
+        del entry['valueFrom']
+        entry['value'] = 'changed'
+        self.assertFalse(app.runtime_contains(actual, desired, comparator))
 
 
 if __name__ == '__main__':

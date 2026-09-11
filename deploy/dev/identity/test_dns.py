@@ -34,4 +34,16 @@ class DnsTests(unittest.TestCase):
             document = copy.deepcopy(self.fixture())
             document['data'] = data
             with self.assertRaises(ValueError):
-                dns.patch_for(document)
+                dns.patch_for(document, flow=True)
+
+    def test_flow_addition_preserves_identity_and_is_not_removed_on_repeat(self):
+        for previous in (dns.BASELINE, dns.DESIRED):
+            document = self.fixture()
+            document['data']['Corefile'] = previous
+            patch = dns.patch_for(document, flow=True)
+            self.assertEqual(patch[2]['value'], {'Corefile': previous})
+            self.assertEqual(patch[-1]['value'], dns.FLOW_DESIRED)
+            self.assertIn(dns.SERVICE, patch[-1]['value'])
+            document['data']['Corefile'] = patch[-1]['value']
+            self.assertEqual(dns.patch_for(document, flow=True), [])
+            self.assertEqual(dns.patch_for(document), [])

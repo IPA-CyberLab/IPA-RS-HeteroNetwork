@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 15,
+  "revision": 16,
   "dev": {
     "heteronetwork": {
       "schema_version": 1,
@@ -79,12 +79,12 @@
     "flow": {
       "schema_version": 1,
       "component": "flow",
-      "version": "0.1.21-dev.6",
-      "commit": "7e2b8e2db16387faff4087341c51efeac66802de",
-      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:e768fe4d5846e1c7a4e86199a97684aa87dfd75a7ea431550a8e1dcb2470721b",
+      "version": "0.1.21-dev.7",
+      "commit": "38d5c8805e4b477af3efd9090eaab2a49e53fded",
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:2753423925f4dcbe92488002326ea86499ab7dab7b7fe88574ff694ccde4884d",
       "companions": {
         "livekit": {
-          "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:02920c1d1d5dc4957105692fa236c11abba8a7825e3bf3153e3cbddd69ea949b"
+          "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:6f532540530d5673f4030dc5a29bde5f0d4511261d1b1e2caab28aead3529db0"
         }
       }
     }
@@ -680,6 +680,37 @@
         "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:70a41870b9e5c986512f2665bceb5a4d079dd7e1e0958ac36751b95e7928b9b3"
       },
       "at": "2026-09-11T03:26:16.745Z"
+    },
+    {
+      "revision": 16,
+      "command": "stage",
+      "channel": "dev",
+      "component": "flow",
+      "before": {
+        "schema_version": 1,
+        "component": "flow",
+        "version": "0.1.21-dev.6",
+        "commit": "7e2b8e2db16387faff4087341c51efeac66802de",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:e768fe4d5846e1c7a4e86199a97684aa87dfd75a7ea431550a8e1dcb2470721b",
+        "companions": {
+          "livekit": {
+            "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:02920c1d1d5dc4957105692fa236c11abba8a7825e3bf3153e3cbddd69ea949b"
+          }
+        }
+      },
+      "after": {
+        "schema_version": 1,
+        "component": "flow",
+        "version": "0.1.21-dev.7",
+        "commit": "38d5c8805e4b477af3efd9090eaab2a49e53fded",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:2753423925f4dcbe92488002326ea86499ab7dab7b7fe88574ff694ccde4884d",
+        "companions": {
+          "livekit": {
+            "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:6f532540530d5673f4030dc5a29bde5f0d4511261d1b1e2caab28aead3529db0"
+          }
+        }
+      },
+      "at": "2026-09-11T08:50:39.141Z"
     }
   ]
 }
