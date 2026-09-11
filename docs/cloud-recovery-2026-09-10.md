@@ -198,3 +198,52 @@ This removes network registration, not files or services on the offline host.
 Its agent could not be disabled remotely. No Kubernetes node, PVC, underlying
 data, Tailscale device or other HeteroNetwork node was deleted. In particular,
 `uc-k8sp1` and `mh-k8sp2` remain untouched by this retirement.
+
+## Public-Service Recurrence, 2026-09-11 12:53 UTC
+
+All production Keycloak listeners on port 18080 were initially unavailable and
+the edge listeners on port 18079 returned 503. The surviving agent directory
+contained only a stale STUN endpoint on `163.220.236.61:19444`. The recovery
+agent build `bed2a7a` treated that authoritative directory as exclusive, so NAT
+classification expired. Public-service promotion then withdrew the local
+STUN, control-plane and Keycloak services required to refresh the directory.
+This was a circular recovery dependency, not a Keycloak database failure.
+
+Recovery first restored the reviewed STUN listener on `.61`, then used the
+existing authenticated local-control-plane override on `.8`. Its Keycloak
+autopilot helper was atomically brought to the same
+`07946bd45138d466ea94c170c5c28323c0039a32a78956c650174c5df349782b`
+artifact already installed on `.6` and `.10`. Normal timers subsequently
+re-established fresh NAT classifications, control-plane leases and Keycloak
+placement. No tenant Pod or database process was restarted.
+
+The durable fix from `99ea8268` retries configured eligible public STUN servers
+only after the current primary directory fails. Release `v0.1.15-dev.6`, source
+`22c4e3baf5de53f70bbac08f5fe62a0590e24526`, contains that fix. Its native
+archive was verified against the release manifest before deployment. The
+installed `iparsd` SHA256 is
+`dd26e9907c426fe1f2b628a5010441a4127ef26ab763195c353a8c7e09cf05bb`.
+
+The agent was rolled one node at a time to `.8`, `.6`, then `.10`, retaining
+the prior `bed2a7a` binary as a rollback artifact. Each restart had to report
+build `0.1.15-dev.6`/`22c4e3b`, at least one candidate and a non-null NAT
+classification before proceeding. The final snapshot reported two candidates
+on every node. Control Plane, Signal, STUN and the public-service timer were
+active on all three nodes. `.6` and `.10` hosted active Keycloak replicas; `.8`
+remained an edge-only Keycloak proxy. Both `heteronetwork` and `heterocloud`
+OIDC discovery returned 200 through every local edge.
+
+Kubernetes remained available after the rollout. `ichikawap1`, `uc-k8s3p` and
+`uc-k8sv1` were Ready control-plane nodes on v1.36.3. The pre-existing
+`mizuame-nucboxg5`, `uc-k8sp1` and `uc-k8sp2` NotReady states were not changed
+or represented as recovered.
+
+`uc-k8s3p` and `uc-k8sv1` were also missing the sysctl file already generated
+by `kubeadm-ha-node.sh`. Root held 118/128 and 128/128 inotify instances,
+respectively, which caused systemd's `Too many open files` watch warning. The
+existing four-value Kubernetes sysctl configuration was installed atomically
+on both hosts and applied without restarting services; the inotify instance
+limit is now 1024, matching `ichikawap1`.
+
+This verifies service recovery and a bounded agent rollout. It is not a new
+browser login, media E2E, load, two-node chaos or complete-fleet recovery test.
