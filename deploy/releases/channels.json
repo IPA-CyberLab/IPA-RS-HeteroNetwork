@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 14,
+  "revision": 15,
   "dev": {
     "heteronetwork": {
       "schema_version": 1,
@@ -65,9 +65,9 @@
     "heterocloud": {
       "schema_version": 1,
       "component": "heterocloud",
-      "version": "0.1.71-dev.3",
-      "commit": "523ebbb71c39ee87e94b5672e73171acdc456b54",
-      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:36ef514770fefd5dcce820ad3c6324b45d791507013f5037b3431e819e582a70"
+      "version": "0.1.71-dev.5",
+      "commit": "c81681b89b2151a9ae3214d045c938d38b8f74df",
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:70a41870b9e5c986512f2665bceb5a4d079dd7e1e0958ac36751b95e7928b9b3"
     },
     "syouyu": {
       "schema_version": 1,
@@ -659,6 +659,27 @@
         }
       },
       "at": "2026-09-11T02:31:40.741Z"
+    },
+    {
+      "revision": 15,
+      "command": "stage",
+      "channel": "dev",
+      "component": "heterocloud",
+      "before": {
+        "schema_version": 1,
+        "component": "heterocloud",
+        "version": "0.1.71-dev.3",
+        "commit": "523ebbb71c39ee87e94b5672e73171acdc456b54",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:36ef514770fefd5dcce820ad3c6324b45d791507013f5037b3431e819e582a70"
+      },
+      "after": {
+        "schema_version": 1,
+        "component": "heterocloud",
+        "version": "0.1.71-dev.5",
+        "commit": "c81681b89b2151a9ae3214d045c938d38b8f74df",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:70a41870b9e5c986512f2665bceb5a4d079dd7e1e0958ac36751b95e7928b9b3"
+      },
+      "at": "2026-09-11T03:26:16.745Z"
     }
   ]
 }
