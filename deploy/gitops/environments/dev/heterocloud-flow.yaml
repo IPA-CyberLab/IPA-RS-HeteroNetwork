@@ -52,7 +52,7 @@ coturn:
 redis:
   enabled: false
 externalRedis:
-  address: redis.heterocloud-flow-dev.svc.cluster.local:6379
+  address: redis://redis.heterocloud-flow-dev.svc.cluster.local:6379
   sentinelUrls: []
   passwordSecretKey: redis-password
 postgresql-ha:

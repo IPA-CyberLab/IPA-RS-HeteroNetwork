@@ -47,6 +47,6 @@ networkPolicy:
     sameNamespace: true
     podSelector:
       matchLabels:
-        app.kubernetes.io/name: dev-postgres
+        cnpg.io/cluster: dev-postgres
     peers: []
     externalCidrs: []

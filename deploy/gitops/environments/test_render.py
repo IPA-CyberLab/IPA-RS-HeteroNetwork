@@ -67,6 +67,15 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn(turn["servicePort"], (3478, 3479))
         self.assertEqual(turn["additionalPools"], [])
 
+    def test_dev_direct_redis_address_is_a_url(self):
+        _, site = fixtures()
+        address = render.dev_values("heterocloud-flow", site)["externalRedis"]["address"]
+        parsed = render.urlsplit(address)
+        self.assertEqual(parsed.scheme, "redis")
+        self.assertEqual(parsed.hostname, "redis.heterocloud-flow-dev.svc.cluster.local")
+        self.assertEqual(parsed.port, 6379)
+        self.assertIsNone(parsed.password)
+
     def test_rendered_dev_owner_requires_secure_cookies(self):
         _, site = fixtures()
         owner = render.dev_values("heterocloud", site)["ownerConsole"]
@@ -167,7 +176,27 @@ class RendererTests(unittest.TestCase):
         state, site = fixtures()
         resources = render.infrastructure(state, site, render.render(state, "dev", site))
         sets = [r for r in resources if r["kind"] == "StatefulSet"]
-        self.assertEqual(len(sets), 4)
+        self.assertEqual(len(sets), 1)  # Redis is not yet migrated to Sentinel.
+        clusters = [r for r in resources if r["kind"] == "Cluster"]
+        self.assertEqual({r["metadata"]["namespace"] for r in clusters},
+                         {"heterocloud-dev", "heterocloud-flow-dev", "heterocloud-syouyu-dev"})
+        for cluster in clusters:
+            spec = cluster["spec"]
+            self.assertEqual(spec["instances"], 3)
+            self.assertEqual(spec["affinity"]["podAntiAffinityType"], "required")
+            self.assertEqual(spec["storage"], {"size": "5Gi", "storageClass": "dev-storage", "resizeInUseVolumes": False})
+            self.assertEqual(spec["postgresql"]["synchronous"],
+                             {"method": "any", "number": 1, "dataDurability": "required", "failoverQuorum": True})
+            self.assertEqual(spec["bootstrap"]["initdb"]["owner"], cluster["metadata"]["namespace"].replace("-", "_"))
+            self.assertNotIn("externalClusters", spec)
+            self.assertFalse(spec["enableSuperuserAccess"])
+        self.assertFalse(any(r["kind"] == "Service" and r["metadata"]["name"] == "dev-postgres" for r in resources))
+        operator = next(r for r in resources if r["metadata"]["name"] == "dev-application-databases")
+        self.assertEqual(operator["metadata"]["namespace"], "cnpg-system")
+        self.assertEqual({t["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+                          for t in operator["spec"]["egress"][0]["to"]},
+                         {c["metadata"]["namespace"] for c in clusters})
+        self.assertNotIn("hetero-dev-identity", str(resources))
         self.assertFalse(any(r["kind"] == "Secret" for r in resources))
         for resource in sets:
             self.assertTrue(resource["metadata"]["namespace"].endswith("-dev"))
@@ -175,6 +204,9 @@ class RendererTests(unittest.TestCase):
                 self.assertNotIn("dataSource", claim["spec"])
                 self.assertNotIn("volumeName", claim["spec"])
                 self.assertEqual(claim["spec"]["storageClassName"], "dev-storage")
+        site["storage_class"] = "dev-identity-local"
+        with self.assertRaisesRegex(ValueError, "identity storage"):
+            render.infrastructure(state, site, render.render(state, "dev", site))
 
     def test_syouyu_selector_and_explicit_api_backends(self):
         state, site = fixtures()
@@ -183,7 +215,7 @@ class RendererTests(unittest.TestCase):
                    if app["metadata"]["name"] == "heterocloud-syouyu-dev")
         policy = app["spec"]["source"]["helm"]["valuesObject"]["networkPolicy"]
         self.assertEqual(policy["database"]["podSelector"],
-                         {"matchLabels": {"app.kubernetes.io/name": "dev-postgres"}})
+                         {"matchLabels": {"cnpg.io/cluster": "dev-postgres"}})
         self.assertEqual(policy["kubernetesApiCidrs"],
                          ["172.21.0.0/16", "10.251.0.1/32", "10.251.0.2/32", "10.251.0.3/32"])
         for bad in (None, [], "10.251.0.1/32", ["0.0.0.0/0"], ["::/0"], ["invalid"], [True], [1]):
@@ -338,7 +370,7 @@ class RendererTests(unittest.TestCase):
                 self.assertEqual(render.canonical_image(garage_images[0]), site["auxiliary_images"]["garage"]["image"])
                 policy = next(d for d in documents if d and d.get("kind") == "NetworkPolicy"
                               and d["metadata"]["name"] == "heterocloud-syouyu-dev-api")
-                self.assertIn({"podSelector": {"matchLabels": {"app.kubernetes.io/name": "dev-postgres"}}},
+                self.assertIn({"podSelector": {"matchLabels": {"cnpg.io/cluster": "dev-postgres"}}},
                               [peer for rule in policy["spec"]["egress"] for peer in rule.get("to", [])])
             if app["metadata"]["name"] != "heterocloud-dev":
                 return

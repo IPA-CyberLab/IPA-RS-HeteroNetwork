@@ -45,7 +45,8 @@ Provision independently, without copying production user state:
 
 - Dev namespaces, storage class and fresh volumes; never restored production
   snapshots or existing production claims. Optional generated database/Redis
-  infrastructure uses fresh volume claim templates and one replica per DB.
+  infrastructure uses three-instance CNPG clusters for application Postgres.
+  Redis remains a single-instance intermediate configuration, not HA.
 - Dev edge/TLS/DNS, Flow forwarding infrastructure, and Flash's own
   `heterocloud-edge/heterocloud-edge` Gateway and gVisor runtime in the dev cluster.
 - A separate dev OIDC realm and `heterocloud-dev-web` client. Its only console
@@ -62,12 +63,36 @@ Provision independently, without copying production user state:
   `heterocloud-syouyu-dev-secrets`. Follow each selected chart's secret-key contract.
   LiveKit configuration must use dev-only Redis, TURN hosts, and new credentials.
 
-Optional generated Postgres services are `dev-postgres` in each API namespace
-except Flash. Database/user names are the namespace with hyphens replaced by
-underscores, port 5432. Passwords come from `<namespace>-postgres-auth`, key
-`password`; API database URL secrets must refer to that namespace's service and
-matching credentials. Flow's separate `redis` service uses its own Flow secret's
-`redis-password`. No Secret values are generated or copied.
+Optional generated CNPG clusters are `dev-postgres` in each API namespace
+except Flash. Use the operator-managed writable Service `dev-postgres-rw:5432`,
+never a selector spanning primary and standby instances. Database/user names
+are the namespace with hyphens replaced by underscores. CNPG generates each
+namespace's fresh `dev-postgres-app` Secret; the protected credential provisioning
+step must build the corresponding API `database-url` Secret from it. The old
+password-only `<namespace>-postgres-auth` contract is not used. The renderer
+does not read, generate or copy secret values.
+
+`auxiliary_images.postgres` must be a CNPG-compatible image supporting UID/GID
+26, such as the independently pinned Postgres 18.6 image in the DEV identity
+foundation, not an arbitrary Docker-library Postgres image. The CNPG operator
+and CRDs must already exist. App clusters have required hostname separation,
+one required synchronous standby and connection ceilings of 200 (HCloud/Flow)
+or 100 (Syouyu), including headroom over current API/worker pools. These are
+configuration choices, not a measured capacity or failover guarantee.
+
+The operator receives a separate additive egress policy for exactly these three
+DEV app namespaces and `cnpg.io/cluster=dev-postgres`, ports 8000/5432. Existing
+identity policies, Cluster, credentials and volumes remain untouched.
+`dev-identity-local` is explicitly rejected as app storage. App Postgres alone
+needs nine fresh 5Gi PVCs; Garage and Redis require additional storage. Prepare
+capacity and app-only PV reservations before apply. There is no automatic
+migration or removal of older StatefulSets/Services: verify this is a fresh
+application namespace before provisioning. This generator is not a DB migration.
+
+Flow's intermediate standalone `redis` Service still uses the Flow secret's
+`redis-password`. Its direct connection uses a full `redis://` URL. Authenticated
+Redis/Sentinel, live failover, credential provisioning, and storage admission
+remain required before calling the app infrastructure deployment-ready or HA.
 
 ## Site Configuration
 
@@ -95,14 +120,15 @@ Syouyu API egress merges the service CIDRs with `kubernetes_api_backend_cidrs`,
 normalizing and deduplicating exact CIDRs in stable order. Include the actual
 dev control-plane backend addresses used after Service DNAT and verify policy
 enforcement with the chosen CNI. Production rendering does not require this field.
-Syouyu's namespace-local database selector uses `matchLabels` for `dev-postgres`.
+Syouyu's namespace-local database selector uses `matchLabels` for
+`cnpg.io/cluster: dev-postgres`.
 
 Flow LiveKit is taken from `companions.livekit.image` in the selected Flow
 release, not a site-specific override. Its digest is preserved through promotion.
 Auxiliary image bindings: `coturn`, `garage`, `redis`,
 `redis-sentinel`, `prometheus`, `prometheus-init`, `grafana`, `busybox`, `haproxy`.
-Optional dev infrastructure also needs `postgres` and `redis`, using official
-Postgres/Redis-compatible entrypoints. Disabled components do not need image
+Optional dev infrastructure also needs CNPG-compatible `postgres` and
+Redis-compatible `redis` images. Disabled components do not need image
 pins. `--helm-check` rejects any emitted container image absent from the selected
 artifacts or supplied auxiliary pins, including mutable chart defaults.
 

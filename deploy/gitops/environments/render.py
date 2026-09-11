@@ -13,6 +13,7 @@ import tempfile
 from urllib.parse import urlsplit
 
 import yaml
+import app_postgres
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -213,11 +214,15 @@ def infrastructure(state, site, applications):
     require(all(app["metadata"]["name"].endswith("-dev") for app in applications), "infrastructure is dev-only")
     pins = site.get("auxiliary_images", {})
     namespaces = [app["spec"]["destination"]["namespace"] for app in applications]
+    require(site["storage_class"] != "dev-identity-local", "app storage must not reuse identity storage")
     resources = [{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns, "labels": {"release.heteronetwork.io/channel": "dev"}}} for ns in namespaces]
+    databases = [ns for ns in namespaces if ns in ("heterocloud-dev", "heterocloud-flow-dev", "heterocloud-syouyu-dev")]
+    if databases:
+        require("postgres" in pins and IMAGE.fullmatch(pins["postgres"].get("image", "")),
+                "dev CNPG image needs an immutable auxiliary pin")
+        resources.extend(app_postgres.resources(databases, site, pins["postgres"]["image"]))
     for ns in namespaces:
         services = []
-        if ns != "heterocloud-flash-dev":
-            services.append(("dev-postgres", "postgres", 5432, "5Gi"))
         if ns == "heterocloud-flow-dev":
             services.append(("redis", "redis", 6379, "1Gi"))
         for name, image, port, size in services:
@@ -225,15 +230,9 @@ def infrastructure(state, site, applications):
             labels = {"app.kubernetes.io/name": name, "release.heteronetwork.io/channel": "dev"}
             env = []
             container = {"name": name, "image": pins[image]["image"], "ports": [{"containerPort": port}], "env": env,
-                         "volumeMounts": [{"name": "data", "mountPath": "/var/lib/postgresql/data" if image == "postgres" else "/data"}]}
-            if image == "postgres":
-                database = ns.replace("-", "_")
-                env.extend([{"name": "POSTGRES_DB", "value": database}, {"name": "POSTGRES_USER", "value": database},
-                    {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {"name": ns + "-postgres-auth", "key": "password"}}},
-                    {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"}])
-            else:
-                env.append({"name": "REDIS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "heterocloud-flow-dev-secrets", "key": "redis-password"}}})
-                container["args"] = ["--appendonly", "yes", "--requirepass", "$(REDIS_PASSWORD)"]
+                         "volumeMounts": [{"name": "data", "mountPath": "/data"}]}
+            env.append({"name": "REDIS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "heterocloud-flow-dev-secrets", "key": "redis-password"}}})
+            container["args"] = ["--appendonly", "yes", "--requirepass", "$(REDIS_PASSWORD)"]
             resources.extend([
                 {"apiVersion": "v1", "kind": "Service", "metadata": {"name": name, "namespace": ns}, "spec": {"selector": labels, "ports": [{"port": port, "targetPort": port}]}},
                 {"apiVersion": "apps/v1", "kind": "StatefulSet", "metadata": {"name": name, "namespace": ns}, "spec": {
