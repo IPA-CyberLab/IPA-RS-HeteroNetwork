@@ -59,6 +59,22 @@ The root-protected DEV1 bundle is
 `/opt/heteronetwork-dev-databases-974dcc91`.
 Archive SHA-256: `974dcc91d6df29f9577e97a92872438d0e67602b66d6b47ebe8b30ce00743815`.
 
+## Transport Verification: 2026-09-11
+
+After checking DEV1 machine identity and the live Kubernetes UID, read-only
+probes verified all three database services at
+`dev-postgres-rw.<namespace>.svc.cluster.local:5432`. Each namespace has its own
+distinct CA. OpenSSL PostgreSQL STARTTLS from the existing `dev-postgres-1`
+container succeeded with the correct CA and matching service hostname. The
+other namespace's CA and a mismatched hostname were both rejected with a
+certificate-verification error. All nine cases passed.
+
+The procedure is retained as `verify-tls.py`. It passes only public CA bytes
+through stdin; it creates no Pod, writes no database records and does not
+restart workloads. This verifies transport from a database Pod, not access from
+application Pods under their NetworkPolicies, SQLx behavior or password login.
+Those application-level checks remain necessary.
+
 ## Remaining Work
 
 CA-reference support is committed and pushed in the application charts:
@@ -69,11 +85,15 @@ Syouyu `81f9705` (chart 0.1.7). The common optional values are
 migration Job. Ten focused Helm tests passed. No database credentials were read
 or copied during that work.
 
-These commits are not yet released or selected in `channels.json`; do not
-assume the currently selected releases consume these values. No DEV workload
-was changed. Fresh database URLs must separately use `sslmode=verify-full`
-and certificate-matching Service names. Actual valid-CA handshake and invalid-CA
-rejection checks remain outstanding. CA environment updates require a controlled
+Cloud `0.1.71-dev.3` and Syouyu `0.1.7-dev.2` were successfully released and
+selected in `channels.json` revisions 12 and 13 after registry digest readback.
+Release runs: Cloud `34554131779`, Syouyu `34554134114`. Flow release run
+`34554132897` for `0.1.21-dev.6` remains in progress; its selected chart is still
+the old version without CA support. No DEV workload was changed.
+Fresh database URLs must separately use `sslmode=verify-full` and
+certificate-matching Service names. Application-level SQLx login and certificate
+rejection checks remain outstanding; OpenSSL transport checks do not replace them.
+CA environment updates require a controlled
 rollout; the chart does not implement automatic certificate rotation.
 
 Translate the generated database credentials into each application's fresh
