@@ -12,6 +12,28 @@ spec.loader.exec_module(module)
 
 
 class DeviceLoginTests(unittest.TestCase):
+    def test_requests_use_product_user_agent(self):
+        class Response:
+            status = 200
+            headers = {}
+
+            @staticmethod
+            def read(_maximum):
+                return b"{}"
+
+        class Opener:
+            request = None
+
+            def open(self, request, timeout):
+                self.request = request
+                self.timeout = timeout
+                return Response()
+
+        opener = Opener()
+        self.assertEqual(module.request(opener, module.ISSUER + "/test"), {})
+        self.assertEqual(opener.request.get_header("User-agent"), module.USER_AGENT)
+        self.assertEqual(opener.timeout, 15)
+
     def test_endpoint_is_pinned_to_issuer(self):
         expected = module.ISSUER + "/protocol/openid-connect/token"
         self.assertEqual(module.endpoint(expected, module.ISSUER, "test"), expected)

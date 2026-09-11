@@ -22,6 +22,7 @@ OWNER_SUBJECT = "4daa569e-635c-49ed-bb17-5fe0a07581b2"
 OWNER_EMAIL = "fasutotesuto@gmail.com"
 MAX_RESPONSE = 1024 * 1024
 PKCE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}\Z")
+USER_AGENT = "HeteroNetwork-Sudo-Owner/0.1"
 
 
 def require(value, reason):
@@ -41,7 +42,7 @@ def decode(raw):
 
 
 def request(opener, url, data=None, token=None):
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if data is not None:
         data = urllib.parse.urlencode(data).encode("ascii")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
