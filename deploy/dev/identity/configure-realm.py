@@ -10,6 +10,7 @@ import ssl
 import sys
 from pathlib import Path
 from urllib.parse import urlencode
+from uuid import UUID
 
 sys.dont_write_bytecode = True
 ROOT = Path('/opt/heteronetwork-dev-identity')
@@ -62,7 +63,7 @@ class Api:
             raw.close()
 
 
-def configure(api, desired, uid):
+def configure(api, desired, uid, upgrade_cloud_client=False):
     base = '/admin/realms/' + REALM
     status, current = api.request('GET', base, authenticated=True)
     created = status == 404
@@ -73,19 +74,37 @@ def configure(api, desired, uid):
     require(status == 200 and current.get('attributes', {}).get(MARKER) == uid)
     require(matches(current, {key: value for key, value in desired.items() if key != 'clients'}))
     verified = []
+    upgraded = False
     for expected in desired['clients']:
         status, clients = api.request('GET', base + '/clients?' + urlencode({'clientId': expected['clientId']}),
                                       authenticated=True)
         require(status == 200 and len(clients) == 1)
         client = clients[0]
         require(client.get('attributes', {}).get(MARKER) == uid)
+        if (upgrade_cloud_client and expected['clientId'] == 'heterocloud-dev-web'
+                and expected.get('publicClient') is False and client.get('publicClient') is True):
+            legacy = {key: value for key, value in expected.items() if key != 'clientAuthenticatorType'}
+            legacy['publicClient'] = True
+            require(matches(client, legacy))
+            require(client.get('clientAuthenticatorType') in (None, 'client-secret'))
+            client_id = client.get('id', '')
+            require(str(UUID(client_id)) == client_id)
+            # Preserve unrelated settings; never write a returned or masked secret.
+            updated = dict(client, publicClient=False, clientAuthenticatorType='client-secret')
+            updated.pop('secret', None)
+            status, _ = api.request('PUT', base + '/clients/' + client_id, updated, authenticated=True)
+            require(status == 204)
+            status, client = api.request('GET', base + '/clients/' + client_id, authenticated=True)
+            require(status == 200)
+            upgraded = True
         require(matches(client, expected))
         verified.append(client['clientId'])
-    return {'created': created, 'realm': REALM, 'verified_clients': verified}
+    return {'created': created, 'realm': REALM, 'verified_clients': verified,
+            'cloud_client_upgraded': upgraded}
 
 
 def main():
-    require(len(sys.argv) == 1)
+    require(sys.argv[1:] in ([], ['--upgrade-cloud-client']))
     helper_path = ROOT / 'apply.py'
     require(hashlib.sha256(helper_path.read_bytes()).hexdigest() ==
             '0b396e7873f6970433b893c6ab04ea33bddc84bb6bfa02f0e129343dc16ae006')
@@ -93,9 +112,9 @@ def main():
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
     helper.guard()
-    desired_raw = helper.trusted_file(ROOT / 'realm.json', 32768)
+    desired_raw = helper.trusted_file(Path(__file__).resolve().with_name('realm.json'), 32768)
     require(hashlib.sha256(desired_raw).hexdigest() ==
-            '6cdddc89e98e6a0bbbc44a29d42efa5ad93a117590ac97b909cdb38a5778e5ba')
+            '77b1c2ffd870e5d369b432a490bf82ea71471ef43263e42c4e515d22cf06bd03')
     desired = json.loads(desired_raw)
     require(desired['realm'] == REALM and desired['attributes'][MARKER] == helper.UID)
     service = json.loads(helper.run(['get', 'service', 'dev-keycloak', '-n', 'hetero-dev-identity', '-o', 'json']))
@@ -111,7 +130,7 @@ def main():
     require(status == 200 and isinstance(token.get('access_token'), str))
     api.token = token['access_token']
     try:
-        result = configure(api, desired, helper.UID)
+        result = configure(api, desired, helper.UID, '--upgrade-cloud-client' in sys.argv[1:])
         status, discovery = api.request('GET', '/realms/' + REALM + '/.well-known/openid-configuration')
         issuer = 'https://' + HOST + '/realms/' + REALM
         require(status == 200 and discovery['issuer'] == issuer)

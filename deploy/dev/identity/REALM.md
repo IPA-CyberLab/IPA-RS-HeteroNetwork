@@ -6,12 +6,13 @@ the separate account setup, and enables bounded brute-force protection. It sets
 three-minute access tokens, a 30-minute idle SSO session and an eight-hour maximum.
 This does not change production session settings.
 
-There are two separate public OIDC clients:
+There are two separate OIDC clients:
 
-- `heterocloud-dev-web`: authorization code with required PKCE S256 and only the
+- `heterocloud-dev-web`: confidential client using `client-secret`, authorization
+  code with required PKCE S256 and only the
   DEV console and DEV owner console's exact HTTPS callback URLs. No wildcards,
   implicit grant, password direct grant or service account is enabled.
-- `heteronetwork-dev-web`: device authorization only, with no browser callback
+- `heteronetwork-dev-web`: public client for device authorization only, with no browser callback
   URLs, implicit grant, password direct grant or service account. This client
   matches the HeteroNetwork device-login flow, not the Cloud callback flow.
 
@@ -22,7 +23,9 @@ Neither client's creation grants sudo or pins an owner subject.
 ## Guarded Application
 
 Deliver `configure-realm.py` and `realm.json` to root-only
-`/opt/heteronetwork-dev-identity` on DEV1 after checking their reviewed hashes.
+versioned tooling on DEV1 after checking their reviewed hashes. Keep the original
+foundation bundle at `/opt/heteronetwork-dev-identity` unchanged. The realm JSON
+is read beside the invoked script; the foundation helper remains separately pinned.
 The helper pins the realm JSON and existing foundation helper, repeats its DEV
 cluster/guest guards, and reads the actual Service IP from that cluster. Requests
 connect to that private IP while validating HTTPS SNI/hostname against the DEV CA.
@@ -32,7 +35,7 @@ credentials and the resulting admin token are never printed, placed in arguments
 or used as a sudo owner's credentials.
 
 ```sh
-sudo python3 -B /opt/heteronetwork-dev-identity/configure-realm.py
+sudo python3 -B /opt/<reviewed-versioned-tools>/configure-realm.py
 ```
 
 The helper creates an absent realm using the official
@@ -49,7 +52,28 @@ according to Keycloak's device-flow policy. Consequently the validation run has
 bounded temporary authentication-session side effects, even when no configuration
 changes occur. It is not an authenticated device-login or token-grant test.
 
-## Observed Result
+## Confidential Cloud Client Transition
+
+The initial DEV realm incorrectly used a public Cloud web client. The selected
+Cloud API requires a client secret of at least 16 characters and authenticates
+the token exchange with HTTP Basic client authentication. An empty or invented
+Secret cannot make that client contract correct.
+
+The reviewed tooling supports the explicit `--upgrade-cloud-client` option for
+only this known transition. It checks the DEV marker and all previously managed
+settings, changes only the Cloud client's public/authenticator settings, omits
+any returned secret from the update body, and reads the client back. Unrelated
+drift is rejected. A repeat on the desired confidential client is read-only for
+configuration. The device client stays public. No secret rotation or account
+creation is performed by this option.
+
+This transition has eight focused fixture tests but has not yet been applied to
+the running realm. Its actual client secret must then be obtained privately from
+Keycloak and provisioned to the DEV Cloud OIDC Secret. Real login remains pending.
+Desired realm SHA256:
+`77b1c2ffd870e5d369b432a490bf82ea71471ef43263e42c4e515d22cf06bd03`.
+
+## Original Observed Result
 
 On 2026-09-10 the first actual run returned `created: true` and verified both
 clients. Discovery returned issuer
