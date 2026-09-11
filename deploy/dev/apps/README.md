@@ -51,3 +51,7 @@ requires an additional quota mechanism. Three guests on one physical host are
 not physical-host HA. These manifests must not be applied until dedicated
 mounts, directory ownership, cluster identity, and consumer mount dependencies
 have been verified operationally.
+
+The dedicated disks, directory preparation and real PV apply are now recorded
+in [STORAGE_ACTIVATION.md](STORAGE_ACTIVATION.md). These are infrastructure
+milestones, not proof of application startup or storage-loss recovery.

@@ -127,6 +127,7 @@ three identity database instances Ready. Post-format host inventory still
 verified allocated blocks, with 308095922176 available bytes versus a remaining
 admission budget of 286759317504 bytes. These are point-in-time observations.
 
-The kubelet guard is installed but activation and consumer failure behavior
-remain unverified. No app directories, PVs or workloads have been provisioned
-on these filesystems yet. No storage-loss or physical-host HA test was run.
+At this mount-only checkpoint the kubelet guard was installed but not activated,
+and no app directories, PVs or workloads had been provisioned. Subsequent guard
+activation, directory preparation and PV apply are recorded in
+`../apps/STORAGE_ACTIVATION.md`. No storage-loss or physical-host HA test was run.
