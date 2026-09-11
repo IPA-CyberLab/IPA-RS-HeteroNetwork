@@ -109,8 +109,34 @@ the physical-host coordinator SHA256 is
 `e35d9ad2192c451d0411f4dfcfe474d19fabe92c3b9bcd855be57aa9ab9bd9c3`.
 Twelve focused offline tests passed before deployment.
 
-This advances only the host-attestation prerequisite. No `config.json`, local
-runtime directory, signer service or sudo plugin was created or started. The
-real owner's exact DEV OIDC subject remains absent, so constructing an active
-policy or enabling enforcement would currently substitute an unverified
-identity and is intentionally refused.
+At that checkpoint only the host-attestation prerequisite had advanced. No
+`config.json`, signer process or sudo plugin was active. The real owner's exact
+DEV OIDC subject remains absent, so constructing an active policy or enabling
+enforcement would currently substitute an unverified identity and is
+intentionally refused.
+
+## Observed Inactive Runtime Provisioning: 2026-09-11
+
+The dev6 signer binary and local sudo companion were subsequently provisioned
+to all three DEV guests through the pinned physical-host coordinator. The
+signer uses its own immutable binary under
+`/opt/heteronetwork/sudo-v2/runtime/0.1.15-dev.6`; it does not replace or restart
+the running HeteroNetwork agent. The local companion remains under the verified
+artifact tree. Versioned `current` symlinks and the two hardened systemd unit
+files were installed on each guest.
+
+The guest runtime provisioner SHA256 is
+`1baf64fd95a9a44f5e86f0bb8eb365ac60649ddb06e08355a975a4ba29eac821`;
+the physical-host coordinator SHA256 is
+`0327f25c58cbf4bdd72b6376cd76b06d06aa5d6a08c43cf8e3abc9e8c447795d`.
+The installed signer binary SHA256 is
+`dd26e9907c426fe1f2b628a5010441a4127ef26ab763195c353a8c7e09cf05bb`.
+
+Both `heteronetwork-sudo-local.service` and
+`heteronetwork-quorum-signer.service` reported `inactive`, `dead` and
+`disabled` on every guest after deployment. No policy, daemon configuration,
+runtime socket, ledger, sudo plugin setting, service start or service enable was
+created. An immediate second coordinator run installed no files and changed no
+symlink or unit, while returning the same inactive state on all three guests.
+The active sudo path is therefore unchanged; this is staged runtime material,
+not majority-sudo enforcement.
