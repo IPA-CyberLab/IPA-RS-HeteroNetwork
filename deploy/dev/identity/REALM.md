@@ -67,11 +67,36 @@ drift is rejected. A repeat on the desired confidential client is read-only for
 configuration. The device client stays public. No secret rotation or account
 creation is performed by this option.
 
-This transition has eight focused fixture tests but has not yet been applied to
-the running realm. Its actual client secret must then be obtained privately from
-Keycloak and provisioned to the DEV Cloud OIDC Secret. Real login remains pending.
+This transition has eight focused fixture tests. It was applied to the running
+DEV realm on 2026-09-11: the first invocation reported
+`cloud_client_upgraded: true`, and the second reported `false`. Both verified
+the two clients, discovery and device authorization initiation. No owner was
+created or authenticated.
+
+The hash-verified tools reside at `/opt/heteronetwork-dev-realm-b4f13fa7` on DEV1.
+Archive SHA256:
+`b4f13fa7dd24c88c5a5fdb69248828c826f9aa14cdc50b408f831df87a9677d3`.
+Script SHA256:
+`d1b20c180f8cdc49605b83d6b96ed25f0bbef378e14b1e287a6715a38d10e57c`.
 Desired realm SHA256:
 `77b1c2ffd870e5d369b432a490bf82ea71471ef43263e42c4e515d22cf06bd03`.
+
+`provision-oidc-secret.py` subsequently obtained the existing Keycloak client
+secret over the pinned private TLS connection and created
+`heterocloud-dev/heterocloud-dev-oidc`, key `client-secret`. It does not generate
+or rotate client credentials. The first invocation reported `created: true`;
+the second reported `created: false`. Both verified the stored credential equals
+Keycloak's current value without emitting it. Existing secrets must match the
+DEV/client ownership annotations, managed-by label and exact data; conflicting
+state is rejected rather than overwritten. Creation uses server dry-run, create
+and readback. No other application Secret or workload was changed.
+
+The provisioning helper on DEV1 is
+`/opt/heteronetwork-dev-oidc-7af0ed51/provision-oidc-secret.py`, SHA256
+`7af0ed51a479729373f2fbc54a7c5bad562f0a6a261171e91b6db39c94f21548`.
+Three focused fixture tests cover idempotent verification, foreign/changed
+secrets and invalid credential handling. Real Cloud callback/token exchange,
+owner login and majority sudo enforcement remain unverified.
 
 ## Original Observed Result
 
