@@ -70,3 +70,38 @@ Do not touch production VMs or user Flash containers. The eventual operation
 must preserve the existing provisioner journal and disks, update only validated
 resource hashes, handle one guest at a time and verify all four database
 clusters and the identity service before proceeding to another guest.
+
+## Approved Execution: 2026-09-11
+
+The user approved proceeding with the DEV-only rolling capacity change.
+`scripts/resize-dev-capacity.py` now implements one-guest admission and execution
+using the original provisioner's lock, file/resource ownership checks and firewall
+guard. It leaves the bootstrap profile hash and disks unchanged; reviewed capacity
+definitions and completion records are appended to the existing journal. Pending
+operations are not automatically adopted or cleared after an error.
+
+Fresh host inspection reported104 logical CPUs,82061076KiB total memory and
+57367668KiB available memory. Other domain `vercel-research` remains untouched.
+The operation requests graceful guest `systemctl poweroff --no-block`, pins the
+machine ID and pre-operation boot ID, waits for shutdown, starts only the selected
+domain and verifies a new boot,8 CPUs, expanded memory and mounted app storage.
+All three Kubernetes nodes, all four three-instance DB clusters and the complete
+three-replica Keycloak rollout must be ready before continuing.
+
+DEV2 completed first:8 CPUs,10182476KiB guest MemTotal, all DBs and identity ready.
+Its initial ACPI-based runner needed intervention: a guest poweroff request raced
+with restart, leaving the expanded VM stopped. After checking pending intent,
+definition hashes, ownership and firewall guards, the same selected VM was started
+again and the existing runner completed. No disk or journal reset occurred.
+The revised runner avoids mixed ACPI/guest requests and validates boot identity.
+
+During this restart the identity DB elected a new primary and Keycloak temporarily
+lost readiness; it recovered before the subsequent JDBC timeout change was applied.
+Do not attribute that recovery to the later change or claim uninterrupted HA.
+The DEV JDBC configuration now bounds connection/read waits while retaining
+verify-full TLS. Its rollout is a prerequisite for continuing DEV3 and DEV1.
+
+Current reviewed execution bundle:
+`/opt/heteronetwork-dev-capacity-e3bc8132`, archive SHA256
+`e3bc813240f8cd8f43f1d4d8706cb9853fc8a32d10d5ebc45f058dc290661664`.
+DEV3/DEV1 completion must be recorded separately after actual verification.

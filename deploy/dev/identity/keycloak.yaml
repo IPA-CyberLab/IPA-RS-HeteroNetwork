@@ -51,7 +51,7 @@ spec:
           env:
             - {name: KC_DB, value: postgres}
             - name: KC_DB_URL
-              value: 'jdbc:postgresql://dev-identity-postgres-rw.hetero-dev-identity.svc.cluster.local:5432/keycloak?sslmode=verify-full&sslrootcert=/var/run/postgres-ca/ca.crt'
+              value: 'jdbc:postgresql://dev-identity-postgres-rw.hetero-dev-identity.svc.cluster.local:5432/keycloak?sslmode=verify-full&sslrootcert=/var/run/postgres-ca/ca.crt&connectTimeout=5&loginTimeout=10&socketTimeout=30&tcpKeepAlive=true'
             - name: KC_DB_USERNAME
               valueFrom:
                 secretKeyRef: {name: dev-identity-postgres-app, key: username}

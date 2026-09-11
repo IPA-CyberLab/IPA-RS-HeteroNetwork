@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 spec = importlib.util.spec_from_file_location("render_keycloak", Path(__file__).with_name("render-keycloak.py"))
 renderer = importlib.util.module_from_spec(spec)
@@ -31,6 +32,10 @@ class KeycloakContract(unittest.TestCase):
         env = {item["name"]: item for item in container["env"]}
         self.assertEqual(env["KC_HTTP_ENABLED"]["value"], "false")
         self.assertIn("sslmode=verify-full", env["KC_DB_URL"]["value"])
+        params = parse_qs(urlsplit(env["KC_DB_URL"]["value"].removeprefix("jdbc:")).query)
+        self.assertEqual(params, {"sslmode": ["verify-full"], "sslrootcert": ["/var/run/postgres-ca/ca.crt"],
+                                 "connectTimeout": ["5"], "loginTimeout": ["10"],
+                                 "socketTimeout": ["30"], "tcpKeepAlive": ["true"]})
         self.assertNotIn("value", env["KC_DB_PASSWORD"])
         self.assertNotIn("value", env["KC_BOOTSTRAP_ADMIN_PASSWORD"])
         service = next(i for i in items if i["kind"] == "Service")
