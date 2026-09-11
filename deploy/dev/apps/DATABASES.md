@@ -61,6 +61,21 @@ Archive SHA-256: `974dcc91d6df29f9577e97a92872438d0e67602b66d6b47ebe8b30ce007438
 
 ## Remaining Work
 
+CA-reference support is committed and pushed in the application charts:
+HeteroCloud `523ebbb` (chart 0.1.71), Flow `7e2b8e2` (chart 0.1.40), and
+Syouyu `81f9705` (chart 0.1.7). The common optional values are
+`databaseTls.caSecretName` and `databaseTls.caSecretKey`. They populate
+`PGSSLROOTCERT` in all eight database client workload types, including Flow's
+migration Job. Ten focused Helm tests passed. No database credentials were read
+or copied during that work.
+
+These commits are not yet released or selected in `channels.json`; do not
+assume the currently selected releases consume these values. No DEV workload
+was changed. Fresh database URLs must separately use `sslmode=verify-full`
+and certificate-matching Service names. Actual valid-CA handshake and invalid-CA
+rejection checks remain outstanding. CA environment updates require a controlled
+rollout; the chart does not implement automatic certificate rotation.
+
 Translate the generated database credentials into each application's fresh
 Secret, run the selected app migrations and deploy the application workloads.
 Test writes and recovery under guest loss before claiming operational HA.
