@@ -301,6 +301,9 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
             check_checkout(repository, source["targetRevision"], source["path"])
             require(result.returncode == 0, f"Helm render failed for {app['metadata']['name']}: {result.stderr[-2000:]}")
             documents = list(yaml.safe_load_all(result.stdout))
+            database_tls = helm.get("valuesObject", {}).get("databaseTls", {})
+            if database_tls.get("caSecretName"):
+                check_database_ca(documents, database_tls)
             if channel == "dev" and component == "heterocloud":
                 check_dev_owner_cookies(documents, helm["valuesObject"]["ownerConsole"])
             if inspect_documents:
@@ -310,6 +313,35 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
                 for image in container_images(document):
                     require(canonical_image(image) in allowed, f"rendered image lacks a selected or auxiliary immutable pin: {image}")
     return counts
+
+
+def check_database_ca(documents, settings):
+    """Verify rendered CA references, not TLS mode or a live DB handshake."""
+    expected = {"name": settings["caSecretName"],
+                "key": settings.get("caSecretKey", "ca.crt"), "optional": False}
+    clients = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in ("containers", "initContainers") and isinstance(item, list):
+                    for container in item:
+                        env = container.get("env", [])
+                        if (any(entry.get("name") in ("DATABASE_URL", "SYOUYU_DATABASE_URL") for entry in env)
+                                or any(arg.startswith("--database-url-file=") for arg in container.get("args", []))):
+                            clients.append(container)
+                else:
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(documents)
+    require(clients, "database CA configured but no rendered database clients found")
+    for container in clients:
+        entries = [entry for entry in container.get("env", []) if entry.get("name") == "PGSSLROOTCERT"]
+        require(entries == [{"name": "PGSSLROOTCERT", "valueFrom": {"secretKeyRef": expected}}],
+                "rendered database client must use the configured non-optional CA Secret: " + container["name"])
 
 
 def check_dev_owner_cookies(documents, owner):
