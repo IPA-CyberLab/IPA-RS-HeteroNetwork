@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "caller_uid": 1000,
+  "identity": {
+    "issuer": "https://heterocloud.mizuame.app/id/realms/heterocloud",
+    "subject": "4daa569e-635c-49ed-bb17-5fe0a07581b2"
+  },
+  "oidc_client_id": "ipars-web",
+  "required_email": "fasutotesuto@gmail.com",
+  "vpn_cidr": "10.251.0.0/24"
+}
