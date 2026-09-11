@@ -1,8 +1,11 @@
 import importlib.util
+import io
 import os
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.error
+from unittest.mock import patch
 
 
 SOURCE = Path(__file__).with_name("heteronetwork-sudo-device-login.py")
@@ -33,6 +36,45 @@ class DeviceLoginTests(unittest.TestCase):
         self.assertEqual(module.request(opener, module.ISSUER + "/test"), {})
         self.assertEqual(opener.request.get_header("User-agent"), module.USER_AGENT)
         self.assertEqual(opener.timeout, 15)
+
+    def test_transient_requests_retry_but_permanent_http_errors_do_not(self):
+        class Response:
+            status = 200
+            headers = {}
+
+            @staticmethod
+            def read(_maximum):
+                return b"{}"
+
+        class Opener:
+            calls = 0
+
+            def open(self, _request, timeout):
+                self.calls += 1
+                if self.calls < 3:
+                    raise TimeoutError()
+                self.timeout = timeout
+                return Response()
+
+        opener = Opener()
+        with patch.object(module.time, "sleep") as sleep:
+            self.assertEqual(module.request_with_retries(opener, module.ISSUER + "/test"), {})
+        self.assertEqual(opener.calls, 3)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
+
+        denied = urllib.error.HTTPError(
+            module.ISSUER + "/test", 403, "denied", {}, io.BytesIO(b"{}")
+        )
+        with patch.object(opener, "open", side_effect=denied), \
+                self.assertRaises(urllib.error.HTTPError):
+            module.request_with_retries(opener, module.ISSUER + "/test")
+
+        certificate_error = urllib.error.URLError(
+            module.ssl.SSLCertVerificationError(1, "certificate rejected")
+        )
+        with patch.object(opener, "open", side_effect=certificate_error), \
+                self.assertRaises(urllib.error.URLError):
+            module.request_with_retries(opener, module.ISSUER + "/test")
 
     def test_endpoint_is_pinned_to_issuer(self):
         expected = module.ISSUER + "/protocol/openid-connect/token"

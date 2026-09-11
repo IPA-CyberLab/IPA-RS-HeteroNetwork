@@ -23,6 +23,7 @@ OWNER_EMAIL = "fasutotesuto@gmail.com"
 MAX_RESPONSE = 1024 * 1024
 PKCE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}\Z")
 USER_AGENT = "HeteroNetwork-Sudo-Owner/0.1"
+TRANSIENT_HTTP_STATUS = frozenset((408, 425, 429, 500, 502, 503, 504))
 
 
 def require(value, reason):
@@ -55,6 +56,30 @@ def request(opener, url, data=None, token=None):
     raw = response.read(MAX_RESPONSE + 1)
     require(len(raw) <= MAX_RESPONSE, "response_too_large")
     return decode(raw)
+
+
+def retryable_url_error(error):
+    return not isinstance(error.reason, (ssl.SSLCertVerificationError, ssl.CertificateError))
+
+
+def request_with_retries(opener, url, data=None, token=None, attempts=5):
+    require(1 <= attempts <= 8, "invalid_retry_count")
+    for attempt in range(attempts):
+        try:
+            return request(opener, url, data=data, token=token)
+        except urllib.error.HTTPError as error:
+            if error.code not in TRANSIENT_HTTP_STATUS:
+                raise
+            require(len(error.read(MAX_RESPONSE + 1)) <= MAX_RESPONSE, "response_too_large")
+        except urllib.error.URLError as error:
+            if not retryable_url_error(error):
+                raise
+        except TimeoutError:
+            pass
+        if attempt + 1 == attempts:
+            raise ValueError("identity_provider_temporarily_unavailable") from None
+        time.sleep(min(4, 1 << attempt))
+    raise AssertionError("unreachable")
 
 
 def endpoint(value, issuer, name):
@@ -118,13 +143,13 @@ def login(output):
     context = ssl.create_default_context()
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
-    discovery = request(opener, ISSUER + "/.well-known/openid-configuration")
+    discovery = request_with_retries(opener, ISSUER + "/.well-known/openid-configuration")
     require(discovery.get("issuer") == ISSUER, "issuer_mismatch")
     device_url = endpoint(discovery.get("device_authorization_endpoint"), ISSUER, "device_endpoint")
     token_url = endpoint(discovery.get("token_endpoint"), ISSUER, "token_endpoint")
     userinfo_url = endpoint(discovery.get("userinfo_endpoint"), ISSUER, "userinfo_endpoint")
     code_verifier, code_challenge = new_pkce_pair()
-    authorization = request(opener, device_url, {
+    authorization = request_with_retries(opener, device_url, {
         "client_id": CLIENT_ID,
         "scope": "openid profile email",
         "code_challenge": code_challenge,
@@ -161,6 +186,8 @@ def login(output):
         except urllib.error.HTTPError as error:
             raw = error.read(MAX_RESPONSE + 1)
             require(len(raw) <= MAX_RESPONSE, "response_too_large")
+            if error.code in TRANSIENT_HTTP_STATUS:
+                continue
             body = decode(raw)
             code = body.get("error")
             if code == "authorization_pending":
@@ -169,8 +196,14 @@ def login(output):
                 interval = min(20, interval + 5)
                 continue
             raise ValueError("device_authorization_rejected") from None
+        except urllib.error.URLError as error:
+            if not retryable_url_error(error):
+                raise
+            continue
+        except TimeoutError:
+            continue
     require(token is not None, "device_authorization_expired")
-    identity = request(opener, userinfo_url, token=token)
+    identity = request_with_retries(opener, userinfo_url, token=token)
     require(identity.get("sub") == OWNER_SUBJECT
             and str(identity.get("email", "")).lower() == OWNER_EMAIL
             and identity.get("email_verified") is True,
