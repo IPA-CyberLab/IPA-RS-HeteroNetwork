@@ -1,4 +1,7 @@
 fullnameOverride: heterocloud-dev
+databaseTls:
+  caSecretName: dev-postgres-ca
+  caSecretKey: ca.crt
 replicaCount: 3
 hostNetwork: false
 hostAliases: []

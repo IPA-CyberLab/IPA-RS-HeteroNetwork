@@ -88,8 +88,10 @@ or copied during that work.
 Cloud `0.1.71-dev.3` and Syouyu `0.1.7-dev.2` were successfully released and
 selected in `channels.json` revisions 12 and 13 after registry digest readback.
 Release runs: Cloud `34554131779`, Syouyu `34554134114`. Flow release run
-`34554132897` for `0.1.21-dev.6` remains in progress; its selected chart is still
-the old version without CA support. No DEV workload was changed.
+`34554132897` for `0.1.21-dev.6` also succeeded; its primary and LiveKit digests
+were verified in the registry before selecting it at revision 14. All three
+DEV value overlays now reference `dev-postgres-ca` key `ca.crt` in their own
+namespace. No DEV workload was changed.
 Fresh database URLs must separately use `sslmode=verify-full` and
 certificate-matching Service names. Application-level SQLx login and certificate
 rejection checks remain outstanding; OpenSSL transport checks do not replace them.
@@ -98,6 +100,15 @@ rollout; the chart does not implement automatic certificate rotation.
 
 Translate the generated database credentials into each application's fresh
 Secret, run the selected app migrations and deploy the application workloads.
+`database_credentials.py` provides the in-memory conversion for that provisioning
+step: it checks exact DEV namespace, Secret name, database owner and Service
+target, constructs a percent-encoded URL with `sslmode=verify-full`, and returns
+only that URL and the public CA field. It ignores generated URI query options.
+It neither obtains credentials nor writes a partial application Secret. The
+caller must check live cluster identity before obtaining inputs and keep the
+returned credential material out of logs and Git. PEM envelope checks are not
+cryptographic certificate validation. Four synthetic tests cover URL encoding,
+foreign targets, malformed base64, and private-key-field exclusion.
 Test writes and recovery under guest loss before claiming operational HA.
 All DEV guests still share one physical host.
 

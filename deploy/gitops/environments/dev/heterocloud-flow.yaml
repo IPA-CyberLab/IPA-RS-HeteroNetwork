@@ -1,4 +1,7 @@
 fullnameOverride: heterocloud-flow-dev
+databaseTls:
+  caSecretName: dev-postgres-ca
+  caSecretKey: ca.crt
 runtime:
   hostNetwork: false
 secrets:

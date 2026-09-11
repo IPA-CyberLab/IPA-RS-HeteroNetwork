@@ -1,4 +1,7 @@
 fullnameOverride: heterocloud-syouyu-dev
+databaseTls:
+  caSecretName: dev-postgres-ca
+  caSecretKey: ca.crt
 secrets:
   create: false
   existingSecret: heterocloud-syouyu-dev-secrets
