@@ -137,9 +137,53 @@ The successful verifier is installed on DEV1 at
 Ten focused selection/admission tests passed. Full S3 compatibility, multipart
 operations, application-level quotas and node-loss recovery remain unverified.
 
+## Syouyu API Applied And Verified
+
+The API phase uses the same immutable revision15 manifest. `apply-syouyu-api.py`
+selects only its Deployment, Service and NetworkPolicy after checking the DEV
+cluster, three ready PostgreSQL and Garage instances, preinstalled service
+account, referenced Secret keys, verify-full database URL and initial per-node
+request headroom including one extra replica. Existing objects must match the
+bundle stamp and field manager; mismatches are not overwritten. The Garage
+helper is hash-pinned and reused only for structural readback comparison.
+
+Actual DEV rollout on 2026-09-11 completed with three API pods under ReplicaSet
+`heterocloud-syouyu-dev-api-67b747b49c`, one per DEV guest. The database migrations
+ran on application startup. `verify-syouyu-api.py` independently confirmed:
+
+- `/health/ready` returned `{"status":"ready"}` on each of the three pods;
+  this handler calls both PostgreSQL and Garage health checks.
+- An unauthenticated `/v1/service-overview` returned401 on each pod.
+- `_sqlx_migrations` contains successful versions1 and2.
+- PostgreSQL reports TLS for all application-user client connections, including
+  connections from each of the three API pod IPs.
+- The application PostgreSQL cluster still has three ready instances.
+
+An actual second apply preserved all three API pod UIDs, and the complete
+verifier passed again afterward. Eleven focused admission tests also passed;
+no full repository suite was run.
+
+These HTTP checks execute against each pod's loopback interface. They do not
+prove Cloud-to-Syouyu Service routing, authenticated provider operations, public
+DNS/TLS, browser login, quota enforcement or failure recovery. The selected API
+chart still has its PDB disabled and placement preferences rather than mandatory
+anti-affinity; actual current spreading is not a permanent scheduling guarantee.
+Those HA configuration gaps remain open for the complete environment rollout.
+
+Deployment archive SHA256:
+`3e83ad31046a8e256b50bda970190a56a1fa1c85ef030a9eba5779462e3bf1ac`.
+Deployment source SHA256:
+`c3c5df0f7af8f95a99137144c7d579558b6ed96b91f1188bc9aa9751c0f65ccb`.
+Verifier archive SHA256:
+`05a530e2650f57b848a9166b34517d2254799f792db2012fd092822eede3b2b7`.
+Verifier source SHA256:
+`2d86854d2a667a700a170566371e546188b00d74da09d2cb9a285f829b68def3`.
+Installed verifier on DEV1:
+`/opt/heteronetwork-dev-syouyu-api-verify-05a530e2/verify-syouyu-api.py`.
+
 ## Remaining Deployment
 
-All four application APIs/controllers/workers, Flash gVisor and
+Cloud/Flow/Flash APIs/controllers/workers, complete Syouyu integration, Flash gVisor and
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that

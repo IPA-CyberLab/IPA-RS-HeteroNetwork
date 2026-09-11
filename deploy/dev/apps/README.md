@@ -61,6 +61,7 @@ placement, PVC and synchronous replication evidence is in
 [DATABASES.md](DATABASES.md). Application migrations and service startup remain
 separate from this database milestone.
 
-Actual-site release-bound preparation, three-node Redis replication and Garage
-deployment with authenticated S3 round-trip are recorded in [RUNTIME.md](RUNTIME.md). Other application runtime
+Actual-site release-bound preparation, three-node Redis replication, Garage
+deployment with authenticated S3 round-trip, and the three-replica Syouyu API
+deployment are recorded in [RUNTIME.md](RUNTIME.md). Other application runtime
 dependencies and complete user workflows remain unfinished.
