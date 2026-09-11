@@ -55,3 +55,8 @@ have been verified operationally.
 The dedicated disks, directory preparation and real PV apply are now recorded
 in [STORAGE_ACTIVATION.md](STORAGE_ACTIVATION.md). These are infrastructure
 milestones, not proof of application startup or storage-loss recovery.
+
+The three independent application database clusters are now running in DEV;
+placement, PVC and synchronous replication evidence is in
+[DATABASES.md](DATABASES.md). Application migrations and service startup remain
+separate from this database milestone.
