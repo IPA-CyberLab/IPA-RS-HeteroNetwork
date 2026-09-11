@@ -6,6 +6,7 @@ ConditionPathExists=/etc/heteronetwork/sudo-quorum/manifest.json
 ConditionPathExists=/etc/heteronetwork/sudo-quorum/policy.json
 ConditionPathExists=/etc/heteronetwork/sudo-quorum/signer.env
 ConditionPathExists=/etc/credstore/heteronetwork-sudo-quorum-share.json
+ConditionFileIsExecutable=/opt/heteronetwork/sudo-v2/runtime/current/bin/iparsd
 
 [Service]
 Type=simple
@@ -14,7 +15,7 @@ EnvironmentFile=/etc/heteronetwork/sudo-quorum/signer.env
 Environment=HETERONETWORK_ADMIN_QUORUM_MANIFEST_PATH=/etc/heteronetwork/sudo-quorum/manifest.json
 Environment=HETERONETWORK_SUDO_QUORUM_POLICY_PATH=/etc/heteronetwork/sudo-quorum/policy.json
 LoadCredential=quorum-share.json:/etc/credstore/heteronetwork-sudo-quorum-share.json
-ExecStart=/opt/heteronetwork/bin/iparsd quorum-signer --key-package-path %d/quorum-share.json
+ExecStart=/opt/heteronetwork/sudo-v2/runtime/current/bin/iparsd quorum-signer --key-package-path %d/quorum-share.json
 Restart=on-failure
 RestartSec=5s
 UMask=0077
