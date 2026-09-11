@@ -234,6 +234,21 @@ data transport, public DNS or full client E2E. Its archive is staged only on the
 physical host, not installed on DEV1:
 `c90e04681a8801a3e28ce92914aadecc8231c429ac570421ae4840fabd2ba56f`.
 
+`flow_transition.py` prepares admission for the specific dev6-to-dev7 repair.
+Its CLI verifies the old manifest against the installed revision15 hash and
+all input resource-file hashes, plus the explicitly supplied new manifest hash.
+It requires revision16, the exact repair commit, unchanged site/cluster identity,
+unchanged non-Flow components and unchanged other rendered application files.
+The new Flow list must equal the old list with only four Flow image references,
+one LiveKit image reference, and the migration's four Redis environment entries
+changed. Redis values must match the API's existing values/Secret references.
+Unrelated changes to resource specifications are rejected. Four focused fixture
+tests pass, including negative cases for credentials, replicas, component and
+identity changes. This checker is offline only: it does not suspend/delete Jobs,
+apply Kubernetes resources, validate live ownership or authorize production.
+It has not yet admitted actual dev7 artifacts; their release build was still
+running when this transition check was added.
+
 ## Remaining Deployment
 
 Cloud/Flow/Flash APIs/controllers/workers, complete Syouyu integration, Flash gVisor and
