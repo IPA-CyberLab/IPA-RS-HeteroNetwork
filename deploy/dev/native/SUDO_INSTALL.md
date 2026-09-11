@@ -53,3 +53,19 @@ effective sudo plugin integration, authenticated majority issuance and privilege
 end-to-end validation remain required. Installed bytes and a disabled notice are
 not proof that majority approval is enforced. Do not enable the plugin until the
 complete local and remote approval path is provisioned and verified.
+
+## Admission Boundary
+
+The public preflight also rejects duplicate host attestation keys, root or
+noncanonical caller UIDs, out-of-range key epochs and malformed owner identity
+strings. These structural checks do not replace native cryptographic validation
+of the public keys, FROST package or policy. Passing them still reports
+`ready_to_enable: false`.
+
+Owner authorization uses the exact verified OIDC issuer and subject, not an email
+address or display name. A real owner must be enrolled and those public identity
+pins confirmed before activation; the temporary DEV bootstrap administrator must
+not be silently substituted. Quorum participation is machine policy approval,
+not evidence that a separate human approved on each VM. Existing root access or
+unrestricted sudo can bypass an inactive plugin, so installed signing artifacts
+alone do not enforce the requested administrative boundary.

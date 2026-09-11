@@ -91,11 +91,25 @@ def validate_expected(expected, cluster, hostname, machine_id):
             sorted(manifest["members"], key=lambda m: m["node_id"]) == sorted(members, key=lambda m: m["node_id"]),
             "voter_mapping_mismatch")
     require(set(policy["hosts"]) == {m["node_id"] for m in members}, "host_mapping_mismatch")
+    host_keys = set()
     for host in policy["hosts"].values():
-        require(host["callers"] and host["attestation_key_epoch"] > 0, "missing_host_pins")
+        require(host["callers"] and len(host["callers"]) <= 256
+                and type(host["attestation_key_epoch"]) is int
+                and 0 < host["attestation_key_epoch"] <= 2**64 - 1, "missing_host_pins")
         require(len(host["attestation_public_key"]) == 32 and all(
             type(b) is int and 0 <= b <= 255 for b in host["attestation_public_key"]), "invalid_host_public_pin")
-        for identity in host["callers"].values():
+        key = bytes(host["attestation_public_key"])
+        require(key not in host_keys, "duplicate_host_public_pin")
+        host_keys.add(key)
+        for uid, identity in host["callers"].items():
+            require(isinstance(uid, str) and re.fullmatch(r"[1-9][0-9]{0,9}", uid)
+                    and int(uid) <= 2**32 - 1, "invalid_caller_uid")
+            require(isinstance(identity["issuer"], str) and len(identity["issuer"].encode("utf-8")) <= 2048
+                    and not any(c.isspace() for c in identity["issuer"])
+                    and isinstance(identity["subject"], str)
+                    and 0 < len(identity["subject"].encode("utf-8")) <= 256
+                    and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in identity["subject"]),
+                    "invalid_owner_identity")
             issuer = urlsplit(identity["issuer"])
             require(issuer.scheme == "https" and issuer.hostname and not issuer.username
                     and not issuer.password and not issuer.query and not issuer.fragment
