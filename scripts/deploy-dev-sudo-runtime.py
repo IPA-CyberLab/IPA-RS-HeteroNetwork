@@ -14,9 +14,9 @@ import subprocess
 import sys
 import time
 
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-runtime-deploy")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-runtime-deploy-v2")
 FILES = {
-    "provision-dev-sudo-runtime.py": ("2f42a0f261cc08e1753bd46178a342ccecb9ddb7d1b9cb8b4157bfb1611be957", 8539),
+    "provision-dev-sudo-runtime.py": ("2981556b78c5ae556278f7c2b2796c4dd262b8753a4c1649134455043bb00af6", 8754),
     "iparsd": ("dd26e9907c426fe1f2b628a5010441a4127ef26ab763195c353a8c7e09cf05bb", 64022456),
     "sudo-hosts.json": ("c28d3c1fe54d7016752bad8f3fb92652f3f1dd96b81a9271ac6b9aac95b688c8", 2117),
     "heteronetwork-sudo-local.service": ("1a7c9f32574555230056389d2b413e9db57f13a7dc4ccca3236a3735a229853d", 1180),
@@ -98,7 +98,7 @@ def invoke(member, arguments, data=None):
 
 REMOTE = r'''import hashlib,json,os,pathlib,socket,stat,sys
 files={
- "provision-dev-sudo-runtime.py":("2f42a0f261cc08e1753bd46178a342ccecb9ddb7d1b9cb8b4157bfb1611be957",8539),
+ "provision-dev-sudo-runtime.py":("2981556b78c5ae556278f7c2b2796c4dd262b8753a4c1649134455043bb00af6",8754),
  "iparsd":("dd26e9907c426fe1f2b628a5010441a4127ef26ab763195c353a8c7e09cf05bb",64022456),
  "sudo-hosts.json":("c28d3c1fe54d7016752bad8f3fb92652f3f1dd96b81a9271ac6b9aac95b688c8",2117),
  "heteronetwork-sudo-local.service":("1a7c9f32574555230056389d2b413e9db57f13a7dc4ccca3236a3735a229853d",1180),
@@ -107,7 +107,7 @@ guests={"hetero-dev-1":"381d1ae16f555c59b738d8d01dd14c94","hetero-dev-2":"acc515
 name=sys.argv[1];action=sys.argv[2];assert name in files and action in ("check","install")
 assert os.getuid()==0 and os.geteuid()==0 and socket.gethostname() in guests
 assert pathlib.Path("/etc/machine-id").read_text().strip()==guests[socket.gethostname()]
-root=pathlib.Path("/opt/heteronetwork-dev-sudo-runtime");path=root/name;digest,size=files[name]
+root=pathlib.Path("/opt/heteronetwork-dev-sudo-runtime-v2");path=root/name;digest,size=files[name]
 if os.path.lexists(root):
  s=root.lstat();assert stat.S_ISDIR(s.st_mode) and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o700
  assert {p.name for p in root.iterdir()}<=set(files)
@@ -143,7 +143,7 @@ def deliver(member, name, raw):
 def deploy(member, payloads):
     installed = [name for name, raw in payloads.items() if deliver(member, name, raw)]
     result = json.loads(invoke(member, ["sudo", "-n", "/usr/bin/python3", "-B",
-                                        "/opt/heteronetwork-dev-sudo-runtime/provision-dev-sudo-runtime.py"]))
+                                        "/opt/heteronetwork-dev-sudo-runtime-v2/provision-dev-sudo-runtime.py"]))
     require(result["member"] == member and result["services_started"] is False
             and result["services_enabled"] is False and result["activation_performed"] is False
             and result["sudo_configuration_unchanged"] is True)

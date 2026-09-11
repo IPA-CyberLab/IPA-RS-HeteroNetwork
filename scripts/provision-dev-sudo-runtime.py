@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-runtime")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-runtime-v2")
 VERSION = "0.1.15-dev.6"
 IPARSD_SHA = "dd26e9907c426fe1f2b628a5010441a4127ef26ab763195c353a8c7e09cf05bb"
 HOSTS_SHA = "c28d3c1fe54d7016752bad8f3fb92652f3f1dd96b81a9271ac6b9aac95b688c8"
@@ -130,7 +130,10 @@ def main():
     public_records = json.loads(read(BUNDLE / "sudo-hosts.json", 32768))
     require(hashlib.sha256(read(BUNDLE / "sudo-hosts.json", 32768)).hexdigest() == HOSTS_SHA)
     require(public_records["cluster_id"] == dkg.CLUSTER and len(public_records["hosts"]) == 3)
-    expected = public_records["hosts"][member - 1]
+    expected = {**public_records["hosts"][member - 1],
+                "schema_version": public_records["schema_version"],
+                "cluster_id": public_records["cluster_id"],
+                "manifest_file_sha256": public_records["manifest_file_sha256"]}
     require(expected["guest"] == socket.gethostname()
             and expected == dkg.decode(host_helper.read(host_helper.ROOT / "host-public.json", 8192, mode=0o600)))
 
