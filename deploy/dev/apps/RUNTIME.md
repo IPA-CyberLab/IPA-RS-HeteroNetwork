@@ -654,9 +654,32 @@ manually. Two focused tests cover rejection of foreign/bound PVs and attached
 or foreign Longhorn volumes. This cleanup is bound to the completed fixture's
 recorded identities; generic repeatable lifecycle cleanup is still unfinished.
 
+## Repeatable Flash Lifecycle Verification (2026-09-11)
+
+`verify-flash-provider.py --lifecycle --websocket-wheel PATH` now creates a fresh
+fixture and performs the entire signed lifecycle in one run. Unlike the older
+retained-fixture mode, it captures each new PVC/PV/Longhorn UID from that run.
+After API deletion it waits for Released/detached state, checks those identities,
+and lets CSI reclaim the volume by changing only its reclaim policy to Delete.
+It verifies that PV, volume, replicas and engines are gone; it never strips
+finalizers. Existing service/PVC or retained PV identities block a fresh run.
+
+Actual helper: `/opt/heteronetwork-dev-flash-lifecycle-bf223cc2/verify.py`.
+Two sequential runs completed successfully against the still-running dev.1 image.
+Each created a new service/Pod/PVC, performed three signed WebSocket checks,
+updated generation1 to2, verified replacement-Pod data and PVC identity,
+deleted the service/Pods/PVC, accepted repeated deletion, and reclaimed storage.
+Both final results reported `volume_cleanup_verified=true` and `retained_pv=null`.
+This removes the completed fixture's capacity leak on successful repeated runs;
+an interrupted or failed run still deliberately requires inspection before reuse.
+
+Flash dev.2 is now published and staged at channel revision17; release identity,
+digest verification and selected-source rendering are recorded in
+[FLASH_CANDIDATE.md](FLASH_CANDIDATE.md). The new image is not yet deployed.
+
 ## Remaining Deployment
 
-Flash browser Web Shell, repeatable lifecycle cleanup and failure recovery, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
+Flash browser Web Shell and failure recovery, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that

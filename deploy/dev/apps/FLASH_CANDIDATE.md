@@ -8,22 +8,28 @@ the preceding pinned-gVisor installer support. It does not imply PROD promotion.
 
 Release workflow run:
 [34593292094](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/34593292094).
-At the last inspection, release identity/artifact verification succeeded and
-both architecture jobs were in progress. No release artifact or final image
-digest has been accepted yet. Do not restart this run based on an observation
-timeout; inspect its authoritative state first.
+The run completed successfully: release verification, amd64/arm64 image builds
+and the manifest job all succeeded. The published tag resolves to the exact
+source commit above. Registry inspection of the artifact's immutable index
+confirmed both linux/amd64 and linux/arm64 images.
 
-The next steps are to verify successful completion of both image jobs and the
-manifest job, download `flash-release-artifact.json`, verify its component,
-version, commit and registry digest, and stage that exact artifact with the
-release-channel tool. Current channel revision is16 and selected Flash remains
-0.1.30-dev.1. Re-read the revision before staging; never overwrite another update.
-The current runtime still uses its shared-storage migration on revision16.
+Accepted index: `sha256:191c9c68251f7b578490b12fb18797f5f364b1124ae80fd14f457c42eb252cb2`.
+amd64 manifest: `sha256:6015a4f4e9566682d0f3b096c41b7dd01a70f0ad11180e75e40c6e54ef005ed5`.
+arm64 manifest: `sha256:ffc551db8af40bca63b8f4cf82e2efebd509e72f19056c482573a6590674b555`.
+Artifact file SHA256: `e637d4fc3fddc2bb33fab73e8fbf917ea472e4b704d9a8092cc8a4daffe09d9b`.
+The release-channel tool staged this artifact at revision17, changing only DEV
+Flash. All nine channel tests passed. PROD remains unchanged.
 
-After staging, prepare the selected-source manifests with `prepare-runtime.py`,
-review the exact Flash-only delta and dependency/capacity admission, deploy into
-the identified DEV cluster, then verify diagnostic pending generations, real
-provider operations and preserved unrelated workloads. Do not substitute an
-unverified architecture tag or source-commit tag for the published digest.
+Selected-source preparation passed with clean checkouts at each selected commit.
+Bundle: `/tmp/hetero-dev-runtime-revision17-prepared`.
+Manifest SHA256: `146d12418c17a225e84168e779db7bf830b0771b86eca9a8762cae7bc64ce5d1`.
+Flash resources SHA256: `99388dcf194b5a53b09b8d1e4976f2757a83c436da0773e2eee6a3aa6d922e40`.
+The Flash-only render diff changes the two Deployment images and the controller
+storage class (already migrated live to dev-flash-rwx). Chart sources are unchanged.
 
-No DEV runtime image or PROD channel was changed by publishing this candidate.
+Still required: guarded DEV rollout, pending-generation response checks on the
+new image, provider lifecycle verification and unrelated workload preservation.
+Do not substitute mutable architecture/source tags for the published digest.
+
+No DEV runtime image or PROD channel has changed yet. Live DEV Flash still runs
+0.1.30-dev.1 with its separate shared-storage migration on revision16.

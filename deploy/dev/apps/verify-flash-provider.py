@@ -44,6 +44,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--exercise-retained', action='store_true')
     mode.add_argument('--verify-deleted', action='store_true')
+    mode.add_argument('--lifecycle', action='store_true')
     parser.add_argument('--websocket-wheel', type=Path)
     args = parser.parse_args()
     foundation = Path('/opt/heteronetwork-dev-identity/apply.py')
@@ -55,7 +56,8 @@ def main():
     h.guard()
 
     def get(kind, name=None, namespace=WORK):
-        raw = h.run(['get', kind, *([name, '--ignore-not-found'] if name else []), '-n', namespace, '-o', 'json'])
+        raw = h.run(['get', kind, *([name, '--ignore-not-found'] if name else []),
+                     *(['-n', namespace] if namespace else []), '-o', 'json'])
         return json.loads(raw) if raw.strip() else None
 
     name = 'flash-' + SERVICE
@@ -73,11 +75,17 @@ def main():
         for field in ('image', 'replicas', 'cpu_millis', 'memory_mib', 'ephemeral_storage_gib', 'ports',
                       'command', 'args', 'metadata', 'env'):
             h.require(retained['spec']['workload'][field] == expected_workload[field])
+    else:
+        h.require(retained is None)
+    if args.exercise_retained or args.lifecycle:
         h.require(args.websocket_wheel and hashlib.sha256(h.trusted_file(args.websocket_wheel, 131072)).hexdigest()
                   == 'af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef')
         sys.path.insert(0, str(args.websocket_wheel))
-    else:
-        h.require(retained is None)
+    if args.lifecycle:
+        h.require(get('pvc', name + '-home') is None)
+        h.require(not any(p['spec'].get('claimRef', {}).get('namespace') == WORK
+                          and p['spec'].get('claimRef', {}).get('name') == name + '-home'
+                          for p in get('pv', namespace=None)['items']))
     deployment = get('deployment', NS + '-controller', NS)
     env = {e['name']: e.get('value') for e in deployment['spec']['template']['spec']['containers'][0]['env']}
     h.require(env['FLASH_PERSISTENT_STORAGE_CLASS'] == 'dev-flash-rwx')
@@ -153,7 +161,7 @@ def main():
     print(json.dumps({'provider_status_ready': True, 'container_list': json.loads(raw),
                       'service_id': SERVICE, 'service_retained_for_exec_update_checks': True,
                       'delete_verified': False, 'exec_verified': False}), flush=True)
-    if not args.exercise_retained:
+    if not (args.exercise_retained or args.lifecycle):
         return
     import websocket
 
@@ -187,6 +195,12 @@ def main():
     old_pod = get('pod', items[0]['name'])
     pvc = get('pvc', name + '-home')
     h.require(pvc['spec']['storageClassName'] == 'dev-flash-rwx' and pvc['status']['phase'] == 'Bound')
+    pv_name = pvc['spec']['volumeName']
+    original_pv = get('pv', pv_name, None)
+    h.require(original_pv['spec']['claimRef']['uid'] == pvc['metadata']['uid']
+              and original_pv['spec']['csi']['driver'] == 'driver.longhorn.io'
+              and original_pv['spec']['csi']['volumeHandle'] == pv_name)
+    original_volume = get('volumes.longhorn.io', pv_name, 'longhorn-system')
     value = uuid.uuid4().hex
     shell(items[0]['name'], generation,
           'printf %s ' + value + ' > /root/dev-provider-check; sync; printf "WRITE_%s\\n" OK', b'WRITE_OK')
@@ -234,10 +248,36 @@ def main():
         time.sleep(5)
     code, _ = request('DELETE', 'service-instance.delete', generation=next_generation, suffix=f'?generation={next_generation}')
     h.require(code == 202)
+    if args.lifecycle:
+        deadline = time.monotonic() + 180
+        while True:
+            current_pv = get('pv', pv_name, None)
+            current_volume = get('volumes.longhorn.io', pv_name, 'longhorn-system')
+            h.require(current_pv and current_pv['metadata']['uid'] == original_pv['metadata']['uid']
+                      and current_pv['spec']['claimRef']['uid'] == pvc['metadata']['uid']
+                      and current_pv['spec']['persistentVolumeReclaimPolicy'] == 'Retain'
+                      and current_volume and current_volume['metadata']['uid'] == original_volume['metadata']['uid'])
+            if current_pv['status']['phase'] == 'Released' and current_volume['status']['state'] == 'detached':
+                h.require(not current_volume['spec']['nodeID'] and not current_volume['status']['currentNodeID'])
+                break
+            h.require(time.monotonic() < deadline)
+            time.sleep(3)
+        patch = [{'op': 'test', 'path': '/metadata/' + k, 'value': current_pv['metadata'][k]}
+                 for k in ('uid', 'resourceVersion')]
+        patch += [{'op': 'test', 'path': '/spec/persistentVolumeReclaimPolicy', 'value': 'Retain'},
+                  {'op': 'replace', 'path': '/spec/persistentVolumeReclaimPolicy', 'value': 'Delete'}]
+        h.run(['patch', 'pv', pv_name, '--type=json', '-p', json.dumps(patch)])
+        deadline = time.monotonic() + 180
+        while get('pv', pv_name, None) or get('volumes.longhorn.io', pv_name, 'longhorn-system'):
+            h.require(time.monotonic() < deadline)
+            time.sleep(3)
+        for kind in ('replicas.longhorn.io', 'engines.longhorn.io'):
+            h.require(not any(r['spec']['volumeName'] == pv_name for r in get(kind, namespace='longhorn-system')['items']))
     h.guard()
     print(json.dumps({'exec_websocket_checks': 3, 'generation_update': next_generation, 'replacement_data_matched': True,
                       'service_pods_pvc_deleted': True, 'repeat_delete_accepted': True,
-                      'retained_pv': pvc['spec']['volumeName'], 'browser_verified': False,
+                      'retained_pv': None if args.lifecycle else pv_name,
+                      'volume_cleanup_verified': args.lifecycle, 'browser_verified': False,
                       'node_failure_ha_verified': False}), flush=True)
 
 
