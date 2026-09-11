@@ -70,9 +70,76 @@ Verifier source SHA256:
 Focused tests passed: four Redis admission cases and seven bundle publication/
 namespace/check-failure cases. No routine full repository suite was run.
 
+## Garage Applied And S3 Verified
+
+`apply-garage.py` admits only the exact revision15 bundle hash above and selects
+18 storage/discovery/layout resources. It excludes the Syouyu API Deployment,
+API Service and API NetworkPolicy. Before mutation it checks the actual DEV
+identity, existing credentials, all six reserved Garage PVs, database health,
+per-node request capacity and existing resource ownership. It dry-runs every
+object, establishes the CRD before consumers, then applies the StatefulSet and
+layout Job without force-conflicts. No disk is formatted and no existing
+database or tenant workload is changed. This is an initial guarded deployment,
+not an Argo sync or a generic admission controller.
+
+Actual three-node placement on 2026-09-11:
+
+| Pod Suffix | Node | Metadata / Data |
+| --- | --- | --- |
+| 0 | hetero-dev-1 | dev-app-garage-meta-1 / dev-app-garage-data-1 |
+| 1 | hetero-dev-2 | dev-app-garage-meta-2 / dev-app-garage-data-2 |
+| 2 | hetero-dev-3 | dev-app-garage-meta-3 / dev-app-garage-data-3 |
+
+All three pods became Ready at revision
+`heterocloud-syouyu-dev-garage-859f9b894d`, and all six claims are Bound. Initial
+CRD discovery saw a transient Kubernetes storage-initialization429, then
+discovered and connected all three peers. The layout bootstrap completed;
+the authenticated status probe confirmed a nonzero layout version and three
+up nodes with storage roles. The chart requests replication factor3 and
+consistent mode. This is not evidence of availability during node loss.
+
+An actual second apply preserved all three pod UIDs, StatefulSet generation1
+and update revision. The TTL-cleaned bootstrap Job ran again and reported
+`Garage layout already matches the requested three-node layout`; it did not
+change the layout or restart Garage.
+
+`verify-garage.py` creates an isolated, short-lived probe pod and a policy that
+adds only access to Garage's S3/admin ports for that unique probe. The admin
+credential stays in its existing Secret mount; curl credentials use stdin,
+not argv. The probe creates a unique bucket and a ten-minute access key scoped
+to that bucket, performs authenticated S3 PUT/GET/content comparison/DELETE,
+and deletes its key and bucket. The actual successful result confirmed all
+three operations, both cleanups, and the existing PostgreSQL cluster still
+at three ready instances. Probe pod/policy deletion uses UID preconditions.
+
+Initial probes exposed two client-side readiness/protocol issues: an initial
+connection from a newly created pod was refused before a later GET succeeded,
+and adding an explicit signed-payload SHA256 header resolved the observed S3
+HTTP400. The initial connection timing is consistent with asynchronous policy
+reconciliation but its precise cause was not independently isolated.
+Only the initial status GET is retried; mutation requests
+are not blindly retried. Payload hashes are explicit for PUT and empty-body
+GET/DELETE, following the [curl signing API](https://curl.se/libcurl/c/CURLOPT_AWS_SIGV4.html).
+No server authentication or network isolation was relaxed. Failed-probe logs
+are root-only in `/var/lib/heteronetwork-dev-garage-probes`; an externally killed
+probe may need cleanup of its uniquely named bucket even after its key expires.
+
+Deployment archive SHA256:
+`91a89f8ab40eeeb468a5a25c68bec0125fa39fb0b4a1e48ad88d00383fe8e760`.
+Deployment source SHA256:
+`36af889532d42138b6a619ff7ccfa72dc0697cfd3efbf1deaa21eb7a6b9c8ad9`.
+Successful verifier archive SHA256:
+`f98377f77f10a9286371640f1ee80c30a89a27fafc7747c552f449e7b6d4f313`.
+Verifier source SHA256:
+`46aedc7452e2e96a8f6f936c340248e5ca5d5ed04edf299c33b17a9eaa02b408`.
+The successful verifier is installed on DEV1 at
+`/opt/heteronetwork-dev-garage-verify-f98377f7/verify-garage.py`.
+Ten focused selection/admission tests passed. Full S3 compatibility, multipart
+operations, application-level quotas and node-loss recovery remain unverified.
+
 ## Remaining Deployment
 
-Garage/layout, all four application APIs/controllers/workers, Flash gVisor and
+All four application APIs/controllers/workers, Flash gVisor and
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that
