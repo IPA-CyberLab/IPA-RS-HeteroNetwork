@@ -65,7 +65,7 @@ print(json.dumps({'uid':ns['metadata']['uid'],'nodes':{n['metadata']['name']:rea
     return result
 
 
-def admit(p):
+def admit(p, stage='core'):
     domains = dev.run(['virsh', '-c', p['connection'], 'list', '--all', '--name']).split()
     dev.require(set(domains) == {*p['vms'], 'vercel-research'}, 'Unexpected VM inventory')
     other = dev.resource_xml(p, 'domain', 'vercel-research')
@@ -73,13 +73,14 @@ def admit(p):
     dev.require(xml.find('memory').attrib == {'unit': 'KiB'}, 'Unknown other VM memory units')
     mem = {line.split(':')[0]: int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines()
            if line.startswith(('MemTotal:', 'MemAvailable:'))}
-    budget = capacity.static_budget(mem['MemTotal'], os.cpu_count(), int(xml.findtext('memory')), int(xml.findtext('vcpu')))
+    budget = capacity.static_budget(mem['MemTotal'], os.cpu_count(), int(xml.findtext('memory')), int(xml.findtext('vcpu')), stage)
     dev.require(budget['static_totals_fit'] and mem['MemAvailable'] >= (capacity.HOST_RESERVE_MIB + 6144) * 1024,
                 'Insufficient current host headroom')
     return other
 
 
-def resize(name, apply):
+def resize(name, apply, stage='core'):
+    target_cpu, target_memory = capacity.target(stage)
     p = dev.profile()
     dev.require(name in p['vms'], 'Unknown DEV guest')
     with dev.locked_journal(p) as journal:
@@ -87,14 +88,14 @@ def resize(name, apply):
         dev.verify_resources(p, journal.value, allow_running=True)
         dev.verify_guard(journal.value)
         dev.require(all(dev.resource_info(p, 'domain', n)['State'] == 'running' for n in p['vms']), 'DEV guest is down')
-        other = admit(p)
+        other = admit(p, stage)
         observer = next(n for n in p['vms'] if n != name)
         cluster(p, observer)
         before = guest(p, name)
         original = dev.resource_xml(p, 'domain', name)
-        requested = capacity.requested_xml(original, name)
+        requested = capacity.requested_xml(original, name, stage)
         if dev.definition_hash(requested) == dev.definition_hash(original):
-            dev.require(before['cpus'] == 8 and before['memory_kib'] >= 9 * 1024 * 1024, 'Configured capacity is not active')
+            dev.require(before['cpus'] == target_cpu and before['memory_kib'] >= (target_memory - 1024) * 1024, 'Configured capacity is not active')
             return {'guest': name, 'already_active': True, 'restart_performed': False}
         if not apply:
             return {'guest': name, 'admitted': True, 'restart_performed': False}
@@ -124,7 +125,7 @@ def resize(name, apply):
             time.sleep(2)
         dev.verify_resources(p, journal.value, allow_running=True)
         dev.verify_guard(journal.value)
-        admit(p)
+        admit(p, stage)
         print(json.dumps({'guest': name, 'phase': 'starting-expanded-guest'}), flush=True)
         dev.run(['virsh', '-c', p['connection'], 'start', dev.identity(p, 'domain', name)])
         actual = dev.resource_xml(p, 'domain', name)
@@ -134,8 +135,8 @@ def resize(name, apply):
         while True:
             try:
                 after = guest(p, name)
-                dev.require(after['boot'] != before['boot'] and after['cpus'] == 8
-                            and after['memory_kib'] >= 9 * 1024 * 1024, 'New boot/capacity not observed')
+                dev.require(after['boot'] != before['boot'] and after['cpus'] == target_cpu
+                            and after['memory_kib'] >= (target_memory - 1024) * 1024, 'New boot/capacity not observed')
                 cluster(p, observer)
                 break
             except (ValueError, OSError, subprocess.SubprocessError):
@@ -146,7 +147,7 @@ def resize(name, apply):
         dev.require(dev.resource_xml(p, 'domain', 'vercel-research') == other, 'Unrelated domain changed')
         journal.value.setdefault('capacity_resizes', {})[name] = {
             'completed': True, 'boot_before': before['boot'], 'boot_after': after['boot'],
-            'vcpu': 8, 'memory_mib': 10240}
+            'vcpu': target_cpu, 'memory_mib': target_memory}
         journal.done()
         return {'guest': name, 'restart_performed': True, 'vcpu': after['cpus'],
                 'memory_kib': after['memory_kib'], 'four_databases_and_identity_ready': True}
@@ -156,5 +157,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--guest', choices=capacity.GUESTS, required=True)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--stage', choices=tuple(capacity.STAGES), default='core')
     args = parser.parse_args()
-    print(json.dumps(resize(args.guest, args.apply)))
+    print(json.dumps(resize(args.guest, args.apply, args.stage)))

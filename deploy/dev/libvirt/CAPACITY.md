@@ -133,3 +133,59 @@ one ready replica, and uses UID/resourceVersion delete preconditions. With
 `--apply`, it replaces only currently unready replicas sequentially and waits
 for readiness to increase. Its actual invocation found zero candidates and
 made no changes; the pod deletion/replacement path is not yet runtime-tested.
+
+## Services Capacity Stage
+
+After the actual Cloud, Flow, Flash control plane and Syouyu rollouts, fresh
+request accounting on2026-09-11 showed only550m/550m/650m remaining CPU on the
+three8-vCPU guests. This is insufficient for shared storage, remaining platform
+dependencies and tenant execution.
+
+`--stage services` permits only the reviewed transition from8vCPU/10240MiB to
+12vCPU/12288MiB, or an already active identical target. The default `core` stage
+retains the earlier4-to8-vCPU behavior and rejects a downsize from the services
+stage. Non-capacity XML, disks, machine identities and the provisioner journal
+remain subject to the original guards. Stage selection does not bypass health,
+host admission, pending-operation or firewall checks.
+
+The all-guest target plus the unrelated16GiB VM commits52GiB RAM. With the
+unchanged24GiB host reserve, the static total is76GiB and52vCPUs. The real
+host-side admission passed for all three guests; these dry-runs did not reboot
+them. Dynamic admission still requires at least30GiB MemAvailable before a
+change, and is repeated before startup. No physical resources are inferred from
+the sum of Kubernetes requests.
+
+Reviewed host bundle: `/opt/heteronetwork-dev-capacity-services-09945f78`.
+Runner SHA256: `09945f782bb67269a39bfd50bdd1e6618bc72d2ed7abade06d8a0710d0cc89de`.
+Pure capacity helper SHA256: `c696df9b23f5ffb8b6038f6c2b80c9494c366464ed73b099fc150d9b3bfb4208`.
+
+DEV2 completed the services-stage operation with12 CPUs,12245452KiB guest
+MemTotal, mounted app storage, all three ready nodes, all four DB clusters at
+three ready instances, and Keycloak3/3. The operation was graceful; no forced
+poweroff was used. Before Keycloak recovered, all observed Cloud/Flow/Flash/
+Syouyu Deployments and Redis/Garage StatefulSets were at their requested counts.
+These are recovery snapshots, not continuous successful user requests.
+
+The restarted Keycloak container rebuilt its server configuration on startup:
+the log reported Quarkus augmentation taking59618ms, followed by application
+startup and cluster discovery. A future immutable prebuilt/optimized identity
+image must preserve the current database, TLS and health configuration; merely
+adding `--optimized` to the unbuilt upstream image is not a verified fix.
+
+DEV3 and DEV1 subsequently completed the same services-stage operation, with
+MemTotal12245448KiB and12245452KiB respectively and12 CPUs each. Each operation
+waited for all three nodes, all four DB clusters and Keycloak3/3 before its
+completion record was written and the next guest was stopped. No manual
+Keycloak Pod deletion or database reset was needed during this sequence.
+DEV1 logs confirmed cache state transfer/rebalancing followed by successful
+Keycloak initialization. This still does not prove uninterrupted browser login
+or tolerance of simultaneous failures, and all three guests share one physical
+host.
+
+Post-expansion verification passed the existing Flash15 health/auth/RBAC checks
+and Cloud15 HTTPS checks plus three owner-readiness checks, including three
+OIDC initiations and TLS database connections. This is not completed owner
+login or browser E2E. Kubernetes now reports11 allocatable CPUs on each guest;
+remaining requests are4550m/4550m/4650m CPU and3781636096/3781636096/3915849728
+bytes memory. These are scheduler request margins, not measured idle capacity
+or a claim that all remaining dependencies and maximum tenant quotas fit.

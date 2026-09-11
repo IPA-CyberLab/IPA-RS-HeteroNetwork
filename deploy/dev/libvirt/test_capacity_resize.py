@@ -6,6 +6,26 @@ import capacity_resize as capacity
 
 
 class ResizeTests(unittest.TestCase):
+    def test_services_stage_preserves_identity_disks_and_is_repeatable(self):
+        core = capacity.requested_xml(self.original(), 'hetero-dev-1')
+        expanded = capacity.requested_xml(core, 'hetero-dev-1', 'services')
+        self.assertEqual(capacity.without_capacity(core), capacity.without_capacity(expanded))
+        root = ET.fromstring(expanded)
+        self.assertEqual(root.findtext('vcpu'), '12')
+        self.assertEqual(root.findtext('memory'), str(12288 * 1024))
+        self.assertEqual(expanded, capacity.requested_xml(expanded, 'hetero-dev-1', 'services'))
+        for text, stage in ((self.original(), 'services'), (expanded, 'core'), (core, 'arbitrary'),
+                            (core.replace('>8<', '>12<'), 'services')):
+            with self.assertRaises(ValueError):
+                capacity.requested_xml(text, 'hetero-dev-1', stage)
+
+    def test_services_budget_retains_host_and_other_vm_reservations(self):
+        result = capacity.static_budget(82061076, 104, 16777216, 16, 'services')
+        self.assertEqual(result['with_host_reserve_kib'], 76 * 1024 * 1024)
+        self.assertEqual(result['total_vm_vcpus'], 52)
+        self.assertTrue(result['static_totals_fit'])
+        self.assertFalse(capacity.static_budget(76 * 1024 * 1024 - 1, 104, 16777216, 16, 'services')['static_totals_fit'])
+
     def original(self):
         name = 'hetero-dev-1'
         ident = uuid.uuid5(uuid.NAMESPACE_URL, f'urn:heteronetwork:dev:ichikawap1:domain:{name}')
