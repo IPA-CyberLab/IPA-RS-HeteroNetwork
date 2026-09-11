@@ -98,8 +98,9 @@ rejection checks remain outstanding; OpenSSL transport checks do not replace the
 CA environment updates require a controlled
 rollout; the chart does not implement automatic certificate rotation.
 
-Translate the generated database credentials into each application's fresh
-Secret, run the selected app migrations and deploy the application workloads.
+The generated database credentials have now been translated into each
+application's fresh Secret; see [SECRETS.md](SECRETS.md) for actual creation and
+repeat verification. Run the selected app migrations and deploy the application workloads.
 `database_credentials.py` provides the in-memory conversion for that provisioning
 step: it checks exact DEV namespace, Secret name, database owner and Service
 target, constructs a percent-encoded URL with `sslmode=verify-full`, and returns
