@@ -593,9 +593,51 @@ bounded to one hour, so readiness must be rechecked before further operations.
 This does not establish browser login, user-facing Web Shell, public endpoints,
 full CRUD or node-failure HA. No PROD resources were changed.
 
+## Flash WebSocket, Update and Deletion Check (2026-09-11)
+
+The retained test service was still Ready with one gVisor Pod and a Bound
+1812Mi RWX home PVC. The exact service UID was
+`dd74ad7d-3ba3-43c2-9fa0-888f3b68dea6`; the PVC UID was
+`8955ede1-ea4b-40fb-9e9b-a03f9df94c7d`. The extended verifier validates this
+fixture's scope/spec before operations. Its retained mode is deliberately tied
+to that fixture UID; it is not a generic rerunnable lifecycle harness yet.
+
+The actual Web Shell protocol was exercised through Flash's signed WebSocket
+API, not kubectl exec. The client sent resize controls and binary terminal input,
+disabled PTY echo and used split markers to avoid counting echoed input as output.
+It wrote a random value into `/root/dev-provider-check`, synced it, and read it
+back through a second authenticated WebSocket connection. A signed generation
+update changed the Pod template; the replacement Pod had a different UID but
+the same PVC UID, and a third WebSocket connection read the same value.
+
+The first generation1-to2 run stopped because the deployed containers API returns
+403 while observed_generation still lags the desired generation. The revised
+verifier waits through the status API before requesting containers. It verified
+generation2-to3 replacement persistence, then sent the signed delete request.
+A second verifier bug mishandled kubectl's empty-list output with
+`--ignore-not-found`; that flag is now used only for named resource lookups.
+No Pod was forcibly restarted to work around either observation failure.
+
+Final authoritative deletion audit passed through
+`/opt/heteronetwork-dev-flash-delete-086b775d/verify.py --verify-deleted`:
+the service, its Pods and PVC were absent, and repeated signed deletion returned
+202. The successful WebSocket/update run used
+`/opt/heteronetwork-dev-flash-exec-7e42bf72/verify.py`.
+The runtime client is the unmodified websocket-client1.9.0 wheel, SHA256
+`af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef`,
+loaded from a verified root-owned path without changing the guest Python environment.
+
+Flash source commit `1bd4250` changes only lagging observed generations from
+Forbidden to NotReady; mismatched tenant/request scope and impossible future
+observed generations remain forbidden. Both targeted diagnostics-scope tests
+passed. This change is pushed but **not deployed**: the selected DEV image
+remains0.1.30-dev.1. The Retain-policy PV/Longhorn volume cleanup has not been
+verified. Browser rendering, user OIDC login, public networking and node-failure
+HA are still outside these checks. PROD is unchanged.
+
 ## Remaining Deployment
 
-Flash tenant Web Shell/update/delete and failure recovery, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
+Flash browser Web Shell, repeatable lifecycle cleanup and failure recovery, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that
