@@ -51,6 +51,13 @@ def fixtures():
 
 
 class RendererTests(unittest.TestCase):
+    def test_dev_oidc_egress_uses_private_backend_port(self):
+        _, site = fixtures()
+        values = render.dev_values("heterocloud", site)["networkPolicy"]
+        self.assertEqual(values["oidcPort"], 8443)
+        self.assertEqual(values["oidcCidrs"], site["pod_cidrs"] + site["service_cidrs"])
+        self.assertNotIn("0.0.0.0/0", values["oidcCidrs"])
+
     def test_oidc_ca_wiring_rejects_missing_or_optional_trust(self):
         _, site = fixtures()
         settings = render.dev_values("heterocloud", site)["oidc"]

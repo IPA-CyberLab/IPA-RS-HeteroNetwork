@@ -75,6 +75,6 @@ networkPolicy:
   providerCidrs: []
   registryCidrs: []
   databasePort: 5432
-  oidcPort: 443
+  oidcPort: 8443
 nodeSelector: {}
 affinity: {}

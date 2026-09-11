@@ -33,7 +33,27 @@ matching the observed Keycloak Service. Those Pods ran on DEV1, DEV2 and DEV3.
 No Pod restart was requested and no production configuration was changed.
 
 This proves sampled cluster DNS resolution, not browser/public DNS or login.
-Cloud's namespace still lacks `heteronetwork.dev/identity-client=true`, required
-by the existing Keycloak ingress policy. The Cloud OIDC egress configuration also
-needs to permit the backend TLS port 8443 with appropriate destination scoping.
-Those application-network changes and real authenticated login remain pending.
+Cloud's namespace intentionally lacks `heteronetwork.dev/identity-client=true`;
+the scoped policy described below replaces that namespace-wide permission.
+Real authenticated login remains pending.
+
+## Cloud Ingress Permission
+
+`configure-cloud-access.py` creates and verifies the separate
+`hetero-dev-identity/dev-keycloak-cloud-clients` NetworkPolicy. Both namespace
+labels (exact Cloud DEV namespace and DEV channel) and Pod labels (Cloud name,
+release instance, API or owner component) must match in the same peer entry.
+Only Keycloak Pod ingress TCP/8443 is granted. Worker/Flash Pods do not match.
+Other existing policies remain additive; this is not proof of global isolation.
+
+Actual first create and second no-change verification succeeded on 2026-09-11.
+No namespace labels, existing policies or workloads were changed. The root-owned
+helper is at `/opt/heteronetwork-dev-cloud-access-33ae7d2d/configure-cloud-access.py`,
+SHA256 `33ae7d2db9475e2a4d7a2da9ac7e18f03051829dee82fb604b7b5d243f333cd5`.
+
+The tracked DEV Helm overlay changes API OIDC egress from unrestricted destinations
+on port443 to DEV Pod/Service CIDRs on backend port8443. That chart change is not
+deployed yet. It restricts destination ranges, not individual destination Pods;
+the ingress policy above supplies the Keycloak client selection. The owner chart
+currently has no Egress policy. End-to-end allowed/denied connectivity and actual
+user login must still be exercised after application rollout.

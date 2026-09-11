@@ -149,6 +149,7 @@ def dev_values(app, site):
         values["networkPolicy"]["databaseCidrs"] = site["pod_cidrs"]
         values["networkPolicy"]["providerCidrs"] = site["pod_cidrs"] + site["service_cidrs"]
         values["networkPolicy"]["registryCidrs"] = site["pod_cidrs"] + site["service_cidrs"]
+        values["networkPolicy"]["oidcCidrs"] = site["pod_cidrs"] + site["service_cidrs"]
     elif app == "heterocloud-flash":
         values["networkPolicy"] = {"dnsCidrs": site["dns_cidrs"]}
     elif app == "heterocloud-syouyu":
