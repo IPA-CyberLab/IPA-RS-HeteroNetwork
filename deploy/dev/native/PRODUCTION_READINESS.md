@@ -72,3 +72,22 @@ SSH banner exchanges through ichikawap1 timed out for VPN peers .4, .5 and
 100.97.114.85 answered SSH but rejected the available key for mizuame.
 No password attempts, VM power operations, network changes or service restarts
 were performed. Out-of-band guest state and the other voters remain unverified.
+
+## Follow-Up: 2026-09-11 After DEV Identity Probe
+
+A fresh read using ichikawap1's actual `/etc/kubernetes/admin.conf` succeeded:
+the production kube-system namespace UID is
+`6d773ea3-e3a7-4bc2-a6fa-d5b53279d524`. The current kubeconfig server is
+`https://k8s-api.heteronetwork.internal:7443`. This supersedes the earlier
+unverified-UID blocker; it does not establish sustained production health or
+explain how the earlier consensus failure recovered. No production mutation was
+performed during these checks.
+
+The distinct DEV API Service origin `https://172.30.0.1:443` was independently
+queried from DEV1 with its admin kubeconfig and normal TLS verification. It
+returned DEV UID `a39281cb-d273-4c5f-b7a7-fca722fb417b`. This origin is for an
+in-cluster DEV Argo installation, not an externally reachable Kubernetes API.
+DEV Service/EndpointSlice reads confirmed DNS172.30.0.10, API backends
+10.251.0.1/2/3:6443 and both expected storage classes. All three DEV nodes have
+no taints and each reports7CPU allocatable. These observations supply the real
+inputs in `deploy/dev/site.json`; they do not bypass runtime identity admission.

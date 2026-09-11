@@ -1,0 +1,37 @@
+{
+  "destination_server": "https://172.30.0.1:443",
+  "production_destination_server": "https://k8s-api.heteronetwork.internal:7443",
+  "cluster_uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b",
+  "production_cluster_uid": "6d773ea3-e3a7-4bc2-a6fa-d5b53279d524",
+  "domain": "dev.heterocloud.mizuame.app",
+  "oidc_issuer": "https://id.dev.heterocloud.mizuame.app/realms/heterocloud-dev",
+  "oidc_client_id": "heterocloud-dev-web",
+  "owner_email": "fasutotesuto@gmail.com",
+  "storage_class": "dev-app-local",
+  "pod_cidrs": ["172.29.0.0/16"],
+  "service_cidrs": ["172.30.0.0/16"],
+  "dns_cidrs": ["172.30.0.10/32"],
+  "kubernetes_api_backend_cidrs": ["10.251.0.1/32", "10.251.0.2/32", "10.251.0.3/32"],
+  "auxiliary_images": {
+    "postgres": {
+      "version": "18.6-standard-trixie",
+      "image": "ghcr.io/cloudnative-pg/postgresql@sha256:71eef62330076deb985c8ffb1abeb957d86779c3911a8057c0b97f3c5a30b50b"
+    },
+    "redis": {
+      "version": "8.10.1",
+      "image": "docker.io/bitnami/redis@sha256:ffa455a3ad00bccc24dfde113ef55329dde687da242e9feb6ccd2b30eb93e8f3"
+    },
+    "redis-sentinel": {
+      "version": "8.10.1",
+      "image": "docker.io/bitnami/redis-sentinel@sha256:97433fd14ea945c164ac514c162e2d2a017e9044fdc7ec46abf12a92f4660770"
+    },
+    "coturn": {
+      "version": "4.16.0",
+      "image": "docker.io/coturn/coturn@sha256:01fc8655e7c262fa4ccfb8dca74ff80fb372b0ee021e80370a4d3e3dd01a951e"
+    },
+    "garage": {
+      "version": "v2.3.0",
+      "image": "docker.io/dxflrs/garage@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690"
+    }
+  }
+}

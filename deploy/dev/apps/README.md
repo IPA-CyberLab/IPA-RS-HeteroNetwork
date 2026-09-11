@@ -60,3 +60,7 @@ The three independent application database clusters are now running in DEV;
 placement, PVC and synchronous replication evidence is in
 [DATABASES.md](DATABASES.md). Application migrations and service startup remain
 separate from this database milestone.
+
+Actual-site release-bound preparation and the first three-node Redis runtime
+deployment are recorded in [RUNTIME.md](RUNTIME.md). Other application runtime
+dependencies and complete user workflows remain unfinished.
