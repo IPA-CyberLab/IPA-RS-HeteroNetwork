@@ -635,6 +635,25 @@ remains0.1.30-dev.1. The Retain-policy PV/Longhorn volume cleanup has not been
 verified. Browser rendering, user OIDC login, public networking and node-failure
 HA are still outside these checks. PROD is unchanged.
 
+## Completed Fixture Storage Reclamation (2026-09-11)
+
+After signed service deletion, its home PV was Released with reclaimPolicy=Retain.
+The associated Longhorn volume was detached, had no current/desired node and
+still referenced the exact deleted fixture PVC. `cleanup-flash-probe-storage.py`
+checks the known PV, PVC and Longhorn UIDs, namespace, claim name, CSI driver and
+storage class, as well as absence of the service/Pods/PVC. It switches only that
+PV's reclaim policy to Delete with UID/resourceVersion preconditions, then waits
+for the regular CSI/Longhorn controllers to finish reclamation.
+
+Actual helper: `/opt/heteronetwork-dev-flash-cleanup-bab2fa39/cleanup.py`.
+Initial apply and repeated apply both passed. PV
+`pvc-8955ede1-ea4b-40fb-9e9b-a03f9df94c7d`, its Longhorn volume, replicas and
+engines are absent. The separate one-GiB cross-node RWX fixture remains, with its
+original volume UID. No finalizers were modified and no host files were removed
+manually. Two focused tests cover rejection of foreign/bound PVs and attached
+or foreign Longhorn volumes. This cleanup is bound to the completed fixture's
+recorded identities; generic repeatable lifecycle cleanup is still unfinished.
+
 ## Remaining Deployment
 
 Flash browser Web Shell, repeatable lifecycle cleanup and failure recovery, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
