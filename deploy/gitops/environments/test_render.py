@@ -60,6 +60,13 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(flash["api"]["replicaCount"], 3)
         self.assertEqual(flash["controller"]["replicaCount"], 2)
 
+    def test_dev_turn_does_not_overlap_native_stun(self):
+        _, site = fixtures()
+        turn = render.dev_values("heterocloud-flow", site)["coturn"]
+        self.assertEqual(turn["servicePort"], 13478)
+        self.assertNotIn(turn["servicePort"], (3478, 3479))
+        self.assertEqual(turn["additionalPools"], [])
+
     def test_rendered_dev_owner_requires_secure_cookies(self):
         _, site = fixtures()
         owner = render.dev_values("heterocloud", site)["ownerConsole"]
@@ -306,6 +313,22 @@ class RendererTests(unittest.TestCase):
         state = json.loads((render.ROOT / "deploy/releases/channels.json").read_text())
 
         def inspect(app, documents):
+            if app["metadata"]["name"] == "heterocloud-flow-dev":
+                turn = next(d for d in documents if d and d.get("kind") == "Deployment"
+                            and d["metadata"]["name"] == "heterocloud-flow-dev-coturn")
+                pod = turn["spec"]["template"]["spec"]
+                self.assertIs(pod["hostNetwork"], True)
+                container = next(c for c in pod["containers"] if c["name"] == "coturn")
+                self.assertIn("--listening-port=13478", " ".join(container["args"]))
+                self.assertEqual({(p["protocol"], p["containerPort"], p["hostPort"])
+                                  for p in container["ports"] if "hostPort" in p},
+                                 {("UDP", 13478, 13478), ("TCP", 13478, 13478)})
+                urls = [env["value"] for d in documents if d and d.get("kind") in ("Deployment", "Job")
+                        for c in d["spec"]["template"]["spec"]["containers"]
+                        for env in c.get("env", []) if env["name"] == "TURN_URLS"]
+                self.assertTrue(urls)
+                self.assertTrue(all(value == "turn:turn.dev.example.invalid:13478?transport=udp,"
+                                    "turn:turn.dev.example.invalid:13478?transport=tcp" for value in urls))
             if app["metadata"]["name"] == "heterocloud-syouyu-dev":
                 garage_images = [container["image"] for document in documents
                     if document and document.get("kind") == "StatefulSet"

@@ -39,6 +39,8 @@ livekit:
   existingConfigSecret: heterocloud-flow-dev-livekit-config
 coturn:
   replicaCount: 3
+  # Native DEV STUN owns 3478/3479 on guest 1.
+  servicePort: 13478
   additionalPools: []
   realm: turn.${domain}
   publicHosts: ["turn.${domain}"]

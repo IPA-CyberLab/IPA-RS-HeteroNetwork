@@ -169,8 +169,18 @@ with PDB minimum availability two. Flash requests three API replicas and two
 controllers, matching its chart's redundant defaults. The selected charts supply
 required hostname anti-affinity; these settings are not observed runtime HA.
 Fresh database redundancy and actual failure recovery remain separate requirements.
-Flow's host-network Coturn
-default port 3478 overlaps the native STUN listener on dev guest 1; resolve its
-dev port and media/NAT configuration before deployment. Neither setting is
-silently changed here. Fresh secrets, dev IdP, DNS/TLS/edge resources, verified
+DEV Flow's host-network Coturn explicitly uses 13478 (UDP and TCP), leaving
+3478/3479 to native DEV STUN. The chart derives listener arguments, host ports,
+Service ports and advertised TURN URLs from `coturn.servicePort`. On 2026-09-11,
+read-only socket inspection found 13478 unused on all three DEV guests and
+3478/3479 in use on guest 1. This observation is not a port reservation.
+DEV media/NAT mappings and access to the TURN listener and relay range still
+need provisioning and live validation; no public TURN reachability is claimed.
+The focused port-value regression passed on 2026-09-11. The full immutable Helm
+check refused the current Flow checkout before templating because its
+`charts/redis-23.1.1.tgz` and `charts/postgresql-ha-16.3.2.tgz` are ignored files,
+not selected-commit content. The new rendered listener/URL regression is therefore
+not yet verified. Preserve the checkout guard: dependency packaging must be
+reviewed and bound to a release before this is considered deployable.
+Fresh secrets, dev IdP, DNS/TLS/edge resources, verified
 cluster destinations, and runtime/network prerequisites above remain required.
