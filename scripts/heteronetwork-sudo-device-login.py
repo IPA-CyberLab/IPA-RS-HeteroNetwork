@@ -2,6 +2,8 @@
 """Obtain a short-lived owner token through the pinned Keycloak device flow."""
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,7 @@ CLIENT_ID = "ipars-web"
 OWNER_SUBJECT = "4daa569e-635c-49ed-bb17-5fe0a07581b2"
 OWNER_EMAIL = "fasutotesuto@gmail.com"
 MAX_RESPONSE = 1024 * 1024
+PKCE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}\Z")
 
 
 def require(value, reason):
@@ -61,6 +64,18 @@ def endpoint(value, issuer, name):
             and not parsed.username and not parsed.password and not parsed.fragment,
             "invalid_" + name)
     return value
+
+
+def pkce_challenge(verifier):
+    require(isinstance(verifier, str) and PKCE_VERIFIER.fullmatch(verifier),
+            "invalid_pkce_verifier")
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def new_pkce_pair():
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
+    return verifier, pkce_challenge(verifier)
 
 
 def publish(path, raw):
@@ -107,9 +122,12 @@ def login(output):
     device_url = endpoint(discovery.get("device_authorization_endpoint"), ISSUER, "device_endpoint")
     token_url = endpoint(discovery.get("token_endpoint"), ISSUER, "token_endpoint")
     userinfo_url = endpoint(discovery.get("userinfo_endpoint"), ISSUER, "userinfo_endpoint")
+    code_verifier, code_challenge = new_pkce_pair()
     authorization = request(opener, device_url, {
         "client_id": CLIENT_ID,
         "scope": "openid profile email",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     })
     device_code = authorization.get("device_code")
     user_code = authorization.get("user_code")
@@ -133,6 +151,7 @@ def login(output):
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 "device_code": device_code,
                 "client_id": CLIENT_ID,
+                "code_verifier": code_verifier,
             })
             token = response.get("access_token")
             require(isinstance(token, str) and 32 <= len(token) <= 65536,

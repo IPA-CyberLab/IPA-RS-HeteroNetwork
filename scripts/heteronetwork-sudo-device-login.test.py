@@ -21,6 +21,16 @@ class DeviceLoginTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 module.endpoint(value, module.ISSUER, "test")
 
+    def test_pkce_uses_rfc_7636_s256(self):
+        verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        self.assertEqual(
+            module.pkce_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        )
+        generated, challenge = module.new_pkce_pair()
+        self.assertRegex(generated, module.PKCE_VERIFIER)
+        self.assertEqual(challenge, module.pkce_challenge(generated))
+
     def test_token_publish_is_atomic_and_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
