@@ -336,13 +336,96 @@ Fourteen focused applicator tests and four redirect-validation tests passed.
 
 These are internal startup and OIDC initiation checks, not a completed owner
 login or browser E2E. Worker readiness alone does not prove provider operations.
-Flash is still undeployed, registry integration disabled, and external DEV
+At this Cloud checkpoint Flash was still undeployed; its subsequent rollout is
+recorded below. Registry integration is disabled, and external DEV
 DNS/edge/owner TLS unfinished. No owner identity was fabricated or inferred
 from its configured email; no sudo approval policy was activated.
 
+## GVisor Installed And Executed
+
+On 2026-09-11, `install-gvisor.py` installed the authenticated APT version
+`20260907.0` on each of the three identified DEV guests. `gvisor-lock.json`
+records the package metadata and the exact Flash installer source commit and
+SHA256. The observed package SHA256 is provenance, not a claim that this wrapper
+independently verified the downloaded Debian artifact against that field.
+
+The installer checks guest machine identity, DEV cluster UID, all three ready
+nodes, four healthy PostgreSQL clusters, containerd v3 configuration and
+`KillMode=process`. It preserves the existing runc default and base configuration.
+Each guest needed a containerd restart to load the runsc drop-in; all26 previously
+running container IDs on each guest remained running afterward. No production
+guest or tenant container was stopped. This is task preservation evidence, not
+proof that all application requests succeeded throughout the change.
+
+`verify-gvisor.py` then ran a bounded, nonroot, tokenless probe using the pinned
+LiveKit image on each named guest with the runsc handler. All three probes
+confirmed `Starting gVisor` in the sandbox kernel log before the corresponding
+node received `flash.heterocloud.io/gvisor-ready=true`. The resulting `gvisor`
+RuntimeClass selects only verified nodes. All probe Pods and temporary
+RuntimeClasses were removed. The first DEV1 cleanup encountered a stale resource
+version; rereading before UID-preconditioned deletion addresses that race.
+
+Installer bundle on all guests: `/opt/heteronetwork-dev-gvisor-a6cfcb7c`, SHA256
+`a6cfcb7cb6a8da9ffd53cd352b0246b075ec17779b418d01911d07b0e148cedc`.
+Current verifier on DEV1: `/opt/heteronetwork-dev-gvisor-verify-b262de0d/verify-gvisor.py`,
+SHA256 `b262de0dfbd6b8b536caccd5375b3615cf03366c37365ee13bfb6200f899e71b`.
+The runtime is installed, but Flash tenant storage and end-to-end operations are
+separate prerequisites; no tenant isolation or recovery result is implied.
+
+## Flash Control Plane Applied And Verified
+
+`apply-flash.py` admits the12 selected revision16 Flash objects and one pinned
+HTTPRoute CRD from the existing Envoy chart version1.8.3. It requires the actual
+DEV identity, all three verified runtime labels, provider public keys, exact
+images, namespace boundaries, node-read-only ClusterRole, expected ownership and
+per-node request headroom. No tenant object is created by this helper.
+
+The initial readback stopped on empty CRD `status` fields packaged upstream;
+`desired_crd` now removes only that server-owned top-level field without modifying
+the original bundle. The actual retry completed all13 objects. On 2026-09-11,
+API ReplicaSet `78bd688449` had three ready Pods, one per guest; controller
+ReplicaSet `7b7f987b5c` had two ready Pods on DEV1 and DEV2. Required anti-affinity
+is configured separately for both components.
+
+`verify-flash.py` passed six HTTP live/ready checks, three unauthenticated401
+checks using a structurally valid generation query, and six RBAC checks.
+The service account can read nodes and create deployments/exec sessions in the
+Flash workload namespace; it cannot read Cloud Secrets, create Cloud deployments
+or create ClusterRoleBindings. Structured SelfSubjectAccessReview requests use
+the raw API endpoint and normal service-account groups, avoiding kubectl's
+unrelated CRD discovery requirement without adding controller permissions.
+These checks are not a tenant network-isolation test or signed provider E2E.
+An actual second apply preserved all five Flash Pod UIDs; all15 verification
+checks passed again afterward without changing the deployment configuration.
+
+Runtime on DEV1: `/opt/heteronetwork-dev-flash-2c651c87`, applicator SHA256
+`2c651c87693a8a13feac710d942cf994d03d8b352f8deffdf254b286a544d7c3`.
+Original bundle SHA256:
+`069ae46f44be1a8b129502541af69f894984d266ae9f42656d967ad4962f0968`.
+Verifier: `/opt/heteronetwork-dev-flash-verify-95855e8a/verify-flash.py`, SHA256
+`95855e8a3ecaee3f457db3507a6b20ca45e550bb4f0625541000963c16057bac`.
+Fourteen focused Flash admission tests and one sandbox Pod-shape test passed.
+
+### Tenant Storage Dependency
+
+The selected controller creates an RWX filesystem home PVC for each service.
+Its current `dev-app-local` class is a static, node-local provisioner with only
+the database, Redis and Garage claims reserved. It cannot provision Flash homes.
+No node-local PV was relabeled RWX, persistence disabled, or tenant storage
+claimed operational to bypass this missing dependency.
+
+PROD uses Longhorn for homes and a separate CSI-S3/geesefs admin workspace mount.
+DEV needs its own explicitly defined shared class, capacity admission, host
+prerequisites and actual cross-node/gVisor persistence tests. Preserve the
+requested replication: a single-replica storage shortcut would not establish HA.
+The recorded64GiB app disks already reserve35GiB each for other services; free
+space alone is insufficient admission because those directories lack quotas.
+Longhorn must not enroll root disks or consume capacity committed to local PVs.
+No Longhorn or CSI-S3 resources were installed during this control-plane step.
+
 ## Remaining Deployment
 
-Flash APIs/controllers/workers, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash gVisor and
+Flash tenant execution/storage, Cloud/Flow authenticated E2E, complete Syouyu integration, Flash
 edge services, DEV Argo, registry, monitoring, DNS/TLS entry points, real owner
 login and complete E2E/HA checks are not established by these steps. Bootstrap
 and registry integrations currently remain disabled in the DEV overlays; that

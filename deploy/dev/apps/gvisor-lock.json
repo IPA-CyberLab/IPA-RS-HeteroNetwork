@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "cluster_uid": "a39281cb-d273-4c5f-b7a7-fca722fb417b",
+  "architecture": "amd64",
+  "version": "20260907.0",
+  "repository": "https://storage.googleapis.com/gvisor/releases",
+  "package_url": "https://storage.googleapis.com/gvisor/releases/pool/20260907.0/binary-amd64/runsc.deb",
+  "package_sha256_observed": "0fc03b87cbb81e5f71e2fefe5046bd4c62ce38156c67ab81ff8cb3dc8f456fa9",
+  "installer_repository": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git",
+  "installer_commit": "302f3f17caead30e7ecc4239f70f8bb1351ef656",
+  "installer_path": "scripts/install-gvisor.sh",
+  "installer_sha256": "6ddb1921db7d152c40d964de2435b68d6dde3ddde8ff2dd2218b75665aa06737"
+}
