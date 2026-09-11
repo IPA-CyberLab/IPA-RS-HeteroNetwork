@@ -90,3 +90,27 @@ not be silently substituted. Quorum participation is machine policy approval,
 not evidence that a separate human approved on each VM. Existing root access or
 unrestricted sudo can bypass an inactive plugin, so installed signing artifacts
 alone do not enforce the requested administrative boundary.
+
+## Observed Host Attestation Provisioning: 2026-09-11
+
+The pinned provisioner generated one Ed25519 host-attestation key independently
+inside each DEV guest. Private 32-byte seeds remain root-only at
+`/etc/ipars-sudo-v2/host.key`; neither the physical host coordinator nor this
+repository received them. The three public records are committed in
+`sudo-hosts.json` and bind guest name, machine ID, cluster ID, node ID, DKG
+manifest hash and key epoch. Their public keys are distinct.
+
+The first coordinator run reported `key_created: true` on all three guests. A
+second run reported `key_created: false` and derived the same three public keys
+from the stored private seeds. Both runs reported no sudo configuration change,
+no activation and no private-key export. The guest provisioner SHA256 is
+`f0e8c9437d3a9e108de253bf3aff1cd66c30078e52b363168bc32cf6254f2fff`;
+the physical-host coordinator SHA256 is
+`e35d9ad2192c451d0411f4dfcfe474d19fabe92c3b9bcd855be57aa9ab9bd9c3`.
+Twelve focused offline tests passed before deployment.
+
+This advances only the host-attestation prerequisite. No `config.json`, local
+runtime directory, signer service or sudo plugin was created or started. The
+real owner's exact DEV OIDC subject remains absent, so constructing an active
+policy or enabling enforcement would currently substitute an unverified
+identity and is intentionally refused.
