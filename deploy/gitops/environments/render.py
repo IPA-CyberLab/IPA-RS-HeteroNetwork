@@ -28,7 +28,7 @@ AUX = {
     "heterocloud": {"haproxy": ("ownerConsole.databaseProxy.image", "scalar")},
     "flow": {
         "coturn": ("coturn.image", "tag"),
-        "redis": ("redis.image", "digest"), "redis-sentinel": ("redis.sentinel.image", "digest"),
+        "redis": ("redis.image", "registry"), "redis-sentinel": ("redis.sentinel.image", "registry"),
         "prometheus": ("monitoring.prometheus.image", "digest"),
         "prometheus-init": ("monitoring.prometheus.initImage", "digest"),
         "grafana": ("monitoring.grafana.image", "digest"),
@@ -162,6 +162,12 @@ def image_parameters(prefix, pin, mode="tag"):
     repository, digest = match.groups()
     if mode == "scalar":
         return {prefix: pin["image"]}
+    if mode == "registry":
+        registry, separator, path = repository.partition("/")
+        require(separator and path and ("." in registry or ":" in registry or registry == "localhost"),
+                "registry-style image pins require a fully qualified registry")
+        return {prefix + ".registry": registry, prefix + ".repository": path,
+                prefix + ".tag": pin["version"], prefix + ".digest": digest}
     result = {prefix + ".repository": repository, prefix + ".tag": pin["version"] if mode == "digest" else pin["version"] + "@" + digest}
     if mode == "digest":
         result[prefix + ".digest"] = digest

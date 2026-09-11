@@ -48,6 +48,18 @@ def fixtures():
 
 
 class RendererTests(unittest.TestCase):
+    def test_redis_image_registry_is_not_duplicated(self):
+        for name, prefix in (("redis", "redis.image"), ("redis-sentinel", "redis.sentinel.image")):
+            image = {"version": "8.10.1", "image": "docker.io/bitnami/" + name + "@sha256:" + "a" * 64}
+            values = render.image_parameters(prefix, image, render.AUX["flow"][name][1])
+            self.assertEqual(values[prefix + ".registry"], "docker.io")
+            self.assertEqual(values[prefix + ".repository"], "bitnami/" + name)
+            self.assertEqual(values[prefix + ".registry"] + "/" + values[prefix + ".repository"] +
+                             "@" + values[prefix + ".digest"], image["image"])
+        with self.assertRaisesRegex(ValueError, "fully qualified"):
+            render.image_parameters("redis.image", {"version": "8.10.1", "image":
+                                    "bitnami/redis@sha256:" + "a" * 64}, "registry")
+
     def test_dev_keeps_redundant_cloud_and_flash_replicas(self):
         _, site = fixtures()
         cloud = render.dev_values("heterocloud", site)

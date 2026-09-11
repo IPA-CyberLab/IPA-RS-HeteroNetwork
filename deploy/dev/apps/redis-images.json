@@ -1,0 +1,10 @@
+{
+  "redis": {
+    "version": "8.10.1",
+    "image": "docker.io/bitnami/redis@sha256:ffa455a3ad00bccc24dfde113ef55329dde687da242e9feb6ccd2b30eb93e8f3"
+  },
+  "redis-sentinel": {
+    "version": "8.10.1",
+    "image": "docker.io/bitnami/redis-sentinel@sha256:97433fd14ea945c164ac514c162e2d2a017e9044fdc7ec46abf12a92f4660770"
+  }
+}
