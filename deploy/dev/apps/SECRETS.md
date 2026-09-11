@@ -58,7 +58,8 @@ Credential mapping module SHA256:
 These Secrets are not proof that applications run or authenticate. OIDC is
 provisioned separately by the identity helper. LiveKit's authenticated
 Redis/Sentinel configuration has now been created and verified; see
-[LIVEKIT.md](LIVEKIT.md). Cloud serving TLS remains to be provisioned. App
+[LIVEKIT.md](LIVEKIT.md). Cloud serving TLS and a public identity-CA Secret are
+now provisioned; see [CLOUD_TLS.md](CLOUD_TLS.md) for remaining client-trust work. App
 migrations, network-policy access checks, end-user login and functional tests
 are still required. No credential rotation, replica failover or loss-of-DEV1
 recovery has been demonstrated by this provisioning step.
