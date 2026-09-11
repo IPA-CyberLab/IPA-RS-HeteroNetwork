@@ -181,6 +181,59 @@ Verifier source SHA256:
 Installed verifier on DEV1:
 `/opt/heteronetwork-dev-syouyu-api-verify-05a530e2/verify-syouyu-api.py`.
 
+## Flow Runtime Attempt And Migration Fix
+
+`apply-flow.py` selects the22 remaining Flow resources from revision15, excluding
+the already deployed Redis subchart. It verifies the immutable bundle, actual
+DEV identity, three ready database/Redis instances, referenced credentials and
+per-node initial request capacity. It admits host networking only for the
+selected Coturn deployment. All five deployments require three replicas.
+Support resources are applied first; the migration must complete before any
+Flow runtime Deployment is created. This is not a production rollout.
+
+Actual admission initially rejected `metadata.annotations: null` in the Helm
+output before mutation. The helper now normalizes missing/null annotations
+while preserving hook annotations; tests cover this case. The corrected apply
+installed the16 support resources and migration Job, but stopped at the migration
+barrier. No API, matchmaker, signaling, LiveKit or Coturn Deployment was started
+by this attempt. The existing Redis and PostgreSQL pods remained running.
+
+The actual migration container exited during configuration parsing with:
+`REDIS_URL or REDIS_SENTINEL_URLS is required`. The selected chart supplied
+neither to the Job, despite supplying them to API/signaling. This happens before
+database connection/migration in `flow-api migrate`; it was not a DB outage.
+
+Flow commit `38d5c8805e4b477af3efd9090eaab2a49e53fded` fixes the Job template
+to use the same backend and authentication settings as the API. The Redis
+chart tests now include migration, with six passing cases including direct
+external Redis and authenticated Sentinel. HN's15 focused Flow admission tests
+also pass. The immutable replacement prerelease is `v0.1.21-dev.7`:
+[release workflow34580135357](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow/actions/runs/34580135357).
+It was observed in progress; no successful artifact or channel promotion is
+claimed here. `deploy/releases/channels.json` remains revision15.
+
+The known-invalid DEV migration was suspended using its exact UID and resource
+version after checking its bundle annotation, missing Redis configuration and
+zero successful completions. Job UID:
+`b8f31a23-d5b8-4a27-bcd0-e3af56c552b1`.
+Do not resume it unchanged: the old template cannot
+succeed. The replacement requires a reviewed new release/bundle and deliberate
+replacement of the immutable Job, not an in-place image or manifest overwrite.
+
+Applied partial-bundle archive SHA256:
+`2d0f233ff5510cf29c473223d878ebb461cbaeffe255eb1de1cf6c34e9798458`.
+Installed helper on DEV1:
+`/opt/heteronetwork-dev-flow-2d0f233f/apply-flow.py`.
+Helper source SHA256:
+`c9e9b35788e81970749321c7dbd23517f75aec8bffdb3b131505a55d5669aa31`.
+
+`verify-flow.py` is prepared but has not run. It checks placement/readiness for
+15 runtime pods,12 HTTP endpoints, three TCP TURN listeners, six migrations and
+application DB TLS. It explicitly does not establish TURN allocations, WebRTC
+data transport, public DNS or full client E2E. Its archive is staged only on the
+physical host, not installed on DEV1:
+`c90e04681a8801a3e28ce92914aadecc8231c429ac570421ae4840fabd2ba56f`.
+
 ## Remaining Deployment
 
 Cloud/Flow/Flash APIs/controllers/workers, complete Syouyu integration, Flash gVisor and
