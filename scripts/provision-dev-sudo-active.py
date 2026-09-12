@@ -17,7 +17,7 @@ import time
 import urllib.request
 
 
-BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v8")
+BUNDLE = Path("/opt/heteronetwork-dev-sudo-active-v9")
 VERSION = "0.1.15-dev.8"
 SOURCE_COMMIT = "04ec0371dae8efad1b24efac192e016b0f8a14b1"
 RELEASE_DOCUMENT_SHA256 = "69cca7eaeaf594478b96bcbaa11a66c534237ac6db477ea8842fbb228d36bef6"
@@ -30,7 +30,8 @@ SIGNER_UNIT_SHA256 = "15cebfc09eb6934138230ba8d783aa9c1ab1208d89759b353aea68f4a9
 PREVIOUS_SIGNER_UNIT_SHA256 = "a7c966d14295d62ff14f645092a161b846f7b6a8b993a9d686cc8fa8849a8328"
 LOGIN_HELPER_SHA256 = "20ee0f92c7c423d69150a1b30a1c4fe040ebd1864e9270c982ddbc090c04931f"
 PREVIOUS_LOGIN_HELPER_SHA256 = "0fbd6d19edf72fac10baf0298c6d0cd09ca8d1136534433d9174009bef4daeac"
-APPROVE_HELPER_SHA256 = "405800c59902ea8bee15375657f65ce0d1d2496ffab3a6340ea65cc920b20787"
+APPROVE_HELPER_SHA256 = "8b9cf38e98b9ef0a0c48db1d73591ade9ef68c73fbf2fada66b2a09304f54eac"
+PREVIOUS_APPROVE_HELPER_SHA256 = "405800c59902ea8bee15375657f65ce0d1d2496ffab3a6340ea65cc920b20787"
 CLUSTER = "02282a57-784b-4269-90a0-8fda47ee62ec"
 ISSUER = "https://heterocloud.mizuame.app/id/realms/heterocloud"
 OWNER_SUBJECT = "4daa569e-635c-49ed-bb17-5fe0a07581b2"
@@ -49,6 +50,7 @@ RUNTIME = Path("/opt/heteronetwork/sudo-v2/runtime")
 ARTIFACTS = Path("/opt/heteronetwork/sudo-v2/artifacts")
 MANIFEST = Path("/etc/heteronetwork/sudo-quorum/manifest.json")
 POLICY = Path("/etc/heteronetwork/sudo-quorum/policy.json")
+CALLER_POLICY = Path("/etc/heteronetwork-sudo-quorum/policy.json")
 SIGNER_ENV = Path("/etc/heteronetwork/sudo-quorum/signer.env")
 SOURCE_SHARE = Path("/var/lib/heteronetwork-dev-sudo-dkg/key-share.json")
 SERVICE_SHARE = Path("/etc/credstore/heteronetwork-sudo-quorum-share.json")
@@ -362,9 +364,11 @@ def prepare():
     selected = {"runtime": select(RUNTIME), "artifacts": select(ARTIFACTS)}
 
     mkdir(MANIFEST.parent, 0o755)
+    mkdir(CALLER_POLICY.parent, 0o755)
     mkdir(SERVICE_SHARE.parent, 0o700)
     install(MANIFEST, manifest_raw, 0o644)
     install(POLICY, policy_raw, 0o644)
+    install(CALLER_POLICY, policy_raw, 0o644)
     install(SERVICE_SHARE, share, 0o600)
     env_raw = (f"HETERONETWORK_ADMIN_QUORUM_NODE_ID={node}\n"
                f"HETERONETWORK_ADMIN_QUORUM_LISTEN={vpn_ip}:8981\n"
@@ -381,7 +385,8 @@ def prepare():
     install_known_replacement(SIGNER_UNIT, signer_unit, 0o644, PREVIOUS_SIGNER_UNIT_SHA256)
     install_known_replacement(Path("/usr/local/bin/heteronetwork-sudo-login"), login, 0o555,
                               PREVIOUS_LOGIN_HELPER_SHA256)
-    install("/usr/local/bin/heteronetwork-sudo-approve", approve, 0o555)
+    install_known_replacement(Path("/usr/local/bin/heteronetwork-sudo-approve"), approve,
+                              0o555, PREVIOUS_APPROVE_HELPER_SHA256)
     systemctl("daemon-reload")
 
     account = pwd.getpwnam("devadmin")
@@ -415,7 +420,8 @@ def check_prepared(require_inactive):
     release_payloads()
     manifest_raw, policy_raw, policy = public_inputs()
     require(read(MANIFEST, len(manifest_raw), mode=0o644) == manifest_raw
-            and read(POLICY, len(policy_raw), mode=0o644) == policy_raw,
+            and read(POLICY, len(policy_raw), mode=0o644) == policy_raw
+            and read(CALLER_POLICY, len(policy_raw), mode=0o644) == policy_raw,
             "installed_policy_mismatch")
     require(decode(read(LOCAL_CONFIG, 2 * 1024 * 1024, mode=0o600))
             == {"host_node_id": node, "policy": policy}, "local_config_mismatch")

@@ -183,6 +183,11 @@ grant is bound to the host, caller UID, run-as UID and pending invocation; it
 expires within 60 seconds and is durably single-use. It is intentionally not a
 reusable root bearer credential.
 
+The approval helper reads a public-only policy copy from
+`/etc/heteronetwork-sudo-quorum/policy.json`. Signer shares and service inputs
+remain below root-only directories; the public copy contains only the voter
+roster, public keys, command constraints and owner identity pins.
+
 All three DEV voters currently share one physical host. This validates protocol,
 service and sudo integration behavior but does not prove physical fault-domain
 availability. Production enrollment requires a separate DKG and independently

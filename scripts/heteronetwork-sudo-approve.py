@@ -9,7 +9,7 @@ import sys
 
 
 IPARS = "/opt/heteronetwork/sudo-v2/runtime/current/bin/ipars"
-POLICY = "/etc/heteronetwork/sudo-quorum/policy.json"
+POLICY = "/etc/heteronetwork-sudo-quorum/policy.json"
 REQUESTER_KEY = Path.home() / ".config/heteronetwork/sudo/requester.key"
 OWNER_TOKEN = Path.home() / ".config/heteronetwork/sudo/owner.token"
 

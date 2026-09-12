@@ -16,6 +16,13 @@ spec.loader.exec_module(module)
 
 
 class ProvisionDevSudoActiveTests(unittest.TestCase):
+    def test_caller_policy_is_public_without_exposing_private_parent(self):
+        helper = (ROOT / "scripts/heteronetwork-sudo-approve.py").read_text()
+        self.assertEqual(module.CALLER_POLICY,
+                         Path("/etc/heteronetwork-sudo-quorum/policy.json"))
+        self.assertNotEqual(module.CALLER_POLICY.parent, module.POLICY.parent)
+        self.assertIn(f'POLICY = "{module.CALLER_POLICY}"', helper)
+
     def test_inventory_is_exact_and_distinct(self):
         self.assertEqual(set(module.GUESTS), {"hetero-dev-1", "hetero-dev-2", "hetero-dev-3"})
         self.assertEqual({value[2] for value in module.GUESTS.values()}, {1, 2, 3})
