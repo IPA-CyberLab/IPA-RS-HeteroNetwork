@@ -13,23 +13,25 @@ spec:
     - dnsName: heterocloud.mizuame.app
       recordType: A
       recordTTL: 60
-      targets: [163.220.236.53, 163.220.236.61]
+      # uc-k8s3p (.53) is quarantined from public HTTP ingress while its
+      # control-plane workload is being isolated from memory pressure.
+      targets: [163.220.236.61]
       providerSpecific:
         - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
           value: "true"
     - dnsName: flow.heterocloud.mizuame.app
       recordType: A
       recordTTL: 60
-      targets: [163.220.236.53, 163.220.236.61]
+      targets: [163.220.236.61]
     - dnsName: registry.heterocloud.mizuame.app
       recordType: A
       recordTTL: 60
-      targets: [163.220.236.53, 163.220.236.61]
+      targets: [163.220.236.61]
     - dnsName: s3.heterocloud.mizuame.app
       recordType: A
       recordTTL: 60
-      targets: [163.220.236.53, 163.220.236.61]
+      targets: [163.220.236.61]
     - dnsName: '*.flash.heterocloud.mizuame.app'
       recordType: A
       recordTTL: 60
-      targets: [163.220.236.53, 163.220.236.61]
+      targets: [163.220.236.61]
