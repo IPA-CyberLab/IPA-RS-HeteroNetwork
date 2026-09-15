@@ -42,8 +42,9 @@ python3 scripts/master-only-iac.py plan
 python3 scripts/master-only-iac.py apply
 ```
 
-The entry point prompts for sudo credentials, runs an Ansible check, and marks
-only hosts with observed drift for Terraform reconciliation. Secret credentials
+The entry point prompts for sudo credentials, checks the master hosts and the
+internal Git source with Ansible, and marks only resources with observed drift
+for Terraform reconciliation. Secret credentials
 are passed in the process environment rather than Terraform variables or state.
 The canonical host entry point is this wrapper: plain `terraform plan` checks
 the Terraform resources and source hashes, and does not inspect remote host
@@ -78,7 +79,8 @@ and includes only this change's explicit file list. Git is served only over
 the existing encrypted HeteroNetwork, with remote pushes disabled. Rebuild
 `infrastructure.bundle` with the publication script and reapply Terraform to
 publish changes. Back up the Git directory on `uc-k8sp5` with its infrastructure
-state. Moving to another reviewed revision requires changing `git_revision` and
+state. Moving to another branch requires setting `git_revision`, building its
+bundle with `publish-master-only.py --branch BRANCH --work-dir DIRECTORY`, and
 reapplying Terraform. Moving to GitHub after write authentication is restored
 requires publishing the commit and setting `git_repository_url`; the AppProject
 allowlist must include the selected source. Existing nonessential GitOps
