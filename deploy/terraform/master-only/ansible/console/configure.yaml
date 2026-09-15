@@ -90,6 +90,17 @@
       retries: 12
       delay: 2
       when: not ansible_check_mode
+    - name: Check the gateway IP probe used by the native client
+      ansible.builtin.uri:
+        url: 'http://{{ hnn_console_ip }}/v1/web-ui/healthz'
+        status_code: 200
+        return_content: true
+        timeout: 5
+      register: hnn_console_client_probe
+      until: hnn_console_client_probe.status | default(0) == 200 and hnn_console_client_probe.json.status | default('') == 'ok'
+      retries: 12
+      delay: 2
+      when: not ansible_check_mode
   handlers:
     - name: Restart console Agent
       ansible.builtin.systemd_service:

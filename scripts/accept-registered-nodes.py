@@ -38,6 +38,20 @@ def quarantine(name):
     kubectl('taint', 'node', name, TAINT + '=pending:NoSchedule', '--overwrite')
 
 
+def release_quarantine(name, uid):
+    node = json.loads(kubectl('get', 'node', name, '-o', 'json').stdout)
+    if node['metadata']['uid'] != uid:
+        raise RuntimeError('Node identity changed before quarantine release')
+    taints = node['spec'].get('taints', [])
+    retained = [t for t in taints if not (
+        t['key'] == TAINT and t.get('value') == 'pending' and t['effect'] == 'NoSchedule')]
+    if len(retained) == len(taints):
+        raise RuntimeError('Onboarding quarantine changed before release')
+    patch = {'metadata': {'uid': uid, 'resourceVersion': node['metadata']['resourceVersion']},
+             'spec': {'taints': retained}}
+    kubectl('patch', 'node', name, '--type=merge', '-p', json.dumps(patch))
+
+
 @contextlib.contextmanager
 def operator_proxy(work):
     inventory = json.loads((work / 'inventory.json').read_text())['all']
@@ -110,7 +124,7 @@ def accept(work, masters, standard, revision, verify):
         for name in report['nodes']:
             mark(name, 'accepted', revision, checked_at, uid=report['node_uids'][name])
         for name in standard:
-            kubectl('taint', 'node', name, TAINT + ':NoSchedule-')
+            release_quarantine(name, report['node_uids'][name])
         report.update(accepted=True, finished_at_utc=checked_at)
     except Exception:
         for name in report['nodes']:

@@ -49,6 +49,20 @@ try {
           throw new Error(`${gateway}:${port} console authentication configuration is invalid`);
         }
         const row = { gateway, port, ui_http: 200, config_http: 200, login_button_rendered: true };
+        if (port === 80) {
+          // The Windows client uses the gateway IP without overriding Host.
+          // A failure here makes it repeatedly abandon an otherwise healthy gateway.
+          const probe = await context.newPage();
+          try {
+            const response = await probe.goto(`http://${gateway}/v1/web-ui/healthz`);
+            if (response.status() !== 200 || (await response.json()).status !== 'ok') {
+              throw new Error(`${gateway} native client IP health probe failed: HTTP ${response.status()}`);
+            }
+            row.client_ip_health_http = 200;
+          } finally {
+            await probe.close();
+          }
+        }
         if (port === 9781) {
           const opened = page.waitForEvent('popup');
           await page.getByRole('button', { name: 'Keycloakでログイン' }).click();

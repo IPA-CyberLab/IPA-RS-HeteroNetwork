@@ -21,7 +21,10 @@ class OnboardingGateTest(unittest.TestCase):
 
     def api(self, *args):
         self.calls.append(args)
-        return subprocess.CompletedProcess(args, 0, json.dumps({'metadata': {'uid': 'uid-1'}}), '')
+        return subprocess.CompletedProcess(args, 0, json.dumps({
+            'metadata': {'uid': 'uid-1', 'resourceVersion': '17'},
+            'spec': {'taints': [{'key': acceptance.TAINT, 'value': 'pending', 'effect': 'NoSchedule'},
+                                {'key': 'maintenance', 'effect': 'NoExecute'}]}}), '')
 
     def test_browser_or_storage_failure_cannot_accept_or_release_quarantine(self):
         with patch.object(acceptance, 'kubectl', self.api):
@@ -71,9 +74,26 @@ class OnboardingGateTest(unittest.TestCase):
             proof = acceptance.accept(self.work, ['master'], ['standard'], 'revision', lambda: {'passed': True})
         self.assertTrue(proof['accepted'])
         accepted = [i for i, c in enumerate(self.calls) if c[0] == 'patch' and
-                    json.loads(c[-1])['metadata']['annotations'][acceptance.STATUS] == 'accepted']
-        release = self.calls.index(('taint', 'node', 'standard', acceptance.TAINT + ':NoSchedule-'))
+                    json.loads(c[-1])['metadata'].get('annotations', {}).get(acceptance.STATUS) == 'accepted']
+        release = next(i for i, c in enumerate(self.calls) if c[0] == 'patch' and 'spec' in json.loads(c[-1]))
         self.assertTrue(accepted and max(accepted) < release)
+        patch_data = json.loads(self.calls[release][-1])
+        self.assertEqual(patch_data['metadata'], {'uid': 'uid-1', 'resourceVersion': '17'})
+        self.assertEqual(patch_data['spec']['taints'], [{'key': 'maintenance', 'effect': 'NoExecute'}])
+
+    def test_node_replacement_after_accept_annotation_cannot_release_new_node(self):
+        replaced = False
+        def api(*args):
+            nonlocal replaced
+            if args[0] == 'patch' and json.loads(args[-1])['metadata'].get('annotations', {}).get(acceptance.STATUS) == 'accepted':
+                replaced = True
+            if args[0] == 'get' and replaced:
+                return subprocess.CompletedProcess(args, 0, json.dumps({'metadata': {'uid': 'new'}}), '')
+            return self.api(*args)
+        with patch.object(acceptance, 'kubectl', api), self.assertRaises(RuntimeError):
+            acceptance.accept(self.work, [], ['standard'], 'revision', lambda: {'passed': True})
+        self.assertFalse(json.loads((self.work / 'onboarding-acceptance.json').read_text())['accepted'])
+        self.assertFalse(any(c[0] == 'patch' and 'spec' in json.loads(c[-1]) for c in self.calls))
 
 
 if __name__ == '__main__':

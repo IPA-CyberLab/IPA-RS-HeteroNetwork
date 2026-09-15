@@ -9,8 +9,11 @@ defaults
 
 frontend heteronetwork_console
   bind {{ hnn_console_ip }}:80
-  acl console_host hdr(host) -i console.heteronetwork.internal console.heteronetwork.internal:80
+  acl console_host hdr(host) -i console.heteronetwork.internal console.heteronetwork.internal:80 {{ hnn_console_ip }} {{ hnn_console_ip }}:80
+  acl request_origin_present hdr_cnt(origin) gt 0
+  acl console_origin hdr(origin) -i http://console.heteronetwork.internal http://console.heteronetwork.internal:80 http://{{ hnn_console_ip }} http://{{ hnn_console_ip }}:80
   http-request deny unless console_host
+  http-request deny if request_origin_present !console_origin
   http-request set-header Host 127.0.0.1:9780
   http-request set-header Origin http://127.0.0.1:9780
   http-response set-header X-HeteroNetwork-Console proxy

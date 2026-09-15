@@ -13,7 +13,11 @@ DNSはクライアントが接続しているgateway自身のVPN IPを返すた�
 [専用Ansible構成](../deploy/terraform/master-only/ansible/console/configure.yaml) を全6台へ適用する。
 既存のポート設定を明示したsystemd drop-inでAgentの待ち受けを9781に固定し、
 VPNアドレスの80はループバックAgentの9780へHAProxyで転送する。
-Hostをcanonicalコンソール名に制限し、既存AgentのHost/Origin検査に合わせて転送する。
+Host/Originをcanonicalコンソール名またはそのgateway自身のVPN IPに制限し、
+既存Agentの検査に合わせて転送する。
+Native WindowsクライアントはIP直指定のhealth probeと管理URLを使う。
+canonical Hostだけを許すプロキシではprobeが全6台とも403になり、
+クライアントがgatewayを故障と判断して再接続する原因になるため、Agent本来のIP許可を保持する。
 Agentからプロキシを `Wants` するため、Agent再起動後も80が戻る。
 内部Git配布もAgentから `Wants` し、Agent再起動後に配布daemonが停止したままになることを防ぐ。
 マスター専用構成は、このAgent用互換プロキシを停止対象から除外する。
@@ -34,6 +38,7 @@ Agentからプロキシを `Wants` するため、Agent再起動後も80が戻�
 - [ブラウザ検証](../scripts/verify-console-gateways.mjs)：全gatewayの80と9781の
   正規URL、UIと設定のHTTP 200、JavaScriptエラーなし。9781から実際にDevice Loginを
   開き、公開Keycloakのユーザー名・パスワードフォームと送信先を確認する。
+  全gatewayのIP直指定health probeもHTTP 200・`status: ok`を必須とする。
 - [マスター検証](../scripts/verify-master-only.py)：Ready、各台6個の必須Ready Pod、
   通常Pod・bindingの拒否、DaemonSet隔離とネットワーク用tolerationの復元。
 - [標準ノード検証](../scripts/verify-standard-node.py)：通常スケジューラーによる
@@ -46,6 +51,7 @@ Agentからプロキシを `Wants` するため、Agent再起動後も80が戻�
 判定はIaC完了状態とKubernetesの配置許可を制御し、Native登録プロトコル自体を変更しない。
 検証中のNode UID変更と古い成功ログによる誤acceptも拒否する。
 accept注釈の更新にも検証済みNode UIDを指定し、更新直前のNode置き換えをAPIで拒否する。
+quarantine解除にもUIDとresourceVersionを指定し、注釈更新後の再登録や他のtaintの更新を誤って上書きしない。
 Argoのrevision待機前にhard refreshを要求し、Gitキャッシュ待ちで誤って時間切れになることを防ぐ。
 root専用 `onboarding-acceptance.json` に実検証結果とNode UIDを保存する。
 IaC wrapperの `check` / `plan` はこの証跡と実Node状態の不一致も検出する。
