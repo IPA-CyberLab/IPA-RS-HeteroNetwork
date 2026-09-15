@@ -1,0 +1,7 @@
+{
+  "uc-k8sp4": {
+    "ssh_host": "163.220.236.54",
+    "tailscale_ip": "100.111.33.52",
+    "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIpcThKJiGUIaAviR+fO2r3NIPh8XZhM0cmR8vqIpNwD"
+  }
+}

@@ -23,7 +23,7 @@ def files():
               'deploy/gitops/cluster-dns/postgres-ha-connector.yaml','deploy/gitops/cluster-dns/service-route.yaml',
               'deploy/gitops/network-policy-engine/kube-router.yaml','deploy/gitops/longhorn-prerequisites/node-prerequisites.yaml',
               'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml']
-    for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only']:
+    for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes']:
         for p in (ROOT/directory).rglob('*'):
             if not p.is_file() or '.terraform' in p.parts or '__pycache__' in p.parts: continue
             if p.suffix in ['.tf','.py','.yaml','.j2','.json','.md'] or p.name=='.terraform.lock.hcl':

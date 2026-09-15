@@ -1,0 +1,334 @@
+- name: Register standard full-service control planes
+  hosts: standard
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+  tasks:
+    - name: Create private host directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      loop: [/etc/heteronetwork/kubernetes, /var/lib/heteronetwork, /var/backups/heteronetwork/iac-standard]
+    - name: Create public runtime directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop: [/opt/heteronetwork/bin, /opt/heteronetwork/libexec, /opt/heteronetwork/deploy/systemd]
+    - name: Inspect pinned networking binaries
+      ansible.builtin.stat:
+        path: '/opt/heteronetwork/bin/{{ item.key }}'
+        checksum_algorithm: sha256
+      loop: '{{ hnn_native_binary_sha256 | dict2items }}'
+      register: hnn_standard_binaries
+    - name: Install pinned networking binaries
+      ansible.builtin.unarchive:
+        src: '{{ hnn_work_dir }}/native-bin.tar.gz'
+        dest: /opt/heteronetwork/bin
+        owner: root
+        group: root
+        mode: '0755'
+      when: not ansible_check_mode and hnn_standard_binaries.results | selectattr('stat.checksum', 'defined') | map(attribute='stat.checksum') | list | sort != hnn_native_binary_sha256.values() | list | sort
+    - name: Verify installed networking binaries
+      ansible.builtin.stat:
+        path: '/opt/heteronetwork/bin/{{ item.key }}'
+        checksum_algorithm: sha256
+      loop: '{{ hnn_native_binary_sha256 | dict2items }}'
+      register: hnn_standard_verified
+    - name: Require declared binary provenance
+      ansible.builtin.assert:
+        that: item.stat.checksum | default('') == item.item.value
+      loop: '{{ hnn_standard_verified.results }}'
+      when: not ansible_check_mode
+    - name: Install versioned bootstrap helpers
+      ansible.builtin.copy:
+        src: '{{ hnn_repo_root }}/{{ item.src }}'
+        dest: '{{ item.dest }}'
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - {src: scripts/kubeadm-ha-node.sh, dest: /opt/heteronetwork/libexec/kubeadm-ha-node.sh}
+        - {src: scripts/public-services-bootstrap.sh, dest: /opt/heteronetwork/libexec/public-services-bootstrap.sh}
+        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.service, dest: /opt/heteronetwork/deploy/systemd/heteronetwork-public-services-bootstrap.service}
+        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.timer, dest: /opt/heteronetwork/deploy/systemd/heteronetwork-public-services-bootstrap.timer}
+    - name: Inspect enrolled identity
+      ansible.builtin.stat:
+        path: /var/lib/heteronetwork/agent.json
+      register: hnn_standard_identity
+    - name: Inspect protected recovery identity
+      ansible.builtin.stat:
+        path: '/var/lib/heteronetwork-iac/identities/{{ inventory_hostname }}.json'
+      delegate_to: uc-k8sp5
+      register: hnn_standard_saved
+    - name: Read protected recovery identity
+      ansible.builtin.slurp:
+        src: '/var/lib/heteronetwork-iac/identities/{{ inventory_hostname }}.json'
+      delegate_to: uc-k8sp5
+      register: hnn_standard_recovery
+      no_log: true
+      when: not hnn_standard_identity.stat.exists and hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Restore registered identity
+      ansible.builtin.copy:
+        content: '{{ hnn_standard_recovery.content | b64decode }}'
+        dest: /var/lib/heteronetwork/agent.json
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+      when: not hnn_standard_identity.stat.exists and hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Create the protected issuer working directory
+      ansible.builtin.file:
+        path: /var/lib/heteronetwork-iac
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      delegate_to: ichikawap1
+      when: not hnn_standard_identity.stat.exists and not hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Install local token issuer helper
+      ansible.builtin.copy:
+        src: standard-token.py
+        dest: /var/lib/heteronetwork-iac/standard-token.py
+        owner: root
+        group: root
+        mode: '0700'
+      delegate_to: ichikawap1
+      when: not hnn_standard_identity.stat.exists and not hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Issue short-lived enrollment on the existing issuer
+      ansible.builtin.command:
+        argv: [python3, /var/lib/heteronetwork-iac/standard-token.py, --output, '/var/lib/heteronetwork-iac/enrollment/{{ inventory_hostname }}.json']
+      delegate_to: ichikawap1
+      no_log: true
+      when: not hnn_standard_identity.stat.exists and not hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Read short-lived enrollment
+      ansible.builtin.slurp:
+        src: '/var/lib/heteronetwork-iac/enrollment/{{ inventory_hostname }}.json'
+      delegate_to: ichikawap1
+      register: hnn_standard_token
+      no_log: true
+      when: not hnn_standard_identity.stat.exists and not hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Transfer private enrollment
+      ansible.builtin.copy:
+        content: '{{ hnn_standard_token.content | b64decode }}'
+        dest: /etc/heteronetwork/kubernetes/network-join.json
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+      when: not hnn_standard_identity.stat.exists and not hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Enroll networking with the signed single-use token
+      ansible.builtin.shell: /opt/heteronetwork/bin/iparsd agent --join-token-path /etc/heteronetwork/kubernetes/network-join.json --enroll-only > /var/backups/heteronetwork/iac-standard/network-enroll.log 2>&1
+      no_log: true
+      when: not hnn_standard_identity.stat.exists and not hnn_standard_saved.stat.exists and not ansible_check_mode
+    - name: Remove consumed enrollment locally
+      ansible.builtin.file:
+        path: /etc/heteronetwork/kubernetes/network-join.json
+        state: absent
+    - name: Remove consumed enrollment from issuer
+      ansible.builtin.file:
+        path: '/var/lib/heteronetwork-iac/enrollment/{{ inventory_hostname }}.json'
+        state: absent
+      delegate_to: ichikawap1
+    - name: Read registered node identity
+      ansible.builtin.slurp:
+        src: /var/lib/heteronetwork/agent.json
+      register: hnn_standard_state
+      no_log: true
+    - name: Read assigned network address
+      ansible.builtin.set_fact:
+        hnn_standard_ip: '{{ (hnn_standard_state.content | b64decode | from_json).registered_node.vpn_ip }}'
+      no_log: true
+    - name: Require a standard control-plane registration
+      ansible.builtin.assert:
+        that:
+          - (hnn_standard_state.content | b64decode | from_json).registered_node.role == 'worker'
+          - "'kubernetes-control-plane' in (hnn_standard_state.content | b64decode | from_json).registered_node.tags"
+          - "'kubernetes-control-plane-only' not in (hnn_standard_state.content | b64decode | from_json).registered_node.tags"
+      no_log: true
+    - name: Read existing Kubernetes IP allocations
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, get, nodes, -o, json]
+      delegate_to: uc-k8sp5
+      register: hnn_existing_nodes
+      changed_when: false
+      check_mode: false
+    - name: Require a nonconflicting Kubernetes address
+      ansible.builtin.assert:
+        that: hnn_standard_ip not in ((hnn_existing_nodes.stdout | from_json)['items'] | rejectattr('metadata.name', 'equalto', inventory_hostname) | map(attribute='status.addresses') | flatten | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | list)
+    - name: Save protected enrolled identity
+      ansible.builtin.copy:
+        content: '{{ hnn_standard_state.content | b64decode }}'
+        dest: '/var/lib/heteronetwork-iac/identities/{{ inventory_hostname }}.json'
+        owner: root
+        group: root
+        mode: '0600'
+        force: false
+      delegate_to: uc-k8sp5
+      no_log: true
+    - name: Inspect public-service bootstrap generation
+      ansible.builtin.stat:
+        path: /etc/heteronetwork/public-services/bootstrap-generation
+      register: hnn_standard_public
+    - name: Select installed full-service runtime
+      ansible.builtin.set_fact:
+        hnn_public_installed: '{{ hnn_standard_public.stat.exists }}'
+    - name: Configure networking for automatic full-service installation
+      ansible.builtin.template:
+        src: standard-agent.service.j2
+        dest: /etc/systemd/system/heteronetwork-agent.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart standard Agent
+    - name: Enable networking
+      ansible.builtin.systemd_service:
+        name: heteronetwork-agent.service
+        state: started
+        enabled: true
+        daemon_reload: true
+    - name: Save immutable standard-node bootstrap settings
+      ansible.builtin.template:
+        src: standard.env.j2
+        dest: /etc/heteronetwork/kubernetes/standard.env
+        owner: root
+        group: root
+        mode: '0600'
+    - name: Inspect Kubernetes membership
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: hnn_standard_kubernetes
+    - name: Read old Kubernetes CA
+      ansible.builtin.stat:
+        path: /etc/kubernetes/pki/ca.crt
+        checksum_algorithm: sha256
+      register: hnn_standard_ca
+    - name: Read existing cluster CA
+      ansible.builtin.stat:
+        path: /etc/kubernetes/pki/ca.crt
+        checksum_algorithm: sha256
+      delegate_to: uc-k8sp5
+      register: hnn_cluster_ca
+    - name: Require no running containers before retiring stale membership
+      ansible.builtin.command:
+        argv: [crictl, ps, --output, json]
+      register: hnn_old_containers
+      changed_when: false
+      check_mode: false
+      when: hnn_standard_ca.stat.exists and hnn_standard_ca.stat.checksum != hnn_cluster_ca.stat.checksum
+    - name: Reject replacement of active old workloads
+      ansible.builtin.assert:
+        that: (hnn_old_containers.stdout | from_json).containers | length == 0
+      when: hnn_standard_ca.stat.exists and hnn_standard_ca.stat.checksum != hnn_cluster_ca.stat.checksum
+    - name: Back up stale cluster configuration
+      ansible.builtin.command:
+        argv: [tar, -czf, /var/backups/heteronetwork/iac-standard/previous-kubernetes.tar.gz, /etc/kubernetes, /etc/cni/net.d]
+        creates: /var/backups/heteronetwork/iac-standard/previous-kubernetes.tar.gz
+      when: hnn_standard_ca.stat.exists and hnn_standard_ca.stat.checksum != hnn_cluster_ca.stat.checksum
+    - name: Stop stale kubelet
+      ansible.builtin.systemd_service:
+        name: kubelet.service
+        state: stopped
+      when: hnn_standard_ca.stat.exists and hnn_standard_ca.stat.checksum != hnn_cluster_ca.stat.checksum
+    - name: Retire the inactive old-cluster bootstrap
+      ansible.builtin.command:
+        argv: [kubeadm, reset, -f]
+      when: hnn_standard_ca.stat.exists and hnn_standard_ca.stat.checksum != hnn_cluster_ca.stat.checksum and not ansible_check_mode
+    - name: Remove obsolete Cilium CNI configuration
+      ansible.builtin.file:
+        path: /etc/cni/net.d/05-cilium.conflist
+        state: absent
+      when: hnn_standard_ca.stat.exists and hnn_standard_ca.stat.checksum != hnn_cluster_ca.stat.checksum
+    - name: Prepare Kubernetes on unjoined standard hosts
+      ansible.builtin.shell: |
+        set -a
+        . /etc/heteronetwork/kubernetes/standard.env
+        set +a
+        /opt/heteronetwork/libexec/kubeadm-ha-node.sh prepare > /var/backups/heteronetwork/iac-standard/prepare.log 2>&1
+      args: {executable: /bin/bash}
+      when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
+    - name: Issue short-lived Kubernetes control-plane credentials
+      ansible.builtin.shell: |
+        set -a
+        . /etc/heteronetwork/kubernetes/node.env
+        set +a
+        /opt/heteronetwork/libexec/kubeadm-ha-node.sh refresh-join-bundle > /var/lib/heteronetwork-iac/standard-join-refresh.log 2>&1
+      args: {executable: /bin/bash}
+      delegate_to: uc-k8sp5
+      no_log: true
+      when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
+    - name: Read short-lived Kubernetes credentials
+      ansible.builtin.slurp:
+        src: /etc/heteronetwork/kubernetes/join-bundle.json
+      delegate_to: uc-k8sp5
+      register: hnn_standard_join
+      no_log: true
+      when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
+    - name: Transfer Kubernetes credentials privately
+      ansible.builtin.copy:
+        content: '{{ hnn_standard_join.content | b64decode }}'
+        dest: /etc/heteronetwork/kubernetes/join-bundle.json
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+      when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
+    - name: Join the existing Kubernetes control plane
+      ansible.builtin.shell: |
+        set -a
+        . /etc/heteronetwork/kubernetes/standard.env
+        set +a
+        /opt/heteronetwork/libexec/kubeadm-ha-node.sh join-control-plane > /var/backups/heteronetwork/iac-standard/join.log 2>&1
+      args: {executable: /bin/bash}
+      no_log: true
+      when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
+    - name: Remove consumed Kubernetes join credentials
+      ansible.builtin.file:
+        path: /etc/heteronetwork/kubernetes/join-bundle.json
+        state: absent
+    - name: Enforce standard kubelet capacity
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: 'KUBELET_EXTRA_ARGS="--node-ip={{ hnn_standard_ip }} --hostname-override={{ inventory_hostname }} --max-pods=110 --kube-reserved=cpu=500m,memory=512Mi --system-reserved=cpu=500m,memory=512Mi"'
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart standard kubelet
+    - name: Wait for the signed full-service installation
+      ansible.builtin.stat:
+        path: /etc/heteronetwork/public-services/bootstrap-generation
+      register: hnn_standard_generation
+      until: hnn_standard_generation.stat.exists
+      retries: 60
+      delay: 5
+      when: not ansible_check_mode
+    - name: Require the final full-service Agent dependencies
+      ansible.builtin.set_fact:
+        hnn_public_installed: true
+      when: not ansible_check_mode
+    - name: Maintain the final full-service Agent configuration
+      ansible.builtin.template:
+        src: standard-agent.service.j2
+        dest: /etc/systemd/system/heteronetwork-agent.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart standard Agent
+      when: not ansible_check_mode
+  handlers:
+    - name: Restart standard Agent
+      ansible.builtin.systemd_service:
+        name: heteronetwork-agent.service
+        state: restarted
+        daemon_reload: true
+    - name: Restart standard kubelet
+      ansible.builtin.systemd_service:
+        name: kubelet.service
+        state: restarted

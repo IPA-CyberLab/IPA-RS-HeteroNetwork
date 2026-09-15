@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Node
+metadata:
+  name: uc-k8sp4
+  labels:
+    kubernetes.io/hostname: uc-k8sp4
+    node-role.kubernetes.io/control-plane: ''
+    heteronetwork.io/control-plane-only: 'false'
+    networking.heteronetwork.io/public-ingress: 'true'
+  annotations:
+    networking.heteronetwork.io/public-ingress-enabled: 'true'
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: '0'
+spec:
+  unschedulable: false
+---
+apiVersion: longhorn.io/v1beta2
+kind: Node
+metadata:
+  name: uc-k8sp4
+  namespace: longhorn-system
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: '0'
+spec:
+  allowScheduling: true

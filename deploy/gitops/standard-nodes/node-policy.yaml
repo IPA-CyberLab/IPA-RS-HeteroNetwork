@@ -1,0 +1,41 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: heteronetwork-standard-nodes
+  annotations:
+    argocd.argoproj.io/sync-wave: '-3'
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: IfNeeded
+  matchConstraints:
+    matchPolicy: Equivalent
+    namespaceSelector: {}
+    objectSelector: {}
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [nodes]
+        scope: '*'
+  matchConditions:
+    - name: standard-node
+      expression: "object.metadata.name in ['uc-k8sp4']"
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: |-
+          [JSONPatch{op: 'add', path: '/spec/taints',
+            value: has(object.spec.taints) ? object.spec.taints.filter(t,
+              !(t.key == 'node-role.kubernetes.io/control-plane' && t.effect == 'NoSchedule') &&
+              t.key != 'heteronetwork.io/control-plane-only') : []}] +
+          (has(object.metadata.labels) && 'node.kubernetes.io/exclude-from-external-load-balancers' in object.metadata.labels ?
+            [JSONPatch{op: 'remove', path: '/metadata/labels/node.kubernetes.io~1exclude-from-external-load-balancers'}] : [])
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: heteronetwork-standard-nodes
+  annotations:
+    argocd.argoproj.io/sync-wave: '-2'
+spec:
+  policyName: heteronetwork-standard-nodes

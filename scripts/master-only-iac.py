@@ -31,10 +31,12 @@ def main():
     env['ANSIBLE_CALLBACK_PLUGINS']=str(MODULE/'ansible/callback_plugins')
     env['ANSIBLE_STDOUT_CALLBACK']='hnn_json'
     nodes=json.loads((MODULE/'nodes.json').read_text())
+    standard_nodes=json.loads((MODULE/'standard-nodes.json').read_text())
     drift=list(nodes) if args.reconcile_all or not inventory.exists() else []
+    standard_drift=list(standard_nodes) if args.reconcile_all or not inventory.exists() else []
     git_drift=args.reconcile_all or not inventory.exists()
     if inventory.exists() and not args.reconcile_all:
-        for playbook,logname in [('masters.yaml','host-check.log'),('git-source.yaml','git-check.log')]:
+        for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('git-source.yaml','git-check.log')]:
             command=['ansible-playbook','-i',str(inventory),'--check',str(MODULE/'ansible'/playbook)]
             result=subprocess.run(command,env=env,text=True,capture_output=True)
             log=work/logname
@@ -49,14 +51,17 @@ def main():
                 raise RuntimeError('Host check failed. For cleaned hosts use --reconcile-all.')
             if playbook=='masters.yaml':
                 drift=[name for name,stats in report['hosts'].items() if name in nodes and stats['changed']]
+            elif playbook=='standard.yaml':
+                standard_drift=[name for name,stats in report['hosts'].items() if name in standard_nodes and stats['changed']]
             else:
                 git_drift=any(stats['changed'] for stats in report['hosts'].values())
-        print(json.dumps({'host_drift':drift,'git_source_drift':git_drift}))
+        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'git_source_drift':git_drift}))
     if args.action=='check':
-        return 2 if drift or git_drift else 0
+        return 2 if drift or standard_drift or git_drift else 0
     tf=[args.terraform,'-chdir='+str(MODULE)]
     subprocess.run(tf+['init','-input=false'],env=env,check=True)
     replace=['-replace=terraform_data.host_configuration['+json.dumps(name)+']' for name in drift]
+    replace += ['-replace=terraform_data.standard_host_configuration['+json.dumps(name)+']' for name in standard_drift]
     if git_drift:
         replace.append('-replace=terraform_data.git_source')
     plan=work/'master-only.tfplan'

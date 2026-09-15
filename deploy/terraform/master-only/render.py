@@ -33,3 +33,20 @@ policies = list(yaml.safe_load_all((ROOT / 'deploy/kubernetes/control-plane-only
 for policy in policies:
     policy['metadata'].setdefault('annotations', {})['argocd.argoproj.io/sync-wave'] = '-3' if policy['kind']=='ValidatingAdmissionPolicy' else '-2'
 (dest / 'placement-policy.yaml').write_text(yaml.safe_dump_all(policies,sort_keys=False))
+
+standard=json.loads((Path(__file__).parent/'standard-nodes.json').read_text())
+standard_dest=ROOT/'deploy/gitops/standard-nodes'
+standard_dest.mkdir(exist_ok=True)
+standard_resources=[]
+for name in standard:
+    standard_resources.append({'apiVersion':'v1','kind':'Node','metadata':{'name':name,
+        'labels':{'kubernetes.io/hostname':name,'node-role.kubernetes.io/control-plane':'',
+                  'heteronetwork.io/control-plane-only':'false','networking.heteronetwork.io/public-ingress':'true'},
+        'annotations':{'networking.heteronetwork.io/public-ingress-enabled':'true',
+                       'argocd.argoproj.io/sync-options':'Prune=false,Delete=false','argocd.argoproj.io/sync-wave':'0'}},
+        'spec':{'unschedulable':False}})
+    standard_resources.append({'apiVersion':'longhorn.io/v1beta2','kind':'Node',
+        'metadata':{'name':name,'namespace':'longhorn-system','annotations':{
+            'argocd.argoproj.io/sync-options':'Prune=false,Delete=false','argocd.argoproj.io/sync-wave':'0'}},
+        'spec':{'allowScheduling':True}})
+(standard_dest/'nodes.yaml').write_text(yaml.safe_dump_all(standard_resources,sort_keys=False))

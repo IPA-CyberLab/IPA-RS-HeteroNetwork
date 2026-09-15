@@ -1,6 +1,11 @@
 locals {
-  repo_root = abspath("${path.module}/../../..")
-  nodes     = jsondecode(file("${path.module}/nodes.json"))
+  repo_root      = abspath("${path.module}/../../..")
+  nodes          = jsondecode(file("${path.module}/nodes.json"))
+  standard_nodes = jsondecode(file("${path.module}/standard-nodes.json"))
+  enrollment_issuer = {
+    ssh_host     = "10.250.0.10"
+    ssh_host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPW2fAH9gcshjerH7rdbXQU/siGharkb0JZHClS2YuPT"
+  }
   managed_app_paths = {
     cluster-dns            = "deploy/gitops/cluster-dns"
     network-policy-engine  = "deploy/gitops/network-policy-engine"
@@ -15,7 +20,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/git-source.yaml" && !strcontains(f, "/standard") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -37,6 +42,17 @@ locals {
         bootstrap = {
           hosts = { uc-k8sp5 = { ansible_host = local.bootstrap.ssh_host } }
         }
+        standard = {
+          hosts = { for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host }) }
+        }
+        enrollment_issuer = {
+          hosts = {
+            ichikawap1 = {
+              ansible_host            = local.enrollment_issuer.ssh_host
+              ansible_ssh_common_args = "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -o 'ProxyCommand=ssh -i ${pathexpand(var.ssh_private_key_path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -W %h:%p mizuame@${local.bootstrap.ssh_host}'"
+            }
+          }
+        }
       }
     }
   }
@@ -48,6 +64,8 @@ resource "local_file" "known_hosts" {
   directory_permission = "0700"
   content = join("\n", concat(
     [for name, node in local.nodes : "${node.ssh_host} ${node.ssh_host_key}"],
+    [for name, node in local.standard_nodes : "${node.ssh_host} ${node.ssh_host_key}"],
+    ["${local.enrollment_issuer.ssh_host} ${local.enrollment_issuer.ssh_host_key}"],
     ["${local.bootstrap.ssh_host} ${local.bootstrap.ssh_host_key}", ""]
   ))
 }
@@ -152,6 +170,51 @@ resource "terraform_data" "git_source" {
     }
   }
   depends_on = [local_file.inventory, local_file.known_hosts]
+}
+
+resource "terraform_data" "standard_host_configuration" {
+  for_each = local.standard_nodes
+  input    = { name = each.key, profile = "standard", workloads = "enabled", public_services = "enabled" }
+  triggers_replace = [
+    sha256(join("", concat(
+      [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}") if strcontains(f, "/standard") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+      [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh"), filesha256("${local.repo_root}/scripts/public-services-bootstrap.sh"), sha256(jsonencode(var.native_binary_sha256))]
+    ))),
+    sha256(jsonencode(each.value)), sha256(jsonencode(var.control_planes))
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" --limit \"$HNN_IAC_NODE\" ansible/standard.yaml"
+    environment = {
+      HNN_IAC_INVENTORY        = local_file.inventory.filename
+      HNN_IAC_NODE             = each.key
+      ANSIBLE_CALLBACK_PLUGINS = "${abspath(path.module)}/ansible/callback_plugins"
+      ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
+    }
+  }
+  depends_on = [local_file.inventory, local_file.known_hosts]
+}
+
+resource "kubernetes_manifest" "standard_application" {
+  manifest = {
+    apiVersion = "argoproj.io/v1alpha1"
+    kind       = "Application"
+    metadata   = { name = "standard-nodes", namespace = "argocd" }
+    spec = {
+      project           = "hetero-platform"
+      source            = { repoURL = var.git_repository_url, targetRevision = var.git_revision, path = "deploy/gitops/standard-nodes" }
+      destination       = { server = "https://kubernetes.default.svc", namespace = "kube-system" }
+      ignoreDifferences = [{ kind = "Node", jsonPointers = ["/spec/taints"] }]
+      syncPolicy = {
+        automated   = { enabled = true, prune = true, selfHeal = true }
+        retry       = { limit = 10, backoff = { duration = "5s", factor = 2, maxDuration = "3m" } }
+        syncOptions = ["ServerSideApply=true", "RespectIgnoreDifferences=true", "DisableClientSideApplyMigration=true"]
+      }
+    }
+  }
+  field_manager { name = "heteronetwork-terraform" }
+  lifecycle { prevent_destroy = true }
+  depends_on = [terraform_data.standard_host_configuration, terraform_data.git_source, kubernetes_manifest.gitops_project]
 }
 
 import {

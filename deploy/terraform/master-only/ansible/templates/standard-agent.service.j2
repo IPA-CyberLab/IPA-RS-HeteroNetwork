@@ -1,0 +1,31 @@
+[Unit]
+Description=HeteroNetwork Agent for a full-service Kubernetes control plane
+Wants=network-online.target
+After=network-online.target
+{% if hnn_public_installed | default(false) %}
+Requires=heteronetwork-gateway.service
+After=heteronetwork-gateway.service
+{% endif %}
+[Service]
+Type=simple
+Environment=HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ENABLED=true
+Environment=HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=false
+ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink --stun-bind {{ ssh_host }}:51820 --public-stun-url udp://163.220.236.61:19444 --public-stun-url udp://163.220.236.45:19444 --packet-flow-detector conntrack-netlink-events --packet-flow-poll-interval-seconds 1
+Restart=on-failure
+RestartSec=5s
+StateDirectory=heteronetwork
+StateDirectoryMode=0700
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/heteronetwork
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+[Install]
+WantedBy=multi-user.target
