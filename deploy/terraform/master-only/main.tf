@@ -141,7 +141,7 @@ resource "kubernetes_manifest" "master_only_application" {
 }
 
 resource "terraform_data" "git_source" {
-  triggers_replace = [filesha256("${abspath(var.work_dir)}/infrastructure.bundle"), filesha256("${path.module}/ansible/git-source.yaml")]
+  triggers_replace = [filesha256("${abspath(var.work_dir)}/infrastructure.bundle"), filesha256("${path.module}/ansible/git-source.yaml"), var.git_revision]
   provisioner "local-exec" {
     working_dir = abspath(path.module)
     command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/git-source.yaml"
