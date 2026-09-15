@@ -335,6 +335,15 @@
         mode: '0600'
       no_log: true
       when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
+    - name: Quarantine first registration until onboarding E2E passes
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: |
+          KUBELET_EXTRA_ARGS="--node-ip={{ hnn_standard_ip }} --hostname-override={{ inventory_hostname }} --max-pods=110 --kube-reserved=cpu=500m,memory=512Mi --system-reserved=cpu=500m,memory=512Mi --register-with-taints=heteronetwork.io/onboarding=pending:NoSchedule"
+        owner: root
+        group: root
+        mode: '0644'
+      when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
     - name: Join the existing Kubernetes control plane
       ansible.builtin.shell: |
         set -a

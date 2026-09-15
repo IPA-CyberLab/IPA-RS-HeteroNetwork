@@ -36,6 +36,7 @@ def main():
     standard_drift=list(standard_nodes) if args.reconcile_all or not inventory.exists() else []
     git_drift=args.reconcile_all or not inventory.exists()
     console_drift=args.reconcile_all or not inventory.exists()
+    onboarding_drift=args.reconcile_all or not inventory.exists()
     if inventory.exists() and not args.reconcile_all:
         for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('console/configure.yaml','console-check.log'),('git-source.yaml','git-check.log')]:
             command=['ansible-playbook','-i',str(inventory),'--check',str(MODULE/'ansible'/playbook)]
@@ -58,9 +59,18 @@ def main():
                 console_drift=any(stats['changed'] for stats in report['hosts'].values())
             else:
                 git_drift=any(stats['changed'] for stats in report['hosts'].values())
-        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'console_drift':console_drift,'git_source_drift':git_drift}))
+        result=subprocess.run(['python3',str(ROOT/'scripts/accept-registered-nodes.py'),
+                               '--work-dir',str(work),'--branch',env.get('TF_VAR_git_revision','codex/master-only-iac-20260915'),
+                               '--check'],env=env,text=True,capture_output=True)
+        log=work/'onboarding-check.log'
+        log.write_text(result.stdout+result.stderr)
+        log.chmod(0o600)
+        if result.returncode not in [0,2]:
+            raise RuntimeError('Onboarding proof check failed; see private onboarding-check.log')
+        onboarding_drift=result.returncode==2
+        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
     if args.action=='check':
-        return 2 if drift or standard_drift or console_drift or git_drift else 0
+        return 2 if drift or standard_drift or console_drift or onboarding_drift or git_drift else 0
     tf=[args.terraform,'-chdir='+str(MODULE)]
     subprocess.run(tf+['init','-input=false'],env=env,check=True)
     replace=['-replace=terraform_data.host_configuration['+json.dumps(name)+']' for name in drift]
@@ -69,6 +79,8 @@ def main():
         replace.append('-replace=terraform_data.git_source')
     if console_drift:
         replace.append('-replace=terraform_data.console_configuration')
+    if onboarding_drift:
+        replace.append('-replace=terraform_data.onboarding_acceptance')
     plan=work/'master-only.tfplan'
     result=subprocess.run(tf+['plan','-input=false','-parallelism=1','-detailed-exitcode','-out='+str(plan),*replace],env=env)
     if plan.exists():

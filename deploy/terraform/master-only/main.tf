@@ -177,7 +177,9 @@ resource "terraform_data" "console_configuration" {
   triggers_replace = [
     sha256(join("", [for f in sort(tolist(fileset(path.module, "ansible/console/**"))) : filesha256("${path.module}/${f}") if endswith(f, ".yaml") || endswith(f, ".j2")])),
     filesha256("${local.repo_root}/deploy/systemd/heteronetwork-agent-overlay-proxy.conf"),
-    sha256(jsonencode(local.inventory))
+    sha256(jsonencode(local.inventory)),
+    sha256(jsonencode({ for name, host in terraform_data.host_configuration : name => host.id })),
+    sha256(jsonencode({ for name, host in terraform_data.standard_host_configuration : name => host.id }))
   ]
   provisioner "local-exec" {
     working_dir = abspath(path.module)
@@ -189,6 +191,26 @@ resource "terraform_data" "console_configuration" {
     }
   }
   depends_on = [local_file.known_hosts, local_file.inventory, terraform_data.host_configuration, terraform_data.standard_host_configuration]
+}
+
+resource "terraform_data" "onboarding_acceptance" {
+  input = { dedicated_masters = keys(local.nodes), standard_nodes = keys(local.standard_nodes), acceptance_requires = "live-e2e" }
+  triggers_replace = [
+    sha256(join("", [for f in ["scripts/accept-registered-nodes.py", "scripts/verify-console-gateways.mjs", "scripts/verify-master-only.py", "scripts/verify-standard-node.py"] : filesha256("${local.repo_root}/${f}")])),
+    sha256(jsonencode({ for name, host in terraform_data.host_configuration : name => host.id })),
+    sha256(jsonencode({ for name, host in terraform_data.standard_host_configuration : name => host.id })),
+    terraform_data.console_configuration.id, terraform_data.git_source.id
+  ]
+  provisioner "local-exec" {
+    working_dir = local.repo_root
+    command     = "python3 scripts/accept-registered-nodes.py --work-dir \"$HNN_IAC_WORK_DIR\" --branch \"$HNN_IAC_BRANCH\""
+    environment = {
+      HNN_IAC_WORK_DIR = abspath(var.work_dir)
+      HNN_IAC_BRANCH   = var.git_revision
+      KUBECONFIG       = pathexpand(var.kubeconfig_path)
+    }
+  }
+  depends_on = [terraform_data.console_configuration, kubernetes_manifest.master_only_application, kubernetes_manifest.standard_application]
 }
 
 resource "terraform_data" "standard_host_configuration" {

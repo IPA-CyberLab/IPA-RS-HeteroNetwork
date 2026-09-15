@@ -25,6 +25,7 @@ def main():
     parser.add_argument('--peer', default='uc-k8sp5')
     parser.add_argument('--output')
     parser.add_argument('--exercise-storage', action='store_true')
+    parser.add_argument('--allow-onboarding-pending', action='store_true')
     args = parser.parse_args()
     node = get('node', args.node)
     assert any(c['type'] == 'Ready' and c['status'] == 'True'
@@ -34,7 +35,13 @@ def main():
     assert node['metadata']['labels']['heteronetwork.io/control-plane-only'] == 'false'
     assert node['metadata']['labels']['networking.heteronetwork.io/public-ingress'] == 'true'
     assert 'node.kubernetes.io/exclude-from-external-load-balancers' not in node['metadata']['labels']
-    assert not any(t['effect'] in ['NoSchedule', 'NoExecute'] for t in node['spec'].get('taints', []))
+    onboarding_taint = {'key': 'heteronetwork.io/onboarding', 'value': 'pending', 'effect': 'NoSchedule'}
+    if args.allow_onboarding_pending:
+        assert onboarding_taint in node['spec'].get('taints', [])
+        assert node['metadata']['annotations']['heteronetwork.io/onboarding-status'] == 'pending'
+    assert not any(t['effect'] in ['NoSchedule', 'NoExecute'] and
+                   not (args.allow_onboarding_pending and t == onboarding_taint)
+                   for t in node['spec'].get('taints', []))
     storage_node = get('nodes.longhorn.io', args.node, '-n', 'longhorn-system')
     assert storage_node['spec']['allowScheduling']
     disks = storage_node['status'].get('diskStatus', {})
@@ -65,13 +72,32 @@ def main():
                          'revision': app['status']['sync']['revision']}}
     try:
         def pod(name, host, image, command, labels=None):
-            return {'apiVersion': 'v1', 'kind': 'Pod',
+            p = {'apiVersion': 'v1', 'kind': 'Pod',
                     'metadata': {'name': name, 'namespace': ns, 'labels': labels or {}},
                     'spec': {'restartPolicy': 'Never',
                              'nodeSelector': {'kubernetes.io/hostname': host},
                              'containers': [{'name': 'test', 'image': image, 'command': command,
                                              'resources': {'requests': {'cpu': '10m', 'memory': '16Mi'},
                                                            'limits': {'memory': '64Mi'}}}]}}
+            if args.allow_onboarding_pending and host == args.node:
+                p['spec']['tolerations'] = [{**onboarding_taint, 'operator': 'Equal'}]
+            return p
+        if args.allow_onboarding_pending:
+            probe = pod('quarantine-check', args.node, 'busybox:1.37', ['true'])
+            probe['spec'].pop('tolerations')
+            k(['create', '-f', '-'], probe)
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                p = get('pod', 'quarantine-check', '-n', ns)
+                if any(c['type'] == 'PodScheduled' and c['status'] == 'False' and
+                       'heteronetwork.io/onboarding' in c.get('message', '')
+                       for c in p['status'].get('conditions', [])):
+                    assert not p['spec'].get('nodeName')
+                    break
+                time.sleep(2)
+            else:
+                raise RuntimeError('Onboarding quarantine did not block ordinary Pod placement')
+            report['quarantine_blocks_ordinary_pod_placement'] = True
         server = pod('server', args.node, 'busybox:1.37', ['sh', '-ec',
                      'mkdir /tmp/web; echo hnn-standard-node-ok >/tmp/web/index.html; '
                      'exec httpd -f -p 8080 -h /tmp/web'], {'hnn-standard-e2e': 'server'})

@@ -1,0 +1,37 @@
+name: Infrastructure acceptance checks
+
+on:
+  push:
+    paths:
+      - 'deploy/terraform/master-only/**'
+      - 'scripts/accept-registered-nodes.py'
+      - 'scripts/test_onboarding_acceptance.py'
+      - 'scripts/verify-console-gateways.mjs'
+      - 'scripts/verify-standard-node.py'
+      - '.github/workflows/infrastructure-validation.yml'
+  pull_request:
+    paths:
+      - 'deploy/terraform/master-only/**'
+      - 'scripts/accept-registered-nodes.py'
+      - 'scripts/test_onboarding_acceptance.py'
+      - 'scripts/verify-console-gateways.mjs'
+      - 'scripts/verify-standard-node.py'
+      - '.github/workflows/infrastructure-validation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance-failure-paths:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Verify acceptance rejects failed and stale E2E
+        run: python3 -B -m unittest discover -s scripts -p test_onboarding_acceptance.py -v
+      - name: Check verifier syntax
+        run: |
+          node --check scripts/verify-console-gateways.mjs
+          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-master-only.py scripts/verify-standard-node.py

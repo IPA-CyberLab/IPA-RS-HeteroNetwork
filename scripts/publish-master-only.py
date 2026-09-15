@@ -14,8 +14,11 @@ ROOT=Path(__file__).resolve().parents[1]
 def files():
     paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/master-only-iac.py',
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/publish-master-only.py',
+           'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',
            'docs/master-only-iac-2026-09-15.md',
            'docs/standard-node-setup-2026-09-15.md',
+           'docs/onboarding-e2e-gate-2026-09-15.md',
+           '.github/workflows/infrastructure-validation.yml',
            'deploy/systemd/heteronetwork-agent-overlay-proxy.conf',
            'deploy/kubernetes/control-plane-only-policy.yaml',
            'deploy/environments/heteronet/values.yaml','deploy/gitops/project.yaml']

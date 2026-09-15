@@ -25,9 +25,30 @@ the control-plane `NoSchedule` taint and dedicated-master taints on this host
 while preserving other controller taints. Standard-node configuration has a
 separate Terraform trigger from the three dedicated masters. The dedicated
 master isolation policies continue to apply only to the original three hosts.
+`terraform_data.console_configuration` explicitly maintains the Agent's overlay
+listener on 9781 and a VPN-only compatibility proxy on 80 on all six gateways.
+The Agent wants this proxy so it returns after Agent restarts. The dedicated
+master playbook preserves this Agent companion while disabling native
+application services. No application Pod is added to the dedicated masters.
 The [standard-node deployment record](../../../docs/standard-node-setup-2026-09-15.md)
 describes its client DB/Keycloak proxies, declared six-endpoint Kubernetes pool,
 and Longhorn filesystem disk with 64 GiB reserved for the host OS.
+
+`terraform_data.onboarding_acceptance` runs live E2E after host configuration,
+console configuration and Argo synchronization. First registration of a
+standard host starts with `heteronetwork.io/onboarding=pending:NoSchedule`.
+Only the acceptance probe Pods tolerate this taint. The gate verifies both
+console URLs through every real gateway in Chromium, including the public
+Keycloak credential form on 9781, dedicated-master placement rejection, and
+normal scheduling, DNS, cross-node traffic and PVC persistence on standard
+hosts. After every check passes at the candidate Git revision, the gate writes
+`heteronetwork.io/onboarding-status=accepted` and removes its standard-host
+quarantine taint. Failure returns a failed Terraform apply, records `failed`,
+and retains the quarantine. An old passing report or replaced Node UID cannot
+satisfy the gate. Host recreation, console changes and a new infrastructure
+revision retrigger E2E. The wrapper checks this acceptance proof for drift.
+The [acceptance and console recovery record](../../../docs/onboarding-e2e-gate-2026-09-15.md)
+documents the checks and their scope.
 
 Argo CD reconciles the dedicated Node labels, cordon, Longhorn scheduling
 opt-out and admission policies from `deploy/gitops/control-plane-only`.
@@ -113,6 +134,7 @@ DaemonSet sources also declare the dedicated-master exclusion directly.
 ```bash
 KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/verify-master-only.py --exercise-admission
 KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/verify-standard-node.py --exercise-storage
+KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/accept-registered-nodes.py --work-dir "$TF_VAR_work_dir" --check
 python3 scripts/master-only-iac.py check
 python3 scripts/master-only-iac.py plan
 ```
@@ -123,6 +145,12 @@ binding rejection, DaemonSet mutation with existing OR affinity, essential
 network toleration restoration, and Node mutation preserving controller taints.
 It creates a temporary test namespace and removes it afterward. Browser owner
 login E2E and unrelated platform workload readiness are separate checks.
+The automatic acceptance gate requires Node.js, Playwright and an installed
+Chromium browser on the operator. It creates and closes its own pinned SSH
+SOCKS connection to `uc-k8sp5` for overlay browser traffic; the operator
+kubeconfig must already reach Kubernetes. Browser gateway selection changes
+the request destination while retaining the canonical Host and Origin. Every
+response is fetched from the actual gateway, without fixture responses.
 The standard-node verifier also checks normal scheduler placement, DNS and
 Service traffic, cross-node Pod traffic, and Kubernetes Service TLS. With
 `--exercise-storage`, it provisions a 1 GiB Longhorn PVC on the standard node,
