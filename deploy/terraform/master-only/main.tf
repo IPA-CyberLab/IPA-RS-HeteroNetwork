@@ -178,7 +178,7 @@ resource "terraform_data" "standard_host_configuration" {
   triggers_replace = [
     sha256(join("", concat(
       [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}") if strcontains(f, "/standard") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
-      [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh"), filesha256("${local.repo_root}/scripts/public-services-bootstrap.sh"), sha256(jsonencode(var.native_binary_sha256))]
+      [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh"), filesha256("${local.repo_root}/scripts/public-services-bootstrap.sh"), filesha256("${local.repo_root}/scripts/postgres-ha-node.sh"), sha256(jsonencode(var.native_binary_sha256))]
     ))),
     sha256(jsonencode(each.value)), sha256(jsonencode(var.control_planes))
   ]

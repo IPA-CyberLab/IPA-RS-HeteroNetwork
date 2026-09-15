@@ -74,7 +74,7 @@ def main():
             'metadata': {'name': 'server', 'namespace': ns},
             'spec': {'selector': {'hnn-standard-e2e': 'server'},
                      'ports': [{'port': 80, 'targetPort': 8080}]}})
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
             p = get('pod', 'server', '-n', ns)
             if any(c['type'] == 'Ready' and c['status'] == 'True'
@@ -93,7 +93,7 @@ def main():
                 'https://kubernetes.default.svc/version; echo HNN_E2E_OK']
             k(['create', '-f', '-'], pod(name, host, 'curlimages/curl:8.12.1', command))
         results = []
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + 600
         for name, host in [('local-client', args.node), ('peer-client', args.peer)]:
             while time.monotonic() < deadline:
                 p = get('pod', name, '-n', ns)

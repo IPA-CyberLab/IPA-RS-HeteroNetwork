@@ -10,9 +10,13 @@ import tempfile
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ip', required=True)
+parser.add_argument('--check', action='store_true')
 args = parser.parse_args()
 root = Path('/etc/heteronetwork/postgres-autopilot')
 bundle = root / 'bundle'
+if not bundle.exists() and args.check:
+    print(json.dumps({'changed': True}))
+    raise SystemExit(0)
 if not bundle.exists():
     with tempfile.TemporaryDirectory(prefix='iac-proxy-', dir=root) as work:
         stage = Path(work) / 'bundle'
@@ -26,7 +30,8 @@ if not bundle.exists():
         assert (stage / 'cluster-id').read_text().strip() == state['registered_node']['cluster_id']
         os.rename(stage, bundle)
 if not (bundle / '.proxy-only').exists():
-    raise SystemExit('A full database member is already configured; client bootstrap is unnecessary')
+    print(json.dumps({'changed': False, 'mode': 'member'}))
+    raise SystemExit(0)
 manifest = dict(line.split('=', 1) for line in (bundle / 'manifest.env').read_text().splitlines() if '=' in line)
 # Existing members publish authenticated client/health endpoints over the overlay.
 # Their underlying database replication and DCS addresses remain in the bundle.
@@ -37,7 +42,15 @@ env = os.environ.copy()
 env.update(manifest)
 env.update(HETERONETWORK_DB_BUNDLE_DIR=str(bundle), HETERONETWORK_DB_PROXY_BACKENDS=backends,
            HETERONETWORK_DB_PROXY_LISTEN_ADDRESS=args.ip)
-with Path('/var/backups/heteronetwork/iac-standard/database-proxy.log').open('w') as log:
-    os.chmod(log.name, 0o600)
-    subprocess.run(['/opt/heteronetwork/libexec/postgres-ha-node.sh', 'install-proxy'], env=env,
-                   stdout=log, stderr=subprocess.STDOUT, check=True)
+helper = '/opt/heteronetwork/libexec/postgres-ha-node.sh'
+expected = subprocess.check_output([helper, 'render-proxy-config'], env=env)
+config = Path('/etc/heteronetwork/postgres-ha/haproxy.cfg')
+ca = Path('/etc/heteronetwork/postgres-ha/pki/ca.crt')
+changed = (not config.exists() or config.read_bytes() != expected or not ca.exists()
+           or ca.read_bytes() != (bundle / 'ca/ca.crt').read_bytes())
+if changed and not args.check:
+    with Path('/var/backups/heteronetwork/iac-standard/database-proxy.log').open('w') as log:
+        os.chmod(log.name, 0o600)
+        subprocess.run([helper, 'install-proxy'], env=env,
+                       stdout=log, stderr=subprocess.STDOUT, check=True)
+print(json.dumps({'changed': changed, 'mode': 'client-proxy'}))

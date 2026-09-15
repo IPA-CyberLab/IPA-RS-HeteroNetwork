@@ -76,6 +76,7 @@ Commands:
   reconcile-dcs           Add or promote at most one DCS learner
   current-dcs-members     Print the actual DCS membership as name=underlay-ip
   install-proxy           Install only the local primary-selecting database proxy
+  render-proxy-config     Print the declared proxy configuration without changing the host
   verify                  Require DCS quorum, one primary, all replicas, and synchronous writes
   status                  Print bounded cluster health without printing credentials
   self-test               Run non-privileged config renderer and validation checks
@@ -2541,6 +2542,10 @@ case "${1:-}" in
     ;;
   install-proxy)
     install_proxy
+    ;;
+  render-proxy-config)
+    validate_proxy_config
+    render_haproxy_config
     ;;
   verify)
     verify_cluster

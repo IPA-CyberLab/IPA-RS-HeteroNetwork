@@ -65,6 +65,7 @@
       loop:
         - {src: scripts/kubeadm-ha-node.sh, dest: /opt/heteronetwork/libexec/kubeadm-ha-node.sh}
         - {src: scripts/public-services-bootstrap.sh, dest: /opt/heteronetwork/libexec/public-services-bootstrap.sh}
+        - {src: scripts/postgres-ha-node.sh, dest: /opt/heteronetwork/libexec/postgres-ha-node.sh}
         - {src: scripts/kubeadm-ha-node.sh, dest: /opt/heteronetwork/iac/scripts/kubeadm-ha-node.sh}
         - {src: scripts/public-services-bootstrap.sh, dest: /opt/heteronetwork/iac/scripts/public-services-bootstrap.sh}
         - {src: deploy/systemd/heteronetwork-public-services-bootstrap.service, dest: /opt/heteronetwork/iac/deploy/systemd/heteronetwork-public-services-bootstrap.service, mode: '0644'}
@@ -312,6 +313,12 @@
       ansible.builtin.file:
         path: /etc/heteronetwork/kubernetes/join-bundle.json
         state: absent
+    - name: Maintain the explicitly declared Kubernetes backend pool
+      ansible.builtin.systemd_service:
+        name: heteronetwork-kubeadm-backend-autopilot.timer
+        state: stopped
+        enabled: false
+      when: hnn_standard_kubernetes.stat.exists or not ansible_check_mode
     - name: Enforce standard kubelet capacity
       ansible.builtin.copy:
         dest: /etc/default/kubelet
@@ -371,6 +378,24 @@
         state: started
         enabled: true
       when: hnn_standard_database.stat.exists or not ansible_check_mode
+    - name: Inspect client-only database membership
+      ansible.builtin.stat:
+        path: /etc/heteronetwork/postgres-autopilot/bundle/.proxy-only
+      register: hnn_standard_client_only
+    - name: Detect database proxy configuration drift
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/libexec/standard-proxy.py, --ip, '{{ hnn_standard_ip }}', --check]
+      register: hnn_standard_proxy_drift
+      check_mode: false
+      changed_when: (hnn_standard_proxy_drift.stdout | from_json).changed
+      no_log: true
+      when: hnn_standard_client_only.stat.exists
+    - name: Reconcile the declared database client proxy
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/libexec/standard-proxy.py, --ip, '{{ hnn_standard_ip }}']
+      changed_when: true
+      no_log: true
+      when: hnn_standard_client_only.stat.exists and (hnn_standard_proxy_drift.stdout | from_json).changed and not ansible_check_mode
     - name: Normalize the local Keycloak health path
       ansible.builtin.lineinfile:
         path: /etc/heteronetwork/keycloak-autopilot.env
@@ -387,6 +412,12 @@
         mode: '0644'
       notify: Restart standard Agent
       when: not ansible_check_mode
+    - name: Maintain the authenticated database bundle endpoint
+      ansible.builtin.systemd_service:
+        name: heteronetwork-postgres-bundle.service
+        state: started
+        enabled: true
+      when: hnn_standard_public.stat.exists or not ansible_check_mode
   handlers:
     - name: Prepare standard Keycloak
       ansible.builtin.systemd_service:

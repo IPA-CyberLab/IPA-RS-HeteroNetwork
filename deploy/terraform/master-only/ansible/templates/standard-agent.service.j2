@@ -4,6 +4,7 @@ Wants=network-online.target
 After=network-online.target
 {% if hnn_public_installed | default(false) %}
 Requires=heteronetwork-gateway.service
+Wants=heteronetwork-postgres-bundle.service
 After=heteronetwork-gateway.service
 {% endif %}
 [Service]
