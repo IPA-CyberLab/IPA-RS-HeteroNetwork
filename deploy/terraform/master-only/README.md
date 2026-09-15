@@ -25,6 +25,9 @@ the control-plane `NoSchedule` taint and dedicated-master taints on this host
 while preserving other controller taints. Standard-node configuration has a
 separate Terraform trigger from the three dedicated masters. The dedicated
 master isolation policies continue to apply only to the original three hosts.
+The [standard-node deployment record](../../../docs/standard-node-setup-2026-09-15.md)
+describes its client DB/Keycloak proxies, declared six-endpoint Kubernetes pool,
+and Longhorn filesystem disk with 64 GiB reserved for the host OS.
 
 Argo CD reconciles the dedicated Node labels, cordon, Longhorn scheduling
 opt-out and admission policies from `deploy/gitops/control-plane-only`.
@@ -109,6 +112,7 @@ DaemonSet sources also declare the dedicated-master exclusion directly.
 
 ```bash
 KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/verify-master-only.py --exercise-admission
+KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/verify-standard-node.py
 python3 scripts/master-only-iac.py check
 python3 scripts/master-only-iac.py plan
 ```

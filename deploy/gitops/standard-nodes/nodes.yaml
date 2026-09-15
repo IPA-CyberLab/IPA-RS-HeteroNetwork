@@ -23,6 +23,7 @@ metadata:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'
 spec:
+  name: uc-k8sp4
   allowScheduling: true
   disks:
     iac-default-disk:
