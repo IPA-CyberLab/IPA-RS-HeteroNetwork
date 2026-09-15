@@ -127,7 +127,7 @@ resource "kubernetes_manifest" "master_only_application" {
         server    = "https://kubernetes.default.svc"
         namespace = "kube-system"
       }
-      ignoreDifferences = [{ group = "", kind = "Node", jsonPointers = ["/spec/taints"] }]
+      ignoreDifferences = [{ kind = "Node", jsonPointers = ["/spec/taints"] }]
       syncPolicy = {
         automated   = { enabled = true, prune = true, selfHeal = true }
         retry       = { limit = 10, backoff = { duration = "5s", factor = 2, maxDuration = "3m" } }
