@@ -128,6 +128,14 @@ spec:
         prometheus.io/port: "9253"
         prometheus.io/scrape: "true"
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: heteronetwork.io/control-plane-only
+                    operator: NotIn
+                    values: ["true"]
       priorityClassName: system-node-critical
       serviceAccountName: node-local-dns
       hostNetwork: true

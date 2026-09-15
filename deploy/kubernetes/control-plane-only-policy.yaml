@@ -1,0 +1,59 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: heteronetwork-control-plane-only-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        !has(object.spec.nodeName) ||
+        !(object.spec.nodeName in ['uc-k8sp1', 'uc-k8sp2', 'uc-k8s3p']) ||
+        (request.namespace == 'kube-system' &&
+         object.metadata.name.matches('^(etcd|kube-apiserver|kube-controller-manager|kube-scheduler)-') &&
+         has(object.metadata.annotations) &&
+         'kubernetes.io/config.mirror' in object.metadata.annotations &&
+         request.userInfo.username == 'system:node:' + object.spec.nodeName) ||
+        (request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-')) ||
+        (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-'))
+      message: "This node runs only Kubernetes control-plane components, Flannel and kube-proxy."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: heteronetwork-control-plane-only-pods
+spec:
+  policyName: heteronetwork-control-plane-only-pods
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: heteronetwork-control-plane-only-bindings
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods/binding", "bindings"]
+  validations:
+    - expression: >-
+        !(object.target.name in ['uc-k8sp1', 'uc-k8sp2', 'uc-k8s3p']) ||
+        (request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-')) ||
+        (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-'))
+      message: "Application and storage Pods cannot bind to this control-plane-only node."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: heteronetwork-control-plane-only-bindings
+spec:
+  policyName: heteronetwork-control-plane-only-bindings
+  validationActions: [Deny]

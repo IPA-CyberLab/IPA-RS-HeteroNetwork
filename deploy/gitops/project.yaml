@@ -6,6 +6,7 @@ metadata:
 spec:
   description: HeteroNetwork and HeteroCloud production workloads
   sourceRepos:
+    - git://10.250.0.2:19419/heteronetwork-infrastructure.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git

@@ -18,6 +18,14 @@ spec:
       labels:
         app.kubernetes.io/name: longhorn-node-prerequisites
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: heteronetwork.io/control-plane-only
+                    operator: NotIn
+                    values: ["true"]
       hostPID: true
       priorityClassName: system-node-critical
       tolerations:

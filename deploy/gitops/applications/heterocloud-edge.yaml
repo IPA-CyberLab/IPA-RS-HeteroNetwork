@@ -8,8 +8,8 @@ metadata:
 spec:
   project: hetero-platform
   source:
-    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
-    targetRevision: master
+    repoURL: git://10.250.0.2:19419/heteronetwork-infrastructure.git
+    targetRevision: codex/master-only-iac-20260915
     path: deploy/gitops/envoy-gateway
   destination:
     server: https://kubernetes.default.svc

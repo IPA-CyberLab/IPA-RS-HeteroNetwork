@@ -1,0 +1,71 @@
+- name: Publish the infrastructure Git source on the existing bootstrap host
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+  tasks:
+    - name: Install the Git transport
+      ansible.builtin.apt:
+        name: git
+        state: present
+    - name: Create the public-source repository directory
+      ansible.builtin.file:
+        path: /var/lib/heteronetwork-gitops
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Transfer the reviewed infrastructure bundle
+      ansible.builtin.copy:
+        src: '{{ hnn_work_dir }}/infrastructure.bundle'
+        dest: /var/lib/heteronetwork-gitops/infrastructure.bundle
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Adopt the infrastructure repository
+      ansible.builtin.git:
+        repo: /var/lib/heteronetwork-gitops/infrastructure.bundle
+        dest: /var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git
+        bare: true
+        version: '{{ hnn_git_revision }}'
+        update: true
+    - name: Configure read-only Git serving on the HeteroNetwork address
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-gitops-source.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Read-only infrastructure Git source on HeteroNetwork
+          Requires=heteronetwork-agent.service
+          After=heteronetwork-agent.service network-online.target
+          [Service]
+          Type=simple
+          DynamicUser=yes
+          ExecStart=/usr/bin/git -c safe.directory=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git daemon --reuseaddr --export-all --strict-paths --base-path=/var/lib/heteronetwork-gitops --listen=10.250.0.2 --port=19419 /var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          PrivateTmp=yes
+          ReadOnlyPaths=/var/lib/heteronetwork-gitops
+          RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+          CapabilityBoundingSet=
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Git source
+    - name: Enable the Git source
+      ansible.builtin.systemd_service:
+        name: heteronetwork-gitops-source.service
+        daemon_reload: true
+        state: started
+        enabled: true
+  handlers:
+    - name: Restart Git source
+      ansible.builtin.systemd_service:
+        name: heteronetwork-gitops-source.service
+        daemon_reload: true
+        state: restarted

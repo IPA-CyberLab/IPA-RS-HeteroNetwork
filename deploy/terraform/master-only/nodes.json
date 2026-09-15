@@ -1,0 +1,17 @@
+{
+  "uc-k8sp1": {
+    "ssh_host": "163.220.236.51",
+    "vpn_ip": "10.250.0.4",
+    "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC+ZtrZGnc07QiGnt6+r349HE2wU+LimXdgFVpo/W5E4"
+  },
+  "uc-k8sp2": {
+    "ssh_host": "163.220.236.52",
+    "vpn_ip": "10.250.0.5",
+    "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKtl6i9wPFRFl9rjKBmDlNR01+g0gesVkgPUw1/46w1d"
+  },
+  "uc-k8s3p": {
+    "ssh_host": "163.220.236.53",
+    "vpn_ip": "10.250.0.6",
+    "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHy34AahTUQGBp5pLKdVsKryDmf7lHL8XNtTntkzsdQH"
+  }
+}

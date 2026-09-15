@@ -1,0 +1,44 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: heteronetwork-control-plane-only-nodes
+  annotations:
+    argocd.argoproj.io/sync-wave: '-3'
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: IfNeeded
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [nodes]
+  matchConditions:
+    - name: dedicated-master
+      expression: "object.metadata.name in ['uc-k8sp1', 'uc-k8sp2', 'uc-k8s3p']"
+  variables:
+    - name: current
+      expression: "has(object.spec.taints) ? object.spec.taints : []"
+    - name: required
+      expression: >-
+        [{'key': 'node-role.kubernetes.io/control-plane', 'effect': 'NoSchedule'},
+         {'key': 'heteronetwork.io/control-plane-only', 'value': 'true', 'effect': 'NoSchedule'},
+         {'key': 'heteronetwork.io/control-plane-only', 'value': 'true', 'effect': 'NoExecute'}]
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          [JSONPatch{op: 'add', path: '/spec/unschedulable', value: true},
+           JSONPatch{op: 'add', path: '/spec/taints',
+             value: variables.current.filter(t,
+               !variables.required.exists(r, r.key == t.key && r.effect == t.effect)) + variables.required
+           }]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: heteronetwork-control-plane-only-nodes
+  annotations:
+    argocd.argoproj.io/sync-wave: '-2'
+spec:
+  policyName: heteronetwork-control-plane-only-nodes

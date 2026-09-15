@@ -78,7 +78,7 @@ Commands:
                          Point the local API server at selected stacked-etcd members
   reconcile-pod-routing Reconcile host-network traffic routing to the Flannel Pod CIDR
   install-flannel        Install pinned Flannel on the initialized cluster
-  finalize               Allow workloads on control-plane nodes and wait for readiness
+  finalize               Configure scheduling and wait for control-plane readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
   verify-cluster         Verify nodes, control planes, Flannel, DNS, and cross-node Pod traffic
   configure-api-ha       Reconcile API health checks and kubelet HA endpoint
@@ -96,7 +96,9 @@ Required environment for prepare/init/join:
   HETERONETWORK_KUBEADM_CONTROL_PLANES   Comma-separated HeteroNetwork IPv4 addresses
 
 Optional environment:
-  HETERONETWORK_KUBEADM_PROFILE          standard (default) or fresh-dev
+  HETERONETWORK_KUBEADM_PROFILE          standard (default), control-plane-only, or fresh-dev
+                                         control-plane-only keeps workload isolation taints
+                                         and disables public-service bootstrap
                                          fresh-dev requires explicit dev networking;
                                          no split DNS or discovery/public timers
   HETERONETWORK_KUBEADM_INTERFACE        Default: heteronetwork0
@@ -364,7 +366,7 @@ validate_common_config() {
 
 validate_profile() {
   case "$profile" in
-    standard) return ;;
+    standard|control-plane-only) return ;;
     fresh-dev) ;;
     *) die "unknown Kubernetes preparation profile" ;;
   esac
@@ -391,6 +393,11 @@ validate_profile() {
 }
 
 prepare_preflight() {
+  if [[ "$profile" == control-plane-only ]]; then
+    systemctl is-active --quiet heteronetwork-agent.service \
+      || die "start HeteroNetwork before dedicated control-plane preparation"
+    return
+  fi
   if [[ "$profile" == standard ]]; then
     [[ -f "$SCRIPT_DIR/public-services-bootstrap.sh" \
       && -f "$SCRIPT_DIR/../deploy/systemd/heteronetwork-public-services-bootstrap.service" \
@@ -1664,8 +1671,12 @@ reconcile_kubelet_api_endpoint() {
 
 configure_kubelet() {
   reconcile_kubelet_resolver
-  printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s --max-pods=%s --kube-reserved=cpu=500m,memory=512Mi --system-reserved=cpu=500m,memory=512Mi"\n' \
-    "$node_ip" "$node_name" "$max_pods" \
+  local isolation_args=""
+  if [[ "$profile" == control-plane-only ]]; then
+    isolation_args=" --node-labels=heteronetwork.io/control-plane-only=true --register-with-taints=node-role.kubernetes.io/control-plane=:NoSchedule,heteronetwork.io/control-plane-only=true:NoSchedule,heteronetwork.io/control-plane-only=true:NoExecute"
+  fi
+  printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s --max-pods=%s --kube-reserved=cpu=500m,memory=512Mi --system-reserved=cpu=500m,memory=512Mi%s"\n' \
+    "$node_ip" "$node_name" "$max_pods" "$isolation_args" \
     | install_from_stdin /etc/default/kubelet 0644
   install -d -o root -g root -m 0755 /etc/systemd/system/kubelet.service.d
   render_kubelet_dropin \
@@ -1796,7 +1807,7 @@ ensure_agent_api_token() {
 
 install_public_services_bootstrap_autopilot() {
   validate_profile
-  [[ "$profile" != fresh-dev ]] || return 0
+  [[ "$profile" == standard ]] || return 0
   local helper="${SCRIPT_DIR}/public-services-bootstrap.sh"
   local service="${SCRIPT_DIR}/../deploy/systemd/heteronetwork-public-services-bootstrap.service"
   local timer="${SCRIPT_DIR}/../deploy/systemd/heteronetwork-public-services-bootstrap.timer"
@@ -2503,7 +2514,14 @@ finalize_cluster() {
   validate_control_plane_config
   require_command kubectl
   export KUBECONFIG=/etc/kubernetes/admin.conf
-  kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+  kubectl taint nodes -l 'heteronetwork.io/control-plane-only!=true' node-role.kubernetes.io/control-plane- 2>/dev/null || true
+  if [[ "$profile" == control-plane-only ]]; then
+    kubectl label node "$node_name" heteronetwork.io/control-plane-only=true --overwrite
+    kubectl taint node "$node_name" node-role.kubernetes.io/control-plane=:NoSchedule \
+      heteronetwork.io/control-plane-only=true:NoSchedule \
+      heteronetwork.io/control-plane-only=true:NoExecute --overwrite
+    kubectl cordon "$node_name"
+  fi
   kubectl wait --for=condition=Ready nodes --all --timeout=10m
   configure_coredns_ha
 }

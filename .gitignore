@@ -31,3 +31,10 @@ clients/windows/artifacts/
 clients/windows/.build/
 clients/macos/
 .key
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.auto.tfvars
+*.auto.tfvars.json
+!*.auto.tfvars.example

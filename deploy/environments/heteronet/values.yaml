@@ -5,6 +5,12 @@ image:
 
 agent:
   mode: host
+  nodeAffinity:
+    required:
+      matchExpressions:
+        - key: heteronetwork.io/control-plane-only
+          operator: NotIn
+          values: ["true"]
   # Host-networked Kubernetes helpers use the node-local HAProxy, which keeps
   # the API path on HeteroNetwork even when the physical default route is not
   # allowed to reach the Kubernetes Service CIDR.

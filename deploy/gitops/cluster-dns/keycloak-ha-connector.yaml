@@ -19,6 +19,14 @@ spec:
       labels:
         app.kubernetes.io/name: keycloak-ha-connector
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: heteronetwork.io/control-plane-only
+                    operator: NotIn
+                    values: ["true"]
       automountServiceAccountToken: false
       nodeSelector:
         kubernetes.io/os: linux
