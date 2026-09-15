@@ -22,7 +22,7 @@
         owner: root
         group: root
         mode: '0755'
-      loop: [/opt/heteronetwork/bin, /opt/heteronetwork/libexec, /opt/heteronetwork/deploy/systemd, /etc/systemd/system/heteronetwork-agent.service.d, /etc/systemd/system/heteronetwork-control-plane.service.d, /etc/sysusers.d]
+      loop: [/opt/heteronetwork/bin, /opt/heteronetwork/libexec, /opt/heteronetwork/iac/scripts, /opt/heteronetwork/iac/deploy/systemd, /etc/systemd/system/heteronetwork-agent.service.d, /etc/systemd/system/heteronetwork-control-plane.service.d, /etc/sysusers.d]
     - name: Wait for concurrent OS package operations
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/90heteronetwork-lock-timeout
@@ -61,12 +61,16 @@
         dest: '{{ item.dest }}'
         owner: root
         group: root
-        mode: '0755'
+        mode: '{{ item.mode | default("0755") }}'
       loop:
         - {src: scripts/kubeadm-ha-node.sh, dest: /opt/heteronetwork/libexec/kubeadm-ha-node.sh}
         - {src: scripts/public-services-bootstrap.sh, dest: /opt/heteronetwork/libexec/public-services-bootstrap.sh}
-        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.service, dest: /opt/heteronetwork/deploy/systemd/heteronetwork-public-services-bootstrap.service}
-        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.timer, dest: /opt/heteronetwork/deploy/systemd/heteronetwork-public-services-bootstrap.timer}
+        - {src: scripts/kubeadm-ha-node.sh, dest: /opt/heteronetwork/iac/scripts/kubeadm-ha-node.sh}
+        - {src: scripts/public-services-bootstrap.sh, dest: /opt/heteronetwork/iac/scripts/public-services-bootstrap.sh}
+        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.service, dest: /opt/heteronetwork/iac/deploy/systemd/heteronetwork-public-services-bootstrap.service, mode: '0644'}
+        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.timer, dest: /opt/heteronetwork/iac/deploy/systemd/heteronetwork-public-services-bootstrap.timer, mode: '0644'}
+        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.service, dest: /etc/systemd/system/heteronetwork-public-services-bootstrap.service, mode: '0644'}
+        - {src: deploy/systemd/heteronetwork-public-services-bootstrap.timer, dest: /etc/systemd/system/heteronetwork-public-services-bootstrap.timer, mode: '0644'}
     - name: Inspect enrolled identity
       ansible.builtin.stat:
         path: /var/lib/heteronetwork/agent.json
@@ -209,6 +213,13 @@
         owner: root
         group: root
         mode: '0600'
+    - name: Enable automatic full-service promotion
+      ansible.builtin.systemd_service:
+        name: heteronetwork-public-services-bootstrap.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+      when: not ansible_check_mode
     - name: Inspect Kubernetes membership
       ansible.builtin.stat:
         path: /etc/kubernetes/admin.conf
@@ -259,16 +270,9 @@
         set -a
         . /etc/heteronetwork/kubernetes/standard.env
         set +a
-        /opt/heteronetwork/libexec/kubeadm-ha-node.sh prepare > /var/backups/heteronetwork/iac-standard/prepare.log 2>&1
+        /opt/heteronetwork/iac/scripts/kubeadm-ha-node.sh prepare > /var/backups/heteronetwork/iac-standard/prepare.log 2>&1
       args: {executable: /bin/bash}
       when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
-    - name: Enable automatic full-service promotion
-      ansible.builtin.systemd_service:
-        name: heteronetwork-public-services-bootstrap.timer
-        state: started
-        enabled: true
-        daemon_reload: true
-      when: not ansible_check_mode
     - name: Issue short-lived Kubernetes control-plane credentials
       ansible.builtin.shell: |
         set -a

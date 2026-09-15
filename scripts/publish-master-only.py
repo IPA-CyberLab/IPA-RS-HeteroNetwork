@@ -13,7 +13,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def files():
     paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/master-only-iac.py',
-           'scripts/verify-master-only.py','scripts/publish-master-only.py',
+           'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/publish-master-only.py',
            'docs/master-only-iac-2026-09-15.md',
            'deploy/kubernetes/control-plane-only-policy.yaml',
            'deploy/environments/heteronet/values.yaml','deploy/gitops/project.yaml']
