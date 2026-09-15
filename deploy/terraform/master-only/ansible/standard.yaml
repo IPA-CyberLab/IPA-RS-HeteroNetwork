@@ -333,6 +333,51 @@
       ansible.builtin.set_fact:
         hnn_public_installed: true
       when: not ansible_check_mode
+    - name: Inspect database credentials
+      ansible.builtin.stat:
+        path: /etc/heteronetwork/postgres-autopilot/bundle/manifest.env
+      register: hnn_standard_database
+    - name: Read the existing protected client proxy bundle
+      ansible.builtin.slurp:
+        src: /etc/heteronetwork/postgres-autopilot/proxy-bundle.tar.gz
+      delegate_to: uc-k8sp5
+      register: hnn_standard_proxy_bundle
+      no_log: true
+      when: not hnn_standard_database.stat.exists and not ansible_check_mode
+    - name: Transfer client proxy credentials privately
+      ansible.builtin.copy:
+        content: '{{ hnn_standard_proxy_bundle.content | b64decode }}'
+        dest: /var/backups/heteronetwork/iac-standard/database-proxy.tar.gz
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+      when: not hnn_standard_database.stat.exists and not ansible_check_mode
+    - name: Install the client proxy bootstrap helper
+      ansible.builtin.copy:
+        src: standard-proxy.py
+        dest: /opt/heteronetwork/libexec/standard-proxy.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Bootstrap the existing database client connection
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/libexec/standard-proxy.py, --ip, '{{ hnn_standard_ip }}']
+      no_log: true
+      when: not hnn_standard_database.stat.exists and not ansible_check_mode
+    - name: Maintain the database client proxy
+      ansible.builtin.systemd_service:
+        name: heteronetwork-db-proxy.service
+        state: started
+        enabled: true
+      when: hnn_standard_database.stat.exists or not ansible_check_mode
+    - name: Normalize the local Keycloak health path
+      ansible.builtin.lineinfile:
+        path: /etc/heteronetwork/keycloak-autopilot.env
+        regexp: '^HETERONETWORK_KEYCLOAK_OIDC_PROBE_PATH_B64='
+        line: HETERONETWORK_KEYCLOAK_OIDC_PROBE_PATH_B64=L3JlYWxtcy9oZXRlcm9jbG91ZC8ud2VsbC1rbm93bi9vcGVuaWQtY29uZmlndXJhdGlvbg==
+      no_log: true
+      notify: Prepare standard Keycloak
     - name: Maintain the final full-service Agent configuration
       ansible.builtin.template:
         src: standard-agent.service.j2
@@ -343,6 +388,10 @@
       notify: Restart standard Agent
       when: not ansible_check_mode
   handlers:
+    - name: Prepare standard Keycloak
+      ansible.builtin.systemd_service:
+        name: heteronetwork-keycloak-prepare.service
+        state: restarted
     - name: Restart standard Agent
       ansible.builtin.systemd_service:
         name: heteronetwork-agent.service
