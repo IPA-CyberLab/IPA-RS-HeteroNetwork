@@ -18,35 +18,44 @@ spec:
       - UPDATE
       resources:
       - daemonsets
+      scope: '*'
+    matchPolicy: Equivalent
+    namespaceSelector: {}
+    objectSelector: {}
   matchConditions:
   - name: nonessential-daemonset
-    expression: "!((request.namespace == 'kube-flannel' && object.metadata.name ==\
-      \ 'kube-flannel-ds') ||\n  (request.namespace == 'kube-system' && object.metadata.name\
-      \ == 'kube-proxy'))"
+    expression: |-
+      !((request.namespace == 'kube-flannel' && object.metadata.name == 'kube-flannel-ds') ||
+        (request.namespace == 'kube-system' && object.metadata.name == 'kube-proxy'))
   variables:
   - name: terms
     expression: 'has(object.spec.template.spec.affinity) && has(object.spec.template.spec.affinity.nodeAffinity)
-      && has(object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution)
-      ? object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms
+      && has(object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution) ? object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms
       : [{}]'
   mutations:
   - patchType: JSONPatch
     jsonPatch:
-      expression: "variables.terms.all(term,\n  has(term.matchExpressions) && term.matchExpressions.exists(e,\n\
-        \    e.key == 'heteronetwork.io/control-plane-only' && e.operator == 'NotIn'\
-        \ &&\n    has(e.values) && 'true' in e.values))\n? [] :\n(has(object.spec.template.spec.affinity)\
-        \ ? [] :\n  [JSONPatch{op: 'add', path: '/spec/template/spec/affinity', value:\
-        \ Object.spec.template.spec.affinity{}}]) +\n(has(object.spec.template.spec.affinity)\
-        \ && has(object.spec.template.spec.affinity.nodeAffinity) ? [] :\n  [JSONPatch{op:\
-        \ 'add', path: '/spec/template/spec/affinity/nodeAffinity', value: Object.spec.template.spec.affinity.nodeAffinity{}}])\
-        \ +\n[JSONPatch{\n  op: 'add', path: '/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution',\n\
-        \  value: Object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution{\n\
-        \    nodeSelectorTerms: variables.terms.map(term,\n      Object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms{\n\
-        \        matchExpressions: (has(term.matchExpressions) ? term.matchExpressions\
-        \ : []) +\n          [Object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.matchExpressions{key:\
-        \ 'heteronetwork.io/control-plane-only', operator: 'NotIn', values: ['true']}],\n\
-        \        matchFields: has(term.matchFields) ? term.matchFields : []\n    \
-        \  })\n  }\n}]"
+      expression: |-
+        variables.terms.all(term,
+          has(term.matchExpressions) && term.matchExpressions.exists(e,
+            e.key == 'heteronetwork.io/control-plane-only' && e.operator == 'NotIn' &&
+            has(e.values) && 'true' in e.values))
+        ? [] :
+        (has(object.spec.template.spec.affinity) ? [] :
+          [JSONPatch{op: 'add', path: '/spec/template/spec/affinity', value: Object.spec.template.spec.affinity{}}]) +
+        (has(object.spec.template.spec.affinity) && has(object.spec.template.spec.affinity.nodeAffinity) ? [] :
+          [JSONPatch{op: 'add', path: '/spec/template/spec/affinity/nodeAffinity', value: Object.spec.template.spec.affinity.nodeAffinity{}}]) +
+        [JSONPatch{
+          op: 'add', path: '/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution',
+          value: Object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution{
+            nodeSelectorTerms: variables.terms.map(term,
+              Object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms{
+                matchExpressions: (has(term.matchExpressions) ? term.matchExpressions : []) +
+                  [Object.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.matchExpressions{key: 'heteronetwork.io/control-plane-only', operator: 'NotIn', values: ['true']}],
+                matchFields: has(term.matchFields) ? term.matchFields : []
+              })
+          }
+        }]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicyBinding
@@ -77,26 +86,33 @@ spec:
       - UPDATE
       resources:
       - daemonsets
+      scope: '*'
+    matchPolicy: Equivalent
+    namespaceSelector: {}
+    objectSelector: {}
   matchConditions:
   - name: essential-network-daemonset
-    expression: (request.namespace == 'kube-flannel' && object.metadata.name == 'kube-flannel-ds')
-      || (request.namespace == 'kube-system' && object.metadata.name == 'kube-proxy')
+    expression: (request.namespace == 'kube-flannel' && object.metadata.name == 'kube-flannel-ds') || (request.namespace
+      == 'kube-system' && object.metadata.name == 'kube-proxy')
   variables:
   - name: current
-    expression: 'has(object.spec.template.spec.tolerations) ? object.spec.template.spec.tolerations
-      : []'
+    expression: 'has(object.spec.template.spec.tolerations) ? object.spec.template.spec.tolerations : []'
   - name: required
-    expression: "[{'key': 'heteronetwork.io/control-plane-only', 'operator': 'Equal',\
-      \ 'value': 'true', 'effect': 'NoSchedule'},\n {'key': 'heteronetwork.io/control-plane-only',\
-      \ 'operator': 'Equal', 'value': 'true', 'effect': 'NoExecute'}]"
+    expression: |-
+      [{'key': 'heteronetwork.io/control-plane-only', 'operator': 'Equal', 'value': 'true', 'effect': 'NoSchedule'},
+       {'key': 'heteronetwork.io/control-plane-only', 'operator': 'Equal', 'value': 'true', 'effect': 'NoExecute'}]
   mutations:
   - patchType: JSONPatch
     jsonPatch:
-      expression: "[JSONPatch{op: 'add', path: '/spec/template/spec/tolerations',\n\
-        \  value: variables.current + variables.required.filter(r,\n    !variables.current.exists(t,\n\
-        \      has(t.key) && t.key == r.key &&\n      (!has(t.operator) || t.operator\
-        \ == 'Equal') &&\n      has(t.value) && t.value == r.value &&\n      has(t.effect)\
-        \ && t.effect == r.effect))\n}]"
+      expression: |-
+        [JSONPatch{op: 'add', path: '/spec/template/spec/tolerations',
+          value: variables.current + variables.required.filter(r,
+            !variables.current.exists(t,
+              has(t.key) && t.key == r.key &&
+              (!has(t.operator) || t.operator == 'Equal') &&
+              has(t.value) && t.value == r.value &&
+              has(t.effect) && t.effect == r.effect))
+        }]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicyBinding
