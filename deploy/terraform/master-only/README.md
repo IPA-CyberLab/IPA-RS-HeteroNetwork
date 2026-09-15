@@ -1,6 +1,8 @@
 # Dedicated master infrastructure
 
 This module manages the existing `uc-k8sp1`, `uc-k8sp2`, and `uc-k8s3p` hosts.
+The [deployment and verification record](../../../docs/master-only-iac-2026-09-15.md)
+also documents the current workspace's operator connection.
 Terraform runs the versioned Ansible configuration, publishes a read-only
 internal Git source on `uc-k8sp5`, imports the five existing
 HeteroNetwork GitOps Application sources, and creates the `control-plane-only`
