@@ -1,4 +1,4 @@
-# Dedicated master infrastructure
+# HeteroNetwork host infrastructure
 
 This module manages the existing `uc-k8sp1`, `uc-k8sp2`, and `uc-k8s3p` hosts.
 The [deployment and verification record](../../../docs/master-only-iac-2026-09-15.md)
@@ -8,6 +8,23 @@ internal Git source on `uc-k8sp5`, imports the five existing
 HeteroNetwork GitOps Application sources, and creates the `control-plane-only`
 Argo CD Application. The physical machines and their operating systems already
 exist; this module manages their HeteroNetwork and Kubernetes configuration.
+
+`standard-nodes.json` additionally registers `uc-k8sp4` (`100.111.33.52`,
+SSH endpoint `163.220.236.54`) as a full-service node. Its separate Ansible
+resource installs the pinned Agent, enrolls through the existing issuer with
+a short-lived single-use token, joins the existing Kubernetes control plane,
+and enables the signed native public-service installation. An inactive old
+cluster configuration is backed up and reset only after verifying that it has
+no running containers. The enrolled identity is saved in the same protected
+recovery vault. Standard hosts use an Ansible temporary directory under `/tmp`
+because this host's home directory belongs to root.
+
+The `standard-nodes` Argo CD Application maintains schedulable Node settings,
+public ingress, and enabled Longhorn scheduling. Its admission policy removes
+the control-plane `NoSchedule` taint and dedicated-master taints on this host
+while preserving other controller taints. Standard-node configuration has a
+separate Terraform trigger from the three dedicated masters. The dedicated
+master isolation policies continue to apply only to the original three hosts.
 
 Argo CD reconciles the dedicated Node labels, cordon, Longhorn scheduling
 opt-out and admission policies from `deploy/gitops/control-plane-only`.
@@ -44,7 +61,7 @@ python3 scripts/master-only-iac.py plan
 python3 scripts/master-only-iac.py apply
 ```
 
-The entry point prompts for sudo credentials, checks the master hosts and the
+The entry point prompts for sudo credentials, checks both host profiles and the
 internal Git source with Ansible, and marks only resources with observed drift
 for Terraform reconciliation. Secret credentials
 are passed in the process environment rather than Terraform variables or state.
@@ -70,7 +87,7 @@ addresses. Protect this vault separately from the host OS being cleaned.
 Terraform state uses the existing Kubernetes Secret backend in `argocd`, with
 Lease locking. State, kubeconfig, SSH private keys, binary archives and identity
 contents are excluded from Git. The public host inventory pins SSH host keys.
-Update `nodes.json` for an authorized host-key rotation and rerender GitOps nodes
+Update `nodes.json` or `standard-nodes.json` for an authorized host-key rotation and rerender GitOps nodes
 with `python3 deploy/terraform/master-only/render.py`.
 
 The production Git source is

@@ -5,6 +5,7 @@
   serial: 1
   vars:
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
   tasks:
     - name: Create private host directories
       ansible.builtin.file:
@@ -13,7 +14,7 @@
         owner: root
         group: root
         mode: '0700'
-      loop: [/etc/heteronetwork/kubernetes, /var/lib/heteronetwork, /var/backups/heteronetwork/iac-standard]
+      loop: [/etc/heteronetwork/kubernetes, /var/lib/heteronetwork, /var/backups/heteronetwork/iac-standard, /etc/credstore]
     - name: Create public runtime directories
       ansible.builtin.file:
         path: '{{ item }}'
@@ -21,7 +22,14 @@
         owner: root
         group: root
         mode: '0755'
-      loop: [/opt/heteronetwork/bin, /opt/heteronetwork/libexec, /opt/heteronetwork/deploy/systemd]
+      loop: [/opt/heteronetwork/bin, /opt/heteronetwork/libexec, /opt/heteronetwork/deploy/systemd, /etc/systemd/system/heteronetwork-agent.service.d, /etc/systemd/system/heteronetwork-control-plane.service.d, /etc/sysusers.d]
+    - name: Wait for concurrent OS package operations
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/90heteronetwork-lock-timeout
+        content: 'DPkg::Lock::Timeout "300";'
+        owner: root
+        group: root
+        mode: '0644'
     - name: Inspect pinned networking binaries
       ansible.builtin.stat:
         path: '/opt/heteronetwork/bin/{{ item.key }}'
@@ -254,6 +262,13 @@
         /opt/heteronetwork/libexec/kubeadm-ha-node.sh prepare > /var/backups/heteronetwork/iac-standard/prepare.log 2>&1
       args: {executable: /bin/bash}
       when: not hnn_standard_kubernetes.stat.exists and not ansible_check_mode
+    - name: Enable automatic full-service promotion
+      ansible.builtin.systemd_service:
+        name: heteronetwork-public-services-bootstrap.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+      when: not ansible_check_mode
     - name: Issue short-lived Kubernetes control-plane credentials
       ansible.builtin.shell: |
         set -a
@@ -296,7 +311,8 @@
     - name: Enforce standard kubelet capacity
       ansible.builtin.copy:
         dest: /etc/default/kubelet
-        content: 'KUBELET_EXTRA_ARGS="--node-ip={{ hnn_standard_ip }} --hostname-override={{ inventory_hostname }} --max-pods=110 --kube-reserved=cpu=500m,memory=512Mi --system-reserved=cpu=500m,memory=512Mi"'
+        content: |
+          KUBELET_EXTRA_ARGS="--node-ip={{ hnn_standard_ip }} --hostname-override={{ inventory_hostname }} --max-pods=110 --kube-reserved=cpu=500m,memory=512Mi --system-reserved=cpu=500m,memory=512Mi"
         owner: root
         group: root
         mode: '0644'

@@ -57,7 +57,7 @@ def main():
         git('add','--',*paths)
         tree=git('write-tree')
         if tree==git('rev-parse',parent+'^{tree}'): commit=parent
-        else: commit=git('commit-tree',tree,'-p',parent,'-m','Manage dedicated masters with Terraform and Argo CD')
+        else: commit=git('commit-tree',tree,'-p',parent,'-m','Manage HeteroNetwork hosts with Terraform and Argo CD')
         git('update-ref',ref,commit,previous.stdout.strip() if previous.returncode==0 else '0'*40)
         git('bundle','create',str(work/'infrastructure.bundle'),ref)
     (work/'infrastructure.bundle').chmod(0o600)
