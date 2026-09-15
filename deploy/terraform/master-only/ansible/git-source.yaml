@@ -16,6 +16,12 @@
         owner: root
         group: root
         mode: '0755'
+    - name: Create the Git transport account
+      ansible.builtin.user:
+        name: heteronetwork-gitops
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
     - name: Transfer the reviewed infrastructure bundle
       ansible.builtin.copy:
         src: '{{ hnn_work_dir }}/infrastructure.bundle'
@@ -39,26 +45,33 @@
         creates: /var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git/HEAD
     - name: Inspect the published infrastructure revision
       ansible.builtin.command:
-        argv: [git, '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', rev-parse, --verify, 'refs/heads/{{ hnn_git_revision }}']
+        argv: [git, -c, 'safe.directory=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', rev-parse, --verify, 'refs/heads/{{ hnn_git_revision }}']
       register: hnn_published_revision
       changed_when: hnn_published_revision.stdout != hnn_bundle_revision.stdout.split()[0]
       failed_when: false
       check_mode: false
     - name: Import the declared infrastructure branch
       ansible.builtin.command:
-        argv: [git, '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', fetch, /var/lib/heteronetwork-gitops/infrastructure.bundle, '+refs/heads/{{ hnn_git_revision }}:refs/heads/{{ hnn_git_revision }}']
+        argv: [git, -c, 'safe.directory=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', fetch, /var/lib/heteronetwork-gitops/infrastructure.bundle, '+refs/heads/{{ hnn_git_revision }}:refs/heads/{{ hnn_git_revision }}']
       when: hnn_published_revision.stdout != hnn_bundle_revision.stdout.split()[0]
     - name: Inspect the repository default branch
       ansible.builtin.command:
-        argv: [git, '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', symbolic-ref, HEAD]
+        argv: [git, -c, 'safe.directory=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', symbolic-ref, HEAD]
       register: hnn_published_branch
       changed_when: hnn_published_branch.stdout != 'refs/heads/' + hnn_git_revision
       failed_when: false
       check_mode: false
     - name: Declare the repository default branch
       ansible.builtin.command:
-        argv: [git, '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', symbolic-ref, HEAD, 'refs/heads/{{ hnn_git_revision }}']
+        argv: [git, -c, 'safe.directory=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', '--git-dir=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git', symbolic-ref, HEAD, 'refs/heads/{{ hnn_git_revision }}']
       when: hnn_published_branch.stdout != 'refs/heads/' + hnn_git_revision
+    - name: Assign repository ownership to the read-only transport account
+      ansible.builtin.file:
+        path: /var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git
+        state: directory
+        owner: heteronetwork-gitops
+        group: heteronetwork-gitops
+        recurse: true
     - name: Configure read-only Git serving on the HeteroNetwork address
       ansible.builtin.copy:
         dest: /etc/systemd/system/heteronetwork-gitops-source.service
@@ -72,8 +85,9 @@
           After=heteronetwork-agent.service network-online.target
           [Service]
           Type=simple
-          DynamicUser=yes
-          ExecStart=/usr/bin/git -c safe.directory=/var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git daemon --reuseaddr --export-all --strict-paths --base-path=/var/lib/heteronetwork-gitops --listen=10.250.0.2 --port=19419 /var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git
+          User=heteronetwork-gitops
+          Group=heteronetwork-gitops
+          ExecStart=/usr/bin/git daemon --reuseaddr --export-all --strict-paths --base-path=/var/lib/heteronetwork-gitops --listen=10.250.0.2 --port=19419 /var/lib/heteronetwork-gitops/heteronetwork-infrastructure.git
           Restart=on-failure
           RestartSec=5
           NoNewPrivileges=yes
