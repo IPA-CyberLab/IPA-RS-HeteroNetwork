@@ -68,9 +68,20 @@ uc-k8sp4とuc-k8sp5の両方から、DNS、Service経由HTTP、uc-k8sp4のPod IP
 クラスタCAで検証したKubernetes ServiceのTLS接続が成功した。テストnamespaceは削除した。
 標準NodeのAdmissionは専用taintを除き、他のtaintを保持することをserver dry-runで検証した。
 
+`--exercise-storage` 付きの実行では、`longhorn-syouyu-local` の1GiB PVCを作成し、
+uc-k8sp4上の単一replicaへ書き込み・sync後、Podを再作成して同じ内容を読み出せた。
+テストPod、PVC、namespaceは検証終了後に削除した。
+最初のattach検証で、既存Longhorn管理Podの削除処理が残り、そのboundトークンが
+401になってengine-imageの新ノード認識が更新されない問題を検出した。
+該当する管理Podを作り直し、正常な管理ノードによる所有権引き継ぎと
+uc-k8sp4のengine-image認識を確認してから、通信・ボリューム検証を再実行して成功した。
+既存ボリュームやreplicaデータは削除していない。
+
 元の3台は引き続きReady・SchedulingDisabledで、各台は6個の必須Ready Podだけだった。
 アプリケーション・ストレージ用Podは0個。Kubernetes用etcdの全6 endpointで正常コミットを確認した。
 このノードの公開HTTPS `/healthz` への証明書検証付き接続も成功した。
+両ホストprofileと内部Git配布のAnsible差分検査はすべて0で、Terraformの
+`plan -detailed-exitcode` は `No changes` / exit 0だった。
 
 検証結果と操作ログはroot専用 `/root/.local/state/heteronetwork-master-only/` に保存する。
 再実行方法は [既存IaC記録](master-only-iac-2026-09-15.md) とモジュールREADMEを参照する。

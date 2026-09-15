@@ -24,6 +24,7 @@ def main():
     parser.add_argument('--node', default='uc-k8sp4')
     parser.add_argument('--peer', default='uc-k8sp5')
     parser.add_argument('--output')
+    parser.add_argument('--exercise-storage', action='store_true')
     args = parser.parse_args()
     node = get('node', args.node)
     assert any(c['type'] == 'Ready' and c['status'] == 'True'
@@ -34,7 +35,12 @@ def main():
     assert node['metadata']['labels']['networking.heteronetwork.io/public-ingress'] == 'true'
     assert 'node.kubernetes.io/exclude-from-external-load-balancers' not in node['metadata']['labels']
     assert not any(t['effect'] in ['NoSchedule', 'NoExecute'] for t in node['spec'].get('taints', []))
-    assert get('nodes.longhorn.io', args.node, '-n', 'longhorn-system')['spec']['allowScheduling']
+    storage_node = get('nodes.longhorn.io', args.node, '-n', 'longhorn-system')
+    assert storage_node['spec']['allowScheduling']
+    disks = storage_node['status'].get('diskStatus', {})
+    assert disks and any(all(any(c['type'] == kind and c['status'] == 'True'
+                                for c in d.get('conditions', [])) for kind in ['Ready', 'Schedulable'])
+                         for d in disks.values())
     app = get('application', 'standard-nodes', '-n', 'argocd')
     assert app['status']['sync']['status'] == 'Synced'
     assert app['status']['health']['status'] == 'Healthy'
@@ -108,6 +114,43 @@ def main():
                             'dns_and_service_http': True, 'direct_pod_http': True,
                             'kubernetes_service_tls_with_cluster_ca': True})
         report.update({'pod_network_e2e': results, 'passed': True})
+        if args.exercise_storage:
+            k(['create', '-f', '-'], {'apiVersion': 'v1', 'kind': 'PersistentVolumeClaim',
+                'metadata': {'name': 'data', 'namespace': ns},
+                'spec': {'accessModes': ['ReadWriteOnce'], 'storageClassName': 'longhorn-syouyu-local',
+                         'resources': {'requests': {'storage': '1Gi'}}}})
+            def storage_pod(name, command):
+                p = pod(name, args.node, 'busybox:1.37', ['sh', '-ec', command])
+                p['spec']['volumes'] = [{'name': 'data', 'persistentVolumeClaim': {'claimName': 'data'}}]
+                p['spec']['containers'][0]['volumeMounts'] = [{'name': 'data', 'mountPath': '/data'}]
+                p['spec']['terminationGracePeriodSeconds'] = 1
+                return p
+            def ready(name):
+                deadline = time.monotonic() + 300
+                while time.monotonic() < deadline:
+                    p = get('pod', name, '-n', ns)
+                    if any(c['type'] == 'Ready' and c['status'] == 'True'
+                           for c in p['status'].get('conditions', [])):
+                        assert p['spec']['nodeName'] == args.node
+                        return
+                    time.sleep(2)
+                raise RuntimeError('Storage Pod did not become Ready: ' + name)
+            k(['create', '-f', '-'], storage_pod('writer',
+                'echo hnn-standard-pvc-ok >/data/probe; sync; exec sleep 600'))
+            ready('writer')
+            claim = get('pvc', 'data', '-n', ns)
+            assert claim['status']['phase'] == 'Bound'
+            volume = claim['spec']['volumeName']
+            replicas = [r for r in get('replicas.longhorn.io', '-n', 'longhorn-system')['items']
+                        if r['spec']['volumeName'] == volume]
+            assert len(replicas) == 1 and replicas[0]['spec']['nodeID'] == args.node
+            k(['delete', 'pod', 'writer', '-n', ns, '--wait=true', '--timeout=20s'])
+            k(['create', '-f', '-'], storage_pod('reader',
+                'test "$(cat /data/probe)" = hnn-standard-pvc-ok; exec sleep 600'))
+            ready('reader')
+            assert k(['exec', 'reader', '-n', ns, '--', 'cat', '/data/probe']).stdout.strip() == 'hnn-standard-pvc-ok'
+            report['storage_e2e'] = {'pvc_bound': True, 'replica_node': args.node,
+                                     'write_sync_and_read_after_pod_recreation': True}
     finally:
         k(['delete', 'namespace', ns, '--wait=false'], check=False)
     if args.output:

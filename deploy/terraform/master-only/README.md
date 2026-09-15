@@ -112,7 +112,7 @@ DaemonSet sources also declare the dedicated-master exclusion directly.
 
 ```bash
 KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/verify-master-only.py --exercise-admission
-KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/verify-standard-node.py
+KUBECONFIG="$TF_VAR_kubeconfig_path" python3 scripts/verify-standard-node.py --exercise-storage
 python3 scripts/master-only-iac.py check
 python3 scripts/master-only-iac.py plan
 ```
@@ -123,6 +123,11 @@ binding rejection, DaemonSet mutation with existing OR affinity, essential
 network toleration restoration, and Node mutation preserving controller taints.
 It creates a temporary test namespace and removes it afterward. Browser owner
 login E2E and unrelated platform workload readiness are separate checks.
+The standard-node verifier also checks normal scheduler placement, DNS and
+Service traffic, cross-node Pod traffic, and Kubernetes Service TLS. With
+`--exercise-storage`, it provisions a 1 GiB Longhorn PVC on the standard node,
+writes and syncs data, recreates the consumer Pod, and verifies the persisted
+contents before deleting the temporary namespace and test volume.
 
 References: [Terraform provisioners](https://developer.hashicorp.com/terraform/language/provisioners),
 [Kubernetes state backend](https://developer.hashicorp.com/terraform/language/backend/kubernetes),
