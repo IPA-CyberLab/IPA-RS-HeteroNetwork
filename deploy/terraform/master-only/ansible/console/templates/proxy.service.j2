@@ -1,0 +1,14 @@
+[Unit]
+Description=HeteroNetwork canonical overlay console proxy
+Requires=heteronetwork-agent.service
+After=heteronetwork-agent.service
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/haproxy -Ws -f /etc/heteronetwork/console-proxy.cfg -p /run/heteronetwork-console-proxy.pid
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

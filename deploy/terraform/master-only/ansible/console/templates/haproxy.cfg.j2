@@ -1,0 +1,20 @@
+global
+  maxconn 256
+
+defaults
+  mode http
+  timeout connect 3s
+  timeout client 30s
+  timeout server 30s
+
+frontend heteronetwork_console
+  bind {{ hnn_console_ip }}:80
+  acl console_host hdr(host) -i console.heteronetwork.internal console.heteronetwork.internal:80
+  http-request deny unless console_host
+  http-request set-header Host 127.0.0.1:9780
+  http-request set-header Origin http://127.0.0.1:9780
+  http-response set-header X-HeteroNetwork-Console proxy
+  default_backend agent_console
+
+backend agent_console
+  server agent 127.0.0.1:9780 check

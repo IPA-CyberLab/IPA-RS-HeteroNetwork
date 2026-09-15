@@ -267,7 +267,7 @@
         name: '{{ item.split()[0] }}'
         enabled: false
         state: stopped
-      loop: "{{ hnn_units.stdout_lines | select('match', '^heteronetwork-(control-plane|gateway|signal|stun|relay|keycloak|postgres|console|public-services|kubeadm-autopilot)') | list }}"
+      loop: "{{ hnn_units.stdout_lines | select('match', '^heteronetwork-(control-plane|gateway|signal|stun|relay|keycloak|postgres|console|public-services|kubeadm-autopilot)') | reject('match', '^heteronetwork-console-proxy[.]service\\s') | list }}"
 
   handlers:
     - name: Restart networking agent

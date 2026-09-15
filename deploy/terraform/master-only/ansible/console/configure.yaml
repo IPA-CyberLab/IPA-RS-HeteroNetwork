@@ -1,0 +1,103 @@
+- name: Maintain both canonical overlay console ports on every gateway
+  hosts: master_only:standard:bootstrap:enrollment_issuer
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Read the registered gateway address privately
+      ansible.builtin.slurp:
+        src: /var/lib/heteronetwork/agent.json
+      register: hnn_console_identity
+      no_log: true
+    - name: Use the existing enrolled address
+      ansible.builtin.set_fact:
+        hnn_console_ip: '{{ (hnn_console_identity.content | b64decode | from_json).registered_node.vpn_ip }}'
+      no_log: true
+    - name: Require an overlay IPv4 address
+      ansible.builtin.assert:
+        that: hnn_console_ip is match('^10[.]250[.][0-9]{1,3}[.][0-9]{1,3}$')
+    - name: Require the proxy installed by Kubernetes preparation
+      ansible.builtin.stat:
+        path: /usr/sbin/haproxy
+      register: hnn_console_proxy_binary
+    - name: Verify the proxy binary is available
+      ansible.builtin.assert:
+        that: hnn_console_proxy_binary.stat.exists
+    - name: Create the Agent drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/heteronetwork-agent.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Declare the explicit overlay console port
+      ansible.builtin.copy:
+        src: '{{ hnn_repo_root }}/deploy/systemd/heteronetwork-agent-overlay-proxy.conf'
+        dest: /etc/systemd/system/heteronetwork-agent.service.d/90-console-listener.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart console Agent
+    - name: Start the compatibility proxy again after Agent restarts
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-agent.service.d/90-console-autostart.conf
+        content: |
+          [Unit]
+          Wants=heteronetwork-console-proxy.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart console Agent
+    - name: Declare the canonical portless console proxy
+      ansible.builtin.template:
+        src: haproxy.cfg.j2
+        dest: /etc/heteronetwork/console-proxy.cfg
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/haproxy -c -f %s
+      notify: Restart console proxy
+    - name: Declare the console proxy service
+      ansible.builtin.template:
+        src: proxy.service.j2
+        dest: /etc/systemd/system/heteronetwork-console-proxy.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart console proxy
+    - name: Apply the listener change before opening the compatibility port
+      ansible.builtin.meta: flush_handlers
+    - name: Keep both console services running across boots
+      ansible.builtin.systemd_service:
+        name: '{{ item }}'
+        daemon_reload: true
+        enabled: true
+        state: started
+      loop: [heteronetwork-agent.service, heteronetwork-console-proxy.service]
+    - name: Check both canonical listeners after applying configuration
+      ansible.builtin.uri:
+        url: 'http://{{ hnn_console_ip }}:{{ item }}/ui/'
+        headers:
+          Host: 'console.heteronetwork.internal:{{ item }}'
+        status_code: 200
+        timeout: 5
+      loop: [80, 9781]
+      register: hnn_console_check
+      until: hnn_console_check.status | default(0) == 200
+      retries: 12
+      delay: 2
+      when: not ansible_check_mode
+  handlers:
+    - name: Restart console Agent
+      ansible.builtin.systemd_service:
+        name: heteronetwork-agent.service
+        daemon_reload: true
+        state: restarted
+    - name: Restart console proxy
+      ansible.builtin.systemd_service:
+        name: heteronetwork-console-proxy.service
+        daemon_reload: true
+        state: restarted
