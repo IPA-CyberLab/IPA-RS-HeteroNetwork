@@ -75,7 +75,13 @@ def operator_proxy(work):
 
 def check(command, output):
     output.unlink(missing_ok=True)
-    run([*command, '--output', str(output)], timeout=1800)
+    try:
+        run([*command, '--output', str(output)], timeout=1800)
+    except subprocess.CalledProcessError as error:
+        log = output.with_suffix('.error.log')
+        log.write_text((error.stdout or '') + (error.stderr or ''))
+        log.chmod(0o600)
+        raise
     report = json.loads(output.read_text())
     if not (report.get('passed') is True or report.get('result') == 'passed'):
         raise RuntimeError('E2E command did not return a passing report')
@@ -171,17 +177,16 @@ def main():
         selected = [p for p in nodes if p['metadata']['name'] in [*masters, *standard, 'ichikawap1', 'uc-k8sp5']]
         gateways = [next(a['address'] for a in p['status']['addresses'] if a['type'] == 'InternalIP') for p in selected]
         assert len(gateways) == len(masters) + len(standard) + 2
-        with tempfile.TemporaryDirectory(prefix='onboarding-e2e-', dir=work) as temp:
-            directory = Path(temp)
-            with operator_proxy(work) as proxy:
-                console = check(['node', str(ROOT / 'scripts/verify-console-gateways.mjs'),
-                                 '--gateways', ','.join(gateways), '--proxy', proxy], directory / 'console.json')
-            dedicated = check(['python3', str(ROOT / 'scripts/verify-master-only.py'),
-                               '--exercise-admission'], directory / 'masters.json')
-            full = {name: check(['python3', str(ROOT / 'scripts/verify-standard-node.py'), '--node', name,
-                                '--exercise-storage', '--allow-onboarding-pending'], directory / (name + '.json'))
-                    for name in standard}
-            return {'console': console, 'dedicated_masters': dedicated, 'standard_nodes': full}
+        directory = Path(tempfile.mkdtemp(prefix='onboarding-e2e-', dir=work))
+        with operator_proxy(work) as proxy:
+            console = check(['node', str(ROOT / 'scripts/verify-console-gateways.mjs'),
+                             '--gateways', ','.join(gateways), '--proxy', proxy], directory / 'console.json')
+        dedicated = check(['python3', str(ROOT / 'scripts/verify-master-only.py'),
+                           '--exercise-admission'], directory / 'masters.json')
+        full = {name: check(['python3', str(ROOT / 'scripts/verify-standard-node.py'), '--node', name,
+                            '--exercise-storage', '--allow-onboarding-pending'], directory / (name + '.json'))
+                for name in standard}
+        return {'console': console, 'dedicated_masters': dedicated, 'standard_nodes': full}
 
     report = accept(work, masters, standard, revision, verify)
     print(json.dumps({'accepted': report['accepted'], 'nodes': report['nodes'], 'revision': revision}))

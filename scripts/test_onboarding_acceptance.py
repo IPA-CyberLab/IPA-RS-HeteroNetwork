@@ -58,6 +58,14 @@ class OnboardingGateTest(unittest.TestCase):
                 acceptance.check(['e2e'], output)
         self.assertFalse(output.exists())
 
+    def test_zero_exit_with_a_failed_report_is_rejected(self):
+        output = self.work / 'failed.json'
+        def misleading_success(command, **kwargs):
+            Path(command[-1]).write_text('{"passed":false}')
+            return subprocess.CompletedProcess(command, 0, '', '')
+        with patch.object(acceptance, 'run', misleading_success), self.assertRaises(RuntimeError):
+            acceptance.check(['e2e'], output)
+
     def test_passing_e2e_records_acceptance_then_releases_only_onboarding_taint(self):
         with patch.object(acceptance, 'kubectl', self.api):
             proof = acceptance.accept(self.work, ['master'], ['standard'], 'revision', lambda: {'passed': True})

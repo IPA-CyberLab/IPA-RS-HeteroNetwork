@@ -100,6 +100,22 @@
           [Install]
           WantedBy=multi-user.target
       notify: Restart Git source
+    - name: Create the Agent dependency directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/heteronetwork-agent.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Restore internal Git serving after Agent restarts
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-agent.service.d/91-gitops-source.conf
+        content: |
+          [Unit]
+          Wants=heteronetwork-gitops-source.service
+        owner: root
+        group: root
+        mode: '0644'
     - name: Enable the Git source
       ansible.builtin.systemd_service:
         name: heteronetwork-gitops-source.service

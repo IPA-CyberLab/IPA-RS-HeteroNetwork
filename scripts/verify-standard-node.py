@@ -90,7 +90,7 @@ def main():
             while time.monotonic() < deadline:
                 p = get('pod', 'quarantine-check', '-n', ns)
                 if any(c['type'] == 'PodScheduled' and c['status'] == 'False' and
-                       'heteronetwork.io/onboarding' in c.get('message', '')
+                       c.get('reason') == 'Unschedulable' and 'untolerated taint' in c.get('message', '')
                        for c in p['status'].get('conditions', [])):
                     assert not p['spec'].get('nodeName')
                     break

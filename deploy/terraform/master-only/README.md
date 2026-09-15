@@ -37,7 +37,7 @@ and Longhorn filesystem disk with 64 GiB reserved for the host OS.
 `terraform_data.onboarding_acceptance` runs live E2E after host configuration,
 console configuration and Argo synchronization. First registration of a
 standard host starts with `heteronetwork.io/onboarding=pending:NoSchedule`.
-Only the acceptance probe Pods tolerate this taint. The gate verifies both
+Acceptance probe Pods explicitly tolerate this taint. The gate verifies both
 console URLs through every real gateway in Chromium, including the public
 Keycloak credential form on 9781, dedicated-master placement rejection, and
 normal scheduling, DNS, cross-node traffic and PVC persistence on standard

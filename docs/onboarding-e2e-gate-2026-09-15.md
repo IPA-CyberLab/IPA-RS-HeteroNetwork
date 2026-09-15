@@ -15,6 +15,7 @@ DNSはクライアントが接続しているgateway自身のVPN IPを返すた�
 VPNアドレスの80はループバックAgentの9780へHAProxyで転送する。
 Hostをcanonicalコンソール名に制限し、既存AgentのHost/Origin検査に合わせて転送する。
 Agentからプロキシを `Wants` するため、Agent再起動後も80が戻る。
+内部Git配布もAgentから `Wants` し、Agent再起動後に配布daemonが停止したままになることを防ぐ。
 マスター専用構成は、このAgent用互換プロキシを停止対象から除外する。
 元の3台への通常Pod・ストレージPodの配置は禁止したままである。
 
@@ -25,7 +26,7 @@ Agentからプロキシを `Wants` するため、Agent再起動後も80が戻�
 ホストの作り直し、コンソール構成変更、検証コード変更、Git配布revision変更で再実行する。
 検証にはNative署名登録とKubernetes参加が必要なので、それらを先に完了させる。
 標準ノードは初回Kubernetes登録時から `heteronetwork.io/onboarding=pending:NoSchedule` を持ち、
-検証中に通常Podの新規配置を止める。検証Podだけがこのtaintを明示的に許容する。
+検証中に通常スケジューラーからの通常Podの新規配置を止める。検証Podにはこのtaintの明示的な許容を追加する。
 再検証時は既存Podを終了させない。専用マスターは既存の恒久的な隔離を保持する。
 
 次の実検証が、配布されたcandidate Git revisionで全部通ることを要求する。
@@ -54,6 +55,10 @@ IaC wrapperの `check` / `plan` はこの証跡と実Node状態の不一致も�
 ユーザー名・パスワードフォームを開けた。JavaScriptエラーは0件だった。
 誤acceptを防ぐ失敗系テストでは、E2E失敗、検証中のNode再登録、古い成功ログ、
 全検証成功後だけtaintを除去する順序を検証した。
+実環境でも配置拒否の判定が失敗した際、apply失敗・`failed` 注釈・quarantine保持を確認した。
+スケジューラーの集約された拒否文にはtaint名が含まれなかったため、Node上の実taint、
+対象ノードを限定するselector、`Unschedulable` とtaint拒否の理由を照合する判定へ修正した。
+失敗した検証のstderrと途中の証跡もroot専用ディレクトリへ残す。
 
 ブラウザ検証は実gatewayへネットワーク要求を転送し、Host/Originと正規URLを保持する。
 レスポンスのstatus・header・bodyにはfixtureや差し替えデータを使わない。
