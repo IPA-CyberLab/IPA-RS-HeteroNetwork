@@ -24,3 +24,11 @@ metadata:
     argocd.argoproj.io/sync-wave: '0'
 spec:
   allowScheduling: true
+  disks:
+    iac-default-disk:
+      path: /var/lib/longhorn
+      diskType: filesystem
+      allowScheduling: true
+      evictionRequested: false
+      storageReserved: 68719476736
+      tags: []

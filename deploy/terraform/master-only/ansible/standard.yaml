@@ -36,6 +36,41 @@
         checksum_algorithm: sha256
       loop: '{{ hnn_native_binary_sha256 | dict2items }}'
       register: hnn_standard_binaries
+    - name: Inspect multipath storage before configuring Longhorn
+      ansible.builtin.command: multipath -ll
+      register: hnn_standard_multipath
+      changed_when: false
+      check_mode: false
+    - name: Require no multipath devices on this NVMe host
+      ansible.builtin.assert:
+        that: hnn_standard_multipath.stdout | trim | length == 0
+    - name: Disable unused multipath for Longhorn volumes
+      ansible.builtin.systemd_service:
+        name: '{{ item }}'
+        state: stopped
+        enabled: false
+      loop: [multipathd.socket, multipathd.service]
+    - name: Persist Longhorn encryption module support
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/heteronetwork-longhorn.conf
+        content: "dm_crypt\n"
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Inspect Longhorn encryption module
+      ansible.builtin.stat:
+        path: /sys/module/dm_crypt
+      register: hnn_standard_dm_crypt
+    - name: Load the required Longhorn encryption module
+      ansible.builtin.command: modprobe dm_crypt
+      when: not hnn_standard_dm_crypt.stat.exists and not ansible_check_mode
+    - name: Create the declared Longhorn disk path
+      ansible.builtin.file:
+        path: /var/lib/longhorn
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
     - name: Install pinned networking binaries
       ansible.builtin.unarchive:
         src: '{{ hnn_work_dir }}/native-bin.tar.gz'

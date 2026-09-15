@@ -48,5 +48,7 @@ for name in standard:
     standard_resources.append({'apiVersion':'longhorn.io/v1beta2','kind':'Node',
         'metadata':{'name':name,'namespace':'longhorn-system','annotations':{
             'argocd.argoproj.io/sync-options':'Prune=false,Delete=false','argocd.argoproj.io/sync-wave':'0'}},
-        'spec':{'allowScheduling':True}})
+        'spec':{'allowScheduling':True,'disks':{'iac-default-disk':{
+            'path':'/var/lib/longhorn','diskType':'filesystem','allowScheduling':True,
+            'evictionRequested':False,'storageReserved':68719476736,'tags':[]}}}})
 (standard_dest/'nodes.yaml').write_text(yaml.safe_dump_all(standard_resources,sort_keys=False))
