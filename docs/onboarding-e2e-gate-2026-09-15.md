@@ -45,6 +45,8 @@ Agentからプロキシを `Wants` するため、Agent再起動後も80が戻�
 注釈を `failed` としてquarantineを保持する。
 判定はIaC完了状態とKubernetesの配置許可を制御し、Native登録プロトコル自体を変更しない。
 検証中のNode UID変更と古い成功ログによる誤acceptも拒否する。
+accept注釈の更新にも検証済みNode UIDを指定し、更新直前のNode置き換えをAPIで拒否する。
+Argoのrevision待機前にhard refreshを要求し、Gitキャッシュ待ちで誤って時間切れになることを防ぐ。
 root専用 `onboarding-acceptance.json` に実検証結果とNode UIDを保存する。
 IaC wrapperの `check` / `plan` はこの証跡と実Node状態の不一致も検出する。
 
@@ -59,6 +61,9 @@ IaC wrapperの `check` / `plan` はこの証跡と実Node状態の不一致も�
 スケジューラーの集約された拒否文にはtaint名が含まれなかったため、Node上の実taint、
 対象ノードを限定するselector、`Unschedulable` とtaint拒否の理由を照合する判定へ修正した。
 失敗した検証のstderrと途中の証跡もroot専用ディレクトリへ残す。
+修正後の自動判定は実環境で成功し、4台の `accepted` とuc-k8sp4のquarantine解除を確認した。
+全gatewayのブラウザ検証、専用マスターの実placement拒否、quarantine中の通常Pod配置拒否、
+検証Pod通信、実PVCの書き込みとPod再作成後の読み出しがすべて成功した。
 
 ブラウザ検証は実gatewayへネットワーク要求を転送し、Host/Originと正規URLを保持する。
 レスポンスのstatus・header・bodyにはfixtureや差し替えデータを使わない。

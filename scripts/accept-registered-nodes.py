@@ -25,10 +25,12 @@ def kubectl(*args):
     return run(['kubectl', '--request-timeout=15s', *args], timeout=30)
 
 
-def mark(name, state, revision='', checked_at=''):
+def mark(name, state, revision='', checked_at='', uid=None):
     patch = {'metadata': {'annotations': {STATUS: state,
         'heteronetwork.io/onboarding-e2e-revision': revision or None,
         'heteronetwork.io/onboarding-e2e-checked-at': checked_at or None}}}
+    if uid is not None:
+        patch['metadata']['uid'] = uid
     kubectl('patch', 'node', name, '--type=merge', '-p', json.dumps(patch))
 
 
@@ -97,7 +99,7 @@ def accept(work, masters, standard, revision, verify):
         report['node_uids'] = {name: json.loads(kubectl('get', 'node', name, '-o', 'json').stdout)['metadata']['uid']
                                for name in report['nodes']}
         for name in report['nodes']:
-            mark(name, 'pending')
+            mark(name, 'pending', uid=report['node_uids'][name])
         for name in standard:
             quarantine(name)
         report['e2e'] = verify()
@@ -106,7 +108,7 @@ def accept(work, masters, standard, revision, verify):
                 raise RuntimeError('Node identity changed during onboarding E2E')
         checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         for name in report['nodes']:
-            mark(name, 'accepted', revision, checked_at)
+            mark(name, 'accepted', revision, checked_at, uid=report['node_uids'][name])
         for name in standard:
             kubectl('taint', 'node', name, TAINT + ':NoSchedule-')
         report.update(accepted=True, finished_at_utc=checked_at)
@@ -164,6 +166,9 @@ def main():
         raise SystemExit(0 if valid else 2)
 
     def verify():
+        for name in ['control-plane-only', 'standard-nodes']:
+            kubectl('annotate', 'application', name, '-n', 'argocd',
+                    'argocd.argoproj.io/refresh=hard', '--overwrite')
         for _ in range(90):
             apps = [json.loads(kubectl('get', 'application', name, '-n', 'argocd', '-o', 'json').stdout)
                     for name in ['control-plane-only', 'standard-nodes']]
