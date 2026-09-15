@@ -23,6 +23,7 @@ def main():
         if not env.get(key):
             parser.error(key+' is required')
     env['KUBE_CONFIG_PATH']=env['TF_VAR_kubeconfig_path']
+    env['KUBECONFIG']=env['TF_VAR_kubeconfig_path']
     env.setdefault('HNN_IAC_BECOME_PASSWORD',getpass.getpass('sudo password: ') if not env.get('HNN_IAC_BECOME_PASSWORD') else env['HNN_IAC_BECOME_PASSWORD'])
     work=Path(env['TF_VAR_work_dir']).expanduser().resolve()
     work.mkdir(parents=True,exist_ok=True)
