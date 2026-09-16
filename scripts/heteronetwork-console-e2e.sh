@@ -30,6 +30,12 @@ curl_common=(
   --connect-timeout 3
   --max-time 15
 )
+ui_curl_common=(
+  --silent
+  --show-error
+  --connect-timeout 3
+  --max-time 3
+)
 
 probe_console_origin() {
   local resolve_arg="${1:-}" label="${2:-DNS}"
@@ -40,14 +46,14 @@ probe_console_origin() {
   local headers="$work_dir/root-${label}.headers"
   local body="$work_dir/root-${label}.body"
   local code
-  code="$(curl "${curl_common[@]}" "${resolve[@]}" \
+  code="$(curl "${ui_curl_common[@]}" "${resolve[@]}" \
     --dump-header "$headers" --output "$body" --write-out '%{http_code}' \
     "$console_url/")" || fail "$label console root request failed"
   [[ "$code" == 307 ]] || fail "$label console root returned HTTP $code"
   tr -d '\r' <"$headers" | grep -Fqix 'location: /ui/' \
     || fail "$label console root did not redirect to /ui/"
 
-  code="$(curl "${curl_common[@]}" "${resolve[@]}" \
+  code="$(curl "${ui_curl_common[@]}" "${resolve[@]}" \
     --output "$body" --write-out '%{http_code}' "$console_url/ui/")" \
     || fail "$label console UI request failed"
   [[ "$code" == 200 ]] || fail "$label console UI returned HTTP $code"

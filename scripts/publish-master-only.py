@@ -15,6 +15,7 @@ def files():
     paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/master-only-iac.py',
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/publish-master-only.py',
            'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',
+           'scripts/heteronetwork-console-e2e.sh',
            'scripts/verify-gpu-runtime.py',
            'docs/master-only-iac-2026-09-15.md',
            'docs/standard-node-setup-2026-09-15.md',
