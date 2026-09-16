@@ -163,7 +163,7 @@ def proof_is_current(work, names, standard, revision):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--work-dir', required=True)
-    parser.add_argument('--branch', default='codex/master-only-iac-20260915')
+    parser.add_argument('--branch', default='codex/flash-gpu-iac-20260916')
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     work = Path(args.work_dir).expanduser().resolve()

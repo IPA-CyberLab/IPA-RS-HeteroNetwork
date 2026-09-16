@@ -1,0 +1,341 @@
+- name: Configure eligible Kubernetes GPU workers
+  hosts: gpu_candidates
+  gather_facts: true
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_nvidia_driver_package: nvidia-driver-580
+    hnn_nvidia_driver_version: 580.178.04-0ubuntu0.24.04.1
+    hnn_nvidia_toolkit_version: 1.20.0-1
+    hnn_gpu_present_label: nvidia.com/gpu.present
+    hnn_gpu_ready_label: flash.heterocloud.io/gpu-ready
+    hnn_gpu_count_label: flash.heterocloud.io/gpu-count
+  tasks:
+    - name: Count physical NVIDIA display and 3D controllers
+      ansible.builtin.shell: |
+        set -euo pipefail
+        count=0
+        for device in /sys/bus/pci/devices/*; do
+          test -r "$device/vendor" || continue
+          test "$(cat "$device/vendor")" = 0x10de || continue
+          class="$(cat "$device/class")"
+          case "$class" in
+            0x0300*|0x0302*) count=$((count + 1)) ;;
+          esac
+        done
+        printf '%s\n' "$count"
+      args:
+        executable: /bin/bash
+      register: hnn_gpu_detected
+      changed_when: false
+      check_mode: false
+
+    - name: Detect the distribution-recommended NVIDIA driver branch
+      ansible.builtin.command: ubuntu-drivers devices
+      register: hnn_gpu_driver_recommendation
+      failed_when: false
+      changed_when: false
+      check_mode: false
+
+    - name: Select supported automatic GPU hosts
+      ansible.builtin.set_fact:
+        hnn_gpu_count: "{{ hnn_gpu_detected.stdout | int }}"
+        hnn_gpu_eligible: >-
+          {{ (hnn_gpu_detected.stdout | int) > 0 and
+             ansible_distribution == 'Ubuntu' and
+             ansible_distribution_version is version('24.04', '>=') and
+             ansible_architecture == 'x86_64' and
+             'nvidia-driver-580 - distro non-free recommended' in hnn_gpu_driver_recommendation.stdout }}
+
+    - name: Enforce explicitly declared GPU inventory
+      ansible.builtin.assert:
+        that:
+          - hnn_gpu_eligible
+          - hnn_gpu_count | int == gpu_expected_count | int
+        fail_msg: The declared GPU host no longer matches its physical inventory
+      when: gpu_expected_count is defined
+
+    - name: Read current Kubernetes GPU labels
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - node
+          - "{{ inventory_hostname }}"
+          - -o
+          - json
+      delegate_to: uc-k8sp5
+      register: hnn_gpu_node
+      changed_when: false
+      check_mode: false
+
+    - name: Report stale labels on ineligible hosts as drift
+      ansible.builtin.debug:
+        msg: Ineligible hosts must not advertise GPU capacity
+      changed_when: >-
+        not hnn_gpu_eligible and
+        (((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_present_label] | default('')) != '' or
+         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_ready_label] | default('')) != '' or
+         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_count_label] | default('')) != '')
+
+    - name: Remove GPU scheduling labels from ineligible hosts
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - label
+          - node
+          - "{{ inventory_hostname }}"
+          - "{{ item }}-"
+      delegate_to: uc-k8sp5
+      changed_when: true
+      loop:
+        - "{{ hnn_gpu_present_label }}"
+        - "{{ hnn_gpu_ready_label }}"
+        - "{{ hnn_gpu_count_label }}"
+      when: >-
+        not ansible_check_mode and not hnn_gpu_eligible and
+        ((hnn_gpu_node.stdout | from_json).metadata.labels[item] | default('')) != ''
+
+    - name: Require the declared NVIDIA driver package
+      ansible.builtin.command:
+        argv: [apt-cache, policy, "{{ hnn_nvidia_driver_package }}"]
+      register: hnn_gpu_driver_policy
+      changed_when: false
+      check_mode: false
+      when: hnn_gpu_eligible
+
+    - name: Refuse an unsupported or unavailable driver
+      ansible.builtin.assert:
+        that:
+          - "('Candidate: ' + hnn_nvidia_driver_version) in hnn_gpu_driver_policy.stdout"
+        fail_msg: The pinned NVIDIA driver is unavailable on this host
+      when: hnn_gpu_eligible
+
+    - name: Wait for concurrent OS package operations
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/90heteronetwork-lock-timeout
+        content: 'DPkg::Lock::Timeout "300";'
+        owner: root
+        group: root
+        mode: '0644'
+      when: hnn_gpu_eligible
+
+    - name: Disable nouveau before loading the proprietary driver
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/heterocloud-nvidia.conf
+        content: |
+          blacklist nouveau
+          options nouveau modeset=0
+        owner: root
+        group: root
+        mode: '0644'
+      register: hnn_gpu_nouveau_policy
+      when: hnn_gpu_eligible
+
+    - name: Install the pinned NVIDIA driver and matching headers
+      ansible.builtin.apt:
+        name:
+          - "linux-headers-{{ ansible_kernel }}"
+          - "{{ hnn_nvidia_driver_package }}={{ hnn_nvidia_driver_version }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      register: hnn_gpu_driver_install
+      when: hnn_gpu_eligible
+
+    - name: Inspect the loaded NVIDIA kernel driver
+      ansible.builtin.stat:
+        path: /proc/driver/nvidia/version
+      register: hnn_gpu_driver_loaded
+      when: hnn_gpu_eligible
+
+    - name: Rebuild initramfs after changing the nouveau policy
+      ansible.builtin.command: update-initramfs -u
+      changed_when: true
+      when: hnn_gpu_eligible and hnn_gpu_nouveau_policy.changed and not ansible_check_mode
+
+    - name: Cordon the host before a required driver reboot
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, cordon, "{{ inventory_hostname }}"]
+      delegate_to: uc-k8sp5
+      register: hnn_gpu_cordon
+      changed_when: "'already cordoned' not in hnn_gpu_cordon.stdout"
+      when: >-
+        hnn_gpu_eligible and not ansible_check_mode and
+        (hnn_gpu_driver_install.changed or hnn_gpu_nouveau_policy.changed or not hnn_gpu_driver_loaded.stat.exists)
+
+    - name: Drain and restart a host that needs the NVIDIA kernel driver
+      when: >-
+        hnn_gpu_eligible and not ansible_check_mode and
+        (hnn_gpu_driver_install.changed or hnn_gpu_nouveau_policy.changed or not hnn_gpu_driver_loaded.stat.exists)
+      block:
+        - name: Drain movable workloads before reboot
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - drain
+              - "{{ inventory_hostname }}"
+              - --ignore-daemonsets
+              - --delete-emptydir-data
+              - --disable-eviction
+              - --force
+              - --grace-period=60
+              - --timeout=10m
+          delegate_to: uc-k8sp5
+          changed_when: true
+
+        - name: Reboot into the NVIDIA kernel driver
+          ansible.builtin.reboot:
+            reboot_timeout: 900
+            post_reboot_delay: 15
+      always:
+        - name: Restore scheduling after the driver reboot attempt
+          ansible.builtin.command:
+            argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, uncordon, "{{ inventory_hostname }}"]
+          delegate_to: uc-k8sp5
+          changed_when: true
+
+    - name: Query GPUs through the installed driver
+      ansible.builtin.command:
+        argv: [nvidia-smi, --query-gpu=uuid, --format=csv,noheader]
+      register: hnn_gpu_smi
+      changed_when: false
+      check_mode: false
+      when: hnn_gpu_eligible and not ansible_check_mode
+
+    - name: Require every physical GPU to be visible after reboot
+      ansible.builtin.assert:
+        that:
+          - hnn_gpu_smi.stdout_lines | length == hnn_gpu_count | int
+          - hnn_gpu_smi.stdout_lines | unique | length == hnn_gpu_count | int
+      when: hnn_gpu_eligible and not ansible_check_mode
+
+    - name: Install NVIDIA repository prerequisites
+      ansible.builtin.apt:
+        name: [ca-certificates, curl, gnupg2]
+        state: present
+      when: hnn_gpu_eligible
+
+    - name: Download the pinned NVIDIA repository signing key
+      ansible.builtin.get_url:
+        url: https://nvidia.github.io/libnvidia-container/gpgkey
+        dest: /usr/share/keyrings/nvidia-container-toolkit-keyring.asc
+        checksum: sha256:c880576d6cf75a48e5027a871bac70fd0421ab07d2b55f30877b21f1c87959c9
+        owner: root
+        group: root
+        mode: '0644'
+      when: hnn_gpu_eligible
+
+    - name: Convert the NVIDIA signing key for apt
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --dearmor
+          - --output
+          - /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+          - /usr/share/keyrings/nvidia-container-toolkit-keyring.asc
+      args:
+        creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      when: hnn_gpu_eligible
+
+    - name: Declare the stable NVIDIA container toolkit repository
+      ansible.builtin.apt_repository:
+        repo: deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH) /
+        filename: nvidia-container-toolkit
+        state: present
+        update_cache: true
+      when: hnn_gpu_eligible
+
+    - name: Install the pinned NVIDIA container toolkit
+      ansible.builtin.apt:
+        name:
+          - "nvidia-container-toolkit={{ hnn_nvidia_toolkit_version }}"
+          - "nvidia-container-toolkit-base={{ hnn_nvidia_toolkit_version }}"
+          - "libnvidia-container-tools={{ hnn_nvidia_toolkit_version }}"
+          - "libnvidia-container1={{ hnn_nvidia_toolkit_version }}"
+        state: present
+        update_cache: true
+      when: hnn_gpu_eligible and not ansible_check_mode
+
+    - name: Read the installed NVIDIA container toolkit version
+      ansible.builtin.command:
+        argv: [dpkg-query, --show, '--showformat=${Version}', nvidia-container-toolkit]
+      register: hnn_gpu_toolkit_installed
+      failed_when: false
+      changed_when: false
+      check_mode: false
+      when: hnn_gpu_eligible
+
+    - name: Report NVIDIA container toolkit version drift
+      ansible.builtin.debug:
+        msg: The NVIDIA container toolkit must match the pinned version
+      changed_when: >-
+        hnn_gpu_eligible and
+        hnn_gpu_toolkit_installed.stdout != hnn_nvidia_toolkit_version
+
+    - name: Configure the NVIDIA containerd runtime
+      ansible.builtin.command:
+        argv: [nvidia-ctk, runtime, configure, --runtime=containerd]
+      register: hnn_gpu_containerd_configuration
+      changed_when: true
+      when: hnn_gpu_eligible and not ansible_check_mode
+
+    - name: Restart containerd with the NVIDIA runtime
+      ansible.builtin.systemd_service:
+        name: containerd.service
+        state: restarted
+      when: hnn_gpu_eligible and not ansible_check_mode
+
+    - name: Verify the NVIDIA runtime handler in containerd
+      ansible.builtin.shell: |
+        set -euo pipefail
+        containerd config dump | grep -F 'containerd.runtimes.nvidia]' >/dev/null
+        test -x /usr/bin/nvidia-container-runtime
+      args:
+        executable: /bin/bash
+      changed_when: false
+      check_mode: false
+      when: hnn_gpu_eligible and not ansible_check_mode
+
+    - name: Report Kubernetes GPU-label drift
+      ansible.builtin.debug:
+        msg: Eligible GPU labels must match the verified physical devices
+      changed_when: >-
+        hnn_gpu_eligible and
+        (((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_present_label] | default('')) != 'true' or
+         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_count_label] | default('')) != (hnn_gpu_count | string))
+
+    - name: Publish verified hardware and quarantine it until the cluster smoke test
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - label
+          - node
+          - "{{ inventory_hostname }}"
+          - "{{ hnn_gpu_present_label }}=true"
+          - "{{ hnn_gpu_count_label }}={{ hnn_gpu_count }}"
+          - --overwrite
+      delegate_to: uc-k8sp5
+      changed_when: true
+      when: hnn_gpu_eligible and not ansible_check_mode
+
+    - name: Quarantine a reconfigured GPU host until the cluster smoke test
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - label
+          - node
+          - "{{ inventory_hostname }}"
+          - "{{ hnn_gpu_ready_label }}-"
+      delegate_to: uc-k8sp5
+      changed_when: true
+      when: >-
+        hnn_gpu_eligible and not ansible_check_mode and
+        ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_ready_label] | default('')) != ''

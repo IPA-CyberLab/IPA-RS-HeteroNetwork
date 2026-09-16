@@ -18,6 +18,7 @@ spec:
     - https://charts.bitnami.com/bitnami
     - https://helm.goharbor.io
     - https://kubernetes-sigs.github.io/metrics-server/
+    - https://nvidia.github.io/k8s-device-plugin
     - quay.io/jetstack/charts
   destinations:
     - namespace: cert-manager
@@ -43,6 +44,8 @@ spec:
     - namespace: longhorn-system
       server: https://kubernetes.default.svc
     - namespace: heterocloud-registry
+      server: https://kubernetes.default.svc
+    - namespace: nvidia-device-plugin
       server: https://kubernetes.default.svc
   clusterResourceWhitelist:
     - group: "*"

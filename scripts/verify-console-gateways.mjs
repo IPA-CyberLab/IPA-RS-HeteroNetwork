@@ -12,18 +12,41 @@ const gateways = values.gateways?.split(',');
 if (!gateways?.length || gateways.some(ip => !/^10\.250\.\d{1,3}\.\d{1,3}$/.test(ip))) {
   throw new Error('--gateways must contain registered overlay IPv4 addresses');
 }
-const report = { started_at_utc: new Date().toISOString(), result: 'failed', gateways: [], errors: [] };
+const UI_OPEN_BUDGET_MS = 3_000;
+const report = { started_at_utc: new Date().toISOString(), result: 'failed', canonical: null,
+  gateways: [], errors: [] };
 let browser;
 try {
   browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'],
     ...(values.proxy ? { proxy: { server: values.proxy } } : {}) });
+  // Exercise the client-visible split-DNS path before pinning each request to
+  // a gateway. Direct-IP checks alone cannot detect a broken canonical name.
+  {
+    const context = await browser.newContext({ serviceWorkers: 'block' });
+    try {
+      const page = await context.newPage();
+      page.on('pageerror', error => report.errors.push(error.message));
+      const openedAt = performance.now();
+      const main = await page.goto('http://console.heteronetwork.internal:9781/ui/', {
+        waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+      });
+      const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
+      await page.getByRole('button', { name: 'Keycloakでログイン' }).waitFor({ timeout: remaining });
+      const openMs = Math.ceil(performance.now() - openedAt);
+      if (main.status() !== 200) throw new Error(`canonical console UI HTTP ${main.status()}`);
+      if (openMs > UI_OPEN_BUDGET_MS) throw new Error(`canonical console UI opened in ${openMs} ms`);
+      report.canonical = { port: 9781, ui_http: 200, login_button_rendered: true, open_ms: openMs };
+    } finally {
+      await context.close();
+    }
+  }
   for (const gateway of gateways) {
     for (const port of [80, 9781]) {
       const origin = `http://console.heteronetwork.internal${port === 80 ? '' : ':9781'}`;
       const context = await browser.newContext({ serviceWorkers: 'block' });
       try {
         const page = await context.newPage();
-        page.setDefaultTimeout(45_000);
+        page.setDefaultTimeout(15_000);
         page.on('pageerror', error => report.errors.push(error.message));
         // This selects the network destination only. Status, headers and body
         // come unchanged from the actual server; no fixture response is used.
@@ -35,9 +58,17 @@ try {
             headers: { ...route.request().headers(), host: original.host } });
           await route.fulfill({ response });
         });
-        const main = await page.goto(`${origin}/ui/`, { waitUntil: 'networkidle' });
+        const openedAt = performance.now();
+        const main = await page.goto(`${origin}/ui/`, {
+          waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+        });
         if (main.status() !== 200) throw new Error(`${gateway}:${port} UI HTTP ${main.status()}`);
-        await page.getByRole('button', { name: 'Keycloakでログイン' }).waitFor();
+        const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
+        await page.getByRole('button', { name: 'Keycloakでログイン' }).waitFor({ timeout: remaining });
+        const openMs = Math.ceil(performance.now() - openedAt);
+        if (openMs > UI_OPEN_BUDGET_MS) {
+          throw new Error(`${gateway}:${port} console UI opened in ${openMs} ms`);
+        }
         const configuration = await page.evaluate(async () => {
           const response = await fetch('/ui/config');
           return { status: response.status, config: await response.json() };
@@ -48,7 +79,8 @@ try {
             config.device_verification_origin !== 'https://heterocloud.mizuame.app') {
           throw new Error(`${gateway}:${port} console authentication configuration is invalid`);
         }
-        const row = { gateway, port, ui_http: 200, config_http: 200, login_button_rendered: true };
+        const row = { gateway, port, ui_http: 200, config_http: 200,
+          login_button_rendered: true, open_ms: openMs };
         if (port === 80) {
           // The Windows client uses the gateway IP without overriding Host.
           // A failure here makes it repeatedly abandon an otherwise healthy gateway.
@@ -67,7 +99,7 @@ try {
           const opened = page.waitForEvent('popup');
           await page.getByRole('button', { name: 'Keycloakでログイン' }).click();
           const popup = await opened;
-          popup.setDefaultTimeout(45_000);
+          popup.setDefaultTimeout(15_000);
           popup.on('pageerror', error => report.errors.push(error.message));
           await popup.locator('input[name="username"]').waitFor();
           await popup.locator('input[name="password"]').waitFor();

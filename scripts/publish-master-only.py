@@ -15,20 +15,23 @@ def files():
     paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/master-only-iac.py',
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/publish-master-only.py',
            'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',
+           'scripts/verify-gpu-runtime.py',
            'docs/master-only-iac-2026-09-15.md',
            'docs/standard-node-setup-2026-09-15.md',
            'docs/onboarding-e2e-gate-2026-09-15.md',
+           'docs/flash-gpu-iac-2026-09-16.md',
            '.github/workflows/infrastructure-validation.yml',
            'deploy/systemd/heteronetwork-agent-overlay-proxy.conf',
            'deploy/kubernetes/control-plane-only-policy.yaml',
            'deploy/environments/heteronet/values.yaml','deploy/gitops/project.yaml']
     paths += ['deploy/gitops/applications/'+n+'.yaml' for n in
-              ['cluster-dns','network-policy-engine','longhorn-prerequisites','flash-web','heterocloud-edge']]
+              ['cluster-dns','network-policy-engine','longhorn-prerequisites','flash-web','heterocloud-edge',
+               'heterocloud','heterocloud-flash']]
     paths += ['deploy/gitops/cluster-dns/nodelocaldns.yaml','deploy/gitops/cluster-dns/keycloak-ha-connector.yaml',
               'deploy/gitops/cluster-dns/postgres-ha-connector.yaml','deploy/gitops/cluster-dns/service-route.yaml',
               'deploy/gitops/network-policy-engine/kube-router.yaml','deploy/gitops/longhorn-prerequisites/node-prerequisites.yaml',
               'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml']
-    for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes']:
+    for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime']:
         for p in (ROOT/directory).rglob('*'):
             if not p.is_file() or '.terraform' in p.parts or '__pycache__' in p.parts: continue
             if p.suffix in ['.tf','.py','.yaml','.j2','.json','.md'] or p.name=='.terraform.lock.hcl':
@@ -39,7 +42,7 @@ def files():
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--work-dir',required=True)
-    parser.add_argument('--branch',default='codex/master-only-iac-20260915')
+    parser.add_argument('--branch',default='codex/flash-gpu-iac-20260916')
     args=parser.parse_args()
     work=Path(args.work_dir).expanduser().resolve()
     work.mkdir(parents=True,exist_ok=True)

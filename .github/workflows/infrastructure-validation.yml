@@ -8,6 +8,7 @@ on:
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/verify-console-gateways.mjs'
       - 'scripts/verify-standard-node.py'
+      - 'scripts/verify-gpu-runtime.py'
       - '.github/workflows/infrastructure-validation.yml'
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/verify-console-gateways.mjs'
       - 'scripts/verify-standard-node.py'
+      - 'scripts/verify-gpu-runtime.py'
       - '.github/workflows/infrastructure-validation.yml'
 
 permissions:
@@ -34,4 +36,4 @@ jobs:
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs
-          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-master-only.py scripts/verify-standard-node.py
+          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py

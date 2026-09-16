@@ -38,6 +38,8 @@ Agentからプロキシを `Wants` するため、Agent再起動後も80が戻�
 - [ブラウザ検証](../scripts/verify-console-gateways.mjs)：全gatewayの80と9781の
   正規URL、UIと設定のHTTP 200、JavaScriptエラーなし。9781から実際にDevice Loginを
   開き、公開Keycloakのユーザー名・パスワードフォームと送信先を確認する。
+  canonical split-DNS URLと各gatewayのUIは、遷移開始からログインボタン表示まで3000ms以内を
+  必須とし、名前解決失敗、接続拒否、タイムアウト、3000ms超過をすべて不合格にする。
   全gatewayのIP直指定health probeもHTTP 200・`status: ok`を必須とする。
 - [マスター検証](../scripts/verify-master-only.py)：Ready、各台6個の必須Ready Pod、
   通常Pod・bindingの拒否、DaemonSet隔離とネットワーク用tolerationの復元。
