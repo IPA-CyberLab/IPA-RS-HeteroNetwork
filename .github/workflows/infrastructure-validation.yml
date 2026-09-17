@@ -51,14 +51,15 @@ jobs:
     concurrency:
       group: heteronet-live-overlay-browser-e2e
       cancel-in-progress: false
-    env:
-      E2E_ROOT: ${{ runner.temp }}/heteronet-e2e
-      E2E_VENV: ${{ runner.temp }}/heteronet-e2e-venv
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
+      - name: Configure private runner paths
+        run: |
+          echo "E2E_ROOT=$RUNNER_TEMP/heteronet-e2e" >> "$GITHUB_ENV"
+          echo "E2E_VENV=$RUNNER_TEMP/heteronet-e2e-venv" >> "$GITHUB_ENV"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/playwright-browsers" >> "$GITHUB_ENV"
       - name: Install live E2E dependencies
         run: |
           set -euo pipefail
