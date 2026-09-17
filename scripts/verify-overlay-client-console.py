@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 ROOT = Path(__file__).resolve().parents[1]
 CONSOLE_CHECK = ROOT / "scripts/verify-console-gateways.mjs"
+OVERLAY_MTU = 1280
 
 
 def b64url(value):
@@ -210,7 +211,7 @@ def configure_tunnel(work, profile, peer, endpoint, private_key):
             raise RuntimeError("control plane returned an unsafe client address")
         run_checked("wg", "setconf", name, str(config))
         run_checked("ip", "address", "add", f"{client_ip}/32", "dev", name)
-        run_checked("ip", "link", "set", "dev", name, "mtu", "1420", "up")
+        run_checked("ip", "link", "set", "dev", name, "mtu", str(OVERLAY_MTU), "up")
         for route in routes:
             run_checked("ip", "route", "add", route, "dev", name, "src", str(client_ip))
         return name, process, log, routes
@@ -318,11 +319,15 @@ def main():
         name, process, log, routes = configure_tunnel(work, profile, peer, endpoint, private_key)
         tunnel = (name, process, log)
         handshake_at = wait_for_handshake(name, peer["vpn_ip"])
+        report.update({
+            "wireguard_handshake_at": handshake_at,
+            "wireguard_mtu": OVERLAY_MTU,
+            "routes": routes,
+        })
+        write_report(args.output, report)
         console = browser_check(work, peer["vpn_ip"], args.gateways, args.output)
         report.update({
             "result": "passed",
-            "wireguard_handshake_at": handshake_at,
-            "routes": routes,
             "console": console,
         })
     except Exception as error:

@@ -29,6 +29,7 @@ public sealed class WindowsTunnelManager
     private const string ServiceDescription =
         "Gateway-only WireGuard tunnel managed by HeteroNetwork.";
     private const string NrptComment = "HeteroNetwork managed split DNS";
+    private const int OverlayMtu = 1280;
     private static readonly TimeSpan ProbeBudget = TimeSpan.FromSeconds(3);
     private readonly ClientSessionStore sessionStore;
 
@@ -241,6 +242,7 @@ public sealed class WindowsTunnelManager
             "[Interface]",
             $"PrivateKey = {keys.WireGuardPrivateKeyBase64}",
             $"Address = {profile.ClientAddress}",
+            $"MTU = {OverlayMtu}",
             string.Empty,
             "[Peer]",
             $"PublicKey = {profile.GatewayWireGuardPublicKey}",
