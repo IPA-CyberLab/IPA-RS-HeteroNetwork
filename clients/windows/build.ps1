@@ -3,6 +3,7 @@ param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
     [switch]$NoPublish,
+    [switch]$SelfContained,
     [string]$SigningCertificateThumbprint,
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$SigningCertificateStore = "CurrentUser",
@@ -152,11 +153,13 @@ Invoke-DotNet @(
 if (-not $NoPublish) {
     $output = Join-Path $clientRoot "artifacts\win-x64"
     $appProject = Join-Path $clientRoot "src\HeteroNetworkApp\HeteroNetwork.App.csproj"
+    $selfContainedValue = if ($SelfContained) { "true" } else { "false" }
     Invoke-DotNet @(
         "restore",
         $appProject,
         "--runtime",
-        "win-x64"
+        "win-x64",
+        "-p:SelfContained=$selfContainedValue"
     )
     Invoke-DotNet @(
         "publish",
@@ -166,7 +169,7 @@ if (-not $NoPublish) {
         "--runtime",
         "win-x64",
         "--self-contained",
-        "false",
+        $selfContainedValue,
         "--no-restore",
         "--output",
         $output

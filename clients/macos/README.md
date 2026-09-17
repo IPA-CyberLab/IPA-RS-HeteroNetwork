@@ -14,6 +14,17 @@ node inventory.
 - XcodeGen 2.45.4
 - Go 1.20.14 for WireGuardKit's `wireguard-go` bridge
 
+## Install the latest release
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroNetwork/master/install-client.sh | sh
+```
+
+This installs the matching Apple Silicon or Intel archive under
+`~/Applications` and starts it. The CI archive is unsigned: a working packet
+tunnel still requires the app and extension to be rebuilt or re-signed with an
+Apple-issued identity and matching Network Extension provisioning profiles.
+
 ## Generate and build
 
 ```bash

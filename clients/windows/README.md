@@ -17,11 +17,24 @@ the active gateway.
 ## Requirements
 
 - Windows 10 version 2004 (build 19041) or later, or Windows 11
-- .NET 9 Desktop Runtime (the repository build machine needs the .NET 9 SDK)
+- .NET 9 SDK when building from source; release archives include the runtime
 - Git and internet access for the first repository build
 - Administrator approval when connecting, disconnecting, or changing gateways
 
 WireGuard does not need to be installed separately.
+
+## Install the latest release
+
+Run from Git Bash:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroNetwork/master/install-client.sh | sh
+```
+
+The release is self-contained, so this installation does not require a separate
+.NET Desktop Runtime. It installs under the current user's local application
+directory, creates a Start Menu shortcut, and starts the app. Smart App Control
+can require a release built with a trusted Authenticode certificate.
 
 ## Build and run
 

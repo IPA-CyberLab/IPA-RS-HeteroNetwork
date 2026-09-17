@@ -42,6 +42,11 @@ jobs:
           node --test scripts/release-artifact-manifest.test.mjs scripts/release-channels.test.mjs scripts/package-native-release.test.mjs scripts/bind-sudo-release-artifact.test.mjs
           python3 -B -m unittest discover -s scripts -p test_sudo_quorum_v2_artifact.py -v
 
+      - name: Test desktop client installer
+        run: |
+          sh -n install-client.sh
+          sh install-client.sh --self-test
+
       - name: Validate native staging boundaries
         run: |
           # The validator deliberately ignores inherited PATH and NODE_OPTIONS.
@@ -123,8 +128,18 @@ jobs:
         run: bash scripts/test-sudo-quorum-v2.sh
 
   macos-client:
-    name: Native macOS client
-    runs-on: macos-15
+    name: Native macOS client (${{ matrix.client_arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            client_arch: arm64
+            machine_arch: arm64
+          - runner: macos-15-intel
+            client_arch: x64
+            machine_arch: x86_64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     steps:
       - name: Check out repository
@@ -150,12 +165,15 @@ jobs:
 
       - name: Install WireGuard-compatible Go toolchain
         env:
+          EXPECTED_MACHINE_ARCH: ${{ matrix.machine_arch }}
           GO_VERSION: 1.20.14
           GO_AMD64_SHA256: 754363489e2244e72cb49b4ec6ddfd6a2c60b0700f8c4876e11befb1913b11c5
           GO_ARM64_SHA256: 6da3f76164b215053daf730a9b8f1d673dbbaa4c61031374a6744b75cb728641
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
+          machine_arch="$(uname -m)"
+          test "$machine_arch" = "$EXPECTED_MACHINE_ARCH"
+          case "$machine_arch" in
             x86_64)
               go_arch=amd64
               expected_sha256="$GO_AMD64_SHA256"
@@ -217,6 +235,95 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/HeteroNetworkDerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
+
+      - name: Package macOS client release asset
+        env:
+          CLIENT_ARCH: ${{ matrix.client_arch }}
+          MACHINE_ARCH: ${{ matrix.machine_arch }}
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/HeteroNetworkDerivedData/Build/Products/Release/HeteroNetwork.app"
+          extension="$app/Contents/PlugIns/HeteroNetworkPacketTunnel.appex"
+          test -x "$app/Contents/MacOS/HeteroNetwork"
+          test -x "$extension/Contents/MacOS/HeteroNetworkPacketTunnel"
+          xcrun lipo -verify_arch "$MACHINE_ARCH" "$app/Contents/MacOS/HeteroNetwork"
+          xcrun lipo -verify_arch "$MACHINE_ARCH" "$extension/Contents/MacOS/HeteroNetworkPacketTunnel"
+          asset="heteronetwork-client-macos-${CLIENT_ARCH}.zip"
+          asset_dir="$RUNNER_TEMP/desktop-assets"
+          mkdir "$asset_dir"
+          ditto -c -k --keepParent "$app" "$asset_dir/$asset"
+          (
+            cd "$asset_dir"
+            shasum --algorithm 256 "$asset" > "$asset.sha256"
+          )
+
+      - name: Upload macOS client release asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-client-macos-${{ matrix.client_arch }}
+          path: |
+            ${{ runner.temp }}/desktop-assets/heteronetwork-client-macos-${{ matrix.client_arch }}.zip
+            ${{ runner.temp }}/desktop-assets/heteronetwork-client-macos-${{ matrix.client_arch }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  windows-client:
+    name: Native Windows client (x64)
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install .NET 9 SDK
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install WireGuard-compatible Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.20.14
+          cache: false
+
+      - name: Build, test, and publish self-contained Windows client
+        shell: pwsh
+        run: ./clients/windows/build.ps1 -SelfContained
+
+      - name: Package Windows client release asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $published = Join-Path $PWD "clients/windows/artifacts/win-x64"
+          $executable = Join-Path $published "HeteroNetwork.exe"
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "The published Windows client is missing."
+          }
+          $asset = "heteronetwork-client-windows-x64.zip"
+          $assetDirectory = Join-Path $env:RUNNER_TEMP "desktop-assets"
+          $assetPath = Join-Path $assetDirectory $asset
+          New-Item -ItemType Directory -Path $assetDirectory | Out-Null
+          Compress-Archive -Path (Join-Path $published "*") -DestinationPath $assetPath
+          $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksum = Join-Path $assetDirectory "$asset.sha256"
+          [IO.File]::WriteAllText(
+            $checksum,
+            "$hash  $asset`n",
+            [Text.UTF8Encoding]::new($false))
+
+      - name: Upload Windows client release asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-client-windows-x64
+          path: |
+            ${{ runner.temp }}/desktop-assets/heteronetwork-client-windows-x64.zip
+            ${{ runner.temp }}/desktop-assets/heteronetwork-client-windows-x64.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
   netns-smoke:
     name: Privileged network namespace smoke
@@ -522,6 +629,7 @@ jobs:
     needs:
       - rust-quality
       - macos-client
+      - windows-client
       - netns-smoke
       - docker-compose-smoke
       - rootless-docker-smoke
@@ -543,6 +651,34 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Download desktop client release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: desktop-client-*
+          path: ${{ runner.temp }}/desktop-release
+          merge-multiple: true
+
+      - name: Verify desktop client release assets
+        run: |
+          set -euo pipefail
+          asset_dir="$RUNNER_TEMP/desktop-release"
+          expected_assets='heteronetwork-client-macos-arm64.zip
+          heteronetwork-client-macos-x64.zip
+          heteronetwork-client-windows-x64.zip'
+          printf '%s\n' "$expected_assets" | while IFS= read -r asset; do
+            test -s "$asset_dir/$asset"
+            test -s "$asset_dir/$asset.sha256"
+            (
+              cd "$asset_dir"
+              sha256sum --check --strict "$asset.sha256"
+            )
+          done
+          cp install-client.sh "$asset_dir/install-heteronetwork-client.sh"
+          (
+            cd "$asset_dir"
+            sha256sum install-heteronetwork-client.sh > install-heteronetwork-client.sh.sha256
+          )
+
       - name: Validate release tag
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -560,9 +696,26 @@ jobs:
           assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
           native_asset="heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz"
           sudo_asset="heteronetwork-${RELEASE_TAG#v}-sudo-v2-linux-amd64.tar.gz"
+          desktop_assets='heteronetwork-client-macos-arm64.zip
+          heteronetwork-client-macos-arm64.zip.sha256
+          heteronetwork-client-macos-x64.zip
+          heteronetwork-client-macos-x64.zip.sha256
+          heteronetwork-client-windows-x64.zip
+          heteronetwork-client-windows-x64.zip.sha256
+          install-heteronetwork-client.sh
+          install-heteronetwork-client.sh.sha256'
+          desktop_asset_exists=0
+          for desktop_asset in $desktop_assets; do
+            if printf '%s\n' "$assets" | grep -Fxq "$desktop_asset"; then
+              desktop_asset_exists=1
+              break
+            fi
+          done
           if printf '%s\n' "$assets" | grep -Fxq 'heteronetwork-release-artifact.json' \
             || printf '%s\n' "$assets" | grep -Fxq "$native_asset" \
-            || printf '%s\n' "$assets" | grep -Fxq "$sudo_asset"; then
+            || printf '%s\n' "$assets" | grep -Fxq "$sudo_asset" \
+            || [ "$desktop_asset_exists" -eq 1 ]
+          then
             echo 'Release artifact already exists; reuse it for promotion, do not rebuild.' >&2
             exit 1
           fi
@@ -661,4 +814,12 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             "$RUNNER_TEMP/native-release/heteronetwork-release-artifact.json" \
             "$RUNNER_TEMP/native-release/heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz" \
-            "$RUNNER_TEMP/sudo-release/heteronetwork-${RELEASE_TAG#v}-sudo-v2-linux-amd64.tar.gz"
+            "$RUNNER_TEMP/sudo-release/heteronetwork-${RELEASE_TAG#v}-sudo-v2-linux-amd64.tar.gz" \
+            "$RUNNER_TEMP/desktop-release/heteronetwork-client-macos-arm64.zip" \
+            "$RUNNER_TEMP/desktop-release/heteronetwork-client-macos-arm64.zip.sha256" \
+            "$RUNNER_TEMP/desktop-release/heteronetwork-client-macos-x64.zip" \
+            "$RUNNER_TEMP/desktop-release/heteronetwork-client-macos-x64.zip.sha256" \
+            "$RUNNER_TEMP/desktop-release/heteronetwork-client-windows-x64.zip" \
+            "$RUNNER_TEMP/desktop-release/heteronetwork-client-windows-x64.zip.sha256" \
+            "$RUNNER_TEMP/desktop-release/install-heteronetwork-client.sh" \
+            "$RUNNER_TEMP/desktop-release/install-heteronetwork-client.sh.sha256"

@@ -5,6 +5,28 @@ Rust implementation of an operations-oriented P2P VPN / overlay network for Linu
 For a reproducible three-control-plane kubeadm deployment over the VPN underlay,
 see [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md).
 
+## Desktop client install
+
+The release workflow publishes checksum-pinned clients for Apple Silicon Macs,
+Intel Macs, and x64 Windows. On macOS, run this in Terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroNetwork/master/install-client.sh | sh
+```
+
+On Windows, run the same command from Git Bash. The installer selects the host
+architecture, downloads the newest published release (including a pre-release),
+verifies its SHA-256 file, installs it for the current user, and starts the app.
+Use `sh -s -- --version vX.Y.Z` after the pipe to select an exact release.
+Windows release archives include the .NET runtime.
+
+The macOS CI archive is an unsigned development build. Its UI can be installed
+with the command above, but macOS requires an Apple-issued application identity
+and matching provisioning profiles for the Network Extension before the VPN
+tunnel can run. Windows Smart App Control may likewise require an Authenticode
+certificate from a trusted issuer; the Windows build supports that certificate
+through `build.ps1`.
+
 The repository is being built toward a complete system rather than an MVP. The current baseline contains:
 
 - native desktop clients: a SwiftUI macOS menu-bar app backed by a Network
