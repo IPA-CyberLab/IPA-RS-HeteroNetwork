@@ -13415,13 +13415,10 @@ exit 47
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("HeteroNetwork"));
         assert!(!body.contains("Node services"));
-        let Some(mermaid_script) = body.find("/ui/vendor/mermaid.min.js") else {
-            return Err("Web UI must load the self-origin Mermaid bundle".into());
-        };
-        let Some(app_script) = body.find("/ui/app.js") else {
+        assert!(!body.contains("<script src=\"/ui/vendor/mermaid.min.js\""));
+        let Some(_app_script) = body.find("/ui/app.js") else {
             return Err("Web UI must load the application bundle".into());
         };
-        assert!(mermaid_script < app_script);
 
         let response = app
             .clone()
@@ -13468,6 +13465,7 @@ exit 47
         assert!(body.contains("AppLayout"));
         assert!(body.contains("service_directory"));
         assert!(body.contains("client-enrollment"));
+        assert!(body.contains("/ui/vendor/mermaid.min.js"));
         assert!(!body.contains("function renderServices()"));
 
         let response = app
