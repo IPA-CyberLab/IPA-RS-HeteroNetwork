@@ -5,7 +5,8 @@ readonly bootstrap_env="${HETERONETWORK_PUBLIC_SERVICES_BOOTSTRAP_ENV:-/etc/hete
 readonly autopilot="${HETERONETWORK_PUBLIC_SERVICES_AUTOPILOT:-/opt/heteronetwork/libexec/public-services-autopilot.sh}"
 readonly owner_email="${HETERONETWORK_OWNER_EMAIL:-}"
 readonly verification_origin="${HETERONETWORK_OWNER_OIDC_VERIFICATION_ORIGIN:-https://heterocloud.mizuame.app}"
-readonly issuer="http://console.heteronetwork.internal:18079/realms/heterocloud"
+readonly issuer="${verification_origin}/id/realms/heterocloud"
+readonly auth_base="http://console.heteronetwork.internal:18079/realms/heterocloud"
 readonly client_id="ipars-web"
 
 fail() {
@@ -65,7 +66,7 @@ fallbacks="${fallbacks//\/realms\/heteronetwork/\/realms\/heterocloud}"
 
 replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_ISSUER_URL_B64 "$(encode "$issuer")"
 replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_CLIENT_ID_B64 "$(encode "$client_id")"
-replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_AUTH_BASE_URL_B64 "$(encode "$issuer")"
+replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_AUTH_BASE_URL_B64 "$(encode "$auth_base")"
 replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64 \
   "$(encode 'http://127.0.0.1:18079/realms/heterocloud')"
 replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64 \

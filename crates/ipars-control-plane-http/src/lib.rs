@@ -5477,12 +5477,23 @@ fi
 }
 
 fn managed_keycloak_edge_base_url(issuer_url: &str) -> Option<String> {
+    let realm_path = managed_keycloak_realm_path(issuer_url)?;
+    Some(format!(
+        "http://127.0.0.1:{KEYCLOAK_AUTOPILOT_EDGE_PORT}{realm_path}"
+    ))
+}
+
+fn managed_keycloak_realm_path(issuer_url: &str) -> Option<String> {
     let issuer_url = validate_web_auth_base_url(issuer_url.to_string(), "OIDC issuer URL").ok()?;
     let issuer_url = Url::parse(&issuer_url).ok()?;
     let issuer_path = issuer_url.path().trim_end_matches('/');
-    Some(format!(
-        "http://127.0.0.1:{KEYCLOAK_AUTOPILOT_EDGE_PORT}{issuer_path}"
-    ))
+    let realm = issuer_path
+        .strip_prefix("/realms/")
+        .or_else(|| issuer_path.strip_prefix("/id/realms/"))?;
+    if realm.is_empty() || realm.contains('/') {
+        return None;
+    }
+    Some(format!("/realms/{realm}"))
 }
 
 fn public_services_oidc_auth_base_url(
@@ -5495,14 +5506,8 @@ fn public_services_oidc_auth_base_url(
 }
 
 pub fn managed_keycloak_overlay_issuer_url(issuer_url: &str) -> Option<String> {
-    let issuer_url = validate_web_auth_base_url(issuer_url.to_string(), "OIDC issuer URL").ok()?;
-    let issuer_url = Url::parse(&issuer_url).ok()?;
-    let issuer_path = issuer_url.path().trim_end_matches('/');
-    let realm = issuer_path.strip_prefix("/realms/")?;
-    if realm.is_empty() || realm.contains('/') {
-        return None;
-    }
-    Some(format!("{MANAGED_KEYCLOAK_OVERLAY_ORIGIN}{issuer_path}"))
+    let realm_path = managed_keycloak_realm_path(issuer_url)?;
+    Some(format!("{MANAGED_KEYCLOAK_OVERLAY_ORIGIN}{realm_path}"))
 }
 
 fn public_services_start_script(enrollment: &NodeEnrollmentConfig) -> String {
@@ -5589,10 +5594,9 @@ fn keycloak_autopilot_install_script(
     let Some(public_services) = enrollment.public_services.as_deref() else {
         return String::new();
     };
-    let Ok(issuer_url) = Url::parse(&public_services.oidc_issuer_url) else {
+    let Some(issuer_path) = managed_keycloak_realm_path(&public_services.oidc_issuer_url) else {
         return String::new();
     };
-    let issuer_path = issuer_url.path().trim_end_matches('/');
     let oidc_probe_path = format!("{issuer_path}/.well-known/openid-configuration");
     let helper = STANDARD.encode(KEYCLOAK_HA_NODE_SCRIPT.as_bytes());
     let autopilot = STANDARD.encode(KEYCLOAK_AUTOPILOT_SCRIPT.as_bytes());
@@ -7944,6 +7948,25 @@ mod tests {
             ),
             "https://login.example/tenant"
         );
+    }
+
+    #[test]
+    fn managed_keycloak_public_prefix_is_removed_from_private_routes() {
+        let issuer = "https://heterocloud.mizuame.app/id/realms/heterocloud/";
+        assert_eq!(
+            managed_keycloak_realm_path(issuer).as_deref(),
+            Some("/realms/heterocloud")
+        );
+        assert_eq!(
+            managed_keycloak_edge_base_url(issuer).as_deref(),
+            Some("http://127.0.0.1:18079/realms/heterocloud")
+        );
+        assert_eq!(
+            public_services_oidc_auth_base_url(issuer, None),
+            "http://console.heteronetwork.internal:18079/realms/heterocloud"
+        );
+        assert!(managed_keycloak_realm_path("https://idp.example/id/realms/").is_none());
+        assert!(managed_keycloak_realm_path("https://idp.example/id/realms/a/nested").is_none());
     }
 
     #[tokio::test]

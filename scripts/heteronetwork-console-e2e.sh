@@ -3,9 +3,10 @@ set -euo pipefail
 
 readonly console_url="${HETERONETWORK_CONSOLE_E2E_URL:-http://console.heteronetwork.internal}"
 readonly owner_url="${HETERONETWORK_CONSOLE_E2E_OWNER_URL:-http://owner.heteronetwork.internal:21443}"
-readonly expected_issuer="${HETERONETWORK_CONSOLE_E2E_ISSUER:-http://console.heteronetwork.internal:18079/realms/heterocloud}"
 readonly expected_client_id="${HETERONETWORK_CONSOLE_E2E_CLIENT_ID:-ipars-web}"
 readonly expected_verification_origin="${HETERONETWORK_CONSOLE_E2E_VERIFICATION_ORIGIN:-https://heterocloud.mizuame.app}"
+readonly expected_issuer="${HETERONETWORK_CONSOLE_E2E_ISSUER:-${expected_verification_origin}/id/realms/heterocloud}"
+readonly expected_auth_base="${HETERONETWORK_CONSOLE_E2E_AUTH_BASE:-http://console.heteronetwork.internal:18079/realms/heterocloud}"
 readonly expected_verification_issuer="${HETERONETWORK_CONSOLE_E2E_VERIFICATION_ISSUER:-${expected_verification_origin}/id/realms/heterocloud}"
 readonly node_ips_csv="${HETERONETWORK_CONSOLE_E2E_NODE_IPS:-}"
 
@@ -75,6 +76,7 @@ curl "${curl_common[@]}" --fail --output "$config" "$console_url/ui/config" \
   || fail "console auth configuration is unavailable"
 jq -e \
   --arg issuer "$expected_issuer" \
+  --arg auth_base "$expected_auth_base" \
   --arg client_id "$expected_client_id" \
   --arg verification_origin "$expected_verification_origin" '
     .auth_enabled == true
@@ -84,7 +86,8 @@ jq -e \
     and .device_verification_origin == $verification_origin
     and .device_login_endpoint == "/v1/web-ui/auth/device"
     and .device_login_poll_endpoint == "/v1/web-ui/auth/device/poll"
-    and (.device_authorization_endpoint | startswith($issuer + "/protocol/openid-connect/auth/device"))
+    and .device_authorization_endpoint == ($auth_base + "/protocol/openid-connect/auth/device")
+    and .token_endpoint == ($auth_base + "/protocol/openid-connect/token")
   ' "$config" >/dev/null \
   || fail "console does not use the HeteroCloud owner identity client"
 
