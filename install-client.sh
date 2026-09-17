@@ -70,6 +70,37 @@ asset_for_platform() {
     esac
 }
 
+latest_release_for_asset() {
+    wanted_asset=$1
+    awk -v wanted_asset="$wanted_asset" '
+        function json_string_value(line) {
+            sub(/^[^:]*:[[:space:]]*"/, "", line)
+            sub(/".*$/, "", line)
+            return line
+        }
+
+        /^    "tag_name":[[:space:]]*"/ {
+            release_tag = json_string_value($0)
+            release_published_at = ""
+        }
+        /^    "published_at":[[:space:]]*"/ {
+            release_published_at = json_string_value($0)
+        }
+        /^        "name":[[:space:]]*"/ {
+            asset_name = json_string_value($0)
+            if (asset_name == wanted_asset \
+                    && release_tag != "" \
+                    && release_published_at > newest_published_at) {
+                newest_published_at = release_published_at
+                newest_tag = release_tag
+            }
+        }
+        END {
+            print newest_tag
+        }
+    '
+}
+
 run_self_test() {
     test "$(detect_platform Darwin arm64)" = macos-arm64
     test "$(detect_platform Darwin x86_64)" = macos-x64
@@ -84,6 +115,45 @@ run_self_test() {
     if asset_for_platform windows-arm64 >/dev/null 2>&1; then
         fail 'self-test accepted an unsupported release platform'
     fi
+    selected_release=$(
+        latest_release_for_asset heteronetwork-client-macos-arm64.zip <<'EOF'
+[
+  {
+    "tag_name": "v0.1.15-dev.9",
+    "published_at": "2026-09-17T14:46:58Z",
+    "assets": []
+  },
+  {
+    "tag_name": "v0.1.15-dev.12",
+    "published_at": "2026-09-17T16:00:00Z",
+    "assets": [
+      {
+        "name": "heteronetwork-client-windows-x64.zip"
+      }
+    ]
+  },
+  {
+    "tag_name": "v0.1.15-dev.11",
+    "published_at": "2026-09-17T15:06:49Z",
+    "assets": [
+      {
+        "name": "heteronetwork-client-macos-arm64.zip"
+      }
+    ]
+  },
+  {
+    "tag_name": "v0.1.15-dev.10",
+    "published_at": "2026-09-17T14:52:53Z",
+    "assets": [
+      {
+        "name": "heteronetwork-client-macos-arm64.zip"
+      }
+    ]
+  }
+]
+EOF
+    )
+    test "$selected_release" = v0.1.15-dev.11
     printf '%s\n' 'HeteroNetwork installer self-test passed.'
 }
 
@@ -150,11 +220,10 @@ if [ "$version" = latest ]; then
         --connect-timeout 15 --max-time 60 --retry 3 --retry-all-errors \
         -H 'Accept: application/vnd.github+json' \
         -H 'X-GitHub-Api-Version: 2022-11-28' \
-        "https://api.github.com/repos/$repository/releases?per_page=1")
-    version=$(printf '%s\n' "$release_json" \
-        | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-        | sed -n '1p')
-    [ -n "$version" ] || fail 'GitHub did not return a published release'
+        "https://api.github.com/repos/$repository/releases?per_page=100")
+    version=$(printf '%s\n' "$release_json" | latest_release_for_asset "$asset")
+    [ -n "$version" ] \
+        || fail "GitHub did not return a published release containing $asset"
 fi
 case "$version" in
     ''|*[!A-Za-z0-9._-]*)
