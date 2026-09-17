@@ -350,10 +350,18 @@ resource "kubernetes_manifest" "nvidia_device_plugin_application" {
         }
       }
       destination = { server = "https://kubernetes.default.svc", namespace = "nvidia-device-plugin" }
+      ignoreDifferences = [{
+        group     = "apps"
+        kind      = "DaemonSet"
+        namespace = "nvidia-device-plugin"
+        jqPathExpressions = [
+          ".spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions[] | select(.key == \"heteronetwork.io/control-plane-only\")"
+        ]
+      }]
       syncPolicy = {
         automated   = { enabled = true, prune = true, selfHeal = true }
         retry       = { limit = 10, backoff = { duration = "5s", factor = 2, maxDuration = "3m" } }
-        syncOptions = ["CreateNamespace=true", "ServerSideApply=true", "DisableClientSideApplyMigration=true"]
+        syncOptions = ["CreateNamespace=true", "ServerSideApply=true", "DisableClientSideApplyMigration=true", "RespectIgnoreDifferences=true"]
       }
     }
   }

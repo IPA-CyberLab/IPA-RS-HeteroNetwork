@@ -11,6 +11,8 @@ Ansibleで検査する。Ubuntu 24.04以降のamd64、NVIDIA display/3D controll
 切替時だけcordon、Pod退避、再起動、uncordonを行う。`nvidia-smi`で物理GPU数を確認した後に
 ハードウェア検証済みラベルを付ける。Terraformが作るArgo CD Applicationは、`nvidia`
 RuntimeClassとNVIDIA device plugin 0.20.0を管理する。共有設定は有効にしない。
+専用master除外ポリシーがdevice plugin DaemonSetへ注入するaffinityだけはArgo CDの比較対象から除外し、
+clusterが強制した安全な配置条件による恒常的なOutOfSyncを防ぐ。
 
 `gpu_acceptance` はKubernetesのallocatable GPU数と物理宣言値を照合し、digest固定のCUDA
 コンテナを各GPUノードで起動する。Podはrequestとlimitをともに `nvidia.com/gpu: 1` とし、
