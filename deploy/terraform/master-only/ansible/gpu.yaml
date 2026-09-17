@@ -193,6 +193,20 @@
           ansible.builtin.reboot:
             reboot_timeout: 900
             post_reboot_delay: 15
+
+        - name: Wait for local Kubernetes storage readiness after reboot
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - get
+              - --raw=/readyz
+          delegate_to: uc-k8sp5
+          register: hnn_gpu_apiserver_ready
+          changed_when: false
+          until: hnn_gpu_apiserver_ready.rc == 0 and hnn_gpu_apiserver_ready.stdout == 'ok'
+          retries: 60
+          delay: 5
       always:
         - name: Restore scheduling after the driver reboot attempt
           ansible.builtin.command:
@@ -206,6 +220,9 @@
       register: hnn_gpu_smi
       changed_when: false
       check_mode: false
+      until: hnn_gpu_smi.rc == 0
+      retries: 12
+      delay: 5
       when: hnn_gpu_eligible and not ansible_check_mode
 
     - name: Require every physical GPU to be visible after reboot
