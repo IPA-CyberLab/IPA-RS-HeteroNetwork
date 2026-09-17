@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -26,6 +27,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 ROOT = Path(__file__).resolve().parents[1]
 CONSOLE_CHECK = ROOT / "scripts/verify-console-gateways.mjs"
+AUTHENTICATED_CONSOLE_CHECK = ROOT / "scripts/heteronetwork-console-browser-e2e.mjs"
+CONSOLE_IDENTITY_RECONCILER = ROOT / "scripts/reconcile-console-e2e-user.py"
 OVERLAY_MTU = 1280
 
 
@@ -81,7 +84,7 @@ def sponsor(inventory, request_uri):
     all_hosts = inventory["all"]
     variables = all_hosts["vars"]
     bootstrap = all_hosts["children"]["bootstrap"]["hosts"]["uc-k8sp5"]["ansible_host"]
-    password = os.environ.get("HNN_IAC_BECOME_PASSWORD", "")
+    password = os.environ.pop("HNN_IAC_BECOME_PASSWORD", "")
     if not password:
         raise RuntimeError("HNN_IAC_BECOME_PASSWORD is required for client sponsorship")
     remote = (
@@ -107,6 +110,73 @@ def sponsor(inventory, request_uri):
     if len(lines) != 1:
         raise RuntimeError("client sponsorship did not return one import profile")
     return lines[0]
+
+
+def private_credential_file(path):
+    path = path.expanduser()
+    if not path.is_absolute():
+        raise RuntimeError("console credential file must use an absolute path")
+    metadata = path.lstat()
+    if (not stat.S_ISREG(metadata.st_mode) or path.is_symlink()
+            or metadata.st_nlink != 1 or metadata.st_size < 2
+            or metadata.st_size > 8192 or metadata.st_mode & 0o077):
+        raise RuntimeError(
+            "console credential file must be a private, single-link regular file")
+    return path
+
+
+def reconcile_console_identity(inventory, credential_file):
+    credential_file = private_credential_file(credential_file)
+    credential_record = credential_file.read_text()
+    if credential_record.count("\n") != 1 or not credential_record.endswith("\n"):
+        raise RuntimeError("console credential file must contain one JSON record")
+    all_hosts = inventory["all"]
+    variables = all_hosts["vars"]
+    bootstrap = all_hosts["children"]["bootstrap"]["hosts"]["uc-k8sp5"]["ansible_host"]
+    password = os.environ.get("HNN_IAC_BECOME_PASSWORD", "")
+    if not password:
+        raise RuntimeError("HNN_IAC_BECOME_PASSWORD is required for identity reconciliation")
+    known_hosts = variables["ansible_ssh_common_args"].split(
+        "UserKnownHostsFile=", 1)[1].split()[0]
+    remote = "sudo -S -p '' python3 -c " + shlex.quote(
+        CONSOLE_IDENTITY_RECONCILER.read_text())
+    result = subprocess.run(
+        [
+            "ssh", "-i", variables["ansible_ssh_private_key_file"],
+            "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "UserKnownHostsFile=" + known_hosts,
+            "-o", "ConnectTimeout=10",
+            f"{variables['ansible_user']}@{bootstrap}", remote,
+        ],
+        input=password + "\n" + credential_record,
+        capture_output=True, text=True, timeout=60,
+    )
+    credential_record = ""
+    if result.returncode:
+        raise RuntimeError(
+            "console E2E identity reconciliation failed without exposing credentials: "
+            + result.stderr.strip()[-500:])
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("console E2E identity reconciliation returned invalid output") from error
+    if response.get("result") != "reconciled" or not isinstance(response.get("created"), bool):
+        raise RuntimeError("console E2E identity reconciliation was not confirmed")
+    return response
+
+
+def browser_environment():
+    """Keep unrelated job secrets out of Node and Chromium child processes."""
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/root"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    for name in ("PLAYWRIGHT_BROWSERS_PATH", "XDG_CACHE_HOME", "TMPDIR"):
+        if os.environ.get(name):
+            environment[name] = os.environ[name]
+    return environment
 
 
 def decode_profile(uri):
@@ -247,7 +317,7 @@ def browser_check(work, gateway, gateways, output):
         ["unshare", "-m", "--propagation", "private", "python3", "-c", wrapper,
          str(resolv), str(CONSOLE_CHECK), gateways, str(inner_output),
          str(fallback_resolv)],
-        capture_output=True, text=True, timeout=600,
+        capture_output=True, text=True, timeout=600, env=browser_environment(),
     )
     if result.returncode:
         failure = result.stderr.strip() or result.stdout.strip()
@@ -256,6 +326,59 @@ def browser_check(work, gateway, gateways, output):
     if report.get("result") != "passed" or report.get("canonical", {}).get("open_ms", 3001) > 3000:
         raise RuntimeError("real client browser E2E did not satisfy the 3-second gate")
     return report
+
+
+def authenticated_browser_check(work, gateway, credential_file):
+    credential_file = private_credential_file(credential_file)
+    artifacts = work / "authenticated-console"
+    artifacts.mkdir(mode=0o700)
+    environment = browser_environment()
+    environment.update({
+        "HETERONETWORK_CONSOLE_BROWSER_E2E_CREDENTIAL_FILE": str(credential_file),
+        "HETERONETWORK_CONSOLE_BROWSER_E2E_ARTIFACT_DIR": str(artifacts),
+        "HETERONETWORK_CONSOLE_BROWSER_E2E_GATEWAY": gateway,
+        "HETERONETWORK_CONSOLE_BROWSER_E2E_URL": (
+            "http://console.heteronetwork.internal:9781/ui/"),
+    })
+    result = subprocess.run(
+        ["node", str(AUTHENTICATED_CONSOLE_CHECK)],
+        capture_output=True, text=True, timeout=180, env=environment,
+    )
+    reports = list(artifacts.glob("console-browser-*/report.json"))
+    if len(reports) != 1:
+        raise RuntimeError("authenticated browser E2E did not write one private report")
+    browser_report = json.loads(reports[0].read_text())
+    if result.returncode or browser_report.get("result") != "passed":
+        failure = browser_report.get("failure") or result.stderr.strip() or result.stdout.strip()
+        diagnostic = {
+            "failure": failure[-1000:],
+            "checks": browser_report.get("checks", []),
+            "responses": browser_report.get("responses", []),
+            "errors": browser_report.get("errors", []),
+            "identity_provider": browser_report.get("identityProvider"),
+        }
+        raise RuntimeError(
+            "authenticated console browser E2E failed: "
+            + json.dumps(diagnostic, separators=(",", ":")))
+    checks = {row.get("check"): row.get("status")
+              for row in browser_report.get("checks", [])}
+    required = {
+        "Authenticated overview": 200,
+        "Overview after reload": 200,
+        "Refresh cookie in new tab": 200,
+        "Authenticated overview in new tab": 200,
+    }
+    if (checks != required or browser_report.get("authenticated") is not True
+            or browser_report.get("sessionRestored") is not True
+            or browser_report.get("httpOnlyRefreshCookie") is not True):
+        raise RuntimeError("authenticated console browser E2E omitted a required session check")
+    return {
+        "result": "passed",
+        "authenticated": True,
+        "session_restored": True,
+        "http_only_refresh_cookie": True,
+        "checks": checks,
+    }
 
 
 def signed_client_control_request(identity, client_id, kind, active_gateway=None):
@@ -348,6 +471,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--gateways", required=True)
+    parser.add_argument("--credential-file", type=Path)
+    parser.add_argument("--require-authenticated-console", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     work_root = Path(args.work_dir).expanduser().resolve()
@@ -361,7 +486,14 @@ def main():
     client_id = None
     peer = None
     try:
+        if args.require_authenticated_console and args.credential_file is None:
+            raise RuntimeError(
+                "--credential-file is required by --require-authenticated-console")
         inventory = json.loads((work_root / "inventory.json").read_text())
+        if args.credential_file is not None:
+            identity_result = reconcile_console_identity(inventory, args.credential_file)
+            report["console_identity_reconciled"] = True
+            report["console_identity_created"] = identity_result["created"]
         request_uri, identity, private_key, client_id = generate_registration()
         profile = decode_profile(sponsor(inventory, request_uri))
         peer, endpoint = select_gateway(profile)
@@ -384,14 +516,17 @@ def main():
         report["route_convergence_ms"] = wait_for_gateway_routes(args.gateways)
         write_report(args.output, report)
         console = browser_check(work, peer["vpn_ip"], args.gateways, args.output)
+        if args.credential_file is not None:
+            console["authenticated"] = authenticated_browser_check(
+                work, peer["vpn_ip"], args.credential_file)
+        elif args.require_authenticated_console:
+            raise RuntimeError("authenticated console verification was required but skipped")
         report.update({
             "result": "passed",
             "console": console,
         })
     except Exception as error:
-        failure = str(error)
-        password = os.environ.get("HNN_IAC_BECOME_PASSWORD", "")
-        report["failure"] = failure.replace(password, "[redacted]") if password else failure
+        report["failure"] = str(error)
     finally:
         if tunnel is not None:
             name, process, log = tunnel

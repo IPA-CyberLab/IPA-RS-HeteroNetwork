@@ -44,6 +44,45 @@
         fail_msg: Console binary checksum does not match the declared artifact
       loop: '{{ hnn_console_verified_binaries.results }}'
       when: not ansible_check_mode
+    - name: Inspect the public control plane unit
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - heteronetwork-control-plane.service
+          - --property=LoadState
+          - --value
+      register: hnn_console_control_plane_unit
+      changed_when: false
+      failed_when: false
+      check_mode: false
+    - name: Create the public control plane drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/heteronetwork-control-plane.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: hnn_console_control_plane_unit.stdout | trim == 'loaded'
+    - name: Authorize the dedicated console E2E identity
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-control-plane.service.d/95-console-e2e-identity.conf
+        content: |
+          [Service]
+          Environment="HETERONETWORK_WEB_OIDC_ADDITIONAL_REQUIRED_EMAILS=heteronetwork-console-e2e@heteronetwork.invalid"
+        owner: root
+        group: root
+        mode: '0644'
+      when: hnn_console_control_plane_unit.stdout | trim == 'loaded'
+    - name: Activate the reconciled control plane identity policy and binary
+      ansible.builtin.systemd_service:
+        name: heteronetwork-control-plane.service
+        daemon_reload: true
+        enabled: true
+        state: restarted
+      when:
+        - not ansible_check_mode
+        - hnn_console_control_plane_unit.stdout | trim == 'loaded'
     - name: Activate the reconciled console binary
       ansible.builtin.systemd_service:
         name: heteronetwork-agent.service

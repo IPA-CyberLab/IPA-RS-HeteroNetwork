@@ -53,6 +53,14 @@ revision retrigger E2E. The wrapper checks this acceptance proof for drift.
 The [acceptance and console recovery record](../../../docs/onboarding-e2e-gate-2026-09-15.md)
 documents the checks and their scope.
 
+The GitHub Actions live acceptance job adds the credentialed browser boundary:
+the hosted VM itself joins with kernel WireGuard, signs in with a dedicated
+Keycloak E2E identity, and requires the authenticated overview, reload and
+new-tab refresh-cookie restoration to return HTTP 200. Credential values stay
+outside Terraform state and process arguments. The
+[GitHub Actions VPN console E2E record](../../../docs/github-actions-vpn-console-e2e.md)
+documents the checks and secret lifecycle.
+
 Argo CD reconciles the dedicated Node labels, cordon, Longhorn scheduling
 opt-out and admission policies from `deploy/gitops/control-plane-only`.
 The Node mutation policy maintains the three required isolation taints while

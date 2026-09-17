@@ -9,6 +9,8 @@ on:
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/verify-console-gateways.mjs'
       - 'scripts/verify-overlay-client-console.py'
+      - 'scripts/heteronetwork-console-browser-e2e.mjs'
+      - 'scripts/reconcile-console-e2e-user.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
       - 'Cargo.toml'
@@ -23,6 +25,8 @@ on:
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/verify-console-gateways.mjs'
       - 'scripts/verify-overlay-client-console.py'
+      - 'scripts/heteronetwork-console-browser-e2e.mjs'
+      - 'scripts/reconcile-console-e2e-user.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
       - 'Cargo.toml'
@@ -47,7 +51,8 @@ jobs:
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs
-          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py
+          node --check scripts/heteronetwork-console-browser-e2e.mjs
+          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py
 
   live-overlay-browser-e2e:
     if: >-
@@ -81,10 +86,12 @@ jobs:
         env:
           HNN_E2E_SSH_PRIVATE_KEY: ${{ secrets.HNN_E2E_SSH_PRIVATE_KEY }}
           HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+          HNN_E2E_CONSOLE_PASSWORD: ${{ secrets.HNN_E2E_CONSOLE_PASSWORD }}
         run: |
           set -euo pipefail
           test -n "$HNN_E2E_SSH_PRIVATE_KEY"
           test -n "$HNN_IAC_BECOME_PASSWORD"
+          test -n "$HNN_E2E_CONSOLE_PASSWORD"
           install -d -m 0700 "$E2E_ROOT"
           printf '%s\n' "$HNN_E2E_SSH_PRIVATE_KEY" > "$E2E_ROOT/id_ed25519"
           chmod 0600 "$E2E_ROOT/id_ed25519"
@@ -118,6 +125,18 @@ jobs:
               }
           }
           (root / "inventory.json").write_text(json.dumps(inventory) + "\n")
+          credentials = {
+              "username": "heteronetwork-console-e2e@heteronetwork.invalid",
+              "email": "heteronetwork-console-e2e@heteronetwork.invalid",
+              "password": os.environ["HNN_E2E_CONSOLE_PASSWORD"],
+          }
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+          if hasattr(os, "O_NOFOLLOW"):
+              flags |= os.O_NOFOLLOW
+          descriptor = os.open(root / "console-credentials.json", flags, 0o600)
+          with os.fdopen(descriptor, "w") as output:
+              json.dump(credentials, output)
+              output.write("\n")
           PY
       - name: Join HeteroNetwork and run Chromium through the VPN
         env:
@@ -130,6 +149,8 @@ jobs:
             "$E2E_VENV/bin/python" scripts/verify-overlay-client-console.py \
               --work-dir "$E2E_ROOT" \
               --gateways 10.250.0.2,10.250.0.4,10.250.0.5,10.250.0.6,10.250.0.10,10.250.0.11 \
+              --credential-file "$E2E_ROOT/console-credentials.json" \
+              --require-authenticated-console \
               --output "$E2E_ROOT/report.json"
       - name: Publish sanitized E2E result
         if: always()
@@ -138,13 +159,15 @@ jobs:
             {
               echo '### Live HeteroNetwork overlay E2E'
               echo '```json'
-              sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, gateway_vpn_ip, wireguard_handshake_at, route_convergence_ms, canonical: .console.canonical, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
+              sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, console_identity_reconciled, gateway_vpn_ip, wireguard_handshake_at, route_convergence_ms, canonical: .console.canonical, authenticated: .console.authenticated, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Remove materialized sponsor key
+      - name: Remove materialized private inputs
         if: always()
         run: |
-          if test -f "$E2E_ROOT/id_ed25519"; then
-            shred --remove "$E2E_ROOT/id_ed25519"
-          fi
+          for private_file in "$E2E_ROOT/id_ed25519" "$E2E_ROOT/console-credentials.json"; do
+            if test -f "$private_file"; then
+              shred --remove "$private_file"
+            fi
+          done

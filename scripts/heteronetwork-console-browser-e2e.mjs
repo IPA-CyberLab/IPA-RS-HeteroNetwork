@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
 import fs from "node:fs/promises";
+import { isIP } from "node:net";
 import path from "node:path";
 import { chromium } from "playwright";
 
 process.umask(0o077);
-const credentials = process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_CREDENTIAL_FILE
-  ? JSON.parse(await fs.readFile(process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_CREDENTIAL_FILE, "utf8"))
-  : {};
+const credentialFile = process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_CREDENTIAL_FILE;
+const credentials = credentialFile ? await readCredentials(credentialFile) : {};
 const username = process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_USERNAME ?? credentials.username ?? credentials.E2E_USERNAME;
 const password = process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_PASSWORD ?? credentials.password ?? credentials.E2E_PASSWORD;
 if (typeof username !== "string" || typeof password !== "string" || !username || !password) {
@@ -26,12 +26,23 @@ const runDirectory = await fs.mkdtemp(path.join(directory, "console-browser-"));
 const report = { startedAt: new Date().toISOString(), result: "incomplete", checks: [], responses: [], errors: [] };
 const sanitize = (value) => String(value).replaceAll(username, "[test-user]").replaceAll(password, "[redacted]")
   .replace(/eyJ[A-Za-z0-9_.-]+/g, "[token]");
+const gateway = process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_GATEWAY;
+if (gateway && (isIP(gateway) !== 4 || !gateway.startsWith("10.250."))) {
+  throw new Error("Console E2E gateway must be an overlay IPv4 address");
+}
 let browser;
+let popup;
 
 try {
+  const launchArgs = ["--disable-dev-shm-usage"];
+  if (gateway) {
+    // Keep the canonical browser origin while selecting a gateway reached over
+    // the runner's real WireGuard interface. Public Keycloak DNS stays native.
+    launchArgs.push(`--host-resolver-rules=MAP ${target.hostname} ${gateway}`);
+  }
   browser = await chromium.launch({
     headless: true,
-    args: ["--disable-dev-shm-usage"],
+    args: launchArgs,
     ...(process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_PROXY
       ? { proxy: { server: process.env.HETERONETWORK_CONSOLE_BROWSER_E2E_PROXY } } : {}),
   });
@@ -51,7 +62,7 @@ try {
   const overview = waitFor(page, "/v1/admin/overview");
   const popupPromise = page.waitForEvent("popup");
   await page.getByRole("button", { name: "Keycloakでログイン" }).click();
-  const popup = await popupPromise;
+  popup = await popupPromise;
   await popup.locator('input[name="username"]').waitFor();
   const form = await popup.locator("#kc-login").evaluate((button) => ({ action: button.form?.action, method: button.form?.method }));
   const action = new URL(form.action);
@@ -61,10 +72,19 @@ try {
   await popup.locator('input[name="password"]').fill(password);
   await popup.locator("#kc-login").click();
   await popup.waitForLoadState("domcontentloaded");
-  const consent = popup.locator('#kc-accept, button[name="accept"], input[name="accept"]');
-  if (await consent.count()) await consent.first().click();
+  const consent = popup.locator([
+    "#kc-accept",
+    'button[name="accept"]',
+    'input[name="accept"]',
+    'button:has-text("はい")',
+    'button:has-text("Yes")',
+    'button:has-text("Allow")',
+  ].join(", "));
+  await consent.first().waitFor({ state: "visible", timeout: 10_000 }).catch(() => {});
+  if (await consent.count() && await consent.first().isVisible()) await consent.first().click();
   await accepted(overview, "Authenticated overview");
   await page.locator("#hn-header").waitFor();
+  report.authenticated = true;
   await page.screenshot({ path: path.join(runDirectory, "authenticated.png"), fullPage: true });
 
   const reloaded = waitFor(page, "/v1/admin/overview");
@@ -86,12 +106,23 @@ try {
   const cookies = await context.cookies(new URL("/v1/web-ui/auth/refresh", target).href);
   report.httpOnlyRefreshCookie = cookies.some((cookie) => cookie.name === "heteronetwork_web_refresh" && cookie.httpOnly);
   if (!report.httpOnlyRefreshCookie) throw new Error("Missing protected refresh cookie");
+  report.sessionRestored = true;
   await restoredPage.screenshot({ path: path.join(runDirectory, "restored.png"), fullPage: true });
   if (report.errors.length) throw new Error("Browser JavaScript errors detected");
   report.result = "passed";
 } catch (error) {
   report.result = "failed";
   report.failure = sanitize(error.message);
+  if (popup && !popup.isClosed()) {
+    const popupUrl = new URL(popup.url());
+    report.identityProvider = {
+      origin: popupUrl.origin,
+      path: popupUrl.pathname,
+      title: sanitize(await popup.title().catch(() => "")),
+      buttons: (await popup.getByRole("button").allTextContents().catch(() => []))
+        .slice(0, 10).map(sanitize),
+    };
+  }
 } finally {
   await browser?.close().catch((error) => {
     report.result = "failed";
@@ -103,6 +134,16 @@ try {
   if (report.failure) console.error(report.failure);
 }
 process.exitCode = report.result === "passed" ? 0 : 1;
+
+async function readCredentials(file) {
+  if (!path.isAbsolute(file)) throw new Error("Console credential file must use an absolute path");
+  const metadata = await fs.lstat(file);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 ||
+      metadata.size < 2 || metadata.size > 8192 || (metadata.mode & 0o077) !== 0) {
+    throw new Error("Console credential file must be a private, single-link regular file");
+  }
+  return JSON.parse(await fs.readFile(file, "utf8"));
+}
 
 function observe(page) {
   page.setDefaultTimeout(60_000);

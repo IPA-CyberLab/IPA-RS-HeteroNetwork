@@ -605,6 +605,12 @@ struct ControlPlaneArgs {
     web_oidc_device_verification_origin: Option<String>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_REQUIRED_EMAIL")]
     web_oidc_required_email: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_WEB_OIDC_ADDITIONAL_REQUIRED_EMAILS",
+        value_delimiter = ','
+    )]
+    web_oidc_additional_required_emails: Vec<String>,
     #[arg(long, env = "HETERONETWORK_CLUSTER_ID")]
     cluster_id: String,
     #[arg(long, env = "HETERONETWORK_VPN_POOL", default_value = "10.250.0.0/16")]
@@ -4832,6 +4838,13 @@ where
                 .context("web UI OIDC required identity configuration")?,
             None => auth,
         };
+        let mut auth = auth;
+        for email in args.web_oidc_additional_required_emails.clone() {
+            auth = auth
+                .with_additional_required_email(email)
+                .map_err(anyhow::Error::msg)
+                .context("web UI OIDC additional required identity configuration")?;
+        }
         let auth = match args.web_public_url.clone() {
             Some(public_url) => auth
                 .with_public_url(public_url)

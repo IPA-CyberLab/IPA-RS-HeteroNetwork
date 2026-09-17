@@ -827,6 +827,7 @@ pub struct WebUiAuthConfig {
     scopes: String,
     device_verification_origin: String,
     required_email: Option<String>,
+    additional_required_emails: Vec<String>,
     required_subject: Option<String>,
     public_url: Option<String>,
     authorization_endpoint: String,
@@ -989,6 +990,7 @@ impl WebUiAuthConfig {
             scopes,
             device_verification_origin,
             required_email: None,
+            additional_required_emails: Vec::new(),
             required_subject: None,
             public_url: None,
             authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
@@ -1035,6 +1037,33 @@ impl WebUiAuthConfig {
             return Err("OIDC required email is invalid".to_string());
         }
         self.required_email = Some(email);
+        Ok(self)
+    }
+
+    pub fn with_additional_required_email(mut self, email: String) -> Result<Self, String> {
+        let email = email.trim().to_ascii_lowercase();
+        let Some((local, domain)) = email.split_once('@') else {
+            return Err("OIDC additional required email must contain one @ separator".to_string());
+        };
+        if email.len() > 254
+            || local.is_empty()
+            || domain.is_empty()
+            || domain.contains('@')
+            || email.chars().any(|character| {
+                character.is_control() || character.is_whitespace() || character == ','
+            })
+        {
+            return Err("OIDC additional required email is invalid".to_string());
+        }
+        if self.required_email.as_deref() == Some(&email)
+            || self
+                .additional_required_emails
+                .iter()
+                .any(|value| value == &email)
+        {
+            return Err("OIDC additional required email is duplicated".to_string());
+        }
+        self.additional_required_emails.push(email);
         Ok(self)
     }
 
@@ -1144,12 +1173,24 @@ impl WebUiAuthConfig {
                                         .as_deref()
                                         .is_none_or(|required| required == subject)
                             });
-                    let identity_is_allowed = self.required_email.as_ref().is_none_or(|required| {
+                    let identity_is_allowed = if self.required_email.is_none()
+                        && self.additional_required_emails.is_empty()
+                    {
+                        true
+                    } else {
                         claims
                             .get("email")
                             .and_then(Value::as_str)
-                            .is_some_and(|email| email.eq_ignore_ascii_case(required))
-                    });
+                            .is_some_and(|email| {
+                                self.required_email
+                                    .as_deref()
+                                    .is_some_and(|required| email.eq_ignore_ascii_case(required))
+                                    || self
+                                        .additional_required_emails
+                                        .iter()
+                                        .any(|required| email.eq_ignore_ascii_case(required))
+                            })
+                    };
                     subject_is_valid && identity_is_allowed
                 })
             {
@@ -8049,6 +8090,7 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                     {
                         Some("Bearer owner-token") => Some("Owner@Example.com"),
+                        Some("Bearer e2e-token") => Some("console-e2e@example.com"),
                         Some("Bearer other-token") => Some("other@example.com"),
                         _ => None,
                     };
@@ -8068,9 +8110,11 @@ mod tests {
             Some(format!("http://{address}/realms/heterocloud")),
             "openid profile email".to_string(),
         )?
-        .with_required_email("owner@example.com".to_string())?;
+        .with_required_email("owner@example.com".to_string())?
+        .with_additional_required_email("console-e2e@example.com".to_string())?;
 
         assert!(config.validate_access_token("owner-token").await);
+        assert!(config.validate_access_token("e2e-token").await);
         assert!(!config.validate_access_token("other-token").await);
         assert!(!config.validate_access_token("missing-email-token").await);
         assert!(WebUiAuthConfig::new(
@@ -8083,6 +8127,10 @@ mod tests {
         )?
         .with_required_email("not-an-email".to_string())
         .is_err());
+        assert!(config
+            .clone()
+            .with_additional_required_email("owner@example.com".to_string())
+            .is_err());
         task.abort();
         Ok(())
     }
