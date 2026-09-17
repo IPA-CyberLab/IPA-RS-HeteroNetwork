@@ -1,12 +1,14 @@
 name: Infrastructure acceptance checks
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - 'deploy/terraform/master-only/**'
       - 'scripts/accept-registered-nodes.py'
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/verify-console-gateways.mjs'
+      - 'scripts/verify-overlay-client-console.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
       - '.github/workflows/infrastructure-validation.yml'
@@ -16,6 +18,7 @@ on:
       - 'scripts/accept-registered-nodes.py'
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/verify-console-gateways.mjs'
+      - 'scripts/verify-overlay-client-console.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
       - '.github/workflows/infrastructure-validation.yml'
@@ -36,4 +39,103 @@ jobs:
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs
-          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py
+          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py
+
+  live-overlay-browser-e2e:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/codex/flash-gpu-iac-20260916' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: heteronet-e2e
+    concurrency:
+      group: heteronet-live-overlay-browser-e2e
+      cancel-in-progress: false
+    env:
+      E2E_ROOT: ${{ runner.temp }}/heteronet-e2e
+      E2E_VENV: ${{ runner.temp }}/heteronet-e2e-venv
+      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Install live E2E dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes iproute2 iputils-ping python3-venv wireguard-tools
+          python3 -m venv "$E2E_VENV"
+          "$E2E_VENV/bin/pip" --disable-pip-version-check install cryptography==50.0.1
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Materialize protected sponsor access
+        env:
+          HNN_E2E_SSH_PRIVATE_KEY: ${{ secrets.HNN_E2E_SSH_PRIVATE_KEY }}
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$HNN_E2E_SSH_PRIVATE_KEY"
+          test -n "$HNN_IAC_BECOME_PASSWORD"
+          install -d -m 0700 "$E2E_ROOT"
+          printf '%s\n' "$HNN_E2E_SSH_PRIVATE_KEY" > "$E2E_ROOT/id_ed25519"
+          chmod 0600 "$E2E_ROOT/id_ed25519"
+          cat > "$E2E_ROOT/known_hosts" <<'EOF'
+          163.220.236.45 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK038K5HfhW5BFKcXXK22/AunAU2mk2osPM98e0eZ1VI
+          EOF
+          chmod 0600 "$E2E_ROOT/known_hosts"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["E2E_ROOT"])
+          inventory = {
+              "all": {
+                  "vars": {
+                      "ansible_user": "mizuame",
+                      "ansible_ssh_private_key_file": str(root / "id_ed25519"),
+                      "ansible_ssh_common_args": (
+                          "-o StrictHostKeyChecking=yes -o UserKnownHostsFile="
+                          + str(root / "known_hosts")
+                      ),
+                  },
+                  "children": {
+                      "bootstrap": {
+                          "hosts": {
+                              "uc-k8sp5": {"ansible_host": "163.220.236.45"}
+                          }
+                      }
+                  },
+              }
+          }
+          (root / "inventory.json").write_text(json.dumps(inventory) + "\n")
+          PY
+      - name: Join HeteroNetwork and run Chromium through the VPN
+        env:
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+        run: |
+          set -euo pipefail
+          node_path="$(dirname "$(command -v node)")"
+          sudo --preserve-env=HNN_IAC_BECOME_PASSWORD,PLAYWRIGHT_BROWSERS_PATH \
+            env "PATH=${node_path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            "$E2E_VENV/bin/python" scripts/verify-overlay-client-console.py \
+              --work-dir "$E2E_ROOT" \
+              --gateways 10.250.0.2,10.250.0.4,10.250.0.5,10.250.0.6,10.250.0.10,10.250.0.11 \
+              --output "$E2E_ROOT/report.json"
+      - name: Publish sanitized E2E result
+        if: always()
+        run: |
+          if sudo test -f "$E2E_ROOT/report.json"; then
+            {
+              echo '### Live HeteroNetwork overlay E2E'
+              echo '```json'
+              sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, gateway_vpn_ip, wireguard_handshake_at, canonical: .console.canonical, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Remove materialized sponsor key
+        if: always()
+        run: |
+          if test -f "$E2E_ROOT/id_ed25519"; then
+            shred --remove "$E2E_ROOT/id_ed25519"
+          fi

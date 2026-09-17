@@ -126,7 +126,10 @@ def select_gateway(profile):
         for candidate in peer["endpoint_candidates"]:
             if candidate["kind"] not in ("ipv6", "public_udp"):
                 continue
-            choices.append((0 if candidate["kind"] == "ipv6" else 1,
+            # GitHub-hosted runners do not advertise usable IPv6. Prefer the
+            # public IPv4/UDP endpoint so the live CI path is deterministic,
+            # while retaining IPv6 as a fallback for other environments.
+            choices.append((0 if candidate["kind"] == "public_udp" else 1,
                             candidate["cost"], -candidate["priority"],
                             candidate["addr"], peer))
     if not choices:
@@ -176,10 +179,24 @@ def configure_tunnel(work, profile, peer, endpoint, private_key):
     log_path = work / "wireguard.log"
     log = log_path.open("w")
     os.chmod(log_path, 0o600)
-    process = subprocess.Popen(
-        ["wireguard-go", "-f", name], stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    process = None
     try:
-        wait_for_interface(name, process)
+        kernel = subprocess.run(
+            ["ip", "link", "add", "dev", name, "type", "wireguard"],
+            capture_output=True, text=True)
+        if kernel.returncode:
+            wireguard_go = shutil.which("wireguard-go")
+            if wireguard_go is None:
+                raise RuntimeError(
+                    "kernel WireGuard is unavailable and wireguard-go is not installed: "
+                    + kernel.stderr.strip()[:300])
+            process = subprocess.Popen(
+                [wireguard_go, "-f", name], stdin=subprocess.DEVNULL,
+                stdout=log, stderr=log)
+            wait_for_interface(name, process)
+        else:
+            log.write("using kernel WireGuard\n")
+            log.flush()
         routes = safe_routes(peer)
         config = work / "wireguard.conf"
         config.write_text(
@@ -199,12 +216,13 @@ def configure_tunnel(work, profile, peer, endpoint, private_key):
         return name, process, log, routes
     except Exception:
         subprocess.run(["ip", "link", "delete", name], capture_output=True)
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
         log.close()
         raise
 
@@ -321,12 +339,13 @@ def main():
                     report["client_removed"] = False
                     report["client_removal_failure"] = str(error)[:500]
             subprocess.run(["ip", "link", "delete", name], capture_output=True)
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
             log.close()
         if report["result"] == "passed" and not report.get("client_removed"):
             report["result"] = "failed"
