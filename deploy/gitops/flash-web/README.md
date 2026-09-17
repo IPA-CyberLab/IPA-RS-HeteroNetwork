@@ -4,7 +4,10 @@ The cert-manager Application installs the certificate controller. The
 AppProject permits `cert-manager` and `heterocloud-dns`. Issuance is declared
 in `issuer.yaml` / `certificate.yaml` in this directory.
 The Certificate must provision a DNS01-issued `kubernetes.io/tls` Secret named
-`flash-web-tls` in `heterocloud-dns`, with SAN `*.flash.heterocloud.mizuame.app`
+`flash-web-tls` in `heterocloud-dns`, with SANs for
+`*.flash.heterocloud.mizuame.app`, `heterocloud.mizuame.app`,
+`flow.heterocloud.mizuame.app`, `registry.heterocloud.mizuame.app`, and
+`s3.heterocloud.mizuame.app`
 and an unencrypted private key. Kustomize intentionally requires those two
 parent files; this helper neither creates nor modifies them.
 `wildcard-route.yaml` provides the wildcard fallback HTTPRoute, not DNS

@@ -6,7 +6,8 @@ import { chromium } from 'playwright';
 
 process.umask(0o077);
 const { values } = parseArgs({ options: {
-  gateways: { type: 'string' }, output: { type: 'string' }, proxy: { type: 'string' },
+  gateways: { type: 'string' }, output: { type: 'string' },
+  fallbackResolv: { type: 'string' },
 } });
 const gateways = values.gateways?.split(',');
 if (!gateways?.length || gateways.some(ip => !/^10\.250\.\d{1,3}\.\d{1,3}$/.test(ip))) {
@@ -17,8 +18,7 @@ const report = { started_at_utc: new Date().toISOString(), result: 'failed', can
   gateways: [], errors: [] };
 let browser;
 try {
-  browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'],
-    ...(values.proxy ? { proxy: { server: values.proxy } } : {}) });
+  browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
   // Exercise the client-visible split-DNS path before pinning each request to
   // a gateway. Direct-IP checks alone cannot detect a broken canonical name.
   {
@@ -40,6 +40,12 @@ try {
       await context.close();
     }
   }
+  await browser.close();
+  browser = undefined;
+  if (values.fallbackResolv) {
+    await fs.copyFile(values.fallbackResolv, '/etc/resolv.conf');
+  }
+  browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
   for (const gateway of gateways) {
     for (const port of [80, 9781]) {
       const origin = `http://console.heteronetwork.internal${port === 80 ? '' : ':9781'}`;
@@ -97,12 +103,45 @@ try {
         }
         if (port === 9781) {
           const opened = page.waitForEvent('popup');
+          const deviceStarted = page.waitForResponse(response => {
+            const url = new URL(response.url());
+            return url.pathname === '/v1/web-ui/auth/device' &&
+              response.request().method() === 'POST';
+          });
           await page.getByRole('button', { name: 'Keycloakでログイン' }).click();
           const popup = await opened;
+          const deviceResponse = await deviceStarted;
+          const deviceBody = await deviceResponse.json().catch(() => ({}));
+          if (!deviceResponse.ok()) {
+            throw new Error(`${gateway} device login start returned HTTP ${deviceResponse.status()}: ${deviceBody.error || 'invalid response'}`);
+          }
           popup.setDefaultTimeout(15_000);
           popup.on('pageerror', error => report.errors.push(error.message));
-          await popup.locator('input[name="username"]').waitFor();
-          await popup.locator('input[name="password"]').waitFor();
+          const popupResponses = [];
+          popup.on('response', response => {
+            if (response.request().resourceType() !== 'document') return;
+            const url = new URL(response.url());
+            popupResponses.push({ status: response.status(), url: `${url.origin}${url.pathname}` });
+          });
+          try {
+            await popup.locator('input[name="username"]').waitFor();
+            await popup.locator('input[name="password"]').waitFor();
+          } catch (error) {
+            const url = new URL(popup.url());
+            report.keycloak_failure = {
+              gateway,
+              url: `${url.origin}${url.pathname}`,
+              title: await popup.title().catch(() => ''),
+              body: (await popup.locator('body').innerText().catch(() => '')).slice(0, 1_000),
+              closed: popup.isClosed(),
+              login_page: (await page.locator('body').innerText().catch(() => '')).slice(0, 1_000),
+              verification_origin: (() => {
+                try { return new URL(deviceBody.verification_uri).origin; } catch { return ''; }
+              })(),
+              responses: popupResponses,
+            };
+            throw error;
+          }
           const form = await popup.locator('#kc-login').evaluate(button =>
             ({ action: button.form.action, method: button.form.method }));
           const action = new URL(form.action);
@@ -114,6 +153,7 @@ try {
         }
         report.gateways.push(row);
       } finally {
+        await context.unrouteAll({ behavior: 'ignoreErrors' });
         await context.close();
       }
     }

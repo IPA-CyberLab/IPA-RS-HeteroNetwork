@@ -7,6 +7,10 @@ spec:
   secretName: flash-web-tls
   dnsNames:
     - '*.flash.heterocloud.mizuame.app'
+    - heterocloud.mizuame.app
+    - flow.heterocloud.mizuame.app
+    - registry.heterocloud.mizuame.app
+    - s3.heterocloud.mizuame.app
   issuerRef:
     name: flash-web-letsencrypt
     kind: Issuer

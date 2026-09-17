@@ -25,9 +25,11 @@ class SyncTests(unittest.TestCase):
         cls.pairs = []
         for index, hostname in enumerate((sync.HOST, sync.HOST, "wrong.example")):
             key, cert = cls.workspace / f"key{index}", cls.workspace / f"cert{index}"
+            names = sync.REQUIRED_HOSTS if hostname == sync.HOST else (hostname,)
             subprocess.run(["openssl", "req", "-x509", "-newkey", "ec",
                             "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "2",
-                            "-subj", "/CN=test", "-addext", f"subjectAltName=DNS:{hostname}",
+                            "-subj", "/CN=test", "-addext",
+                            "subjectAltName=" + ",".join(f"DNS:{name}" for name in names),
                             "-keyout", str(key), "-out", str(cert)], check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             cls.pairs.append((cert.read_bytes(), key.read_bytes()))
@@ -77,6 +79,7 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(first.startswith(self.original + b"\n"))
         self.assertIn(b"http://*.flash.heterocloud.mizuame.app:80", first)
         self.assertIn(b"https://*.flash.heterocloud.mizuame.app:443", first)
+        self.assertIn(b"(heterocloud_public_tls)", first)
         self.assertIn(b"import heterocloud_envoy /api/v1/health/live heterocloud.mizuame.app", first)
         inode = self.extra.stat().st_ino
         self.assertFalse(self.run_sync())

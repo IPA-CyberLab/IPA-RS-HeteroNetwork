@@ -6,7 +6,6 @@ import datetime
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 import tempfile
 import time
@@ -50,43 +49,6 @@ def release_quarantine(name, uid):
     patch = {'metadata': {'uid': uid, 'resourceVersion': node['metadata']['resourceVersion']},
              'spec': {'taints': retained}}
     kubectl('patch', 'node', name, '--type=merge', '-p', json.dumps(patch))
-
-
-@contextlib.contextmanager
-def operator_proxy(work):
-    inventory = json.loads((work / 'inventory.json').read_text())['all']
-    bootstrap = inventory['children']['bootstrap']['hosts']['uc-k8sp5']['ansible_host']
-    key = inventory['vars']['ansible_ssh_private_key_file']
-    with socket.socket() as free:
-        free.bind(('127.0.0.1', 0))
-        port = free.getsockname()[1]
-    with (work / 'onboarding-ssh.log').open('w') as log:
-        os.chmod(log.name, 0o600)
-        process = subprocess.Popen(['ssh', '-N', '-i', key,
-            '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-            '-o', 'UserKnownHostsFile=' + str(work / 'known_hosts'),
-            '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=10',
-            '-D', '127.0.0.1:' + str(port), 'mizuame@' + bootstrap],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=log)
-        try:
-            for _ in range(100):
-                if process.poll() is not None:
-                    raise RuntimeError('Operator SSH proxy failed; see private onboarding-ssh.log')
-                try:
-                    with socket.create_connection(('127.0.0.1', port), timeout=0.2):
-                        break
-                except OSError:
-                    time.sleep(0.1)
-            else:
-                raise RuntimeError('Operator SSH proxy did not start')
-            yield 'socks5://127.0.0.1:' + str(port)
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
 
 
 def check(command, output):
@@ -197,9 +159,9 @@ def main():
         gateways = [next(a['address'] for a in p['status']['addresses'] if a['type'] == 'InternalIP') for p in selected]
         assert len(gateways) == len(masters) + len(standard) + 2
         directory = Path(tempfile.mkdtemp(prefix='onboarding-e2e-', dir=work))
-        with operator_proxy(work) as proxy:
-            console = check(['node', str(ROOT / 'scripts/verify-console-gateways.mjs'),
-                             '--gateways', ','.join(gateways), '--proxy', proxy], directory / 'console.json')
+        console = check(['python3', str(ROOT / 'scripts/verify-overlay-client-console.py'),
+                         '--work-dir', str(work), '--gateways', ','.join(gateways)],
+                        directory / 'console.json')
         dedicated = check(['python3', str(ROOT / 'scripts/verify-master-only.py'),
                            '--exercise-admission'], directory / 'masters.json')
         full = {name: check(['python3', str(ROOT / 'scripts/verify-standard-node.py'), '--node', name,

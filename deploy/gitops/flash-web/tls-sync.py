@@ -19,6 +19,13 @@ import uuid
 EXTRA = "public-gateway-extra.Caddyfile"
 CERTDIR = "flash-web-certs"
 HOST = "*.flash.heterocloud.mizuame.app"
+PUBLIC_HOSTS = (
+    "heterocloud.mizuame.app",
+    "flow.heterocloud.mizuame.app",
+    "registry.heterocloud.mizuame.app",
+    "s3.heterocloud.mizuame.app",
+)
+REQUIRED_HOSTS = (HOST, *PUBLIC_HOSTS)
 BEGIN = b"# BEGIN managed flash-web TLS\n"
 END = b"# END managed flash-web TLS\n"
 LIMIT = 256 * 1024
@@ -111,10 +118,11 @@ def validate(cert, key):
             with os.fdopen(fd, "wb") as stream:
                 stream.write(data)
         san = openssl("x509", "-in", str(cert_path), "-noout", "-ext", "subjectAltName")
-        require(HOST.encode() in re.findall(rb"DNS:([^,\s]+)", san),
-                "required wildcard SAN missing")
-        openssl("x509", "-in", str(cert_path), "-noout", "-checkhost",
-                "sync-probe.flash.heterocloud.mizuame.app")
+        names = set(re.findall(rb"DNS:([^,\s]+)", san))
+        require(all(host.encode() in names for host in REQUIRED_HOSTS),
+                "required public SAN missing")
+        for host in ("sync-probe.flash.heterocloud.mizuame.app", *PUBLIC_HOSTS):
+            openssl("x509", "-in", str(cert_path), "-noout", "-checkhost", host)
         dates = openssl("x509", "-in", str(cert_path), "-noout", "-dates")
         parsed = dict(line.split("=", 1) for line in dates.decode("ascii").splitlines())
         def timestamp(name):
@@ -133,11 +141,14 @@ def validate(cert, key):
 
 def route(generation):
     base = f"/etc/heteronetwork/{CERTDIR}/{generation}"
-    return BEGIN + f"""http://{HOST}:80 {{
+    return BEGIN + f"""(heterocloud_public_tls) {{
+    tls {base}/tls.crt {base}/tls.key
+}}
+http://{HOST}:80 {{
     redir https://{{host}}{{uri}} 308
 }}
 https://{HOST}:443 {{
-    tls {base}/tls.crt {base}/tls.key
+    import heterocloud_public_tls
     import heterocloud_envoy /api/v1/health/live heterocloud.mizuame.app
 }}
 """.encode() + END

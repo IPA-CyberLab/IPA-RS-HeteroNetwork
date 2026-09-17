@@ -13,12 +13,15 @@ internal static class EmbeddedTunnelService
     private const uint ServiceChangeConfig = 0x0002;
     private const uint Delete = 0x00010000;
     private const uint ServiceWin32OwnProcess = 0x00000010;
-    private const uint ServiceDemandStart = 0x00000003;
+    private const uint ServiceAutoStart = 0x00000002;
     private const uint ServiceErrorNormal = 0x00000001;
     private const uint ServiceControlStop = 0x00000001;
     private const uint ServiceConfigDescription = 1;
+    private const uint ServiceConfigFailureActions = 2;
+    private const uint ServiceConfigFailureActionsFlag = 4;
     private const uint ServiceConfigSidInfo = 5;
     private const uint ServiceSidTypeUnrestricted = 1;
+    private const uint ScActionRestart = 1;
     private const int ErrorServiceDoesNotExist = 1060;
     private const int ErrorServiceAlreadyRunning = 1056;
     private const int ErrorServiceNotActive = 1062;
@@ -60,7 +63,7 @@ internal static class EmbeddedTunnelService
                     | ServiceChangeConfig
                     | Delete,
                 ServiceWin32OwnProcess,
-                ServiceDemandStart,
+                ServiceAutoStart,
                 ServiceErrorNormal,
                 commandLine,
                 null,
@@ -98,6 +101,8 @@ internal static class EmbeddedTunnelService
                 throw LastWin32Exception(
                     "Unable to set the WireGuard tunnel service description.");
             }
+
+            ConfigureRecovery(service);
 
             if (!StartService(service, 0, null)
                 && Marshal.GetLastWin32Error() != ErrorServiceAlreadyRunning)
@@ -258,6 +263,51 @@ internal static class EmbeddedTunnelService
     private static Win32Exception LastWin32Exception(string message) =>
         new(Marshal.GetLastWin32Error(), message);
 
+    private static void ConfigureRecovery(IntPtr service)
+    {
+        var actionPointer = Marshal.AllocHGlobal(Marshal.SizeOf<ServiceFailureAction>());
+        try
+        {
+            Marshal.StructureToPtr(
+                new ServiceFailureAction { Type = ScActionRestart, Delay = 5_000 },
+                actionPointer,
+                false);
+            var actions = new ServiceFailureActions
+            {
+                ResetPeriod = 86_400,
+                RebootMessage = IntPtr.Zero,
+                Command = IntPtr.Zero,
+                ActionCount = 1,
+                Actions = actionPointer,
+            };
+            if (!ChangeServiceConfig2FailureActions(
+                    service,
+                    ServiceConfigFailureActions,
+                    ref actions))
+            {
+                throw LastWin32Exception(
+                    "Unable to configure WireGuard tunnel service recovery.");
+            }
+
+            var flag = new ServiceFailureActionsFlag
+            {
+                FailureActionsOnNonCrashFailures = 1,
+            };
+            if (!ChangeServiceConfig2FailureActionsFlag(
+                    service,
+                    ServiceConfigFailureActionsFlag,
+                    ref flag))
+            {
+                throw LastWin32Exception(
+                    "Unable to enable WireGuard tunnel recovery for service exits.");
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(actionPointer);
+        }
+    }
+
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr OpenSCManager(
         string? machineName,
@@ -308,6 +358,28 @@ internal static class EmbeddedTunnelService
         uint infoLevel,
         ref ServiceDescription description);
 
+    [DllImport(
+        "advapi32.dll",
+        EntryPoint = "ChangeServiceConfig2W",
+        SetLastError = true,
+        CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ChangeServiceConfig2FailureActions(
+        IntPtr service,
+        uint infoLevel,
+        ref ServiceFailureActions actions);
+
+    [DllImport(
+        "advapi32.dll",
+        EntryPoint = "ChangeServiceConfig2W",
+        SetLastError = true,
+        CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ChangeServiceConfig2FailureActionsFlag(
+        IntPtr service,
+        uint infoLevel,
+        ref ServiceFailureActionsFlag flag);
+
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool StartService(
@@ -347,6 +419,29 @@ internal static class EmbeddedTunnelService
     {
         [MarshalAs(UnmanagedType.LPWStr)]
         public string Description;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ServiceFailureAction
+    {
+        public uint Type;
+        public uint Delay;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ServiceFailureActions
+    {
+        public uint ResetPeriod;
+        public IntPtr RebootMessage;
+        public IntPtr Command;
+        public uint ActionCount;
+        public IntPtr Actions;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ServiceFailureActionsFlag
+    {
+        public int FailureActionsOnNonCrashFailures;
     }
 
     [StructLayout(LayoutKind.Sequential)]

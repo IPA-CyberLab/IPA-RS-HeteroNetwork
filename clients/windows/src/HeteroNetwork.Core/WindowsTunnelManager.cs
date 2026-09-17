@@ -29,6 +29,7 @@ public sealed class WindowsTunnelManager
     private const string ServiceDescription =
         "Gateway-only WireGuard tunnel managed by HeteroNetwork.";
     private const string NrptComment = "HeteroNetwork managed split DNS";
+    private static readonly TimeSpan ProbeBudget = TimeSpan.FromSeconds(3);
     private readonly ClientSessionStore sessionStore;
 
     public WindowsTunnelManager(ClientSessionStore? sessionStore = null)
@@ -98,8 +99,13 @@ public sealed class WindowsTunnelManager
         TunnelProfile profile,
         CancellationToken cancellationToken = default)
     {
-        return await ProbeWebUiAsync(profile, cancellationToken).ConfigureAwait(false)
-            && await ProbeDnsAsync(profile, cancellationToken).ConfigureAwait(false);
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(ProbeBudget);
+        var canonical = ProbeCanonicalConsoleAsync(budget.Token);
+        var direct = ProbeWebUiAsync(profile, budget.Token);
+        var dns = ProbeDnsAsync(profile, budget.Token);
+        await Task.WhenAll(canonical, direct, dns).ConfigureAwait(false);
+        return canonical.Result && direct.Result && dns.Result;
     }
 
     public static string ReadLastHelperError()
@@ -467,6 +473,34 @@ public sealed class WindowsTunnelManager
         catch (Exception error) when (error is HttpRequestException
                                       or TaskCanceledException
                                       or JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task<bool> ProbeCanonicalConsoleAsync(
+        CancellationToken cancellationToken)
+    {
+        using var handler = new SocketsHttpHandler
+        {
+            UseProxy = false,
+            ConnectTimeout = ProbeBudget,
+        };
+        using var client = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan,
+        };
+        try
+        {
+            using var response = await client.GetAsync(
+                "http://console.heteronetwork.internal:9781/ui/",
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken).ConfigureAwait(false);
+            return response.StatusCode == HttpStatusCode.OK
+                && response.Content.Headers.ContentLength is not > 512 * 1024;
+        }
+        catch (Exception error) when (error is HttpRequestException
+                                      or TaskCanceledException)
         {
             return false;
         }
