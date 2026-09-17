@@ -11,6 +11,12 @@ After=heteronetwork-gateway.service
 Type=simple
 Environment=HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ENABLED=true
 Environment=HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=false
+{% if hnn_public_installed | default(false) %}
+# The Agent owns the dynamic Caddy configuration through its protected Unix
+# admin socket.  Without this group the gateway stays on its empty bootstrap
+# configuration even though the host is advertised as a public ingress node.
+SupplementaryGroups=heteronetwork-gateway
+{% endif %}
 ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink --stun-bind {{ ssh_host }}:51820 --public-stun-url udp://163.220.236.61:19444 --public-stun-url udp://163.220.236.45:19444 --packet-flow-detector conntrack-netlink-events --packet-flow-poll-interval-seconds 1
 Restart=on-failure
 RestartSec=5s
