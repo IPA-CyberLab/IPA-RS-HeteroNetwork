@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
+use tower_http::compression::CompressionLayer;
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
@@ -328,7 +329,7 @@ pub fn router(state: AgentHttpState) -> Router {
 }
 
 fn gateway_web_ui_routes() -> Router<AgentHttpState> {
-    Router::new()
+    let static_routes = Router::new()
         .route("/", get(local_ui_root))
         .route("/ui", get(local_ui_index))
         .route("/ui/", get(local_ui_index))
@@ -338,6 +339,9 @@ fn gateway_web_ui_routes() -> Router<AgentHttpState> {
         .route("/ui/styles.css", get(local_ui_styles))
         .route("/ui/vendor/mermaid.min.js", get(local_ui_mermaid))
         .route("/ui/fonts/noto-sans-jp-ui.ttf", get(local_ui_japanese_font))
+        .layer(CompressionLayer::new());
+    Router::new()
+        .merge(static_routes)
         .route("/ui/config", get(local_ui_config))
         .route("/v1/web-ui/healthz", get(healthz))
         .route("/v1/web-ui/endpoints", get(web_ui_endpoints))
@@ -2279,6 +2283,7 @@ async fn local_ui_app() -> Response {
     )
         .into_response();
     apply_local_ui_security_headers(&mut response, false, None);
+    apply_local_ui_asset_cache(&mut response);
     response
 }
 
@@ -2289,6 +2294,7 @@ async fn local_ui_theme() -> Response {
     )
         .into_response();
     apply_local_ui_security_headers(&mut response, false, None);
+    apply_local_ui_asset_cache(&mut response);
     response
 }
 
@@ -2299,6 +2305,7 @@ async fn local_ui_styles() -> Response {
     )
         .into_response();
     apply_local_ui_security_headers(&mut response, false, None);
+    apply_local_ui_asset_cache(&mut response);
     response
 }
 
@@ -2309,6 +2316,7 @@ async fn local_ui_mermaid() -> Response {
     )
         .into_response();
     apply_local_ui_security_headers(&mut response, false, None);
+    apply_local_ui_asset_cache(&mut response);
     response
 }
 
@@ -2372,6 +2380,13 @@ fn apply_local_ui_security_headers(
             headers.insert(HeaderName::from_static("content-security-policy"), value);
         }
     }
+}
+
+fn apply_local_ui_asset_cache(response: &mut Response) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
 }
 
 async fn local_ui_config(
@@ -5395,13 +5410,11 @@ mod tests {
                     && !value.contains("'unsafe-eval'")
             }));
         let index = String::from_utf8(to_bytes(index.into_body(), usize::MAX).await?.to_vec())?;
-        let Some(mermaid_script) = index.find("/ui/vendor/mermaid.min.js") else {
-            return Err("Web UI must load the self-origin Mermaid bundle".into());
-        };
         let Some(app_script) = index.find("/ui/app.js") else {
             return Err("Web UI must load the application bundle".into());
         };
-        assert!(mermaid_script < app_script);
+        assert!(app_script > 0);
+        assert!(!index.contains("<script src=\"/ui/vendor/mermaid.min.js\""));
 
         for host in ["10.250.0.1:9781", "console.heteronetwork.internal:9781"] {
             for path in ["/ui/auth/wait", "/ui/app.js", "/ui/vendor/mermaid.min.js"] {
@@ -5439,6 +5452,28 @@ mod tests {
                 }
             }
         }
+
+        let compressed_app = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/app.js")
+                    .header(header::HOST, "console.heteronetwork.internal:9781")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(compressed_app.status(), StatusCode::OK);
+        assert_eq!(
+            compressed_app.headers().get(header::CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("gzip"))
+        );
+        assert_eq!(
+            compressed_app.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("public, max-age=300"))
+        );
+        let compressed_app = to_bytes(compressed_app.into_body(), usize::MAX).await?;
+        assert!(compressed_app.len() < include_bytes!("../../../webui/app.js").len() / 2);
 
         let health = app
             .clone()

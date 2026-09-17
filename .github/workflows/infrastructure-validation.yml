@@ -11,6 +11,10 @@ on:
       - 'scripts/verify-overlay-client-console.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/ipars-agent-http/**'
+      - 'webui/**'
       - '.github/workflows/infrastructure-validation.yml'
   pull_request:
     paths:
@@ -21,6 +25,10 @@ on:
       - 'scripts/verify-overlay-client-console.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/ipars-agent-http/**'
+      - 'webui/**'
       - '.github/workflows/infrastructure-validation.yml'
 
 permissions:
@@ -130,7 +138,7 @@ jobs:
             {
               echo '### Live HeteroNetwork overlay E2E'
               echo '```json'
-              sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, gateway_vpn_ip, wireguard_handshake_at, canonical: .console.canonical, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
+              sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, gateway_vpn_ip, wireguard_handshake_at, route_convergence_ms, canonical: .console.canonical, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi

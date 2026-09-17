@@ -8,15 +8,19 @@ const configuredPublicOrigin = new URL(
   process.env.HETERONETWORK_WEB_PUBLIC_URL || "http://127.0.0.1:18088",
 ).origin;
 
-test("standalone WebConsole serves the pinned Mermaid bundle from its own origin", async (t) => {
+test("standalone WebConsole lazy-loads the pinned Mermaid bundle from its own origin", async (t) => {
   const origin = await startServer(t);
 
   const indexResponse = await fetch(`${origin}/ui/`);
   assert.equal(indexResponse.status, 200);
   const index = await indexResponse.text();
   const mermaidScript = "/ui/vendor/mermaid.min.js";
-  assert.ok(index.includes(mermaidScript));
-  assert.ok(index.indexOf(mermaidScript) < index.indexOf("/ui/app.js"));
+  assert.ok(!index.includes(`<script src="${mermaidScript}"`));
+  assert.ok(index.includes("/ui/app.js"));
+
+  const appResponse = await fetch(`${origin}/ui/app.js`);
+  assert.equal(appResponse.status, 200);
+  assert.ok((await appResponse.text()).includes(mermaidScript));
 
   const bundleResponse = await fetch(`${origin}${mermaidScript}`);
   assert.equal(bundleResponse.status, 200);

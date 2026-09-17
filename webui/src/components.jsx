@@ -12,6 +12,29 @@ import { useCollection } from "@cloudscape-design/collection-hooks";
 import { useEffect, useId, useMemo, useState } from "react";
 import { statusType } from "./utils.js";
 
+let mermaidLoad;
+
+function loadMermaid() {
+  if (window.mermaid) return Promise.resolve(window.mermaid);
+  if (!mermaidLoad) {
+    mermaidLoad = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "/ui/vendor/mermaid.min.js";
+      script.async = true;
+      script.addEventListener("load", () => {
+        if (window.mermaid) resolve(window.mermaid);
+        else reject(new Error("Mermaidを読み込めませんでした"));
+      }, { once: true });
+      script.addEventListener("error", () => {
+        mermaidLoad = undefined;
+        reject(new Error("Mermaidを読み込めませんでした"));
+      }, { once: true });
+      document.head.append(script);
+    });
+  }
+  return mermaidLoad;
+}
+
 export function Status({ value, children }) {
   return (
     <StatusIndicator type={statusType(value)}>
@@ -164,23 +187,26 @@ export function MermaidDiagram({ source }) {
     let cancelled = false;
     setSvg("");
     setError(null);
-    if (!window.mermaid || !source) {
-      setError(new Error("Mermaidを読み込めませんでした"));
+    if (!source) {
       return () => {
         cancelled = true;
       };
     }
-    window.mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      theme: document.documentElement.classList.contains("awsui-dark-mode")
-        ? "dark"
-        : "default",
-      flowchart: { htmlLabels: true, curve: "basis" },
-    });
-    Promise.resolve(window.mermaid.render(renderId, source))
+    loadMermaid()
+      .then((mermaid) => {
+        if (cancelled) return null;
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: document.documentElement.classList.contains("awsui-dark-mode")
+            ? "dark"
+            : "default",
+          flowchart: { htmlLabels: true, curve: "basis" },
+        });
+        return mermaid.render(renderId, source);
+      })
       .then((result) => {
-        if (!cancelled) setSvg(result.svg);
+        if (!cancelled && result) setSvg(result.svg);
       })
       .catch((renderError) => {
         if (!cancelled) setError(renderError);

@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import concurrent.futures
 import datetime
 import hashlib
 import ipaddress
@@ -257,22 +258,76 @@ def browser_check(work, gateway, gateways, output):
     return report
 
 
-def remove_client(identity, client_id, peer):
+def signed_client_control_request(identity, client_id, kind, active_gateway=None):
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     nonce = b64url(secrets.token_bytes(24))
-    payload = (
-        "heteronetwork-client-request-v1\nremove\n"
-        f"{client_id}\n{int(now.timestamp())}\n{nonce}\n"
-    ).encode()
-    body = json.dumps({
+    if active_gateway is None:
+        payload = (
+            f"heteronetwork-client-request-v1\n{kind}\n"
+            f"{client_id}\n{int(now.timestamp())}\n{nonce}\n"
+        ).encode()
+    else:
+        payload = (
+            f"heteronetwork-client-request-v2\n{kind}\n"
+            f"{client_id}\n{active_gateway}\n{int(now.timestamp())}\n{nonce}\n"
+        ).encode()
+    request = {
         "client_id": client_id,
-        "active_gateway_node_id": None,
         "request_signature": {
             "signed_at": timestamp(now),
             "nonce": nonce,
             "signature": base64.b64encode(identity.sign(payload)).decode("ascii"),
         },
-    }).encode()
+    }
+    if active_gateway is not None:
+        request["active_gateway_node_id"] = active_gateway
+    return json.dumps(request).encode()
+
+
+def refresh_client_peers(identity, client_id, peer):
+    body = signed_client_control_request(
+        identity, client_id, "peer_map", peer["node_id"])
+    request = urllib.request.Request(
+        f"http://{peer['vpn_ip']}/v1/clients/peers/query", data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=5) as response:
+        data = json.load(response)
+    peers = data.get("peer_map", {}).get("peers", [])
+    if not peers or peers[0].get("node_id") != peer["node_id"]:
+        raise RuntimeError("control plane did not retain the active client gateway")
+    return data["peer_map"].get("generated_at")
+
+
+def gateway_route_is_ready(gateway):
+    request = urllib.request.Request(
+        f"http://{gateway}/v1/web-ui/healthz",
+        headers={"Accept": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=1) as response:
+            return response.status == 200 and json.load(response).get("status") == "ok"
+    except Exception:
+        return False
+
+
+def wait_for_gateway_routes(gateways, timeout=20):
+    started = time.monotonic()
+    pending = set(gateways.split(","))
+    while pending and time.monotonic() - started < timeout:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as executor:
+            results = dict(zip(pending, executor.map(gateway_route_is_ready, pending)))
+        pending = {gateway for gateway, ready in results.items() if not ready}
+        if pending:
+            time.sleep(0.2)
+    if pending:
+        raise RuntimeError(
+            "client return routes did not converge on gateways: " + ", ".join(sorted(pending)))
+    return round((time.monotonic() - started) * 1000)
+
+
+def remove_client(identity, client_id, peer):
+    body = signed_client_control_request(identity, client_id, "remove")
     request = urllib.request.Request(
         f"http://{peer['vpn_ip']}/v1/clients/{client_id}", data=body,
         headers={"Content-Type": "application/json"}, method="DELETE")
@@ -324,6 +379,9 @@ def main():
             "wireguard_mtu": OVERLAY_MTU,
             "routes": routes,
         })
+        report["peer_map_generated_at"] = refresh_client_peers(
+            identity, client_id, peer)
+        report["route_convergence_ms"] = wait_for_gateway_routes(args.gateways)
         write_report(args.output, report)
         console = browser_check(work, peer["vpn_ip"], args.gateways, args.output)
         report.update({
