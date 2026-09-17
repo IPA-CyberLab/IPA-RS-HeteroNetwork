@@ -27,6 +27,9 @@ separate Terraform trigger from the three dedicated masters. The dedicated
 master isolation policies continue to apply only to the original three hosts.
 `terraform_data.console_configuration` explicitly maintains the Agent's overlay
 listener on 9781 and a VPN-only compatibility proxy on 80 on all six gateways.
+It also distributes and verifies the checksum-pinned native binaries on all six
+gateways, including the bootstrap and enrollment issuer hosts that are not
+created by the master or standard host resources.
 The Agent wants this proxy so it returns after Agent restarts. The dedicated
 master playbook preserves this Agent companion while disabling native
 application services. No application Pod is added to the dedicated masters.

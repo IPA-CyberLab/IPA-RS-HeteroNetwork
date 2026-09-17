@@ -6,7 +6,44 @@
   vars:
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_binary_archive: "{{ hnn_work_dir }}/native-bin.tar.gz"
   tasks:
+    - name: Create the native binary directory
+      ansible.builtin.file:
+        path: /opt/heteronetwork/bin
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Inspect console networking binaries
+      ansible.builtin.stat:
+        path: '/opt/heteronetwork/bin/{{ item.key }}'
+        checksum_algorithm: sha256
+      loop: '{{ hnn_native_binary_sha256 | dict2items }}'
+      register: hnn_console_binaries
+    - name: Install pinned console networking binaries
+      ansible.builtin.unarchive:
+        src: '{{ hnn_binary_archive }}'
+        dest: /opt/heteronetwork/bin
+        owner: root
+        group: root
+        mode: '0755'
+      when:
+        - not ansible_check_mode
+        - hnn_console_binaries.results | selectattr('stat.checksum', 'defined') | map(attribute='stat.checksum') | list | sort != hnn_native_binary_sha256.values() | list | sort
+      notify: Restart console Agent
+    - name: Verify console networking binaries
+      ansible.builtin.stat:
+        path: '/opt/heteronetwork/bin/{{ item.key }}'
+        checksum_algorithm: sha256
+      loop: '{{ hnn_native_binary_sha256 | dict2items }}'
+      register: hnn_console_verified_binaries
+    - name: Enforce console binary provenance
+      ansible.builtin.assert:
+        that: item.stat.checksum | default('') == item.item.value
+        fail_msg: Console binary checksum does not match the declared artifact
+      loop: '{{ hnn_console_verified_binaries.results }}'
+      when: not ansible_check_mode
     - name: Read the registered gateway address privately
       ansible.builtin.slurp:
         src: /var/lib/heteronetwork/agent.json
