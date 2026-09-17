@@ -41,7 +41,8 @@ standard_resources=[]
 for name in standard:
     standard_resources.append({'apiVersion':'v1','kind':'Node','metadata':{'name':name,
         'labels':{'kubernetes.io/hostname':name,'node-role.kubernetes.io/control-plane':'',
-                  'heteronetwork.io/control-plane-only':'false','networking.heteronetwork.io/public-ingress':'true'},
+                  'heteronetwork.io/control-plane-only':'false','networking.heteronetwork.io/public-ingress':'true',
+                  'database.heteronetwork.io/proxy-ready':'true'},
         'annotations':{'networking.heteronetwork.io/public-ingress-enabled':'true',
                        'argocd.argoproj.io/sync-options':'Prune=false,Delete=false','argocd.argoproj.io/sync-wave':'0'}},
         'spec':{'unschedulable':False}})

@@ -16,8 +16,19 @@ spec:
       valueFiles:
         - ../../environments/heteronet/values.yaml
       valuesObject:
+        replicaCount: 3
         image:
           tag: "0.1.71@sha256:44d315a9dd3dba03f1b1517c5a45c2aa9c38d6d5bc6b33537bfe417cd1c7bf7b"
+        worker:
+          replicaCount: 3
+        ownerConsole:
+          replicaCount: 3
+          externalIPs:
+            - 10.250.0.4
+            - 10.250.0.5
+            - 10.250.0.6
+            - 10.250.0.10
+            - 10.250.0.11
         hostAliases:
           - ip: "10.96.180.79"
             hostnames:

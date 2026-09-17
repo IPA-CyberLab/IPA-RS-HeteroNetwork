@@ -7,6 +7,7 @@ metadata:
     node-role.kubernetes.io/control-plane: ''
     heteronetwork.io/control-plane-only: 'false'
     networking.heteronetwork.io/public-ingress: 'true'
+    database.heteronetwork.io/proxy-ready: 'true'
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'true'
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
