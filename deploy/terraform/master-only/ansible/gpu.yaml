@@ -216,7 +216,7 @@
 
     - name: Query GPUs through the installed driver
       ansible.builtin.command:
-        argv: [nvidia-smi, --query-gpu=uuid, --format=csv,noheader]
+        argv: [nvidia-smi, --query-gpu=uuid, "--format=csv,noheader"]
       register: hnn_gpu_smi
       changed_when: false
       check_mode: false
