@@ -118,6 +118,10 @@
         stdin: "{{ item | to_json }}"
         stdin_add_newline: true
       delegate_to: uc-k8sp5
+      register: hnn_gpu_inventory_apply
+      until: hnn_gpu_inventory_apply.rc == 0
+      retries: 12
+      delay: 5
       changed_when: true
       no_log: true
       loop: "{{ hnn_gpu_private_inventory.resources | default([]) }}"
