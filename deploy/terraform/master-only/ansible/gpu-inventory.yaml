@@ -92,7 +92,7 @@
           - --server-side
           - "--field-manager={{ hnn_gpu_inventory_manager }}"
           - -f
-          - -
+          - "-"
         stdin: "{{ item | to_json }}"
         stdin_add_newline: true
       delegate_to: uc-k8sp5
@@ -114,7 +114,7 @@
           - --force-conflicts
           - "--field-manager={{ hnn_gpu_inventory_manager }}"
           - -f
-          - -
+          - "-"
         stdin: "{{ item | to_json }}"
         stdin_add_newline: true
       delegate_to: uc-k8sp5

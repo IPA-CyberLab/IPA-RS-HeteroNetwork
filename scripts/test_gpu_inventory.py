@@ -20,6 +20,22 @@ GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, NVIDIA GeForce GTX 1080 Ti, 00000000:0
 
 
 class GpuInventoryTests(unittest.TestCase):
+    def test_playbook_passes_stdin_marker_as_a_string(self):
+        playbook = (
+            MODULE_PATH.parents[1]
+            / "deploy"
+            / "terraform"
+            / "master-only"
+            / "ansible"
+            / "gpu-inventory.yaml"
+        ).read_text().splitlines()
+        stdin_markers = [
+            playbook[index + 1].strip()
+            for index, line in enumerate(playbook[:-1])
+            if line.strip() == "- -f"
+        ]
+        self.assertEqual(stdin_markers, ['- "-"', '- "-"'])
+
     def test_renders_hardware_without_owner_access_fields(self):
         inventory = gpu_inventory.render_inventory(
             "uc-k8sp5",
