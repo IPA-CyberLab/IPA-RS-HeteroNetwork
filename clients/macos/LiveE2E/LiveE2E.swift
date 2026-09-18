@@ -159,8 +159,18 @@ private struct LiveE2ECommand {
             pending: pending
         )
         try store.completeImport(pending: pending, session: session)
-        guard try store.load() == session else { throw LiveE2EError.roundTripFailed }
+        guard let restored = try store.load(),
+              try canonicalSession(restored) == canonicalSession(session)
+        else {
+            throw LiveE2EError.roundTripFailed
+        }
         return session
+    }
+
+    private static func canonicalSession(_ session: ClientSession) throws -> Data {
+        let encoder = HeteroNetworkCoding.makeEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(session)
     }
 
     private static func ensureSession(profilePath: String) throws -> ClientSession {
