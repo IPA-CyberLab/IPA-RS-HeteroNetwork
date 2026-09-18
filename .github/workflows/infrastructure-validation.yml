@@ -19,6 +19,8 @@ on:
       - 'scripts/test_gpu_inventory.py'
       - 'scripts/verify_gpu_inventory.py'
       - 'scripts/test_verify_gpu_inventory.py'
+      - 'scripts/verify_flash_crds.py'
+      - 'scripts/test_verify_flash_crds.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/ipars-agent-http/**'
@@ -41,6 +43,8 @@ on:
       - 'scripts/test_gpu_inventory.py'
       - 'scripts/verify_gpu_inventory.py'
       - 'scripts/test_verify_gpu_inventory.py'
+      - 'scripts/verify_flash_crds.py'
+      - 'scripts/test_verify_flash_crds.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/ipars-agent-http/**'
@@ -64,12 +68,13 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_verify_standard_node.py -v
           python3 -B -m unittest discover -s scripts -p test_gpu_inventory.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_gpu_inventory.py -v
+          python3 -B -m unittest discover -s scripts -p test_verify_flash_crds.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_overlay_client_console.py -v
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs
           node --check scripts/heteronetwork-console-browser-e2e.mjs
-          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py scripts/gpu_inventory.py scripts/verify_gpu_inventory.py
+          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py scripts/gpu_inventory.py scripts/verify_gpu_inventory.py scripts/verify_flash_crds.py
 
   live-overlay-browser-e2e:
     if: >-

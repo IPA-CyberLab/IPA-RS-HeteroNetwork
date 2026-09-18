@@ -158,6 +158,26 @@ resource "kubernetes_manifest" "external_application" {
   depends_on = [kubernetes_manifest.gitops_project]
 }
 
+resource "terraform_data" "flash_crd_acceptance" {
+  input = {
+    application = "heterocloud-flash"
+    revision    = yamldecode(file("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml")).spec.source.targetRevision
+    contract    = "bounded-private-assignments-and-canonical-gpu-type"
+  }
+  triggers_replace = [
+    filesha256("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml"),
+    filesha256("${local.repo_root}/scripts/verify_flash_crds.py")
+  ]
+  provisioner "local-exec" {
+    working_dir = local.repo_root
+    command     = "python3 scripts/verify_flash_crds.py"
+    environment = {
+      KUBECONFIG = pathexpand(var.kubeconfig_path)
+    }
+  }
+  depends_on = [kubernetes_manifest.external_application["heterocloud-flash"]]
+}
+
 resource "terraform_data" "host_configuration" {
   for_each = local.nodes
   input = {
@@ -439,7 +459,7 @@ resource "terraform_data" "gpu_inventory_configuration" {
   }
   depends_on = [
     terraform_data.gpu_acceptance,
-    kubernetes_manifest.external_application["heterocloud-flash"]
+    terraform_data.flash_crd_acceptance
   ]
 }
 

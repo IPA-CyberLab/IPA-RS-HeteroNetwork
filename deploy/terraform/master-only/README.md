@@ -175,6 +175,9 @@ to each smoke Pod. After the Flash GPU CRD is established,
 server-side apply field manager. Hardware identifiers stay out of Terraform
 state and logs. The owner API controls open/private visibility and user
 assignments through fields the infrastructure manager never applies.
+Argo CD upgrades the Flash CRDs with server-side apply. Terraform waits for
+the live CRDs to enforce the release's bounded UUID assignment and GPU type
+contracts before GPU inventory reconciliation can be accepted.
 
 References: [Terraform provisioners](https://developer.hashicorp.com/terraform/language/provisioners),
 [Kubernetes state backend](https://developer.hashicorp.com/terraform/language/backend/kubernetes),

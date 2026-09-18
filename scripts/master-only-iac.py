@@ -39,6 +39,7 @@ def main():
     gpu_acceptance_drift=args.reconcile_all or not inventory.exists()
     gpu_inventory_drift=args.reconcile_all or not inventory.exists()
     gpu_inventory_acceptance_drift=args.reconcile_all or not inventory.exists()
+    flash_crd_acceptance_drift=args.reconcile_all or not inventory.exists()
     git_drift=args.reconcile_all or not inventory.exists()
     console_drift=args.reconcile_all or not inventory.exists()
     onboarding_drift=args.reconcile_all or not inventory.exists()
@@ -109,9 +110,17 @@ def main():
             if result.returncode not in [0,2]:
                 raise RuntimeError('GPU inventory acceptance check failed; see private gpu-inventory-acceptance-check.log')
             gpu_inventory_acceptance_drift=result.returncode==2
-        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
+        result=subprocess.run(['python3',str(ROOT/'scripts/verify_flash_crds.py'),'--check'],
+                              env=env,text=True,capture_output=True)
+        log=work/'flash-crd-acceptance-check.log'
+        log.write_text(result.stdout+result.stderr)
+        log.chmod(0o600)
+        if result.returncode not in [0,2]:
+            raise RuntimeError('Flash CRD acceptance check failed; see private flash-crd-acceptance-check.log')
+        flash_crd_acceptance_drift=result.returncode==2
+        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'flash_crd_acceptance_drift':flash_crd_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
     if args.action=='check':
-        return 2 if drift or standard_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
+        return 2 if drift or standard_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or flash_crd_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
     tf=[args.terraform,'-chdir='+str(MODULE)]
     subprocess.run(tf+['init','-input=false'],env=env,check=True)
     replace=['-replace=terraform_data.host_configuration['+json.dumps(name)+']' for name in drift]
@@ -124,6 +133,8 @@ def main():
         replace.append('-replace=terraform_data.gpu_inventory_configuration')
     if gpu_inventory_acceptance_drift:
         replace.append('-replace=terraform_data.gpu_inventory_acceptance')
+    if flash_crd_acceptance_drift:
+        replace.append('-replace=terraform_data.flash_crd_acceptance')
     if git_drift:
         replace.append('-replace=terraform_data.git_source')
     if console_drift:
