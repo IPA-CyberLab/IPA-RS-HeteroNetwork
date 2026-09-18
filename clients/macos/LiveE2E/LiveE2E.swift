@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
+#if canImport(HeteroNetworkCore)
 import HeteroNetworkCore
+#endif
 
 private enum LiveE2EError: LocalizedError {
     case disabled

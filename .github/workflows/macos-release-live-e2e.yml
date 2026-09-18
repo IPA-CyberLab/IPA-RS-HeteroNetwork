@@ -93,15 +93,13 @@ jobs:
           test -x "$HOME/Applications/HeteroNetwork.app/Contents/MacOS/HeteroNetwork"
           test -x /Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper
 
-      - name: Compile the live driver against the installed release framework
+      - name: Compile the live driver from the exact release source
         run: |
           set -euo pipefail
           framework_dir="$HOME/Applications/HeteroNetwork.app/Contents/Frameworks"
           test -d "$framework_dir/HeteroNetworkCore.framework"
           xcrun swiftc -parse-as-library \
-            -F "$framework_dir" \
-            -framework HeteroNetworkCore \
-            -Xlinker -rpath -Xlinker "$framework_dir" \
+            clients/macos/Sources/Core/*.swift \
             clients/macos/LiveE2E/LiveE2E.swift \
             -o "$MACOS_E2E_ROOT/macos-live-e2e"
           codesign --force --sign - "$MACOS_E2E_ROOT/macos-live-e2e"
