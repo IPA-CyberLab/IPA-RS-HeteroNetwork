@@ -7,6 +7,7 @@ platform=""
 install_dir=""
 download_dir=""
 launch_after_install=1
+macos_helper_path="/Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper"
 
 usage() {
     cat <<'EOF'
@@ -32,6 +33,14 @@ EOF
 fail() {
     printf 'HeteroNetwork installer: %s\n' "$*" >&2
     exit 1
+}
+
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
 }
 
 detect_platform() {
@@ -300,9 +309,16 @@ case "$platform" in
             || fail 'macOS archive contains a linked client executable'
         [ -f "$source_app/Contents/MacOS/HeteroNetwork" ] \
             || fail 'macOS archive does not contain the client executable'
+        source_helper="$source_app/Contents/Resources/heteronetwork-root-helper"
+        [ ! -L "$source_helper" ] \
+            || fail 'macOS archive contains a linked privileged helper'
+        [ -f "$source_helper" ] && [ -x "$source_helper" ] \
+            || fail 'macOS archive does not contain the privileged helper'
+        "$source_helper" self-test >/dev/null \
+            || fail 'macOS privileged helper self-test failed'
         if ! codesign --verify --deep --strict "$source_app" >/dev/null 2>&1; then
             printf '%s\n' \
-                'Warning: this development build is unsigned; macOS will not start its VPN Network Extension.' >&2
+                'Warning: this development build does not have a valid app signature.' >&2
         fi
 
         if [ -z "$install_dir" ]; then
@@ -315,6 +331,34 @@ case "$platform" in
         backup_app="$install_dir/.HeteroNetwork.app.old.$$"
         rm -rf "$staged_path" "$backup_app"
         ditto "$source_app" "$staged_path"
+
+        if [ "$(id -u)" -ne 0 ]; then
+            command -v sudo >/dev/null 2>&1 \
+                || fail 'sudo is required to install the macOS network helper'
+            printf '%s\n' \
+                'Administrator access is required to install the HeteroNetwork network helper.' >&2
+            sudo -v || fail 'administrator authentication was not completed'
+        fi
+        if [ -x "$macos_helper_path" ]; then
+            "$macos_helper_path" stop >/dev/null 2>&1 || true
+        fi
+        run_as_root /usr/bin/install -d -o root -g wheel -m 0755 \
+            /Library/PrivilegedHelperTools
+        if run_as_root /usr/bin/test -L "$macos_helper_path"; then
+            fail 'refusing to replace a linked privileged helper'
+        fi
+        helper_stage="$macos_helper_path.new.$$"
+        run_as_root /bin/rm -f "$helper_stage"
+        if ! run_as_root /usr/bin/install -o root -g wheel -m 0755 \
+            "$source_helper" "$helper_stage"; then
+            run_as_root /bin/rm -f "$helper_stage" || true
+            fail 'unable to stage the macOS network helper'
+        fi
+        if ! run_as_root /bin/mv -f "$helper_stage" "$macos_helper_path"; then
+            run_as_root /bin/rm -f "$helper_stage" || true
+            fail 'unable to activate the macOS network helper'
+        fi
+
         if [ -e "$target_app" ]; then
             mv "$target_app" "$backup_app"
         fi

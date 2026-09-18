@@ -1,5 +1,4 @@
 import AppKit
-import NetworkExtension
 import SwiftUI
 
 struct MenuBarContent: View {
@@ -46,7 +45,7 @@ struct MenuBarContent: View {
         switch model.vpnStatus {
         case .connected, .connecting, .reasserting:
             Button {
-                model.disconnect()
+                Task { await model.disconnect() }
             } label: {
                 Label("Disconnect", systemImage: "stop.fill")
             }
@@ -58,8 +57,6 @@ struct MenuBarContent: View {
                 Label("Connect", systemImage: "play.fill")
             }
             .disabled(model.isBusy || model.vpnStatus == .disconnecting)
-        @unknown default:
-            EmptyView()
         }
     }
 }

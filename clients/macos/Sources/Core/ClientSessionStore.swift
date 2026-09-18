@@ -23,7 +23,7 @@ public final class ClientSessionStore {
     private let encoder = HeteroNetworkCoding.makeEncoder()
     private let decoder = HeteroNetworkCoding.makeDecoder()
 
-    public init(accessGroup: String? = HeteroNetworkConstants.keychainAccessGroup) {
+    public init(accessGroup: String? = nil) {
         self.accessGroup = accessGroup
     }
 

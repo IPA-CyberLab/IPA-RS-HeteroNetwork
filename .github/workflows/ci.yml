@@ -196,19 +196,24 @@ jobs:
           tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
           printf '%s\n' "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
 
+      - name: Test privileged macOS network helper
+        working-directory: clients/macos/RootHelper
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          test -z "$unformatted"
+          go test -mod=readonly ./...
+          go vet -mod=readonly ./...
+          go build -mod=readonly -trimpath -o "$RUNNER_TEMP/heteronetwork-root-helper-test" .
+          "$RUNNER_TEMP/heteronetwork-root-helper-test" self-test
+
+      - name: Run privileged macOS root-helper E2E
+        working-directory: clients/macos/RootHelper
+        run: ./e2e.sh "$RUNNER_TEMP/heteronetwork-root-helper-test"
+
       - name: Generate Xcode project
         working-directory: clients/macos
         run: ./scripts/bootstrap.sh
-
-      - name: Resolve pinned WireGuardKit package
-        working-directory: clients/macos
-        run: |
-          set -euo pipefail
-          xcodebuild \
-            -project HeteroNetwork.xcodeproj \
-            -scheme HeteroNetwork \
-            -derivedDataPath "$RUNNER_TEMP/HeteroNetworkDerivedData" \
-            -resolvePackageDependencies
 
       - name: Run macOS client tests
         working-directory: clients/macos
@@ -223,7 +228,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
 
-      - name: Build unsigned Release app and packet tunnel
+      - name: Build unsigned Release app and root helper
         working-directory: clients/macos
         run: |
           set -euo pipefail
@@ -243,11 +248,16 @@ jobs:
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/HeteroNetworkDerivedData/Build/Products/Release/HeteroNetwork.app"
-          extension="$app/Contents/PlugIns/HeteroNetworkPacketTunnel.appex"
+          helper="$app/Contents/Resources/heteronetwork-root-helper"
           test -x "$app/Contents/MacOS/HeteroNetwork"
-          test -x "$extension/Contents/MacOS/HeteroNetworkPacketTunnel"
+          test -x "$helper"
+          test -d "$app/Contents/Frameworks/HeteroNetworkCore.framework"
           xcrun lipo "$app/Contents/MacOS/HeteroNetwork" -verify_arch "$MACHINE_ARCH"
-          xcrun lipo "$extension/Contents/MacOS/HeteroNetworkPacketTunnel" -verify_arch "$MACHINE_ARCH"
+          xcrun lipo "$helper" -verify_arch "$MACHINE_ARCH"
+          "$helper" self-test
+          codesign --force --sign - "$helper"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
           asset="heteronetwork-client-macos-${CLIENT_ARCH}.zip"
           asset_dir="$RUNNER_TEMP/desktop-assets"
           mkdir "$asset_dir"

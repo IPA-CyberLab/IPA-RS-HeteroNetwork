@@ -288,10 +288,12 @@ Control Plane. The app validates that the import matches its pending keys,
 brings up WireGuard from the returned globally reachable gateway candidates,
 and performs its first management-plane request only after the VPN is active.
 
-The macOS app installs a signed Network Extension profile; the Windows app
-includes the pinned official WireGuard embeddable service and WireGuardNT
-runtime, and requests administrator approval when its profile changes. No
-separate WireGuard installation is required. Both refresh the gateway map every
+The macOS installer uses `sudo` to install a root-owned userspace WireGuard
+helper under `/Library/PrivilegedHelperTools`; **Connect** requests administrator
+approval before that helper creates a `utun`. The Windows app includes the
+pinned official WireGuard embeddable service and WireGuardNT runtime, and
+requests administrator approval when its profile changes. No separate
+WireGuard installation is required. Both refresh the gateway map every
 five seconds while connected and switch to a cached standby after two failed
 VPN-local health probes. The active gateway is reported in the signed peer-map
 request. The shared control-plane store changes every node's return route for

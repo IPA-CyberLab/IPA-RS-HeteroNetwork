@@ -1,0 +1,14 @@
+module github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/clients/macos/root-helper
+
+go 1.20
+
+require (
+	golang.org/x/sys v0.5.0
+	golang.zx2c4.com/wireguard v0.0.0-20230209153558-1e2c3e5a3c14
+)
+
+require (
+	golang.org/x/crypto v0.6.0 // indirect
+	golang.org/x/net v0.6.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20211104114900-415007cec224 // indirect
+)

@@ -1,5 +1,4 @@
 import HeteroNetworkCore
-import NetworkExtension
 import SwiftUI
 
 struct SettingsView: View {
@@ -149,7 +148,7 @@ struct SettingsView: View {
         switch model.vpnStatus {
         case .connected, .connecting, .reasserting:
             Button {
-                model.disconnect()
+                Task { await model.disconnect() }
             } label: {
                 Label("Disconnect", systemImage: "stop.fill")
             }
@@ -164,8 +163,6 @@ struct SettingsView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(model.isBusy || model.vpnStatus == .disconnecting)
-        @unknown default:
-            EmptyView()
         }
     }
 
@@ -200,7 +197,6 @@ struct SettingsView: View {
         case .connected: return .green
         case .connecting, .disconnecting, .reasserting: return .orange
         case .invalid, .disconnected: return .secondary
-        @unknown default: return .secondary
         }
     }
 }

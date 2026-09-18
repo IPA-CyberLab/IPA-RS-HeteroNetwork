@@ -21,7 +21,6 @@ docker/relay-operator-api.token
 docker/relay-admission.token
 clients/macos/HeteroNetwork.xcodeproj/
 clients/macos/Config/App-Info.plist
-clients/macos/Config/PacketTunnel-Info.plist
 clients/macos/.derived-data/
 clients/macos/.test-derived-data/
 clients/macos/.build/
@@ -29,7 +28,6 @@ clients/windows/**/bin/
 clients/windows/**/obj/
 clients/windows/artifacts/
 clients/windows/.build/
-clients/macos/
 .key
 /HeteroNetwork.tar.gz
 **/.terraform/

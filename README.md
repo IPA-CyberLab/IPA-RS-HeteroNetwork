@@ -20,17 +20,17 @@ verifies its SHA-256 file, installs it for the current user, and starts the app.
 Use `sh -s -- --version vX.Y.Z` after the pipe to select an exact release.
 Windows release archives include the .NET runtime.
 
-The macOS CI archive is an unsigned development build. Its UI can be installed
-with the command above, but macOS requires an Apple-issued application identity
-and matching provisioning profiles for the Network Extension before the VPN
-tunnel can run. Windows Smart App Control may likewise require an Authenticode
-certificate from a trusted issuer; the Windows build supports that certificate
-through `build.ps1`.
+The macOS release is ad-hoc signed and uses a root-owned userspace WireGuard
+helper, so it does not require Apple's Network Extension entitlement. The
+installer asks for `sudo` once to install that helper, and **Connect** shows the
+normal administrator prompt when starting a tunnel. Windows Smart App Control
+may require an Authenticode certificate from a trusted issuer; the Windows
+build supports that certificate through `build.ps1`.
 
 The repository is being built toward a complete system rather than an MVP. The current baseline contains:
 
-- native desktop clients: a SwiftUI macOS menu-bar app backed by a Network
-  Extension and a WPF Windows task-tray app with the official WireGuard
+- native desktop clients: a SwiftUI macOS menu-bar app backed by a root-owned
+  `utun` userspace WireGuard helper and a WPF Windows task-tray app with the official WireGuard
   embeddable tunnel service and WireGuardNT runtime built in. Both use protected identity storage, signed control-plane
   refresh/removal, and a gateway-only WireGuard peer map; see
   [`clients/macos`](clients/macos/README.md) and

@@ -1,18 +1,20 @@
 # HeteroNetwork for macOS
 
-The macOS client is a native SwiftUI menu-bar app backed by a
-`NEPacketTunnelProvider` and the official WireGuardKit package. It joins an
-existing HeteroNetwork overlay as a control-only client. It never advertises
-routes, registers with Signal, accepts relay traffic, or appears in the normal
-node inventory.
+The macOS client is a native SwiftUI menu-bar app. A small root-owned helper
+creates a userspace WireGuard `utun`, installs only the projected overlay
+routes, and publishes split DNS for `heteronetwork.internal`. It does not use
+Apple's Network Extension framework, so the downloadable build does not need a
+Developer ID Network Extension entitlement.
+
+The Mac joins as a control-only client. It never advertises routes, registers
+with Signal, accepts relay traffic, or appears in the normal node inventory.
 
 ## Requirements
 
 - macOS 13 or later
-- Xcode with a Developer ID or Apple Development team that has the Network
-  Extension capability
-- XcodeGen 2.45.4
-- Go 1.20.14 for WireGuardKit's `wireguard-go` bridge
+- An administrator account for installing and starting the network helper
+- Xcode and XcodeGen 2.45.4 when building locally
+- Go 1.20.14 or later for the pinned `wireguard-go` implementation
 
 ## Install the latest release
 
@@ -20,10 +22,18 @@ node inventory.
 curl -fsSL https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroNetwork/master/install-client.sh | sh
 ```
 
-This installs the matching Apple Silicon or Intel archive under
-`~/Applications` and starts it. The CI archive is unsigned: a working packet
-tunnel still requires the app and extension to be rebuilt or re-signed with an
-Apple-issued identity and matching Network Extension provisioning profiles.
+The installer verifies the release checksum, installs the matching Apple
+Silicon or Intel app under `~/Applications`, and uses `sudo` to copy the helper
+to:
+
+```text
+/Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper
+```
+
+The helper remains root-owned and is never setuid. Selecting **Connect** shows
+the normal macOS administrator prompt before the helper creates the tunnel.
+Once running, status, gateway updates, and disconnect requests use an
+owner-only Unix socket and do not prompt again.
 
 ## Generate and build
 
@@ -33,18 +43,11 @@ cd clients/macos
 open HeteroNetwork.xcodeproj
 ```
 
-`bootstrap.sh` fetches the official WireGuardKit source at the pinned commit
-into the ignored `.build` directory, corrects its inconsistent Swift tools
-manifest declaration, and applies the reviewed split-DNS patch in `patches/`
-before generating the project. It refuses a checkout at any other revision.
-
-Set the same Apple development team on `HeteroNetwork`,
-`HeteroNetworkPacketTunnel`, and `HeteroNetworkCore`. The bundle IDs, App Group,
-and shared Keychain group in `project.yml` and `Config/*.entitlements` must be
-registered for that team before an archive can be signed.
-
-The CI job performs an unsigned app/extension build and the core unit tests.
-Running the packet tunnel on a Mac still requires a signed Network Extension.
+The app build runs `scripts/build-root-helper.sh` and embeds the resulting
+architecture-specific helper in the app resources. The Go module pins the same
+reviewed `wireguard-go` revision used by the prior WireGuardKit build. The app
+uses the normal per-application Keychain and does not require an App Group or
+Network Extension entitlement.
 
 ## Enroll
 
@@ -53,24 +56,20 @@ Running the packet tunnel on a Mac still requires a signed Network Extension.
    `sudo ipars client register '<heteronetwork://register?...>'`.
 3. Paste the returned `heteronetwork://import?...` profile into the macOS app
    and select **Import profile**.
-4. Approve the VPN configuration prompt and select **Connect**.
+4. Select **Connect** and approve the administrator prompt.
 5. Open `http://console.heteronetwork.internal/ui/` from the app.
 
 The Ed25519 identity and WireGuard private keys are generated on the Mac and
-stored as a pending, device-only Keychain item. The SSH registration request
-contains only their public keys and a proof-of-possession signature. A valid
-import profile promotes those pending keys into the shared client session and
-then deletes the pending item. Neither URI contains private key material.
+stored as device-only Keychain items. The SSH registration request contains
+only their public keys and a proof-of-possession signature. The WireGuard
+private key is passed to the root helper through a randomly named, mode `0600`
+file and an owner-only Unix socket; it is never placed in a process argument or
+log.
 
-The client installs only the active gateway and projected overlay CIDRs. The
-control plane supplies up to four ready gateway candidates, while the packet
-tunnel refreshes its signed peer map every five seconds and updates the running
-WireGuard adapter when the preferred gateway changes. Two failed VPN-local
-health probes also trigger a cached-gateway switch before server-side health
-expiry. Each refresh signs the active gateway ID so the control plane can move
-the client's return routes on every Linux node at the same time. The private
-`heteronetwork.internal` zone uses split DNS against the active gateway;
-unrelated DNS remains on the host's normal resolver. The first connection uses
-the imported peer map without contacting the VPN-only management API. The client refuses default
-routes, STUN/local/relay candidates, non-global gateway addresses, public
-management URLs, and invalid WireGuard keys before starting the tunnel.
+The control plane supplies up to four ready gateway candidates. While
+connected, the app refreshes its signed peer map every five seconds and updates
+the running helper if the preferred gateway changes. Two failed VPN-local HTTP
+and DNS probes trigger cached-gateway failover before server-side health expiry.
+The client rejects default routes, STUN/local/relay candidates, non-global
+gateway addresses, public management URLs, and invalid WireGuard keys before
+starting the tunnel.
