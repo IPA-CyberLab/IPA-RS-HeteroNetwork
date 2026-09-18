@@ -1,600 +1,110 @@
 # HeteroNetwork
 
-Rust implementation of an operations-oriented P2P VPN / overlay network for Linux hosts, Docker environments, Kubernetes node underlays, edge nodes, and large distributed clusters.
+HeteroNetwork is a Rust-based P2P VPN and overlay network for Linux, Docker,
+Kubernetes, edge nodes, and native desktop clients. It prefers direct
+WireGuard paths, falls back to an end-to-end encrypted relay, and keeps the
+data plane running when the control plane is temporarily unavailable.
 
-For a reproducible three-control-plane kubeadm deployment over the VPN underlay,
-see [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md).
+## Quick setup
 
-## Desktop client install
+### macOS or Windows
 
-The release workflow publishes checksum-pinned clients for Apple Silicon Macs,
-Intel Macs, and x64 Windows. On macOS, run this in Terminal:
+Run this in macOS Terminal or Windows Git Bash:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroNetwork/master/install-client.sh | sh
+curl -fsSL https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases/download/v0.1.15-dev.13/install-heteronetwork-client.sh | sh
 ```
 
-On Windows, run the same command from Git Bash. The installer selects the host
-architecture, downloads the newest published release (including a pre-release),
-verifies its SHA-256 file, installs it for the current user, and starts the app.
-Use `sh -s -- --version vX.Y.Z` after the pipe to select an exact release.
-Windows release archives include the .NET runtime.
+The installer detects the host architecture, downloads the newest published
+client, verifies its SHA-256 checksum, installs it for the current user, and
+opens the app. Sign in with Keycloak and select **Connect**.
 
-The macOS release is ad-hoc signed and uses a root-owned userspace WireGuard
-helper, so it does not require Apple's Network Extension entitlement. The
-installer asks for `sudo` once to install that helper, and **Connect** shows the
-normal administrator prompt when starting a tunnel. Windows Smart App Control
-may require an Authenticode certificate from a trusted issuer; the Windows
-build supports that certificate through `build.ps1`.
+macOS asks for administrator access when it installs the network helper and
+starts a tunnel. Windows includes the required .NET and WireGuard runtime in
+the release archive.
 
-The repository is being built toward a complete system rather than an MVP. The current baseline contains:
+### Linux node
 
-- native desktop clients: a SwiftUI macOS menu-bar app backed by a root-owned
-  `utun` userspace WireGuard helper and a WPF Windows task-tray app with the official WireGuard
-  embeddable tunnel service and WireGuardNT runtime built in. Both use protected identity storage, signed control-plane
-  refresh/removal, and a gateway-only WireGuard peer map; see
-  [`clients/macos`](clients/macos/README.md) and
-  [`clients/windows`](clients/windows/README.md)
-- a Rust workspace split by control plane, signal, relay, STUN, agent, route manager, crypto, shared types, and CLI boundaries
-- typed node, peer, path, relay, token, policy, ACL, route, and health models
-- signed join token creation and verification with shared signer/verifier/CLI/Agent/Control Plane envelope and claim-shape validation: the Ed25519 signature must be canonical standard Base64 of exactly 64 decoded bytes (88 encoded bytes), identifiers are path-safe and capped at 255 bytes, claim and policy tags are capped at 64 entries, policy routes are capped at 256 safe canonical non-overlapping CIDRs, validity is capped at a 30-day TTL plus 5-second `not_before` skew window, and typed bootstrap lists are capped at 32 endpoints total, 8 per service kind, and 2048 bytes per URL
-- shared canonical Ed25519 signature-envelope validation for heartbeat, WireGuard key rotation, node removal, token revocation, Control Plane node query, and Signal upsert/path/hole-punch requests, rejecting malformed, non-canonical, wrong-length, or oversized signatures before cryptographic verification
-- canonical fixed-size key-material validation across issuer configuration, node registration, key rotation, Agent state, and WireGuard backends: Ed25519 and WireGuard keys must encode exactly 32 bytes as 44 bytes of standard Base64, weak Ed25519 public keys and low-order X25519 public keys are rejected, and persisted Agent identity/WireGuard private/public pairs must remain cryptographically consistent
-- pair-scoped path state and scoring primitives
-- control-plane registration/IP-allocation service that skips already assigned VPN IPs and retries after durable-store insert races
-- SQLite and PostgreSQL control-plane store implementations with typed node-ID/VPN-IP uniqueness guards and transaction-locked PostgreSQL schema initialization for concurrent HA startup
-- expiring public-service leases that aggregate active Control Plane, Signal, STUN, Relay, and Web UI endpoints, including signed Agent-published Signal/STUN/Relay leases from nodes without local SQL, and expose HA readiness through the operator API, Prometheus, OTLP, and the Web UI
-- signed control-plane node removal that reclaims durable VPN IP leases and clears stale health/path state
-- token ledger primitives and control-plane revocation API with durable pre-use revocation tombstones, full-claims nonce collision detection for new records, and transaction-serialized first admission, max-use consumption, and revocation
-- control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, relay-capability policy, WireGuard public-key format, identity-derived node IDs, and candidate/route ownership before registration
-- replay-resistant signed node heartbeat updates for health, endpoint candidates, advertised routes, relay capacity, and pair-scoped path state
-- typed control-plane HTTP routes for health, join registration, trusted-issuer-signed token revocation, signed node removal, signed WireGuard key rotation, identity-signed and replay-protected ACL-filtered peer-map/path-status retrieval, and Bearer-protected policy plus JSON/Prometheus operator metrics including VPN pool and join-token ledger gauges
-- `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
-- signal registry, node-identity-signed and replay-protected signal HTTP routes, JSON/Prometheus metrics, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
-- RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, partial-outage-tolerant multi-server NAT mapping/filtering classification, bounded discovery of at most 8 unique usable STUN server sockets, and `iparsd stun` daemon for public endpoint detection
-- relay session admission/status HTTP API with optional Bearer-token admission gating, configurable admission burst limiting that also covers unauthorized admission attempts, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed non-empty opaque UDP payload forwarding with per-session rate limits, bounded relay-frame metadata/payload sizes, and `iparsd relay`
-- control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
-- `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoints with ordered failover
-- persistent agent node state with owner-only state directory creation, atomic file writes, and symlink rejection, agent status/path/path-probe/STUN probe/NAT classification/peer-activity/packet-flow/WireGuard-key-rotation HTTP API with loopback-only default binding and Bearer authentication for non-loopback listeners, and `iparsd agent`
-- `iparsd agent --join-token` or bounded regular-file `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery with ordered failover
-- `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, advertised route updates, relay capability updates, and path state, retrying across known control-plane endpoints
-- Agent-side service-directory persistence and runtime failover: signed token endpoints bootstrap initial registration only; the first non-empty directory learned from registration, heartbeat, or peer-map responses becomes authoritative, is persisted for restart recovery, and replaces retired token endpoints instead of retaining them indefinitely
-- `iparsd agent` signed signal-service node registration that refreshes the authoritative control-plane NodeRecord, endpoint candidates, and relay capability across known signal endpoints, with signal-side membership TTL and non-admissible relay capability normalization
-- `iparsd agent` signed signal path negotiation and hole-punch planning that fetches peer maps across known control-plane endpoints, fails over across known signal endpoints, rejects replayed request nonces, records pair-scoped path state, and reports it in heartbeat payloads
-- `iparsd agent` relay admission for signal-selected relay paths, stable reuse of the active relay session while its relay remains admissible, failing over across utilization-ranked relay candidates, aligning stored path state to the admitted relay, downgrading credentialless relay selections to `UNREACHABLE`, and storing expiring relay credentials only in transient agent runtime state
-- relay session renewal window handling, expired/stale relay credential cleanup, stale relay credential removal when paths return to direct/non-relay states, and relay-to-direct promotion margin only while relay credentials remain active
-- agent relay dataplane forwarder that proxies local WireGuard UDP packets through credentialed relay frames while keeping payload opaque end to end
-- agent relay capability advertisement for public nodes with explicit relay endpoint/admission URL settings, still gated by join-token relay policy at control-plane registration
-- relay-aware peer-map application that revalidates direct selected/fallback endpoint candidates before WireGuard configuration, plus daemon-supervised per-peer forwarder endpoints with namespace placement checks, capacity limits, dead-task reaping, and restart backoff for active relay sessions
-- agent JSON and Prometheus metrics for path state, relay admission, relay forwarders, lazy connect, packet-flow activity, conntrack lifecycle/application classification, and filtered destination reason counters plus bounded structured path-change event export with total/dropped counters
-- `iparsd` root observability options for structured tracing output and optional OTLP HTTP/protobuf trace/log/metrics export to an OpenTelemetry collector across control-plane, signal, relay, and agent components
-- UDP hole-punch executor and `iparsd agent` integration for signal-provided NAT traversal punch plans, with serialized STUN probe/classification updates that replace prior STUN-sourced candidates and deduplicate identical reflexive endpoints, positive attempt/interval startup validation, relay admission fallback when direct traversal setup fails and signal offered usable relay candidates, and `UNREACHABLE` downgrade when no relay fallback is available
-- `scripts/agent-nat-smoke.sh` runs two real `iparsd agent` processes in isolated namespaces, starts the real Control Plane/Signal/STUN/Relay bootstrap, verifies encrypted WireGuard traffic through relay fallback, requires bidirectional `DIRECT_NAT_TRAVERSAL` promotion for endpoint-independent, fixed-port, and mixed-port two-sided SNAT plus one-sided endpoint-independent and port-preserving public-peer profiles, and covers symmetric two-sided, asymmetric two-sided, and one-sided public-peer address/port-dependent SNAT profiles that must remain on relay (`HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=symmetric`, `asymmetric`, or `one-sided-symmetric`)
-- Kubernetes underlay Service/API route application from explicit Helm CIDRs or least-privilege RBAC-backed Kubernetes API Service discovery through command or kernel netlink Linux route backends
-- Docker container CIDR route application from explicit Compose/agent route intents or Docker Engine API network discovery through command or kernel netlink Linux route backends, including logged removal of previously applied routes that disappear from later discovery plans
-- control-plane heartbeat handling for health, candidate refresh, and pair-scoped path-state persistence
-- Linux WireGuard command backend for explicit interface creation and peer upsert/removal through `ip`/`wg`, a selectable kernel netlink backend for current or validated `--linux-netns` WireGuard interface and peer management, and a userspace-command backend that can use an operator-managed userspace WireGuard interface or supervise a configured userspace WireGuard process, configure its private key, listen port, local VPN address, and peers before peer-map sync, and export its lifecycle state through agent status and metrics
-- Linux route-manager command backend for overlay routes and policy rules through `ip route`/`ip rule`, plus a selectable rtnetlink backend, both with validated namespace placement
-- agent peer-map applier that persists the control-plane-assigned local VPN IP, configures the persisted local WireGuard private key without placing it in command arguments or logs and refreshes it after local key rotation, assigns the VPN IP as a `/32` or `/128` address on command, kernel-netlink, or userspace WireGuard interfaces before peer routes are applied, configures a nonzero WireGuard listen port that must match the initial STUN probe bind port for real peer-map runtimes, resolves WireGuard endpoints from pair-scoped negotiated path state even when relay forwarding is disabled, converts active or pinned control-plane peers into WireGuard peer configs and route plans, serializes concurrent map application, rejects duplicate active peer keys or reuse of the local key before mutation, reconciles the actual interface peer-key and main-table route inventories after each successful authoritative map fetch so restart-surviving stale peers, rotated keys, and stale routes are removed without process-local caches, and prunes idle or stale peers after the cluster idle timeout or peer-map removal
-- advertised-route reconciliation that excludes locally provided CIDRs, selects one healthy provider per CIDR by route metric and stable Node ID/route-ID tie-breaks, installs the selected CIDR in both the provider's WireGuard `AllowedIPs` and a Linux route marked for HeteroNetwork, removes unknown or legacy direct routes from the managed interface after restart, and moves `AllowedIPs` plus routes together when the preferred provider disappears
-- `iparsd agent --apply-peer-map` continuous identity-signed peer-map polling through `POST /v1/peers/query` and applying active/pinned peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
-- CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `relay probe`, `stun probe`, `path status`, `path events`, `path activity`, `path probe`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, validated HTTP API-backed agent/control-plane status, peer, route, relay, path query, path-change event, activation, and path probe operations when URLs are provided, plus STUN Binding and optional-Bearer-auth relay admission/dataplane probes for operator validation
-- Docker Compose manifest with service healthchecks, distinct file-backed control-plane, signal, STUN, and relay operator credentials plus agent join-token and management-API Bearer secrets and a shared file-backed relay admission credential, host-network agent loopback wiring, aligned agent STUN/WireGuard port environment defaults (`51821`, separate from the relay's `51820`), env-driven Docker route, route backend, WireGuard backend/userspace lifecycle, explicit relay advertisement plus separate relay admission auth/abuse-control settings, relay forwarder endpoint/bind/namespace/supervisor wiring, discovery-only Docker API socket binding, gated dry-run management-plane plus isolated two-container kernel-WireGuard dataplane smoke coverage, and Helm chart starting points
-- hardened systemd public-node units that bind the four public services into one lease failure domain and restart them without root or network capabilities; see [`deploy/systemd`](deploy/systemd/README.md)
-- Docker Engine route discovery also accepts an explicit `--docker-api-url` for remote engines, with HTTPS required off-host, optional bounded PEM CA material via `--docker-api-ca-cert-path`, and loopback-only HTTP for local development; the existing Unix socket and rootless socket discovery paths remain available. Daemon tests cover two independent remote Engine URLs queried concurrently with per-host namespace separation and independent subnet churn across repeated discovery cycles.
-- `scripts/docker-multi-engine-smoke.sh` can start two isolated local Docker daemons with separate data roots, containerd sockets, and loopback API endpoints, then verifies real API discovery, per-engine namespace separation, and bridge subnet churn across both endpoints; CI runs this gate beside the Compose integration suite.
-- `ipars docker install` propagates that choice into Compose: URL-backed plans omit the local Docker API socket bind and discovery preflight, and add a read-only CA bind overlay when requested; socket-backed plans retain the existing rootful/rootless discovery overrides. Rootless route-provider plans with a remote URL verify the external workload network on both the Compose Docker Engine and the remote discovery Engine, then use `curl` for the remote check, passing `--docker-api-ca-cert-path` as `--cacert` instead of relying on Docker CLI certificate discovery.
-- architecture, operations, security, load-test plan, and `ipars-load` scale/load harness
+Use an existing HeteroNetwork management console:
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/LOAD_TEST_PLAN.md](docs/LOAD_TEST_PLAN.md), and [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for the target design, runbooks, load plan, and current completion gap.
+1. Select **Add device**.
+2. Choose the required setup profile.
+3. Copy the generated one-line command to a clean Ubuntu systemd host and run
+   it with `sudo`.
+4. Wait for the node to become healthy and pass the automated onboarding E2E
+   checks.
 
-## Build
+The generated command contains a short-lived enrollment token and the exact
+release checksum. Do not assign a VPN address or create a Kubernetes join
+command manually.
 
-```bash
+For the first public node or a deployment without an existing console, follow
+the [operations runbook](docs/OPERATIONS.md).
+
+### Build from source
+
+Rust 1.88 or newer is required:
+
+```sh
+git clone https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
+cd IPA-RS-HeteroNetwork
+cargo build --locked --release
 cargo test --locked --workspace
 ```
 
-## Web Management UI
+The binaries are written to `target/release/ipars` and
+`target/release/iparsd`.
 
-The control-plane daemon serves an operations UI at `/ui/`. It shows registered
-devices, health, selected paths, relay/candidate state, advertised routes, the
-active ACL policy, and a node-services matrix with lease expiry and HA
-readiness. The node-services view uses registered nodes as rows, joins leases
-through their owning host and optional overlay-node identities, and lists
-infrastructure-only service hosts separately. The admin endpoints behind the UI are authenticated; node removal,
-path pinning, and policy updates are available from the browser. The UI is
-embedded in the Rust binary and does not require a Node.js build.
+## What it provides
 
-The UI supports explicit light/dark themes (with the operating-system preference
-as the first-run default) and English/Japanese locale selection. Both choices
-are stored locally without storing OIDC credentials or enrollment tokens. With
-node enrollment enabled, **Add device** creates a bounded single-use or reusable
-join token from the live HA service directory and returns a copyable Linux
-install command plus script. The raw token stays only in page memory.
+- Signed, policy-bound node and desktop-client enrollment
+- WireGuard peer and route reconciliation with lazy connections
+- Direct IPv4, IPv6, and NAT-traversed paths with encrypted relay fallback
+- HA Control Plane, Signal, STUN, Relay, Web UI, Keycloak, and PostgreSQL
+- Docker route discovery and Kubernetes underlay integration
+- Native macOS and Windows clients
+- Prometheus, OpenTelemetry, health, path, and service-directory telemetry
+- Terraform, Ansible, Argo CD, Helm, systemd, and release automation
 
-Every Agent bound to the default loopback listener also serves the console at
-`http://127.0.0.1:9780/ui/`. This local origin caches Web UI endpoints from the
-authenticated service directory, checks them concurrently, and proxies
-management reads to another healthy Control Plane when the selected endpoint
-fails. Mutations are sent once to a preflighted endpoint to avoid ambiguous
-double application. If no directory is cached yet, enter one initial IP address
-or URL in the local UI; a validated manual seed is persisted in the owner-only
-Agent state file. Public IP addresses and hostnames require HTTPS with a valid
-certificate, while HTTP is limited to loopback, private, link-local, and CGNAT
-addresses.
+The current implementation and known gaps are tracked in
+[Implementation Status](docs/IMPLEMENTATION_STATUS.md).
 
-The generated Linux installer also installs a checksum-pinned Caddy gateway in
-standby mode. When periodic STUN classification proves that the node owns a
-globally routable address, the Agent provisions a short-lived ACME IP
-certificate and serves the console at `https://<public-ip>/`. A Control Plane
-publishes that origin as a leased `web_ui` service only after probing it over
-public HTTPS. A private reclassification, stale classification, repeated STUN
-failure, or failed HTTPS probe removes the lease and returns the gateway to
-standby automatically. Public gateway requests can reach only UI assets,
-Keycloak device login, read-only endpoint status, and authenticated management
-proxy routes; the remaining Agent API stays loopback-only. Keycloak device
-authorization avoids dynamic redirect-URI and browser CORS exceptions when a
-node gains or changes its public IP.
+## Repository map
 
-A colocated Keycloak replica can be published through the same IP certificate
-by setting
-`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM=127.0.0.1:18080` and a
-realm discovery path in
-`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH`. Only Keycloak realm
-and static-resource paths are exposed. The gateway lease is withdrawn if
-either the UI or OIDC discovery probe fails. The Agent rewrites Keycloak URLs
-in its public `/ui/config` response to the active gateway origin, so a gateway
-can use any healthy Control Plane without returning another node's issuer. A
-node without a local OIDC upstream keeps the HA directory's reachable Keycloak
-origins instead; it can therefore enter or leave the public Gateway pool
-without being assigned a permanent identity-provider role.
+| Path | Purpose |
+| --- | --- |
+| [`crates/`](crates/) | Rust CLI, daemons, protocol, storage, networking, and controllers |
+| [`clients/macos/`](clients/macos/README.md) | SwiftUI client and privileged userspace WireGuard helper |
+| [`clients/windows/`](clients/windows/README.md) | WPF client and WireGuardNT service integration |
+| [`charts/`](charts/) | Helm deployment |
+| [`deploy/`](deploy/) | Terraform, Ansible, Argo CD, systemd, and Kubernetes configuration |
+| [`scripts/`](scripts/) | Deployment, recovery, packaging, and E2E verification |
+| [`webui/`](webui/) | Embedded management UI |
+| [`docs/`](docs/) | Design, operations, security, and incident records |
 
-`scripts/keycloak-ha-node.sh` installs a native Keycloak replica backed by the
-shared PostgreSQL HA service and a private HAProxy backchannel. Set
-`HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES` to a comma-separated list
-of the node's HeteroNetwork and management-network addresses when Control
-Planes use both paths. Public addresses are rejected. Run `install` for the
-initial node setup or `install-backchannel` to reconcile only HAProxy. Deploy at
-least two Keycloak replicas and configure both private realm URLs through the
-Control Plane backchannel variables below.
+## Documentation
 
-Every standard Linux enrollment also installs
-`heteronetwork-postgres-autopilot.service`. Once three eligible Linux nodes are
-ready, it creates the PostgreSQL/Patroni cluster automatically, adds every
-additional non-client Linux node as a replica (up to 32), and expands etcd from
-three to five voters through learners. No database bundle or per-host database
-environment is copied by the operator; see [docs/POSTGRES_HA.md](docs/POSTGRES_HA.md).
+- [Architecture](docs/ARCHITECTURE.md)
+- [Operations](docs/OPERATIONS.md)
+- [Security](docs/SECURITY.md)
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md)
+- [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md)
+- [PostgreSQL HA](docs/POSTGRES_HA.md)
+- [Master-only and standard-node IaC](deploy/terraform/master-only/README.md)
+- [Release channels](docs/RELEASE_CHANNELS.md)
+- [GitHub Actions VPN and console E2E](docs/github-actions-vpn-console-e2e.md)
 
-The operator enrollment API also accepts
-`"setup":"kubernetes_ha_control_plane"` with a reusable token limited to
-exactly three uses. The returned command is identical on all three clean
-Ubuntu hosts: it enrolls the Agent, discovers the three-node cohort and VPN
-addresses, elects the first control plane, transfers short-lived kubeadm
-credentials over an authenticated HeteroNetwork-only endpoint, serializes the
-remaining joins, and verifies the resulting stacked-etcd cluster. No per-host
-VPN address, node role, or kubeadm join command is supplied to the hosts.
-Additional Linux hosts can join that cluster as ordinary workers with
-`refresh-worker-join-bundle`, `prepare`, and `join-worker` from
-`scripts/kubeadm-ha-node.sh`. The worker-only bundle contains a short-lived
-bootstrap token and CA hash without the control-plane certificate key. Enroll
-workers without the `kubernetes-control-plane` or `route-provider` tags so
-Flannel VXLAN traffic over their HeteroNetwork node IPs remains lazy. The
-enrollment API reserves `kubernetes-control-plane` for the HA control-plane
-setup, and `join-worker` rejects an existing Agent registration that still
-carries that tag or a `kubernetes-ha-*` cohort tag.
+## Development checks
 
-OIDC is enabled by default with Keycloak:
-
-The following OIDC fragments assume the cluster, issuer, and complete service
-advertisement settings from `deploy/systemd/public-node.env.example`.
-`iparsd control-plane` refuses to start without a leased Control Plane, Signal,
-and STUN advertisement.
-
-```bash
-HETERONETWORK_WEB_AUTH_PROVIDER=keycloak
-HETERONETWORK_WEB_PUBLIC_URL=https://control-plane.example.com
-HETERONETWORK_WEB_OIDC_ISSUER_URL=https://sso.example.com/realms/heteronetwork
-HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL=http://keycloak.service.consul:8080/realms/heteronetwork
-HETERONETWORK_WEB_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS=http://keycloak-b.service.consul:8080/realms/heteronetwork
-HETERONETWORK_WEB_OIDC_CLIENT_ID=heteronetwork-web
-iparsd control-plane
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 ```
 
-Register `https://control-plane.example.com/ui/` as the public client redirect
-URI and enable Authorization Code with PKCE. The Keycloak client must allow the
-control-plane origin as a Web Origin. To use the failover-safe local console,
-also register `http://127.0.0.1:9780/ui/` as a redirect URI and
-`http://127.0.0.1:9780` as a Web Origin. The default development issuer is
-`http://localhost:8080/realms/heteronetwork`.
+Privileged network, Docker, Kubernetes, desktop-client, and release tests run
+in GitHub Actions for published releases.
 
-When `HETERONETWORK_WEB_PUBLIC_URL` is set, the Control Plane performs the PKCE token
-exchange through short-lived, single-use server-side state and publishes
-`/ui/login` as the login endpoint. This is required for plain-HTTP lab IPs where
-browser WebCrypto is unavailable and also avoids a browser-side token exchange.
-Plain HTTP is accepted only for loopback, private, link-local, and CGNAT
-addresses; Internet-facing issuer and public URLs must use HTTPS.
-`HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL` is optional and affects only
-server-side token exchange and userinfo validation. Set it to a trusted private
-Keycloak route when Control Plane nodes cannot hairpin to the public issuer;
-the browser still receives the public issuer and token endpoints.
-For Keycloak, an access token issued through another dynamic public gateway is
-accepted when its signed issuer uses the same scheme, realm path, and port as
-the configured issuer. The token's issuer host is forwarded only to the private
-Keycloak backchannel for provider validation, allowing every Control Plane to
-validate tokens from newly advertised public gateway IPs without a static host
-list.
+## License
 
-To use Amazon Cognito, keep the issuer URL for token validation and set the
-hosted UI domain separately:
-
-```bash
-HETERONETWORK_WEB_AUTH_PROVIDER=cognito
-HETERONETWORK_WEB_OIDC_ISSUER_URL=https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example
-HETERONETWORK_WEB_OIDC_AUTH_BASE_URL=https://heteronetwork.auth.us-east-1.amazoncognito.com
-HETERONETWORK_WEB_OIDC_CLIENT_ID=exampleclient
-iparsd control-plane
-```
-
-The Cognito app client must allow the same `/ui/` callback URL and use a
-public-client PKCE flow. `HETERONETWORK_WEB_UI_ENABLED=false` disables OIDC setup and
-the UI; an existing `HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN` or its
-file-backed variant can also be entered in the UI as an operator-token
-fallback. The OIDC access token is checked server-side through the configured
-provider userinfo endpoint before any `/v1/admin/*` request is handled.
-`HETERONETWORK_WEB_PUBLIC_URL` defines that Control Plane's callback origin but
-is not advertised as an HA endpoint without an external reachability check.
-Dynamic public gateways publish short leases only after their Agent verifies
-the public TLS UI and, when configured, the OIDC discovery endpoint. New Agents
-receive that verified candidate set through enrollment and heartbeat updates.
-
-Enable the enrollment workflow with a dedicated owner-only signer that is
-shared by the active Control Plane replicas:
-
-```bash
-HETERONETWORK_NODE_ENROLLMENT_ENABLED=true
-HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH=/etc/ipars/node-enrollment-issuer.key
-HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID=web-enrollment
-HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS=604800
-HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH=/opt/ipars/bin/iparsd
-HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/ipars/relay-admission.token
-```
-
-The private-key path above is for direct daemon invocation. The packaged
-systemd unit instead loads the root-only
-`/etc/credstore/node-enrollment-issuer.key` as a service credential, so the
-shared Signal, STUN, and Relay Unix account cannot read the source key.
-The Relay admission file is an owner-only cluster credential shared by every
-Relay replica. Add device installers place that credential and the corresponding
-Agent systemd drop-in by default; pass `--disable-relay` to the downloaded
-installer only for nodes that must not receive it. Joining nodes need no manual
-Relay configuration.
-
-The same installer enables automatic public-service promotion by default.
-Every joined node continuously reconciles its authenticated Agent state and
-starts VPN-reachable Control Plane and Web UI plus public STUN and Relay service
-advertisement while it has a fresh directly reachable public classification and
-healthy database and Relay dependencies. Signal is advertised in addition only
-while the public HTTPS gateway probe succeeds; losing HTTPS withdraws Signal
-without stopping STUN or Relay. A host behind static DNAT can be
-declared with `--mapped-public-ip IP` on the generated installer; promotion then
-also requires that STUN continuously observes that exact globally routable IP
-with a stable endpoint-independent mapping. Losing a base prerequisite withdraws
-the remaining service lease and stops the promoted services. Use
-`--disable-public-services` only for an explicit per-node opt-out.
-An automatically promoted Control Plane remains enrollment verification-only by
-default. If the dedicated signer is explicitly installed at
-`/etc/credstore/node-enrollment-issuer.key` together with the root-only Agent
-Relay admission credential, the autopilot loads both through an isolated
-systemd credential drop-in and advertises that replica as an enrollment signer.
-
-This signer is distinct from the offline root issuer. The verifier limits it to
-non-control-plane node roles, matching tags, no route grants, bounded uses/TTL,
-and redundant bootstrap endpoints. The management endpoint requires the same
-OIDC/operator authorization as the rest of `/v1/admin/*`.
-
-Linux network namespace integration tests are gated because they create host network namespaces and require `iproute2` plus `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`:
-
-```bash
-HETERONETWORK_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
-HETERONETWORK_RUN_PEER_PROBE_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_peer_probe
-HETERONETWORK_RUN_WG_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_wireguard_backend
-HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_hole_punch
-HETERONETWORK_RUN_RELAY_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_relay_fallback
-```
-
-For a repeatable privileged namespace suite with preflight checks, run:
-
-```bash
-scripts/netns-smoke.sh
-```
-
-It verifies temporary namespace creation before running the route, Docker/Kubernetes route-intent, peer-quality UDP probe, WireGuard when `wg` is installed, hole-punch, and relay-fallback namespace tests. The relay fallback case also sends an invalid relay credential before the valid opaque payload and fails if that frame reaches the peer forwarder. Set `HETERONETWORK_NETNS_SMOKE_EBPF_OBJECT_PATH` to a built object to require real tracepoint attach and ring-buffer event delivery; CI always enables this gate. Set `HETERONETWORK_NETNS_SMOKE_SKIP_WIREGUARD=1` to skip the WireGuard case on hosts without kernel WireGuard support.
-
-The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support. The hole-punch namespace tests include a signal-registry generated `DIRECT_NAT_TRAVERSAL` plan executed by the UDP puncher across direct-routed namespaces, fixed-port and port-preserving one-sided public-peer SNAT, IP-only, fixed-port, and mixed port-preserving/fixed-port endpoint-independent two-sided SNAT topologies, plus an address/port-dependent SNAT non-traversal case where advertised STUN reflexive ports differ from peer-destination mappings. Always-on NAT classification and signal tests also cover address-dependent mapping from same-port, different-address STUN probes and keep that strategy on coordinated hole punching when filtering evidence permits it. They require `iptables` plus `sysctl` when the gated tests are enabled.
-
-The privileged gate also runs `scripts/agent-nat-smoke.sh` for eight full multi-daemon Agent loops: endpoint-independent, fixed-port, and mixed-port two-sided SNAT cover registration, NAT classification, peer-map reconciliation, relay admission/forwarding, encrypted overlay ping, and relay-to-direct recovery; the one-sided and one-sided-port-preserving profiles (`HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=one-sided` or `one-sided-port-preserving`) cover a public peer against an endpoint-independent SNAT Agent and direct promotion; the symmetric, asymmetric, and one-sided-symmetric profiles cover address-and-port-dependent classification and encrypted relay-only traffic. The broader namespace matrix remains transport-boundary coverage for the remaining NAT behaviors.
-
-The control-plane NAT discovery contract has a smaller reproducible smoke that registers three signed nodes, submits public, NAT-like, and relay-preferred classifications, reads the authenticated WebConsole overview payload, then updates one node through a signed heartbeat:
-
-```bash
-scripts/nat-discovery-smoke.sh
-```
-
-This verifies that the retained classification count, traversal strategy counts, observed endpoint, and node-level overview data update without manual topology labels. The production Agent performs the same classification at startup and every `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. While a node is classified `public` or `mapped_public` it uses the shorter `HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS` interval so address loss and replacement converge quickly without making NAT filtering paths flap on repeated RFC 5780 probes. A directly addressed node is public only when STUN reports a matching globally routable local/reflexive address. A static-DNAT node is mapped-public only after an operator supplies `--mapped-public-ip` and STUN confirms that exact address with a stable endpoint-independent mapping; a mismatch automatically removes its public candidate. Private, link-local, documentation, and shared CGNAT/Tailscale addresses are never promoted to public candidates.
-
-Docker Compose smoke coverage is also gated because it requires a Docker daemon with Compose/BuildKit, kernel WireGuard support, and builds the repository image. Its first phase generates a signed join token, verifies the bundled Compose Docker API socket render plus multi-network/rootless capability reset/userspace-WireGuard/relay-forwarder environment rendering, starts PostgreSQL/control-plane/signal/STUN/relay plus two agents with `docker compose up --wait`, and uses agent `dry-run` runtime overrides so management-plane checks do not mutate host routes while validating reciprocal control-plane and agent-local peer maps, packet-flow-triggered lazy-connect path negotiation, agent JSON and Prometheus metrics, peer-activity pinning, signal metrics, and heartbeat propagation of agent path state back to the control plane. Its second phase starts two PostgreSQL-backed Control Planes plus paired Signal/STUN services in separate network namespaces and two `linux-command` Agents in distinct Docker network namespaces. Each Agent discovers only its filtered IPv4/IPv6 workload and route-only bridge CIDRs through the read-only Engine API before joining, then the gate requires separate kernel WireGuard interfaces, reciprocal peer maps and routes, nonzero handshakes and transfer counters, and bidirectional IPv4/IPv6 workload traffic. After stopping the primary Control Plane namespace, it checks the secondary Control Plane, Signal, and STUN endpoints, repeats all traffic checks, and changes a live bridge subnet through surviving heartbeat/peer-map reconciliation. Finally it starts a third Agent for the first time and requires multi-bootstrap STUN discovery, new registration with a distinct VPN IP, Signal registration, heartbeat, automatic peer-map sync, and a fresh identity-signed peer-map query through the surviving Control Plane:
-
-```bash
-scripts/docker-smoke.sh
-```
-
-The runner preflights `docker`, Docker daemon reachability, and the `docker compose` CLI before enabling the gated test. The host must have kernel WireGuard available; CI loads the module before running the suite. To invoke the test directly:
-
-```bash
-HETERONETWORK_RUN_DOCKER_COMPOSE_SMOKE=1 cargo test -p ipars-cli --test docker_compose_smoke -- --nocapture
-```
-
-Helm chart smoke coverage uses Docker to run a pinned Helm CLI image and renders default, Service exposure, Service traffic policy/distribution/affinity, node affinity, pod affinity/anti-affinity, scheduler/runtime class, topology spread, NetworkPolicy, route-disabled, namespace-scoped Service discovery RBAC, colocated relay sidecar, relay-forwarder namespace, and expected-failure chart configurations. The kind Kubernetes live smoke additionally verifies Service/API routes through the selected route provider, identity-preserving DaemonSet rollout, the relay Service and sidecar status path, and removal of an injected stale protocol-240 peer-map route from the consumer after authoritative Service discovery reconciliation:
-
-```bash
-scripts/helm-smoke.sh
-```
-
-Run the live Kubernetes integration smoke against a cluster where the HeteroNetwork image is
-already pullable. It creates a disposable namespace, starts control-plane, signal, and
-STUN services, installs the Helm DaemonSet with a signed join token and a colocated
-`iparsd relay` sidecar, and verifies agent registration, Service discovery RBAC,
-peer-map synchronization, control-plane metrics, the relay UDP/HTTP Service through
-ClusterIP and NodePort, healthy relay status, and relay-candidate publication. With
-the default `linux-command` backend it also requires a real cross-agent WireGuard
-handshake and encrypted HTTP request before deleting the namespace:
-
-```bash
-HETERONETWORK_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/heteronetwork \
-HETERONETWORK_K8S_SMOKE_IMAGE_TAG=ci \
-scripts/k8s-live-smoke.sh
-```
-
-For a self-contained local kind cluster run that builds and loads the repository image,
-the wrapper uses the production `linux-command` agent backend by default:
-
-```bash
-scripts/kind-k8s-smoke.sh
-```
-
-Run the non-destructive Keycloak HA end-to-end check from a joined Linux node.
-It follows repeated HeteroCloud OIDC redirects through the rendered login form,
-fetches the referenced CSS and JavaScript, creates a short-lived HeteroNetwork
-device authorization request, and validates both realms on every supplied replica:
-
-```bash
-HETERONETWORK_KEYCLOAK_E2E_BACKEND_URLS='http://10.250.0.1:18080,http://10.250.0.2:18080,http://10.250.0.3:18080,http://10.250.0.4:18080,http://10.250.0.5:18080' \
-HETERONETWORK_KEYCLOAK_E2E_REQUIRED_BACKENDS=5 \
-scripts/keycloak-ha-e2e.sh
-```
-
-Use `scripts/keycloak-ha-e2e.sh --public-only` outside the VPN. The two-node
-chaos suite runs the complete check against all surviving Keycloak candidates
-before fault injection, while degraded, and again after convergence.
-
-When a release is published, the pinned [GitHub Actions CI workflow](.github/workflows/ci.yml) runs Rust 1.96.1 formatting,
-strict workspace Clippy, all workspace tests, an all-target MSRV 1.88 check, 3/10/1000-node and
-multi-process daemon failover load smoke, a real five-process `ipars init --spawn-daemons`
-bootstrap readiness smoke with relay provisioning enabled by default, the privileged network-namespace suite with kernel
-WireGuard support, the live Docker Compose management and real two-container WireGuard suite, Helm lint/render coverage, and the disposable
-two-node kind integration suite before publishing release containers. Workflow permissions are
-read-only, checkout is pinned by commit, and the kind, kubectl, and Helm binaries used by the live
-Kubernetes job are versioned and SHA-256 verified.
-
-Scale/load harness scenarios run against in-memory control-plane and signal components by default,
-against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay
-HTTP admission plus UDP forwarding with `--transport relay-udp`, or across spawned `iparsd`
-control-plane/signal/STUN/relay/agent processes with `--transport daemon`. Relay packet count,
-relay payload size, daemon agent process count, daemon control-plane process count, and daemon
-HTTP/agent readiness timeouts are validated before a run starts so load plans do not silently clamp
-invalid inputs. Daemon transport can spawn
-multiple control-plane processes against the same SQLite store, writes signed agent join tokens into
-post-write validated owner-only regular private runtime files using the selected scenario's
-relay/route-provider distribution for the launched agent prefix and all runtime control-plane
-bootstrap URLs, starts child `iparsd` processes with inherited environment variables cleared and a fixed system `PATH` plus `C` locale restored, supplies only a generated scoped operator credential to Control Plane children, and passes
-`--join-token-path` so token material is not exposed through child process argv, then scrubs those
-token files after agent readiness and agent state files after child shutdown. Daemon transport
-revalidates each scrubbed secret path as a runtime-local regular non-symlink file with the expected
-join-token or agent-state suffix before removal, leaving failed cleanup targets tracked for
-diagnostics. Daemon transport
-probes every control-plane endpoint for every agent peer map, reports per-endpoint edge-count
-min/max plus full source/target edge consistency, then stops one control-plane process when
-redundant endpoints exist and verifies the remaining endpoints can still serve complete peer maps,
-relay-candidate metrics, health metrics, and path status while the previously admitted relay UDP
-sessions still forward opaque payloads and agent status plus runtime path state remain available.
-Load reports are validated before CLI success so missing
-registrations, agent status endpoint coverage, agent endpoint candidates, agent path-state endpoint coverage,
-advertised route loss, missing control-plane metrics endpoint coverage, cross-control-plane skew,
-failed control-plane failover, missing failover survivor relay/health/path metrics or path status, missing failover relay dataplane delivery, missing failover agent runtime path state, all-unreachable path negotiation, missing agent runtime or control-plane path-status reachable paths, relay-candidate loss, relay packet
-loss, relay capacity/policy/E2E/admission counter skew,
-relay admission failure reasons, retained runtime manifest incompleteness, timestamp/workload,
-readiness-timeout, endpoint, `iparsd` binary path/size/SHA-256, child redacted argv/hash/lifecycle timing, child-role/order, or child PID presence/uniqueness/exit-status/code skew, file-backed log diagnostic
-mismatch, duplicate, empty, role-mismatched, or serial/order-skewed retained child logs, retained file permission/owner drift across logs, manifests, and store artifacts, unexpected retained runtime artifacts, retained sensitive or transient runtime residue after final child shutdown, or daemon health inconsistencies fail the run
-instead of only appearing as degraded JSON fields. It captures each child process stdout/stderr log,
-records the canonical `iparsd` binary plus its byte count and SHA-256, per-child redacted argv and argv hashes, per-child start/exit/runtime timing, per-child log byte counts, redacted log-tail hashes, and completed relay/failover dataplane
-measurement counters in an owner-only atomically replaced
-runtime manifest, and reports log tails
-when liveness or readiness checks fail while waiting for service health, agent registration
-visibility across the control-plane endpoints, control-plane/signal health metrics, and signal
-negotiation readiness before measuring:
-
-```bash
-cargo run -p ipars-load -- --scenario three
-cargo run -p ipars-load -- --scenario ten
-cargo run -p ipars-load -- --scenario thousand
-cargo run -p ipars-load -- --transport http --scenario ten
-cargo run -p ipars-load -- --transport relay-udp --scenario ten --relay-packets-per-session 16 --relay-payload-bytes 1200
-cargo build -p ipars-daemon
-cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin target/debug/iparsd --daemon-agent-processes 3 --daemon-control-plane-processes 2 --daemon-agent-readiness-timeout-seconds 30
-HETERONETWORK_LOAD_DAEMON_DATABASE_URL='postgresql://heteronetwork:password@127.0.0.1:5432/heteronetwork?sslmode=disable' cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin target/debug/iparsd --daemon-agent-processes 3 --daemon-control-plane-processes 2 --daemon-agent-readiness-timeout-seconds 30
-HETERONETWORK_TEST_IPARSD_BIN="$(pwd)/target/debug/iparsd" cargo test -p ipars-load load_harness_can_drive_daemon_processes_when_binary_is_provided -- --nocapture
-```
-
-For a repeatable lightweight load harness check, run:
-
-```bash
-scripts/load-smoke.sh
-```
-
-It covers 3/10/1000-node in-memory scenarios plus 3-node HTTP and relay-UDP scenarios, validates the generated report identity fields, and can include daemon transport when `HETERONETWORK_LOAD_SMOKE_DAEMON_BIN` points at an `iparsd` binary or when `HETERONETWORK_LOAD_SMOKE_BUILD_DAEMON=1` should build `target/debug/iparsd` first.
-
-The in-process eBPF packet-flow detector uses a separately built BPF object. Build it with the pinned nightly Rust toolchain, `rust-src`, and `bpf-linker` versions used by CI:
-
-```bash
-rustup toolchain install nightly-2026-07-05 --profile minimal --component rust-src
-cargo install bpf-linker --version 0.10.3 --locked
-scripts/build-ebpf.sh
-iparsd agent --packet-flow-detector ebpf-ringbuf --packet-flow-ebpf-object-path target/ebpf/ipars-packet-flow.bpf.o --packet-flow-ebpf-cgroup-path /sys/fs/cgroup/system.slice/ipars-agent.service --packet-flow-ebpf-cgroup-attach ipars_cgroup_connect4 --packet-flow-ebpf-cgroup-attach ipars_cgroup_connect6 --packet-flow-ebpf-cgroup-attach ipars_cgroup_sendmsg4 --packet-flow-ebpf-cgroup-attach ipars_cgroup_sendmsg6 --packet-flow-ebpf-sockops-attach ipars_cgroup_sockops
-```
-
-The cgroup path should contain the agent and workloads whose outbound flows should trigger lazy connect. Cgroup mode requires Linux 5.3 or newer; startup preflight bounds and parses `/proc/sys/kernel/osrelease`, rejects unavailable, malformed, or older release metadata, and automatically uses explicit multi-program legacy attachment on Linux 5.3-5.6 or the flagless, internally multi-program BPF-link API on Linux 5.7 and newer. Repeated `--packet-flow-ebpf-attach PROGRAM:CATEGORY:NAME` options can additionally attach the lower-fidelity syscall tracepoint fallback. Privileged Linux hosts can run both gated attach/event smoke tests after building the object; the cgroup gate covers IPv4 and IPv6 TCP connect, TCP established/closing lifecycle state, and UDP send-message metadata:
-
-```bash
-sudo env PATH="$PATH" CARGO="$(command -v cargo)" HETERONETWORK_RUN_EBPF_ATTACH_TESTS=1 HETERONETWORK_EBPF_OBJECT_PATH="$PWD/target/ebpf/ipars-packet-flow.bpf.o" cargo test --locked -p ipars-daemon ebpf_ringbuf_privileged_attach_reads_sendto_event
-sudo env PATH="$PATH" CARGO="$(command -v cargo)" HETERONETWORK_RUN_EBPF_ATTACH_TESTS=1 HETERONETWORK_EBPF_OBJECT_PATH="$PWD/target/ebpf/ipars-packet-flow.bpf.o" cargo test --locked -p ipars-daemon ebpf_ringbuf_privileged_cgroup_hooks_read_connect_and_sendmsg_events
-```
-
-## CLI Surface
-
-`iparsd agent` defaults `--packet-flow-detector` to `auto`. A Linux agent that
-applies its peer map resolves `auto` to the conntrack NEW/UPDATE event
-subscriber, so ordinary workload traffic activates exact advertised routes
-without extra detector configuration. Agents without a Linux peer-map
-dataplane avoid that capability requirement; use
-`--packet-flow-detector disabled` explicitly to opt an applying agent out of
-traffic-driven lazy route activation.
-
-After a successful `ipars join`, the owner-only state file contains the
-accepted NodeRecord and bootstrap endpoints as well as the generated keys and
-VPN IP. `iparsd agent` can resume from that state without consuming the
-single-use join token again; explicit Control Plane or Signal URLs still take
-precedence when supplied.
-
-```bash
-ipars init --public-endpoint 203.0.113.10:51820 --issuer-private-key-path ./issuer.key --issuer-key-id root --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token --allowed-route 10.43.0.0/16 --unlimited-uses --daemon-state-dir ./heteronetwork-state --spawn-daemons
-ipars join '<signed-token>' --state-path ~/.local/state/heteronetwork/agent.json
-iparsd agent --state-path ~/.local/state/heteronetwork/agent.json --apply-peer-map
-ipars status --agent-url http://127.0.0.1:9780
-ipars --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token status --control-plane-url http://127.0.0.1:8443
-ipars --agent-state-path /var/lib/heteronetwork/agent.json peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
-ipars --agent-state-path /var/lib/heteronetwork/agent.json routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
-ipars token create --issuer-private-key-path ./issuer.key --issuer-key-id root --role edge --tag edge --bootstrap https://203.0.113.10:8443 --signal-bootstrap https://203.0.113.10:9443 --stun-bootstrap udp://203.0.113.10:3478 --relay-bootstrap udp://203.0.113.10:51820 --allowed-route 10.42.0.0/16 --max-uses 7 --ttl-seconds 86400
-ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce> --issuer-private-key-path ./issuer.key --issuer-key-id root
-ipars key rotate --agent-url http://127.0.0.1:9780 --control-plane-url http://127.0.0.1:8443
-ipars node remove --agent-url http://127.0.0.1:9780 --control-plane-url http://127.0.0.1:8443
-ipars relay status --relay-url http://127.0.0.1:9580
-ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 --relay-admission-bearer-token <relay-secret> --send-invalid-credential
-ipars stun probe --stun-server 127.0.0.1:3478
-ipars path status --agent-url http://127.0.0.1:9780
-ipars --agent-state-path /var/lib/heteronetwork/agent.json path status --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
-ipars path events --agent-url http://127.0.0.1:9780
-ipars path activity --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --pin
-ipars path probe --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --state DIRECT_NAT_TRAVERSAL --latency-ms 23.5 --loss-ppm 100 --jitter-ms 3.25 --candidate-addr 198.51.100.10:51820 --candidate-kind stun-reflexive --pin
-ipars docker install --project-name heteronetwork --compose-file docker/compose.yaml --docker-discover-networks --docker-network heteronetwork_default
-ipars k8s install --release heteronetwork --namespace heteronetwork-system --join-token-secret heteronetwork-join-token --join-token-key token
-```
-
-All CLI calls to an Agent API accept the global `--agent-api-bearer-token` or `--agent-api-bearer-token-path` option and matching environment variables. Control-plane `status` accepts the separate global `--control-plane-operator-api-bearer-token` or `--control-plane-operator-api-bearer-token-path` source. Prefer file-backed forms. Direct node-scoped queries to a Control Plane require the global `--agent-state-path` option or `HETERONETWORK_AGENT_STATE_PATH` so the CLI can sign each request with the queried node's identity. An agent using its default loopback listener may omit authentication; any non-loopback agent listener requires a separate 32-512 byte printable ASCII Bearer token. On Unix, every daemon file-backed Bearer credential must be a direct, single-link regular file with owner read access and no group/world permissions; final symlinks and file replacement races are rejected. The bundled Compose stack reads distinct Control Plane, Signal, STUN, Relay, and Agent operator/management credentials plus the Relay admission credential from `docker/control-plane-operator-api.token`, `docker/signal-operator-api.token`, `docker/stun-operator-api.token`, `docker/relay-operator-api.token`, `docker/agent-api.token`, and `docker/relay-admission.token`. Do not reuse issuer, join-token, node-identity, admission, operator, or management material across these credentials.
-
-`token revoke` requires an existing issuer private key whose issuer/key ID is trusted by the control plane. The request binds the cluster ID, nonce, issuer, key ID, and a fresh timestamp under an Ed25519 signature; unsigned, stale, wrong-cluster, untrusted-key, or tampered revocations are rejected before the token ledger changes. Revocation writes a durable cluster/nonce tombstone even when the token has never reached the ledger, so operators can revoke an unused token before its first join. Existing token state and the tombstone are updated under the same SQLite writer transaction or PostgreSQL token advisory lock, preserving every use that linearized before revocation and rejecting every admission that linearizes after it. The response always includes the tombstone and includes `record` only when full token claims have reached the ledger.
-
-`ipars init` enables relay provisioning by default: it returns the signed bootstrap join token with relay permission, the issuer metadata, the `iparsd` commands for control-plane, signal, STUN, and Relay, and a one-use relay-agent state/token and command, so a manually supervised Relay registers its capability instead of remaining invisible to relay discovery. Pass `--disable-relay` only when relay permission and Relay/relay-agent service bootstrap must be omitted. With `--spawn-daemons`, the enabled services are started in the background with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored, then write logs under `--daemon-state-dir`; the state directory, `logs/` directory, and service logs are forced owner-only, and symlinked or hardlinked log files are rejected. Without it, run the returned commands manually. `init` derives control-plane, signal, and STUN bootstrap ports from their corresponding listener settings while retaining `--public-endpoint` for the relay UDP endpoint, brackets IPv6 bootstrap hosts, and rejects unusable public endpoints, port-zero control-plane/signal/STUN listener ports, and port-zero relay HTTP listeners when no explicit relay admission URL is provided, so the generated token does not advertise dead bootstrap URLs. Later `token create` calls should use the same issuer private key path or `HETERONETWORK_ISSUER_PRIVATE_KEY`. Join clients and agents try multiple control-plane bootstrap endpoints in token order for initial registration failover and reject token-derived control-plane bootstraps that are not absolute HTTP(S) URLs or that use unusable numeric hosts. The CLI applies the same API base URL checks before `join`, `token revoke`, `status`, `peers`, `routes`, `key rotate`, `node remove`, `relay status`, and `path` HTTP calls. After an Agent accepts its first core-complete live service directory, heartbeat reporting, peer-map polling, signal path peer-map fetches, and STUN discovery use that persisted authoritative endpoint list and do not reintroduce retired token, static, or public-fallback endpoints. `ipars join` persists the generated identity and WireGuard private keys plus the assigned VPN IP into the owner-only state file; pass `--state-path` (or the global `--agent-state-path`) to choose the file, otherwise the CLI uses `$XDG_STATE_HOME/heteronetwork/agent.json`, `$HOME/.local/state/heteronetwork/agent.json`, or `/var/lib/heteronetwork/agent.json`. An existing state path is never overwritten by a new join. Start `iparsd agent` with that state path and the returned control-plane URL (and explicit Signal/Relay settings as needed) to continue as the joined node after the CLI exits. Before a complete live directory has been accepted, Agents use signed token and explicit service bootstraps for registration and discovery; token-derived control-plane and signal bootstraps must be absolute HTTP(S) URLs. `ipars k8s install` can supply initial cluster control/signal URLs and an optional STUN socket endpoint, and the Helm chart applies the same endpoint shape checks while rejecting URL userinfo, invalid explicit ports, and unusable numeric hosts before rendering. Before authority is established, STUN discovery uses explicit `--stun-server`, signed-token STUN endpoints, and then the configurable `--public-stun-url` fallbacks (`stun.cloudflare.com` on UDP 3478 and 53 by default). `--disable-public-stun-fallback` retains private-only/offline lab behavior during that bootstrap phase. Unusable sockets are rejected and startup continues without an initial classification when every selected STUN probe is unavailable.
-
-Signed heartbeat, Signal registration, and path-negotiation reports refresh locally observed STUN candidate lease timestamps while the WireGuard endpoint remains active, so a healthy agent does not lose its candidates when the default endpoint-candidate TTL expires.
-
-Multi-server STUN probing retains successful observations when another server times out or rejects the request, and uses a responding server for filtering probes. Public and private STUN servers are not mixed in one NAT classification because different routes can expose different local addresses and produce a false address-dependent result. The Agent continues without a reflexive candidate only when every selected STUN endpoint fails.
-
-Without `--spawn-daemons`, default relay provisioning creates or validates the owner-only admission credential at `--relay-admission-bearer-token-path` or `<daemon-state-dir>/relay-admission.token` before emitting the manual Relay commands. `--disable-relay` omits the credential, relay permission, Relay endpoints, and Relay/relay-agent commands.
-
-Join tokens are single-use by default. The durable ledger creates an unseen token without replacing an existing row and serializes definition checking, tombstone checking, status checking, and use consumption as one admission operation, so simultaneous first joins through different Control Plane replicas cannot reset the counter or exceed `max_uses`. SQLite uses its writer transaction; PostgreSQL uses a transaction-scoped advisory lock derived from cluster/nonce. New ledger records retain the complete signed claims and reject reuse of the same cluster/nonce with different bootstrap, time, role/tag, issuer, or policy claims; legacy records remain readable and use their previously persisted immutable definition fields. `ipars init` and `ipars token create` can set route allowlists with repeated `--allowed-route`, enable relay permission by default unless `--disable-relay` is passed, and set admission limits with `--max-uses` or `--unlimited-uses`. For additional tokens, `--bootstrap` and `--control-plane-bootstrap` add validated HTTP(S) control-plane bootstrap URLs, while `--signal-bootstrap`, `--stun-bootstrap`, and `--relay-bootstrap` add typed service bootstrap endpoints for agent signal failover, startup STUN discovery/NAT classification, and relay discovery metadata; STUN and relay bootstraps must use `udp://host:port`. Numeric bootstrap hosts are rejected when they resolve to unusable port-zero, unspecified, multicast, or IPv4 broadcast socket addresses before they can be signed into a token.
-
-Agent HTTP calls are bounded per endpoint by `--http-connect-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` (default 5) and `--http-request-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS` (default 30). Values must be 1-3600 seconds and connect cannot exceed request. These deadlines cover Control Plane, Signal, Relay, Docker API, Kubernetes API, and Agent-triggered key-rotation/node-removal calls, allowing ordered failover to continue when a peer accepts TCP but stalls. Docker Compose and Helm expose the settings, and `docker install` / `k8s install` accept matching `--agent-http-connect-timeout-seconds` and `--agent-http-request-timeout-seconds` overrides.
-
-Agents autonomously measure active WireGuard paths with a fixed-width UDP
-challenge/response bound to each VPN IP. Five samples per round produce RTT,
-loss, jitter, and path-scoped stability; bounded concurrency preserves lazy
-connect rather than probing every known node. The observation is signed as part
-of Signal negotiation and affects scoring only while its path fingerprint and
-TTL match. Peer-map source allowlisting, same-size responses, nonce/sequence
-validation, and per-peer rate limiting bound responder abuse. Configure the
-loop with daemon `--peer-probe-*` / `HETERONETWORK_AGENT_PEER_PROBE_*`, or matching
-`--agent-peer-probe-*` options on `ipars docker install` and
-`ipars k8s install`. Configure Signal freshness with
-`--path-quality-observation-ttl-seconds` /
-`HETERONETWORK_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS`.
-
-For issuer key rotation, start `iparsd control-plane` with repeated `--trusted-issuer-key issuer_node_id,key_id,public_key` values, or semicolon-separated `HETERONETWORK_TRUSTED_ISSUER_KEYS`, so old and next signing keys overlap while new tokens move to the next `--issuer-key-id`. Registered nodes can rotate WireGuard data-plane keys through the local agent `POST /v1/wireguard-key/rotate` endpoint, which generates a new WireGuard keypair, signs the previous-to-next public-key transition, submits it to `PUT /v1/nodes/{node_id}/wireguard-key`, persists the new private key in the owner-only agent state file, and updates the running agent state after control-plane acceptance. A node can also request its own removal through the local agent `POST /v1/node/remove` endpoint; the agent signs a node-identity removal request and submits it to `DELETE /v1/nodes/{node_id}` using the configured control-plane endpoint failover list or the request's explicit `control_plane_url`. The control plane rejects stale, unsigned, malformed, mismatched, or non-current transitions before updating the durable node record or removing a node, and exposes accepted/rejected key-rotation and node-removal counters through JSON, Prometheus, and OTLP metrics.
-
-Control-plane ACLs can be loaded with repeated `iparsd control-plane --acl-rule '<json>'` values, or semicolon-separated JSON objects in `HETERONETWORK_ACL_RULES`. Each object uses the typed `AclRule` shape with `id`, `from_roles`, `from_tags`, `to_roles`, `to_tags`, `routes`, `protocol`, and `action`; an empty ACL list keeps default allow-all peer visibility, while configured deny rules take precedence over allow rules.
-
-Relay candidates also require fresh healthy status. Signed control-plane heartbeats are accepted only when their node-identity signature timestamp is inside the configured skew window and newer than the last accepted heartbeat for that node; the control plane stores that signature timestamp separately for replay ordering and records server receipt time as health freshness, so accepted client clock skew cannot make a live node immediately stale. Replayed or older signed updates cannot overwrite newer health, endpoint candidates, advertised routes, relay capacity, or path state. Each accepted heartbeat commits endpoint candidates, relay capability, optional routes, health freshness, and the local path snapshot atomically. The store rechecks signature timestamp monotonicity while serializing updates for that node, using an SQLite writer transaction or a PostgreSQL row lock, so concurrent Control Plane replicas cannot commit a stale partial snapshot. Heartbeat route updates are optional; omitted route updates preserve the registered route set, while supplied routes must still be owned by the reporting node and contained within its stored token policy. Heartbeat path state is a local-node snapshot: accepted updates replace that node's previously reported paths so idle-close or restart snapshots do not leave stale paths in control-plane status or metrics, and any selected path candidate must belong to the peer, match its address family, and use a usable nonzero non-multicast/non-broadcast endpoint. `iparsd control-plane --path-state-ttl-seconds` or `HETERONETWORK_PATH_STATE_TTL_SECONDS` also bounds path-state freshness for control-plane path status and metrics, hiding older records from active path counts while reporting the stale path total. `iparsd control-plane --relay-health-ttl-seconds` or `HETERONETWORK_RELAY_HEALTH_TTL_SECONDS` controls how long a healthy relay heartbeat remains eligible for relay maps and relay-candidate metrics, and a fresh heartbeat that omits relay capability clears the node's relay candidacy instead of preserving stale capacity. `iparsd signal --relay-health-ttl-seconds` or `HETERONETWORK_SIGNAL_RELAY_HEALTH_TTL_SECONDS` applies the same freshness window to relay candidates offered during signal path negotiation, and signal upserts drop relay capability that cannot currently admit E2E relay sessions because policy, endpoints, capacity, or bandwidth are missing. Control-plane peer/relay maps filter endpoint candidates older than `iparsd control-plane --endpoint-candidate-ttl-seconds` or `HETERONETWORK_ENDPOINT_CANDIDATE_TTL_SECONDS` and skip unusable port-zero, unspecified, multicast, or IPv4 broadcast endpoints before serving maps; signal direct, IPv6, NAT traversal, and hole-punch-plan selection uses `iparsd signal --endpoint-candidate-ttl-seconds` or `HETERONETWORK_SIGNAL_ENDPOINT_CANDIDATE_TTL_SECONDS` with the same unusable-endpoint filter. Agents repeat the direct endpoint ownership, address-family, and usability checks while resolving selected path candidates or peer-map fallback candidates into WireGuard endpoints. IPv6 endpoint candidates must carry IPv6 socket addresses and are rejected before they can drive `DIRECT_IPV6` path selection. Stale candidate/path counts and the active TTL windows are exposed in control-plane and signal JSON, Prometheus, and OTLP metrics.
-
-Operators can inspect the active control-plane cluster policy, VPN pool, and loaded ACL rules with Bearer-authenticated `GET /v1/policy`. `GET /metrics` and `GET /v1/metrics` use the same operator credential. Without `--operator-api-bearer-token` or `--operator-api-bearer-token-path`, all three operator routes are absent rather than exposed anonymously.
-
-Signal's `GET /metrics` and `GET /v1/metrics` are likewise separate operator routes. Configure `iparsd signal --operator-api-bearer-token-path` or `HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH`; without a credential the routes are absent, and with one they require the matching Bearer token. Signed node upsert, path negotiation, and hole-punch routes keep their node-identity authentication and do not accept the operator credential.
-
-STUN's `GET /metrics` and `GET /v1/metrics` follow the same opt-in operator route model through `iparsd stun --operator-api-bearer-token-path` or `HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_PATH`. The public UDP Binding service and `/healthz` remain credentialless so NAT discovery and orchestration probes continue independently of metrics access.
-
-Relay's detailed `GET /metrics` route uses `iparsd relay --operator-api-bearer-token-path` or `HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_PATH`. Without that distinct credential the route is absent. Public `/v1/status` remains the capability/health protocol contract, while `POST /v1/sessions` continues to use the separately scoped relay admission Bearer token when configured.
-
-`iparsd agent --runtime-backend linux-command` is the default data-plane applier and uses explicit `ip`/`wg` commands. It always validates static runtime configuration such as Linux interface names, namespace names, daemon poll/route/renew intervals, command timeout/output bounds, userspace WireGuard launch settings including one-hour-capped ready/shutdown lifecycle timeouts, active runtime backend/namespace consumers, and relay-forwarder capacity plus relay-forwarder endpoint/WireGuard endpoint usability, then preflights required host commands through the same fixed `/usr/bin:/usr/sbin:/bin:/sbin` PATH used by the command runners as executable regular files without following symlinks, `NETLINK_ROUTE`/`NETLINK_GENERIC`/`NETLINK_NETFILTER` socket availability for selected kernel-netlink and conntrack detectors, Docker API Unix socket readiness for discovery-backed Docker route plans, existing custom procfs conntrack paths as regular non-symlink files, `net.ipv4.ip_forward=1` for Docker/Kubernetes route forwarding, `net.ipv6.conf.all.forwarding=1` when explicit IPv6 Docker/Kubernetes CIDRs are routed, `CAP_NET_ADMIN` for kernel network mutation or conntrack netlink access, `CAP_NET_RAW` when kernel WireGuard peer-map dataplane application is enabled, `CAP_SYS_ADMIN` when `--linux-netns` placement, namespaced userspace WireGuard launch/readiness or peer configuration, or relay-forwarder namespace placement is requested, `CAP_BPF` plus `CAP_PERFMON` or legacy `CAP_SYS_ADMIN` when the in-process eBPF packet-flow detector loads and attaches tracepoint programs, non-empty regular eBPF object files, tracepoint IDs under tracefs, and requested data-plane or relay-forwarder `/var/run/netns` entries before mutating host networking.
-`iparsd agent --preflight-only` runs those static and host runtime checks with the supplied Agent backend, route, detector, Docker, and namespace options, then exits before reading join/API credentials, creating identity state, probing STUN, registering, launching userspace WireGuard, applying routes, creating an interface, or binding the Agent API. It conflicts with `--skip-runtime-preflight` so automation cannot report a no-op as a successful preflight.
-Namespace name validation rejects path-special `.`/`..` names and `-`-prefixed names before they can be joined under `/var/run/netns` or passed to `ip netns exec`. Namespace preflight rejects missing entries, symlinks, directories, and non-`nsfs` regular files, and warns when the requested entry resolves to the current process namespace. Relay forwarder runtime placement reuses that strict namespace path inspection before comparing the configured namespace with the current process namespace, so a symlinked or regular-file `/var/run/netns` entry cannot bypass the bind-time check. `--runtime-command-timeout-seconds` or `HETERONETWORK_AGENT_RUNTIME_COMMAND_TIMEOUT_SECONDS` bounds every `ip`/`wg` child process used by the Linux command backend, including userspace WireGuard readiness and namespaced command execution, and timed-out command process groups are explicitly killed and reaped. `--runtime-command-output-max-bytes` or `HETERONETWORK_AGENT_RUNTIME_COMMAND_OUTPUT_MAX_BYTES` bounds captured stdout and stderr per child process while still draining pipes so failed commands cannot exhaust agent memory with diagnostics, and static validation caps the per-stream capture limit at 1 MiB. The lower-level command runners also reject zero or over-one-hour timeouts, zero or over-1 MiB output capture limits, empty programs, NUL-containing program/argument strings, and oversized argv vectors before spawning, so direct library callers cannot bypass daemon preflight. `--skip-runtime-preflight` skips the host command/netlink/sysctl/capability/path probes, but not static configuration validation.
-Peer-map application can switch WireGuard interface and peer management to kernel netlink with `--wireguard-backend kernel-netlink`, or to userspace peer configuration with `--wireguard-backend userspace-command`; those backend selectors require `--runtime-backend linux-command` and an active peer-map or managed userspace-WireGuard consumer. The userspace mode can either use a pre-existing interface or start a bounded `--userspace-wireguard-command`, supplied as a PATH-resolved bare command or absolute path, with at most 128 repeated, 4 KiB, control-character-free `--userspace-wireguard-arg` values, wait for readiness, supervise the child process, continuously drain bounded stdout/stderr, log escaped/truncated diagnostics for readiness failure or unexpected exits, record starting/ready/exited/stopping/stopped/failed state in `/v1/status`, `ipars status --agent-url`, agent JSON/Prometheus/OpenTelemetry metrics, report degraded or unhealthy heartbeat/signal health when the managed process is not ready, and stop/reap it during readiness failure or shutdown.
-Peer-map/Docker/Kubernetes route application can switch route/rule management to rtnetlink with `--route-backend kernel-netlink`, which requires `--runtime-backend linux-command` and an active route consumer. Namespaced rtnetlink sockets are opened with a thread namespace restore guard so successful, failing, or unwinding socket-open paths restore the caller's namespace after the target namespace socket is created. `--linux-netns` is rejected unless a Linux dataplane loop, managed userspace WireGuard process, or relay forwarder will actually use that namespace. `--runtime-backend dry-run` keeps peer-map, Docker route, and Kubernetes underlay application loops active while using in-memory WireGuard state and dry-run route plans; Docker API discovery sockets, conntrack netlink, explicit conntrack procfs paths, relay-forwarder namespace placement, and eBPF ring-buffer packet-flow detectors are still preflighted unless the operator explicitly skips runtime preflight.
-
-The bounded overlay enforces `overlay_on_demand_peer_limit` (default 4,
-maximum 64) with LRU replacement for non-backbone logical peers. Pins are
-preferred during replacement but do not bypass this hard limit.
-
-Lazy connect is enforced during signal path negotiation and `--apply-peer-map`: route providers, relay-capable peers, control-plane/policy-pinned roles or tags, peers marked through `POST /v1/peer-activity`, and packet-flow destinations resolved through `POST /v1/packet-flow` are negotiated/applied, while idle unpinned peers are removed from WireGuard and relay-forwarder state after the cluster idle timeout. Peer-map advertised routes are rechecked for route ownership before agent route application, lazy-connect route pinning, or packet-flow route resolution. Packet-flow requests can include optional source IP, protocol, source/destination ports, detector metadata, detector-provided application hints, bounded `payload_prefix` samples, conntrack status flags, and TCP state for auditability; shared validation rejects ACL wildcard `Any`, zero ports, TCP state on non-TCP observations, port metadata paired with a known non-TCP/UDP/SCTP protocol, oversized, empty, or control-character-bearing detector names, oversized payload-prefix/conntrack-status fields, unsorted or duplicate conntrack status flags, and protocol-incompatible application hints before lazy-connect activation. The agent classifies accepted observations into inferred conntrack lifecycle buckets and inferred application buckets such as DNS, HTTP, HTTPS, SSH, Kubernetes API, etcd, PostgreSQL, MySQL, Redis, Memcached, Prometheus, OpenTelemetry/OTLP, gRPC, Kafka, NATS, MQTT, AMQP, Cassandra, MongoDB, Elasticsearch, WireGuard, IP tunnel, IPsec, GRE, and ICMP for JSON, Prometheus, and OTLP metrics, preferring typed detector application hints over port-based fallback guesses and using bounded payload-prefix parsers, including DNS wire-format queries plus TLS ClientHello SNI/ALPN hints for control-plane, database, messaging, cache, search, directory, file-sharing, and remote-admin endpoints, QUIC v1 long-header checks, SSH identification checks, PostgreSQL startup/framed frontend messages, MySQL handshake/command packets, Redis RESP array commands and selected inline commands, Memcached text/binary command frames, Kafka length-prefixed request-header checks, NATS control-line subject/wildcard checks, stricter MQTT CONNECT payload validation and AMQP protocol-header/frame validation, Cassandra frame-body validation, MongoDB opcode section/body validation, and Elasticsearch transport status/variable-header validation, when hints and known ports are absent. Detector-specific packet-flow options are rejected unless their matching detector is selected, so stale environment variables do not silently configure an inactive detector. `iparsd agent --packet-flow-detector proc-net-conntrack` can poll `/proc/net/nf_conntrack` or `/proc/net/ip_conntrack`, or a custom `--packet-flow-conntrack-path`; procfs reads are bounded by `--packet-flow-procfs-max-bytes`, `--packet-flow-procfs-max-line-bytes`, and `--packet-flow-procfs-max-flows` so unexpectedly large conntrack tables do not exhaust agent memory, and existing custom paths must be regular files rather than symlinks. `--packet-flow-detector conntrack-netlink` reads the Linux conntrack table through `NETLINK_NETFILTER`, and `--packet-flow-detector conntrack-netlink-events` subscribes to conntrack NEW/UPDATE multicast events; both netlink detectors bound parsed flows per read with `--packet-flow-netlink-max-flows`. `--packet-flow-detector ebpf-jsonl` tails an append-only JSONL file from `--packet-flow-ebpf-event-path` or `HETERONETWORK_AGENT_PACKET_FLOW_EBPF_EVENT_PATH`, intended for an eBPF loader/exporter sidecar, with per-poll byte, line, and flow bounds controlled by `--packet-flow-ebpf-event-max-bytes`, `--packet-flow-ebpf-event-max-line-bytes`, and `--packet-flow-ebpf-event-max-flows`; the path may be created by the sidecar after agent startup, but if it already exists preflight and reads require it to be a regular file rather than a symlink. `--packet-flow-detector ebpf-ringbuf` loads the repository-built `target/ebpf/ipars-packet-flow.bpf.o` object or another Aya-compatible eBPF object from `--packet-flow-ebpf-object-path`, attaches repeated tracepoint programs from `--packet-flow-ebpf-attach PROGRAM:CATEGORY:NAME` and/or repeated cgroup socket-address programs from `--packet-flow-ebpf-cgroup-attach PROGRAM` to `--packet-flow-ebpf-cgroup-path`, and reads the `--packet-flow-ebpf-ringbuf-map` ring buffer directly in-process with a bounded `--packet-flow-ebpf-ringbuf-max-events` burst. Runtime preflight rejects missing, empty, non-regular, or symlinked eBPF object paths, missing tracepoint IDs, cgroup paths that are symlinks or are not cgroup v2 directories, and unavailable, malformed, or pre-5.3 kernel release metadata before the retrying detector loop starts. It requires `CAP_BPF` for either attachment mode, `CAP_PERFMON` or `CAP_SYS_ADMIN` for tracepoints, and `CAP_NET_ADMIN` for cgroup hooks; the ring-buffer loader config revalidates map identifiers, attachment relationships, and bounded unique program specifications before loading the object. The bundled object provides cgroup `connect4/6` and UDP `sendmsg4/6` hooks that emit kernel-derived protocol, destination, and available bound source address/port metadata while always allowing the operation, plus `ipars_sys_enter_connect`, `ipars_sys_enter_sendto`, and `ipars_sys_enter_sendmsg` syscall tracepoint fallbacks. The cgroup hooks require cgroup v2 and Linux 5.3 or newer for the typed `bpf_sock_addr.sk` source metadata. The loader preserves existing cgroup programs by selecting explicit `ALLOW_MULTI` on Aya's legacy Linux 5.3-5.6 path and zero user flags on the internally multi-program Linux 5.7+ BPF-link path. Syscall tracepoint events retain the sockaddr destination port while leaving protocol and source unset because syscall arguments do not provide trustworthy socket metadata. Ring-buffer events use the shared fixed ipars packet-flow ABI version 1: IP family, protocol number, TCP state code, conntrack status bits, network-order source/destination port bytes, 16-byte source IP storage, and 16-byte destination IP storage. JSONL events use the same typed packet-flow schema as the agent API, with required `destination` and optional `source`, `protocol`, `source_port`, `destination_port`, `detector`, `application`, `payload_prefix`, `conntrack_status`, and `tcp_state` fields so payload-aware sidecars can feed application classification without changing lazy-connect matching. Detector-fed observations ignore unspecified, loopback, multicast, broadcast, and link-local destinations before lazy-connect route matching so broad advertised routes do not activate peers for local control traffic. Packet-flow detectors also suppress duplicate flow observations for `--packet-flow-dedup-ttl-seconds` seconds, while still allowing changed conntrack lifecycle/TCP state through.
-
-`--packet-flow-ebpf-sockops-attach PROGRAM` attaches bounded, unique cgroup sockops programs to the same cgroup path as socket-address hooks. The bundled `ipars_cgroup_sockops` program preserves existing callback flags, enables TCP state callbacks, and emits endpoint/port metadata plus normalized established and closing states for IPv4 and IPv6 without changing socket behavior. Sockops and socket-address program names cannot overlap, and both use the same non-replacing kernel-version-selected attachment semantics.
-
-Packet-flow source metadata is validated separately from the destination: explicitly supplied unspecified, loopback, multicast, broadcast, or link-local source addresses are rejected before classification or lazy-connect activation. eBPF ring-buffer events normalize an all-zero source address to an unknown source instead of retaining it as a concrete packet-flow source.
-DNS classification includes the standard encrypted DNS transport port 853 for TCP and UDP, so DNS-over-TLS and DNS-over-QUIC observations do not fall back to generic HTTPS/QUIC classification.
-Payload-prefix classification also recognizes bounded NFS ONC RPC call frames and Syslog RFC3164/RFC5424 messages, so those file-sharing and logging flows can be identified even when they are observed away from the canonical service ports.
-
-Packet-flow detector read-limit structs revalidate positive and maximum bounds when detector tasks build their procfs, conntrack-netlink, eBPF JSONL, or eBPF ring-buffer configs, so internal callers cannot bypass the CLI/runtime preflight caps.
-
-eBPF tracepoint preflight inspects tracepoint `id` entries without following symlinks, rejecting symlinked, non-file, empty, oversized, non-numeric, or zero IDs under tracefs before loading an in-process ring-buffer detector.
-
-Packet-flow duplicate suppression TTL uses `0` to disable suppression, caps nonzero `--packet-flow-dedup-ttl-seconds` values at 24 hours, and caps the retained fingerprint table at 1,048,576 entries so detector fingerprints cannot be retained or accumulated indefinitely.
-
-For Kubernetes underlay routing, `--kubernetes-discover-services` lets the agent query the Kubernetes API with its ServiceAccount token, optionally constrained by validated `--kubernetes-namespace` and `--kubernetes-service-label-selector` values, and convert Service cluster IPs plus the in-cluster API server address into overlay host routes. Discovery-only namespace and selector inputs are rejected unless Service discovery is enabled. Explicit `--kubernetes-api-url` values and in-cluster `KUBERNETES_SERVICE_HOST`/`KUBERNETES_SERVICE_PORT` API discovery inputs are validated as usable HTTP(S) API base URLs before discovery starts. The ServiceAccount token reader follows Kubernetes volume symlinks to a regular file, trims whitespace, and rejects empty or larger-than-64 KiB tokens. `--disable-agent-service-account-token`/`agent.automountServiceAccountToken=false` can be used for static CIDR-only deployments and is rejected when Service discovery needs Kubernetes API authentication. Explicit `--kubernetes-service-cidr` and `--kubernetes-api-server-cidr` values remain supported for static deployments. The install plan, agent runtime, API discovery path, and route-manager backends validate Kubernetes Service/API route CIDRs before advertisement or application, rejecting unrestricted, unspecified, loopback, link-local, multicast/broadcast, non-canonical, and duplicate routes while still allowing specific Service/API host routes to coexist with broader Service CIDRs. When the agent joins with Kubernetes underlay enabled, the resolved Service/API CIDRs are requested from the control plane and must be covered by the join token route allowlist. The Helm chart mounts the join token Secret and passes it to the agent through `--join-token-path`; the agent follows the Secret symlink to a regular file and rejects token input larger than 64 KiB. The chart starts peer-map sync by default with a positive `agent.peerMap.pollIntervalSeconds`, and `ipars k8s install` can disable it explicitly with `--disable-agent-peer-map` for route-only validation deployments. The chart also rejects direct `serviceExposure.apiServerCidrs` and `serviceExposure.serviceCidrs` values that are malformed, unrestricted, unsafe IPv4 route ranges, known unsafe IPv6 ranges, non-canonical IPv4/IPv6 CIDR routes, or exact duplicate route CIDRs before rendering; legacy `serviceExposure.apiServer` values are rejected in favor of `serviceExposure.discoverApiServer` plus explicit `serviceExposure.apiServerCidrs`. The agent and route-manager still enforce full CIDR canonicalization and unsafe-range checks at runtime. The agent and chart reject zero route intervals, namespace/selector filters without Service discovery, invalid namespace DNS labels, repeated namespaces, invalid route-provider Node IDs, oversized selectors, selector control characters, invalid `agent.routeBackend` values, and `agent.routeBackend=kernel-netlink` when both peer-map sync and Kubernetes underlay route application are disabled. The chart only renders Service discovery RBAC when discovery is enabled, limits it to Services, and uses namespace-scoped Role/RoleBinding objects when namespace filters are configured. Private registry image repository/tag/pull policy overrides, image pull Secret names, cluster control/signal/STUN endpoint overrides, peer-map sync cadence, route backend selection, agent hostNetwork and DNS policy controls, securityContext capability/privilege/read-only-root/seccomp and PodSecurityContext controls, persistent state hostPath, configurable HTTP liveness/readiness/startup probes, ServiceAccount creation, name, annotations, token automounting, DaemonSet pod labels, pod annotations, priority class, scheduler/runtime class, node selectors, node affinity, pod affinity/anti-affinity, tolerations, topology spread constraints, termination grace period, resource requests/limits, rollout controls, optional relay admission bearer token SecretKeyRef injection, relay forwarder endpoint/bind/namespace controls, SYS_ADMIN and host netns mount prerequisites, supervisor controls, and optional PodDisruptionBudget controls can be supplied through validated chart values or `ipars k8s install` flags for production scheduling, tainted node placement, capacity planning, graceful node-agent shutdown, authenticated relay admission, voluntary disruption protection, and controlled upgrades; PodSecurityContext validation covers runAsUser/runAsGroup/fsGroup int64 bounds, fsGroupChangePolicy coupling, duplicate supplemental groups, and runAsNonRoot/runAsUser conflicts before rendering; node affinity validation checks required/preferred node selector expressions, operator/value compatibility, and preferred weights before rendering; pod affinity and anti-affinity validation checks required/preferred pod selector terms, namespaces, selector operator/value compatibility, topology keys, and preferred weights before rendering; scheduler and runtime class values are validated as Kubernetes DNS subdomains before rendering; topology spread validation binds selectors to the rendered agent labels and checks topology keys, max skew, min domains, unsatisfiable mode, and node policy fields before rendering. Rollout validation covers `RollingUpdate`/`OnDelete`, `maxUnavailable`/`maxSurge` integer-or-percent values, `minReadySeconds`, `revisionHistoryLimit`, and the Kubernetes rule that `maxUnavailable=0` requires non-zero `maxSurge`, while PDB validation requires exactly one of `minAvailable` or `maxUnavailable`. The chart can optionally create Services for the agent API and colocated relay endpoints. `ipars k8s install` can override the agent API Service/target ports and relay UDP/HTTP Service/target ports when listeners use non-default ports. NodePort/LoadBalancer exposure requires `--allow-public-service-exposure`; explicit NodePort values are limited to 30000-32767, require a NodePort or LoadBalancer Service type, and every explicit Service NodePort or LoadBalancer health check NodePort must be cluster-unique across the agent and relay Services. LoadBalancer exposure also requires `--agent-api-allow-source-cidr` or `--relay-allow-source-cidr` unless `--allow-unrestricted-load-balancer` is set, and the chart validates those source ranges as non-repeated canonical CIDRs, restricts them to LoadBalancer Services, and rejects combining them with unrestricted LoadBalancer acknowledgement before rendering. Optional LoadBalancer class values must be Kubernetes qualified names and only apply to LoadBalancer Services, explicit health check NodePorts only apply to LoadBalancer Services with `externalTrafficPolicy=Local` and must not reuse Service NodePorts, disabling LoadBalancer node-port allocation only applies to LoadBalancer Services and cannot be combined with explicit NodePorts, Service IP family settings accept only Kubernetes `IPv4`/`IPv6` with `SingleStack`, `PreferDualStack`, or `RequireDualStack` policy, internal traffic policy settings accept only `Cluster` or `Local`, and Service session affinity accepts `None` or `ClientIP` with optional integer `ClientIP` timeout seconds in the Kubernetes 1-86400 range. `--enable-network-policy` can render ingress-only `networking.k8s.io/v1` NetworkPolicies for the agent API and relay ports from explicit CIDR allowlists; because the chart defaults to `agent.hostNetwork=true`, enabling those policies requires `--network-policy-acknowledge-host-network` unless `--disable-agent-host-network` is selected, and the acknowledgement is rejected when NetworkPolicy or host networking is disabled. `externalTrafficPolicy=Cluster` requires `--allow-cluster-external-traffic-policy`, chart values reject exposure acknowledgements outside the Service mode they acknowledge, CLI install metadata validates Helm release, namespace, join-token Secret name, Secret key values, and relay admission bearer token Secret references, CLI Service annotation overrides validate Kubernetes annotation keys, 262144-byte values, and generated Helm-safe values, and the chart rejects invalid image repository/tag/pull policy values, invalid image pull Secret names, invalid agent securityContext capability/privilege/read-only-root/seccomp and PodSecurityContext values, invalid DNS policy values, invalid state hostPath values, invalid HTTP liveness/readiness/startup probe values, invalid join-token or relay-admission Secret metadata, agent WireGuard interface names, ServiceAccount creation/name/annotation values, DaemonSet pod metadata/scheduling/node-affinity/pod-affinity/runtime-class/topology-spread/hostNetwork/service-account-token/lifecycle/resource/rollout/PDB values, cluster control/signal URLs with userinfo, invalid explicit ports, or unusable numeric hosts, optional STUN literal socket endpoints, Service annotation key/value pairs with string-only control-character-free values capped at 262144 bytes, inactive Service exposure-specific values including type, port, appProtocol, and annotations, unknown Service types, invalid Service ports and NodePorts, duplicate explicit NodePort allocations, invalid LoadBalancer source-range CIDRs or non-LoadBalancer source-range usage, invalid LoadBalancer classes, invalid health check NodePorts, invalid LoadBalancer node-port allocation combinations, inconsistent Service IP family settings, invalid integer session affinity timeout settings, invalid NetworkPolicy CIDR settings, internal/external traffic policies, invalid literal relay public socket endpoints, invalid relay forwarder bind/endpoint/WireGuard endpoint/namespace or supervisor settings, and zero relay advertisement capacity before rendering.
-
-Each DaemonSet agent is a local route provider by default (`agent.routeProvider=true`). To consume routes from one explicit remote provider, set `agent.routeProvider=false` together with `serviceExposure.routeProviderNodeId`; the chart rejects ambiguous local-plus-remote ownership and missing-provider configurations. Selected remote route CIDRs are configured in the peer's WireGuard `AllowedIPs` as well as the Linux route table, while CIDRs advertised by the local agent are excluded from remote peer configuration. Kernel WireGuard uses a kernel link and therefore does not require a `/dev/net/tun` hostPath or device mount in Kubernetes.
-
-Kubernetes fixed ClusterIPs, LoadBalancer IPs, and externalIPs are additionally rejected when they are unspecified, loopback, link-local, multicast, or broadcast addresses; fixed IP values must match configured Service `ipFamilies` when set; and duplicate fixed ClusterIPs or fixed external addresses (`loadBalancerIP` plus `externalIPs`) are rejected within and across the rendered agent/relay Services before Helm values are emitted or rendered directly. Service annotations that configure provider-specific LoadBalancer source ranges, inbound CIDRs, fixed IPs, EIPs, static IPs, or IP-address lists are rejected so they cannot bypass the typed source-range, `loadBalancerIP`, and `externalIPs` controls. LoadBalancer source ranges and NetworkPolicy CIDR allowlists reject all-source, unsafe, non-canonical IPv4/IPv6, and repeated CIDRs such as `0.0.0.0/0`, `::/0`, loopback, link-local, multicast, and broadcast ranges before Helm values are emitted or rendered directly; IPv4 and IPv6 NetworkPolicy allowlists are also rejected when they are broader than the same Service's LoadBalancer source ranges, or when supplied for inactive NetworkPolicy sections. Direct Helm chart toggles for exposure, service discovery, RBAC, NetworkPolicy, ServiceAccount, PDB, peer-map, route-provider, relay-forwarder, probes, host networking, and security context must use boolean values rather than string lookalikes. Intentionally unrestricted LoadBalancer exposure must use the explicit unrestricted acknowledgement path without source ranges.
-Direct Helm values reject `agent.relayService.enabled=true` unless `agent.relayAdvertisement.enabled=true`, so a relay Service cannot be silently enabled without an advertised relay endpoint.
-Service discovery and its RBAC-only namespace/selector settings are rejected when `serviceExposure.enabled=false`, so disabling Kubernetes underlay route application cannot still render Service-list permissions.
-Agent API NetworkPolicy ingress rules use the configured `agent.apiService.targetPort` value, and relay NetworkPolicy ingress rules use the configured relay target ports, so Service port overrides do not leave CIDR allowlists pointing at the wrong pod listener.
-`ipars k8s install` also rejects Service type, targetPort, or LoadBalancer source-range overrides for Services that are not exposed, so generated Helm commands do not rely on chart-side inactive-value failures.
-`ipars k8s install` can also pass validated Helm `nameOverride` and `fullnameOverride` values through `--chart-name-override` and `--chart-fullname-override`, keeping direct chart metadata overrides and CLI-generated install plans aligned.
-
-Direct Helm values for agent and relay Service and target ports, NodePorts, LoadBalancer health-check NodePorts, session-affinity timeouts, peer-map cadence, relay-forwarder supervision limits, relay advertisement capacity, Kubernetes route intervals, probe/lifecycle/scheduling fields, and rollout/PodDisruptionBudget integer-or-percent values are validated as bounded non-negative integers or bounded integer-percentage values before template `int` conversion, so non-numeric strings, fractional values, oversized numeric values, or empty required numeric fields cannot be silently coerced during rendering.
-
-Public nodes that run a colocated relay can start `iparsd agent` with `--relay-public-endpoint` and `--relay-admission-url` to advertise relay capability during join and each heartbeat. Startup validates those advertisement settings before control-plane registration, heartbeat updates, or signal registration can report them. The relay public endpoint must be a usable nonzero literal IPv4 host:port or [IPv6]:port UDP socket address, and relay admission and status URLs must be absolute HTTP(S) URLs with a host and a usable numeric endpoint when the host is an IP address; the chart also rejects relay advertisement URL userinfo and invalid explicit ports before rendering. Control-plane registration and heartbeat handling reject malformed relay capability, and signal relay-candidate checks enforce those public endpoint and admission URL requirements before offering a relay. `iparsd relay` also requires its own `--public-endpoint` and `--admission-url` so relay status cannot advertise a bind address such as `0.0.0.0`. `iparsd relay --admission-bearer-token-path` or `HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH` makes `/v1/sessions` require `Authorization: Bearer ...`; agents that should use such relays set `--relay-admission-bearer-token-path` or `HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH` to the same 32-512 byte file secret so signal-selected relay admission requests carry the credential. The existing inline options and environment variables remain available, but each conflicts with its file-backed counterpart. Before sending an admission request, agents choose local and peer session endpoints only from usable non-relay UDP candidates, skipping port-zero, unspecified, multicast, and IPv4 broadcast addresses. Relay admission rejects self-relay sessions, unusable UDP endpoints such as port-zero, unspecified, multicast, or IPv4 broadcast addresses, and same-UDP-endpoint pairs. Repeated admission for an active node pair is idempotent: the relay refreshes the observed endpoint addresses and expiry and returns the existing credential without allocating replacement session state, allowing both peers to converge on one bidirectional session. `iparsd relay --max-sessions-per-node`/`HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE` caps active sessions that any participating node can hold on one relay; exceeded caps return `node_session_limit_exceeded` admission failures without allocating relay state. `iparsd relay --admission-rate-limit`/`HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT` and `--admission-rate-limit-window-seconds`/`HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS` bound all session-admission attempts, including missing or rejected Bearer credentials; exceeded windows return `rate_limited` admission failures without allocating relay state. `--relay-status-url` lets heartbeat and signal registration refresh capacity and active-session counts from the relay daemon and requires relay advertisement settings; advertised relay capacity values must be positive before the agent starts. If the status URL is unreachable or reports non-healthy relay state, the agent omits relay capability from control-plane heartbeats and signal upserts so stale relay candidates are cleared instead of preserved. The control plane enables that capability only when the signed join token includes relay permission and clears it when a later heartbeat no longer reports relay capability.
-
-Docker route application can use explicit `--docker-container-cidr` inputs or `--docker-discover-networks` to query Docker Engine bridge networks over the Unix socket. Explicit mode requires a validated `--docker-container-namespace` and at least one container CIDR before the agent starts route loops. Explicit container CIDRs reject unrestricted, unspecified, loopback, link-local, multicast/broadcast, non-canonical, duplicate, and overlapping route entries; discovered Docker IPAM subnets use the same unsafe-range, canonical-prefix, duplicate, and overlap checks before route intent construction. The route manager repeats the same Docker route-intent CIDR validation before dry-run, Linux command, or kernel-netlink route application so direct library callers cannot bypass daemon-side checks. Discovery validates the Docker API version, network name/ID filters, discovered bridge-network names before they become route intent namespace labels, and positive route intervals, requires `--docker-discover-networks` for `--docker-network`, rejects Docker-specific route/discovery settings when Docker route application is disabled, treats Docker API socket overrides as discovery-only, and rejects ambiguous use with explicit container CIDRs. Explicit `--docker-network` filters are checked by name or ID, must not be repeated before they are rendered into comma-delimited Compose environment, and fail with targeted diagnostics when the requested network is absent, not a bridge network, or lacks IPAM subnets, instead of silently producing a partial route set. When a joining agent uses `HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES=true`, those container CIDRs are requested from the control plane and must be covered by the join token route allowlist. `--docker-api-socket` overrides socket placement with a validated absolute Unix socket path without `.` or `..` components, otherwise `DOCKER_HOST=unix://...` with the same path restrictions, `/var/run/docker.sock`, and rootless absolute `$XDG_RUNTIME_DIR/docker.sock` are checked in order. Non-Unix, relative, or dot-component `DOCKER_HOST` values such as `tcp://`, `unix://docker.sock`, or `unix:///tmp/../docker.sock` are rejected instead of silently falling back to the rootful socket. `--docker-network` filters discovery by network name or ID for multi-network Compose deployments. `HETERONETWORK_AGENT_ROUTE_BACKEND=kernel-netlink` selects the rtnetlink route backend for Docker route application instead of the default command backend. `HETERONETWORK_AGENT_WIREGUARD_BACKEND=userspace-command` lets peer-map sync configure a userspace WireGuard interface through `wg show`/`wg set`, assign its local VPN address through `ip address replace`, and avoid creating a kernel WireGuard link; `HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND`, `HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS`, `HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS`, and `HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS` can start the userspace implementation and bound readiness/shutdown waits. The bundled Compose manifest gates control-plane startup on PostgreSQL readiness, adds HTTP healthchecks for control-plane, signal, relay, and agent services, mounts `docker/join.token` as a file-backed Compose secret for `HETERONETWORK_AGENT_JOIN_TOKEN_PATH`, keeps the base agent service free of Docker API socket access, and runs the agent with host networking plus loopback control/signal/relay URLs. Rootful Docker discovery install plans add `docker/compose.docker-discovery.yaml`, which binds `HETERONETWORK_DOCKER_API_SOCKET_HOST` to `/run/heteronetwork/docker.sock` and sets `HETERONETWORK_DOCKER_API_SOCKET=/run/heteronetwork/docker.sock` only when discovery is enabled; rootless route-provider plans use `docker/compose.rootless-docker-discovery.yaml` and default the host side to `$XDG_RUNTIME_DIR/docker.sock`. The Compose stack also passes the relay daemon advertisement through `HETERONETWORK_RELAY_PUBLIC_ENDPOINT` and `HETERONETWORK_RELAY_ADMISSION_URL`, mounts `docker/relay-admission.token` into Relay and Agent through `HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH` and `HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH`, and exposes relay admission session cap/rate-limit controls through the matching `HETERONETWORK_RELAY_*` environment variables. Docker route mutation, route backend selection, and WireGuard backend selection are enabled by the `ipars docker install` environment output so explicit-CIDR, discovery, kernel-netlink routes, kernel WireGuard, and userspace WireGuard deployments do not conflict.
-
-Rootless Docker install plans add `docker/compose.rootless.yaml`; the default `linux-command` plan also adds `docker/compose.rootless-dataplane.yaml` and selects the in-process BoringTun backend with `HETERONETWORK_AGENT_RUNTIME_BACKEND=linux-command`, `HETERONETWORK_AGENT_WIREGUARD_BACKEND=userspace-boringtun`, `HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES=false`, and `HETERONETWORK_DOCKER_DISCOVER_NETWORKS=false`. The dataplane override requests only user-namespace-scoped `CAP_NET_ADMIN` and `/dev/net/tun`, and startup fails during preflight when the rootless engine cannot provide them. An explicit `--agent-runtime-backend dry-run` selects the non-mutating validation-only override. With `--rootless-workload-network`, rootless plans may use explicit CIDRs or Docker API discovery; discovery adds the read-only Docker socket override and requires `--docker-network` filters or an equivalent bounded network selection. The shared namespace route-provider still requires workloads to use `network_mode: service:agent`; it does not automatically attach arbitrary Compose services or mutate Docker networks. The rootless CI smoke covers API discovery, bidirectional workload traffic, and live bridge-subnet replacement; general rootless engine portability and arbitrary Compose lifecycle management remain outside this contract.
-
-Generic `RoutePlan` application validates Linux interface names, canonical safe route CIDRs, duplicate route CIDRs, and policy-rule table/priority/address-family before dry-run, Linux command, or kernel-netlink backends run, so lower-level callers cannot bypass intent-specific route validation.
-
-The bundled Docker Compose and Helm examples use plain HTTP between private deployment services because the current `iparsd` daemons serve HTTP directly. Agent Bearer authentication protects management authorization but does not provide transport confidentiality. Terminate TLS at an external reverse proxy or Kubernetes Ingress when exposing control-plane, signal, relay, or agent APIs outside the private deployment network.
-
-`ipars docker install` and `ipars k8s install` emit JSON install plans with the manifest path, shell-safe validation/apply commands, environment overrides, privilege requirements, and exposure/security notes. The Docker plan validates discovery-only network filters, absolute dot-component-free explicit Docker API socket paths, Linux host interface and namespace names, bounded bare-command-or-absolute-path userspace WireGuard launch commands, at-most-128 control-character-free and comma-free 4 KiB userspace WireGuard arguments for the comma-delimited Compose environment, positive one-hour-capped readiness/shutdown timeouts, and relay forwarder endpoint/bind/WireGuard endpoint/netns/supervisor settings, rejects ambiguous discovery plus explicit CIDR settings, rejects unsafe, non-canonical, duplicate, or overlapping explicit container CIDR routes before exporting Compose environment, shell-quotes the Compose manifest path in emitted commands, emits a Docker API socket preflight command for explicit or default sockets when network discovery is enabled, adds the discovery Compose override for rootful plans and explicit rootless route-provider plans, and exports route application through `HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES=true` only when a Docker route-provider boundary is selected. Rootless plans select the in-process `userspace-boringtun` backend and add the dataplane override by default; default plans omit Docker route environment, while shared-network route-provider plans emit the selected namespace/CIDR or discovery/socket settings and reject unsupported userspace WireGuard process/lifecycle and relay-forwarder settings. An explicit `--agent-runtime-backend dry-run` selects the non-mutating validation-only override. The Kubernetes plan validates and emits Helm release, namespace, chart metadata overrides, join-token Secret metadata, DaemonSet pod metadata/scheduling/node-affinity/pod-affinity/runtime-class/topology-spread/hostNetwork/DNS policy/securityContext/PodSecurityContext/state hostPath/lifecycle probe/resource/rollout/PDB values, peer-map sync enablement and positive poll interval settings, Service/API route discovery values with unsafe/non-canonical/duplicate explicit route rejection, namespace and selector filters, route-provider settings, route backend selection through `agent.routeBackend` from `--route-backend command|kernel-netlink`, join-token Secret wiring, route-provider forwarding sysctl prerequisites, relay advertisement literal socket address/admission/status URL plus capacity/bandwidth validation and Helm values, and optional flags for agent API and relay Service exposure, including Service type, Service and targetPort overrides, explicit NodePort values, LoadBalancer class, health check NodePort, LoadBalancer node-port allocation, Service IP families, source-range, unrestricted LoadBalancer acknowledgement, internal traffic policy, session affinity, NetworkPolicy CIDR allowlists with hostNetwork acknowledgement only when host networking remains enabled, external traffic policy acknowledgement, and bounded Kubernetes annotation key/value overrides; Helm chart paths are shell-quoted in emitted commands and relay exposure requires the public UDP endpoint and relay admission URL that peers should use.
-
-For `--rootless`, the Docker install plan includes the rootless Compose override in every generated `docker compose` command and adds the BoringTun dataplane override unless explicit `--agent-runtime-backend dry-run` was selected. Static-CIDR and discovery route settings require `--rootless-workload-network`; namespaced relay-forwarder settings remain unsupported because rootless Docker does not provide that host dataplane boundary. To attach selected arbitrary Compose workloads, render the merged rootless config and run `scripts/rootless-compose-attach.sh`; it joins services to the Agent namespace and moves explicit TCP/UDP published ports to the Agent so rootlesskit preserves host service access. This does not provide arbitrary unprivileged outer-host L3 routing.
-
-`iparsd` accepts root observability flags before the subcommand. `--otel-enabled --otel-endpoint http://collector:4318` exports traces, logs, and metrics through OTLP HTTP/protobuf; control-plane node/path/health/VPN-pool/join-token-ledger/lifecycle-operation gauges, signal node/relay/NAT/fresh-NAT-strategy/health-total/health-state/stale-health/request metrics, relay capacity/e2e-only/dataplane metrics, and agent path, path-probe, relay-admission, relay-forwarder, lazy-connect, packet-flow, packet-flow lifecycle/application classification, and filtered destination reason metrics are also recorded as OTLP metrics. Signal fresh-NAT-strategy gauges are emitted for every traversal strategy, including zero counts, so dashboard series do not disappear when a strategy is absent in a snapshot. `--otel-service-name` overrides the default `iparsd-<component>` service name, `--otel-metrics-poll-interval-seconds` controls control-plane, signal, relay, and agent snapshot polling and must be positive, and `--log-filter` maps to tracing filter syntax. The same settings are available through `HETERONETWORK_OTEL_ENABLED`, `HETERONETWORK_OTEL_ENDPOINT`, `HETERONETWORK_OTEL_SERVICE_NAME`, `HETERONETWORK_OTEL_METRICS_POLL_INTERVAL_SECONDS`, and `HETERONETWORK_LOG_FILTER`.
-
-When a relay admission URL fronts a shared Service or another load-balanced endpoint, the admission response identifies the relay instance that actually created the session. The agent accepts that identity only when it is present in the current signed relay advertisements, including the local or peer relay advertisement when the endpoint is shared with a path participant, then uses that advertisement's UDP endpoint for the forwarder; an unknown response identity remains an admission failure.
-
-The current verification split is intentional: the privileged network-namespace suite exercises the full two-Agent loop for one endpoint-independent SNAT topology and covers additional signal-generated direct traversal, SNAT/NAT filtering behaviors, hole-punch failure classification, and opaque relay forwarding at the transport boundary, while the Docker Compose and kind Kubernetes gates run the full multi-agent control-plane, Signal, peer-map, WireGuard, relay-fallback, route, and encrypted-dataplane loops. A production deployment still needs an environment-specific acceptance run with its actual NAT/firewall/load-balancer behavior; the repository tests do not claim to reproduce every provider's NAT implementation.
+[MIT](LICENSE)
