@@ -13,10 +13,12 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def files():
     paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/master-only-iac.py',
-           'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/publish-master-only.py',
+           'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/test_verify_standard_node.py',
+           'scripts/publish-master-only.py',
            'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',
            'scripts/heteronetwork-console-e2e.sh','scripts/heteronetwork-console-browser-e2e.mjs',
-           'scripts/verify-overlay-client-console.py','scripts/reconcile-console-e2e-user.py',
+           'scripts/verify-overlay-client-console.py','scripts/test_verify_overlay_client_console.py',
+           'scripts/reconcile-console-e2e-user.py',
            'scripts/verify-gpu-runtime.py',
            'scripts/gpu_inventory.py','scripts/test_gpu_inventory.py',
            'scripts/verify_gpu_inventory.py','scripts/test_verify_gpu_inventory.py',

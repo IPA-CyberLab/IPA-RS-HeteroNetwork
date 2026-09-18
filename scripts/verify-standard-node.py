@@ -5,7 +5,9 @@ import copy
 import datetime
 import json
 from pathlib import Path
+import re
 import subprocess
+import sys
 import time
 
 
@@ -17,6 +19,115 @@ def k(args, obj=None, check=True):
 
 def get(resource, *args):
     return json.loads(k(['get', resource, *args, '-o', 'json']).stdout)
+
+
+def endpoint_slice_has_ready_address(slices, address):
+    """Return whether an EndpointSlice publishes address as usable."""
+    for endpoint_slice in slices.get('items', []):
+        for endpoint in endpoint_slice.get('endpoints', []):
+            conditions = endpoint.get('conditions', {})
+            if (address in endpoint.get('addresses', []) and
+                    conditions.get('ready') is not False and
+                    conditions.get('terminating') is not True):
+                return True
+    return False
+
+
+def wait_for_service_endpoint(namespace, service, address, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        slices = get('endpointslices.discovery.k8s.io', '-n', namespace, '-l',
+                     'kubernetes.io/service-name=' + service)
+        if endpoint_slice_has_ready_address(slices, address):
+            return
+        time.sleep(1)
+    raise RuntimeError('Service did not publish the ready server endpoint')
+
+
+_AUTHORIZATION_HEADER = re.compile(r'(?im)\bauthorization\s*:\s*[^\r\n]*')
+_SENSITIVE_LOG_VALUE = re.compile(
+    r'(?i)\b(bearer|token|password|passwd|secret|api[_-]?key)'
+    r'(\s*[:=]\s*|\s+)([^\s]+)')
+
+
+def safe_log(text, limit=16384):
+    """Bound diagnostics and redact common credential-shaped log values."""
+    text = ''.join(c for c in text if c in '\n\r\t' or ord(c) >= 32)
+    text = _AUTHORIZATION_HEADER.sub('Authorization: [redacted]', text)
+    text = _SENSITIVE_LOG_VALUE.sub(lambda match:
+        match.group(1) + match.group(2) + '[redacted]', text)
+    encoded = text.encode('utf-8')
+    if len(encoded) > limit:
+        text = encoded[:limit].decode('utf-8', errors='ignore') + '\n[truncated]'
+    return text
+
+
+def pod_diagnostics(namespace):
+    """Collect bounded, non-secret diagnostics before the test namespace is removed."""
+    try:
+        response = k(['get', 'pods', '-n', namespace, '-o', 'json'], check=False)
+    except Exception as error:
+        return {'collection_error': safe_log(type(error).__name__ + ': ' + str(error), 2048)}
+    if response.returncode:
+        return {'collection_error': safe_log(response.stderr, 2048)}
+    try:
+        pods = json.loads(response.stdout).get('items', [])
+    except (json.JSONDecodeError, AttributeError) as error:
+        return {'collection_error': safe_log(type(error).__name__ + ': ' + str(error), 2048)}
+    diagnostics = {}
+    for pod in pods:
+        name = pod.get('metadata', {}).get('name', '')
+        if not name:
+            continue
+        statuses = []
+        for container in pod.get('status', {}).get('containerStatuses', []):
+            state = container.get('state', {})
+            state_name = next((kind for kind in ('terminated', 'waiting', 'running')
+                               if kind in state), 'unknown')
+            details = state.get(state_name, {})
+            statuses.append({
+                'name': container.get('name'),
+                'ready': container.get('ready', False),
+                'restart_count': container.get('restartCount', 0),
+                'state': state_name,
+                'reason': details.get('reason'),
+                'exit_code': details.get('exitCode'),
+                'signal': details.get('signal'),
+            })
+        entry = {
+            'phase': pod.get('status', {}).get('phase'),
+            'node': pod.get('spec', {}).get('nodeName'),
+            'containers': statuses,
+        }
+        try:
+            logs = k(['logs', name, '-n', namespace, '--all-containers=true',
+                      '--tail=100', '--limit-bytes=16384'], check=False)
+            if logs.stdout:
+                entry['log'] = safe_log(logs.stdout)
+            if logs.returncode and logs.stderr:
+                entry['log_error'] = safe_log(logs.stderr, 2048)
+        except Exception as error:
+            entry['log_error'] = safe_log(type(error).__name__ + ': ' + str(error), 2048)
+        diagnostics[name] = entry
+    return diagnostics
+
+
+def write_report(path, report):
+    if not path:
+        return
+    output = Path(path)
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    output.chmod(0o600)
+
+
+def record_failure(report, output, namespace, error):
+    report.update({
+        'passed': False,
+        'failure': {'type': type(error).__name__, 'message': safe_log(str(error), 1024)},
+        'pod_diagnostics': pod_diagnostics(namespace),
+    })
+    write_report(output, report)
+    return report
 
 
 def main():
@@ -116,6 +227,7 @@ def main():
         else:
             raise RuntimeError('Standard node could not start the ordinary server Pod')
         server_ip = p['status']['podIP']
+        wait_for_service_endpoint(ns, 'server', server_ip)
         for name, host in [('local-client', args.node), ('peer-client', args.peer)]:
             command = ['sh', '-ec',
                 'curl -fsS --connect-timeout 5 --max-time 15 http://server/; '
@@ -177,12 +289,13 @@ def main():
             assert k(['exec', 'reader', '-n', ns, '--', 'cat', '/data/probe']).stdout.strip() == 'hnn-standard-pvc-ok'
             report['storage_e2e'] = {'pvc_bound': True, 'replica_node': args.node,
                                      'write_sync_and_read_after_pod_recreation': True}
+    except Exception as error:
+        failure_report = record_failure(report, args.output, ns, error)
+        print(json.dumps(failure_report, ensure_ascii=False), file=sys.stderr)
+        raise
     finally:
         k(['delete', 'namespace', ns, '--wait=false'], check=False)
-    if args.output:
-        p = Path(args.output)
-        p.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
-        p.chmod(0o600)
+    write_report(args.output, report)
     print(json.dumps(report, ensure_ascii=False))
 
 

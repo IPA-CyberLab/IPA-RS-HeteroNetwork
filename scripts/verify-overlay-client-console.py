@@ -13,7 +13,9 @@ from pathlib import Path
 import secrets
 import shlex
 import shutil
+import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -30,6 +32,8 @@ CONSOLE_CHECK = ROOT / "scripts/verify-console-gateways.mjs"
 AUTHENTICATED_CONSOLE_CHECK = ROOT / "scripts/heteronetwork-console-browser-e2e.mjs"
 CONSOLE_IDENTITY_RECONCILER = ROOT / "scripts/reconcile-console-e2e-user.py"
 OVERLAY_MTU = 1280
+CONSOLE_DNS_NAME = "console.heteronetwork.internal"
+CONSOLE_PORT = 9781
 
 
 def b64url(value):
@@ -422,7 +426,7 @@ def refresh_client_peers(identity, client_id, peer):
     return data["peer_map"].get("generated_at")
 
 
-def gateway_route_is_ready(gateway):
+def gateway_client_probe_is_ready(gateway):
     request = urllib.request.Request(
         f"http://{gateway}/v1/web-ui/healthz",
         headers={"Accept": "application/json"})
@@ -434,19 +438,146 @@ def gateway_route_is_ready(gateway):
         return False
 
 
+def dns_a_query(name, query_id):
+    labels = name.rstrip(".").split(".")
+    if (not labels or any(not label or len(label.encode("ascii")) > 63
+                          for label in labels)):
+        raise ValueError("invalid DNS query name")
+    question = b"".join(
+        bytes([len(label.encode("ascii"))]) + label.encode("ascii")
+        for label in labels
+    ) + b"\x00" + struct.pack("!HH", 1, 1)
+    return struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0) + question
+
+
+def skip_dns_name(message, offset):
+    labels = 0
+    while True:
+        if offset >= len(message):
+            raise ValueError("truncated DNS name")
+        length = message[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 2 > len(message):
+                raise ValueError("truncated DNS compression pointer")
+            pointer = ((length & 0x3F) << 8) | message[offset + 1]
+            if pointer >= offset:
+                raise ValueError("invalid DNS compression pointer")
+            return offset + 2
+        if length & 0xC0 or length > 63:
+            raise ValueError("invalid DNS label")
+        offset += 1
+        if length == 0:
+            return offset
+        if offset + length > len(message):
+            raise ValueError("truncated DNS label")
+        offset += length
+        labels += 1
+        if labels > 127:
+            raise ValueError("DNS name has too many labels")
+
+
+def dns_a_answers(message, query_id):
+    if len(message) < 12:
+        raise ValueError("truncated DNS response")
+    response_id, flags, questions, answers, _, _ = struct.unpack(
+        "!HHHHHH", message[:12])
+    if (response_id != query_id or flags & 0x8000 == 0 or flags & 0x0200
+            or flags & 0x000F or questions != 1):
+        raise ValueError("invalid DNS response")
+    offset = skip_dns_name(message, 12)
+    if offset + 4 > len(message):
+        raise ValueError("truncated DNS question")
+    offset += 4
+    if message[12:offset] != dns_a_query(CONSOLE_DNS_NAME, query_id)[12:]:
+        raise ValueError("unexpected DNS question")
+    addresses = []
+    for _ in range(answers):
+        offset = skip_dns_name(message, offset)
+        if offset + 10 > len(message):
+            raise ValueError("truncated DNS answer")
+        record_type, record_class, _, length = struct.unpack(
+            "!HHIH", message[offset:offset + 10])
+        offset += 10
+        if offset + length > len(message):
+            raise ValueError("truncated DNS record data")
+        if record_type == 1 and record_class == 1 and length == 4:
+            addresses.append(socket.inet_ntoa(message[offset:offset + length]))
+        offset += length
+    return addresses
+
+
+def overlay_dns_resolves_to_gateway(gateway):
+    query_id = secrets.randbits(16)
+    query = dns_a_query(CONSOLE_DNS_NAME, query_id)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(1)
+            client.sendto(query, (gateway, 53))
+            response, source = client.recvfrom(4096)
+        return (source[0] == gateway and source[1] == 53
+                and dns_a_answers(response, query_id) == [gateway])
+    except (OSError, ValueError):
+        return False
+
+
+def gateway_console_ui_is_ready(gateway):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    headers = {
+        "Accept": "text/html",
+        "Host": f"{CONSOLE_DNS_NAME}:{CONSOLE_PORT}",
+    }
+    try:
+        request = urllib.request.Request(
+            f"http://{gateway}:{CONSOLE_PORT}/ui/", headers=headers)
+        with opener.open(request, timeout=1) as response:
+            document = response.read(128 * 1024)
+            if (response.status != 200 or b'<div id="root"></div>' not in document
+                    or b'<script src="/ui/app.js"></script>' not in document):
+                return False
+        request = urllib.request.Request(
+            f"http://{gateway}:{CONSOLE_PORT}/ui/config",
+            headers={**headers, "Accept": "application/json"})
+        with opener.open(request, timeout=1) as response:
+            configuration = json.load(response)
+        return (response.status == 200
+                and configuration.get("auth_enabled") is True
+                and configuration.get("provider") == "keycloak")
+    except Exception:
+        return False
+
+
+def gateway_route_is_ready(gateway):
+    # A small port-80 probe can succeed while the Agent's split DNS or direct
+    # port-9781 listener is still starting. Chromium uses all three paths, so
+    # do not start its strict three-second timer until each one is usable.
+    return (gateway_client_probe_is_ready(gateway)
+            and overlay_dns_resolves_to_gateway(gateway)
+            and gateway_console_ui_is_ready(gateway))
+
+
 def wait_for_gateway_routes(gateways, timeout=20):
     started = time.monotonic()
-    pending = set(gateways.split(","))
-    while pending and time.monotonic() - started < timeout:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as executor:
-            results = dict(zip(pending, executor.map(gateway_route_is_ready, pending)))
+    targets = tuple(sorted(set(gateways.split(","))))
+    if not targets or "" in targets:
+        raise RuntimeError("at least one gateway is required for route convergence")
+    pending = set(targets)
+    stable_rounds = 0
+    while time.monotonic() - started < timeout:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            results = dict(zip(targets, executor.map(gateway_route_is_ready, targets)))
         pending = {gateway for gateway, ready in results.items() if not ready}
         if pending:
-            time.sleep(0.2)
+            stable_rounds = 0
+        else:
+            stable_rounds += 1
+            if stable_rounds == 2:
+                return round((time.monotonic() - started) * 1000)
+        time.sleep(0.2)
     if pending:
         raise RuntimeError(
-            "client return routes did not converge on gateways: " + ", ".join(sorted(pending)))
-    return round((time.monotonic() - started) * 1000)
+            "client console routes, split DNS, and listeners did not converge on gateways: "
+            + ", ".join(sorted(pending)))
+    raise RuntimeError("client console readiness did not remain stable across two probes")
 
 
 def remove_client(identity, client_id, peer):
