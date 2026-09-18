@@ -10,7 +10,24 @@
     hnn_gpu_inventory_api: flashgpudevices.flash.heterocloud.io
     hnn_gpu_inventory_manager: heteronetwork-gpu-inventory
   tasks:
-    - name: Wait for the Flash GPU inventory API
+    - name: Wait for the Flash GPU inventory CRD to be created
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - crd/flashgpudevices.flash.heterocloud.io
+          - -o
+          - name
+      delegate_to: uc-k8sp5
+      register: hnn_gpu_inventory_crd
+      changed_when: false
+      check_mode: false
+      until: hnn_gpu_inventory_crd.rc == 0
+      retries: 60
+      delay: 5
+
+    - name: Wait for the Flash GPU inventory API to be established
       ansible.builtin.command:
         argv:
           - kubectl
