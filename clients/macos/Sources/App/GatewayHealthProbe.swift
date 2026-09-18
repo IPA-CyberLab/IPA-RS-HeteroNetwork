@@ -57,7 +57,7 @@ enum GatewayHealthProbe {
     }
 }
 
-private final class UDPDNSProbe {
+private final class UDPDNSProbe: @unchecked Sendable {
     private let connection: NWConnection
     private let request: Data
     private let queryID: UInt16
@@ -113,7 +113,9 @@ private final class UDPDNSProbe {
                 guard let self else { return }
                 finish(
                     receiveError == nil
-                        && data.map { OverlayDNSHealthProbe.isHealthyResponse($0, queryID: queryID) }
+                        && data.map {
+                            OverlayDNSHealthProbe.isHealthyResponse($0, queryID: self.queryID)
+                        }
                             == true
                 )
             }
