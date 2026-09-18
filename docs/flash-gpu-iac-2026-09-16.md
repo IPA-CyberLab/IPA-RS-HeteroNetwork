@@ -3,7 +3,8 @@
 2026-09-16 UTC。Terraformの `gpu_host_configuration` は、通常Podを実行できる管理対象ノードを
 Ansibleで検査する。Ubuntu 24.04以降のamd64、NVIDIA display/3D controller、Ubuntuが
 `nvidia-driver-580` を推奨することを同時に満たしたノードだけをGPU対応にする。
-`uc-k8sp5` はGTX 1080 Ti 2基を宣言値として照合する。`uc-k8sp4` のGT 710はUbuntuの
+`uc-k8sp5` は `NVIDIA GeForce GTX 1080 Ti`、11264 MiBを2基という宣言値まで照合し、
+型名 `nvidia-geforce-gtx-1080-ti` をNodeへ付ける。`uc-k8sp4` のGT 710はUbuntuの
 推奨ドライバが470で、CUDA 12用のこの実行環境を満たさないため対象外になる。
 専用マスター3台は候補に含めず、引き続き通常Podを配置しない。
 
@@ -20,5 +21,18 @@ clusterが強制した安全な配置条件による恒常的なOutOfSyncを防�
 `flash.heterocloud.io/gpu-ready=true` を付ける。FlashのGPU Podはこのラベルを要求するため、
 未検証ノードには配置されない。
 
-Flash APIの `gpu_count` は省略時0、最大1である。0は従来のgVisor、1はNVIDIAランタイムを
-使う。GPU Deploymentは更新時の余分なGPUを要求しないよう `maxSurge: 0` とする。
+検証後、別のTerraformリソースが `nvidia-smi` のUUID、型名、モデル、メモリを物理GPUごとの
+cluster-scoped `FlashGpuDevice` に同期する。UUIDはAnsibleの `no_log` 対象であり、Terraform
+state、Git、ユーザー向けcatalogには保存しない。Kubernetesオブジェクト名にもUUIDそのものを
+使わずSHA-256の先頭16桁を使う。消失した物理GPUは宣言数とdriver照合が成功した場合だけ
+inventoryから除く。
+
+IaCのserver-side apply field managerはhardware fieldsだけを所有する。新規GPUのaccessはCRDの
+defaultにより `open` で、管理コンソールが管理する `visibility` とprivate user assignmentsは
+別のfield ownerが保持する。このためdriverやモデル情報の再同期で管理者の割り当てを初期化しない。
+一般ユーザーには利用可能な型と台数だけを集約表示し、同じ型の物理GPUは選ばせない。
+
+新規Flash API入力は `gpu_type` を省略するとCPU、指定すると暗黙に最大1 GPUである。旧
+`gpu_count` は保存済みspecの移行用だけに残す。GPU Deploymentは更新時の余分なGPUを要求しない
+よう `maxSurge: 0` とし、schedulerがaccess、health、reservationとweekly limitを満たすslotを
+原子的に確保する。

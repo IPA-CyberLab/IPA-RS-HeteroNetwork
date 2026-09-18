@@ -127,7 +127,7 @@ with `python3 deploy/terraform/master-only/render.py`.
 
 The production Git source is
 `git://10.250.0.2:19419/heteronetwork-infrastructure.git`, branch
-`codex/master-only-iac-20260915`. It contains the public upstream history plus
+`master`. It contains the public upstream history plus
 the infrastructure files. The publication script uses a temporary Git index
 and includes only this change's explicit file list. Git is served only over
 the existing encrypted HeteroNetwork, with remote pushes disabled. Rebuild
@@ -167,6 +167,14 @@ Service traffic, cross-node Pod traffic, and Kubernetes Service TLS. With
 `--exercise-storage`, it provisions a 1 GiB Longhorn PVC on the standard node,
 writes and syncs data, recreates the consumer Pod, and verifies the persisted
 contents before deleting the temporary namespace and test volume.
+
+GPU workers receive a canonical model-type label only after the pinned driver
+reports the declared hardware. The acceptance probe grants exactly one device
+to each smoke Pod. After the Flash GPU CRD is established,
+`gpu_inventory_configuration` publishes physical devices with a dedicated
+server-side apply field manager. Hardware identifiers stay out of Terraform
+state and logs. The owner API controls open/private visibility and user
+assignments through fields the infrastructure manager never applies.
 
 References: [Terraform provisioners](https://developer.hashicorp.com/terraform/language/provisioners),
 [Kubernetes state backend](https://developer.hashicorp.com/terraform/language/backend/kubernetes),

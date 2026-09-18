@@ -12,6 +12,7 @@
     hnn_gpu_present_label: nvidia.com/gpu.present
     hnn_gpu_ready_label: flash.heterocloud.io/gpu-ready
     hnn_gpu_count_label: flash.heterocloud.io/gpu-count
+    hnn_gpu_type_label: flash.heterocloud.io/gpu-type
   tasks:
     - name: Count physical NVIDIA display and 3D controllers
       ansible.builtin.shell: |
@@ -79,7 +80,8 @@
         not hnn_gpu_eligible and
         (((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_present_label] | default('')) != '' or
          ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_ready_label] | default('')) != '' or
-         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_count_label] | default('')) != '')
+         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_count_label] | default('')) != '' or
+         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_type_label] | default('')) != '')
 
     - name: Remove GPU scheduling labels from ineligible hosts
       ansible.builtin.command:
@@ -96,6 +98,7 @@
         - "{{ hnn_gpu_present_label }}"
         - "{{ hnn_gpu_ready_label }}"
         - "{{ hnn_gpu_count_label }}"
+        - "{{ hnn_gpu_type_label }}"
       when: >-
         not ansible_check_mode and not hnn_gpu_eligible and
         ((hnn_gpu_node.stdout | from_json).metadata.labels[item] | default('')) != ''
@@ -214,22 +217,28 @@
           delegate_to: uc-k8sp5
           changed_when: true
 
-    - name: Query GPUs through the installed driver
-      ansible.builtin.command:
-        argv: [nvidia-smi, --query-gpu=uuid, "--format=csv,noheader"]
-      register: hnn_gpu_smi
+    - name: Query and validate GPUs through the installed driver
+      ansible.builtin.script:
+        cmd: >-
+          {{ hnn_repo_root | quote }}/scripts/gpu_inventory.py
+          --node {{ inventory_hostname | quote }}
+          {% if gpu_expected_count is defined %}--expected-count {{ gpu_expected_count | int }}{% endif %}
+          {% if gpu_expected_type is defined %}--expected-type {{ gpu_expected_type | quote }}{% endif %}
+          {% if gpu_expected_model is defined %}--expected-model {{ gpu_expected_model | quote }}{% endif %}
+          {% if gpu_expected_memory_mib is defined %}--expected-memory-mib {{ gpu_expected_memory_mib | int }}{% endif %}
+        executable: python3
+      register: hnn_gpu_inventory_command
       changed_when: false
-      check_mode: false
-      until: hnn_gpu_smi.rc == 0
+      no_log: true
+      until: hnn_gpu_inventory_command.rc == 0
       retries: 12
       delay: 5
       when: hnn_gpu_eligible and not ansible_check_mode
 
-    - name: Require every physical GPU to be visible after reboot
-      ansible.builtin.assert:
-        that:
-          - hnn_gpu_smi.stdout_lines | length == hnn_gpu_count | int
-          - hnn_gpu_smi.stdout_lines | unique | length == hnn_gpu_count | int
+    - name: Retain the validated GPU summary without logging physical identifiers
+      ansible.builtin.set_fact:
+        hnn_gpu_inventory: "{{ hnn_gpu_inventory_command.stdout | from_json }}"
+      no_log: true
       when: hnn_gpu_eligible and not ansible_check_mode
 
     - name: Install NVIDIA repository prerequisites
@@ -325,7 +334,9 @@
       changed_when: >-
         hnn_gpu_eligible and
         (((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_present_label] | default('')) != 'true' or
-         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_count_label] | default('')) != (hnn_gpu_count | string))
+         ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_count_label] | default('')) != (hnn_gpu_count | string) or
+         (gpu_expected_type is defined and
+          ((hnn_gpu_node.stdout | from_json).metadata.labels[hnn_gpu_type_label] | default('')) != gpu_expected_type))
 
     - name: Publish verified hardware and quarantine it until the cluster smoke test
       ansible.builtin.command:
@@ -337,6 +348,7 @@
           - "{{ inventory_hostname }}"
           - "{{ hnn_gpu_present_label }}=true"
           - "{{ hnn_gpu_count_label }}={{ hnn_gpu_count }}"
+          - "{{ hnn_gpu_type_label }}={{ hnn_gpu_inventory.gpu_type }}"
           - --overwrite
       delegate_to: uc-k8sp5
       changed_when: true

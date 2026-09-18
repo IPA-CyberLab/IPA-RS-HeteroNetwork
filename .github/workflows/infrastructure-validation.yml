@@ -13,6 +13,10 @@ on:
       - 'scripts/reconcile-console-e2e-user.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
+      - 'scripts/gpu_inventory.py'
+      - 'scripts/test_gpu_inventory.py'
+      - 'scripts/verify_gpu_inventory.py'
+      - 'scripts/test_verify_gpu_inventory.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/ipars-agent-http/**'
@@ -29,6 +33,10 @@ on:
       - 'scripts/reconcile-console-e2e-user.py'
       - 'scripts/verify-standard-node.py'
       - 'scripts/verify-gpu-runtime.py'
+      - 'scripts/gpu_inventory.py'
+      - 'scripts/test_gpu_inventory.py'
+      - 'scripts/verify_gpu_inventory.py'
+      - 'scripts/test_verify_gpu_inventory.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/ipars-agent-http/**'
@@ -47,17 +55,20 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify acceptance rejects failed and stale E2E
-        run: python3 -B -m unittest discover -s scripts -p test_onboarding_acceptance.py -v
+        run: |
+          python3 -B -m unittest discover -s scripts -p test_onboarding_acceptance.py -v
+          python3 -B -m unittest discover -s scripts -p test_gpu_inventory.py -v
+          python3 -B -m unittest discover -s scripts -p test_verify_gpu_inventory.py -v
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs
           node --check scripts/heteronetwork-console-browser-e2e.mjs
-          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py
+          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py scripts/gpu_inventory.py scripts/verify_gpu_inventory.py
 
   live-overlay-browser-e2e:
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.ref == 'refs/heads/codex/flash-gpu-iac-20260916' || github.ref == 'refs/heads/master')
+      github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: heteronet-e2e

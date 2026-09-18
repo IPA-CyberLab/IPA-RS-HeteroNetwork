@@ -1,0 +1,152 @@
+- name: Reconcile verified hardware into the private Flash GPU inventory
+  hosts: gpu_candidates
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_gpu_present_label: nvidia.com/gpu.present
+    hnn_gpu_inventory_api: flashgpudevices.flash.heterocloud.io
+    hnn_gpu_inventory_manager: heteronetwork-gpu-inventory
+  tasks:
+    - name: Wait for the Flash GPU inventory API
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - wait
+          - --for=condition=Established
+          - crd/flashgpudevices.flash.heterocloud.io
+          - --timeout=5m
+      delegate_to: uc-k8sp5
+      changed_when: false
+      check_mode: false
+
+    - name: Read the node's verified GPU state
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - node
+          - "{{ inventory_hostname }}"
+          - -o
+          - json
+      delegate_to: uc-k8sp5
+      register: hnn_gpu_inventory_node
+      changed_when: false
+      check_mode: false
+
+    - name: Select nodes that passed hardware configuration
+      ansible.builtin.set_fact:
+        hnn_gpu_advertised: >-
+          {{ ((hnn_gpu_inventory_node.stdout | from_json).metadata.labels[hnn_gpu_present_label]
+              | default('')) == 'true' }}
+
+    - name: Collect the protected physical inventory
+      ansible.builtin.script:
+        cmd: >-
+          {{ hnn_repo_root | quote }}/scripts/gpu_inventory.py
+          --node {{ inventory_hostname | quote }}
+          {% if gpu_expected_count is defined %}--expected-count {{ gpu_expected_count | int }}{% endif %}
+          {% if gpu_expected_type is defined %}--expected-type {{ gpu_expected_type | quote }}{% endif %}
+          {% if gpu_expected_model is defined %}--expected-model {{ gpu_expected_model | quote }}{% endif %}
+          {% if gpu_expected_memory_mib is defined %}--expected-memory-mib {{ gpu_expected_memory_mib | int }}{% endif %}
+        executable: python3
+      register: hnn_gpu_private_inventory_command
+      changed_when: false
+      check_mode: false
+      no_log: true
+      when: hnn_gpu_advertised
+
+    - name: Retain the physical inventory only in Ansible memory
+      ansible.builtin.set_fact:
+        hnn_gpu_private_inventory: "{{ hnn_gpu_private_inventory_command.stdout | from_json }}"
+      no_log: true
+      when: hnn_gpu_advertised
+
+    - name: Preview hardware-owned inventory changes
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - diff
+          - --server-side
+          - "--field-manager={{ hnn_gpu_inventory_manager }}"
+          - -f
+          - -
+        stdin: "{{ item | to_json }}"
+        stdin_add_newline: true
+      delegate_to: uc-k8sp5
+      register: hnn_gpu_inventory_diff
+      failed_when: hnn_gpu_inventory_diff.rc not in [0, 1]
+      changed_when: hnn_gpu_inventory_diff.rc == 1
+      check_mode: false
+      no_log: true
+      loop: "{{ hnn_gpu_private_inventory.resources | default([]) }}"
+      when: ansible_check_mode and hnn_gpu_advertised
+
+    - name: Apply only hardware-owned inventory fields
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - apply
+          - --server-side
+          - --force-conflicts
+          - "--field-manager={{ hnn_gpu_inventory_manager }}"
+          - -f
+          - -
+        stdin: "{{ item | to_json }}"
+        stdin_add_newline: true
+      delegate_to: uc-k8sp5
+      changed_when: true
+      no_log: true
+      loop: "{{ hnn_gpu_private_inventory.resources | default([]) }}"
+      when: not ansible_check_mode and hnn_gpu_advertised
+
+    - name: List inventory objects managed for this node
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - "{{ hnn_gpu_inventory_api }}"
+          - -l
+          - "app.kubernetes.io/managed-by=heteronetwork-iac,flash.heterocloud.io/inventory-node={{ inventory_hostname }}"
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+      delegate_to: uc-k8sp5
+      register: hnn_gpu_managed_inventory_names
+      changed_when: false
+      check_mode: false
+
+    - name: Identify inventory entries whose physical device disappeared
+      ansible.builtin.set_fact:
+        hnn_gpu_stale_inventory_names: >-
+          {{ hnn_gpu_managed_inventory_names.stdout_lines
+             | difference(hnn_gpu_private_inventory.resources
+                          | default([])
+                          | map(attribute='metadata.name')
+                          | list) }}
+
+    - name: Report stale physical inventory as drift
+      ansible.builtin.debug:
+        msg: A managed physical GPU inventory entry must be removed
+      changed_when: hnn_gpu_stale_inventory_names | length > 0
+      when: ansible_check_mode
+
+    - name: Remove inventory entries for verified-absent devices
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - delete
+          - "{{ hnn_gpu_inventory_api }}"
+          - "{{ item }}"
+          - --wait=true
+      delegate_to: uc-k8sp5
+      changed_when: true
+      loop: "{{ hnn_gpu_stale_inventory_names }}"
+      when: not ansible_check_mode

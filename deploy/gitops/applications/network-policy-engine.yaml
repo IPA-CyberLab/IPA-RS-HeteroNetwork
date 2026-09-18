@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: git://10.250.0.2:19419/heteronetwork-infrastructure.git
-    targetRevision: codex/master-only-iac-20260915
+    targetRevision: master
     path: deploy/gitops/network-policy-engine
   destination:
     server: https://kubernetes.default.svc

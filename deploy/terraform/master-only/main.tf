@@ -3,7 +3,12 @@ locals {
   nodes          = jsondecode(file("${path.module}/nodes.json"))
   standard_nodes = jsondecode(file("${path.module}/standard-nodes.json"))
   gpu_expected_nodes = {
-    uc-k8sp5 = 2
+    uc-k8sp5 = {
+      count      = 2
+      type       = "nvidia-geforce-gtx-1080-ti"
+      model      = "NVIDIA GeForce GTX 1080 Ti"
+      memory_mib = 11264
+    }
   }
   enrollment_issuer = {
     ssh_host     = "10.250.0.10"
@@ -47,7 +52,13 @@ locals {
           hosts = { for name, node in local.nodes : name => merge(node, { ansible_host = node.ssh_host }) }
         }
         bootstrap = {
-          hosts = { uc-k8sp5 = { ansible_host = local.bootstrap.ssh_host, gpu_expected_count = local.gpu_expected_nodes.uc-k8sp5 } }
+          hosts = { uc-k8sp5 = {
+            ansible_host            = local.bootstrap.ssh_host
+            gpu_expected_count      = local.gpu_expected_nodes.uc-k8sp5.count
+            gpu_expected_type       = local.gpu_expected_nodes.uc-k8sp5.type
+            gpu_expected_model      = local.gpu_expected_nodes.uc-k8sp5.model
+            gpu_expected_memory_mib = local.gpu_expected_nodes.uc-k8sp5.memory_mib
+          } }
         }
         standard = {
           hosts = { for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host }) }
@@ -62,7 +73,13 @@ locals {
         }
         gpu_candidates = {
           hosts = merge(
-            { uc-k8sp5 = { ansible_host = local.bootstrap.ssh_host, gpu_expected_count = local.gpu_expected_nodes.uc-k8sp5 } },
+            { uc-k8sp5 = {
+              ansible_host            = local.bootstrap.ssh_host
+              gpu_expected_count      = local.gpu_expected_nodes.uc-k8sp5.count
+              gpu_expected_type       = local.gpu_expected_nodes.uc-k8sp5.type
+              gpu_expected_model      = local.gpu_expected_nodes.uc-k8sp5.model
+              gpu_expected_memory_mib = local.gpu_expected_nodes.uc-k8sp5.memory_mib
+            } },
             { for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host }) },
             {
               ichikawap1 = {
@@ -246,7 +263,7 @@ resource "terraform_data" "onboarding_acceptance" {
       KUBECONFIG       = pathexpand(var.kubeconfig_path)
     }
   }
-  depends_on = [terraform_data.console_configuration, terraform_data.gpu_acceptance, kubernetes_manifest.master_only_application, kubernetes_manifest.standard_application]
+  depends_on = [terraform_data.console_configuration, terraform_data.gpu_inventory_acceptance, kubernetes_manifest.master_only_application, kubernetes_manifest.standard_application]
 }
 
 resource "terraform_data" "standard_host_configuration" {
@@ -280,6 +297,7 @@ resource "terraform_data" "gpu_host_configuration" {
   }
   triggers_replace = [
     filesha256("${path.module}/ansible/gpu.yaml"),
+    filesha256("${local.repo_root}/scripts/gpu_inventory.py"),
     sha256(jsonencode(local.gpu_expected_nodes)),
     sha256(jsonencode(local.inventory))
   ]
@@ -385,7 +403,7 @@ resource "terraform_data" "gpu_acceptance" {
   ]
   provisioner "local-exec" {
     working_dir = local.repo_root
-    command     = "python3 scripts/verify-gpu-runtime.py --require-node uc-k8sp5=2"
+    command     = "python3 scripts/verify-gpu-runtime.py --require-node uc-k8sp5=2 --require-type uc-k8sp5=nvidia-geforce-gtx-1080-ti"
     environment = {
       KUBECONFIG = pathexpand(var.kubeconfig_path)
     }
@@ -394,6 +412,56 @@ resource "terraform_data" "gpu_acceptance" {
     kubernetes_manifest.gpu_runtime_application,
     kubernetes_manifest.nvidia_device_plugin_application
   ]
+}
+
+resource "terraform_data" "gpu_inventory_configuration" {
+  input = {
+    expected_nodes = local.gpu_expected_nodes
+    api            = "flashgpudevices.flash.heterocloud.io/v1alpha1"
+    field_manager  = "heteronetwork-gpu-inventory"
+    access_owner   = "heterocloud-owner-api"
+  }
+  triggers_replace = [
+    filesha256("${path.module}/ansible/gpu-inventory.yaml"),
+    filesha256("${local.repo_root}/scripts/gpu_inventory.py"),
+    sha256(jsonencode(local.gpu_expected_nodes)),
+    terraform_data.gpu_acceptance.id,
+    filesha256("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml")
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/gpu-inventory.yaml"
+    environment = {
+      HNN_IAC_INVENTORY        = local_file.inventory.filename
+      ANSIBLE_CALLBACK_PLUGINS = "${abspath(path.module)}/ansible/callback_plugins"
+      ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
+    }
+  }
+  depends_on = [
+    terraform_data.gpu_acceptance,
+    kubernetes_manifest.external_application["heterocloud-flash"]
+  ]
+}
+
+resource "terraform_data" "gpu_inventory_acceptance" {
+  input = {
+    expected_nodes    = local.gpu_expected_nodes
+    physical_ids      = "redacted"
+    visibility_policy = "owner-managed-open-or-private"
+  }
+  triggers_replace = [
+    filesha256("${local.repo_root}/scripts/verify_gpu_inventory.py"),
+    terraform_data.gpu_inventory_configuration.id,
+    filesha256("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml")
+  ]
+  provisioner "local-exec" {
+    working_dir = local.repo_root
+    command     = "python3 scripts/verify_gpu_inventory.py --require-node uc-k8sp5=2 --require-type uc-k8sp5=nvidia-geforce-gtx-1080-ti"
+    environment = {
+      KUBECONFIG = pathexpand(var.kubeconfig_path)
+    }
+  }
+  depends_on = [terraform_data.gpu_inventory_configuration]
 }
 
 resource "kubernetes_manifest" "standard_application" {

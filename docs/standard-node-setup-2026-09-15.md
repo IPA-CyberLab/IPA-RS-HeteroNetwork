@@ -42,7 +42,7 @@ Nodeのcordon解除、通常Podを許可するラベル、公開ingress、Longho
 Admissionがcontrol-planeの `NoSchedule` と専用master taintを取り除き、その他のcontroller taintを保持する。
 元の3台は別の `control-plane-only` Application が管理する。
 Git同期元は内部の `git://10.250.0.2:19419/heteronetwork-infrastructure.git`、
-branchは `codex/master-only-iac-20260915`。
+branchは `master`。
 
 ## Nativeサービスとストレージ
 

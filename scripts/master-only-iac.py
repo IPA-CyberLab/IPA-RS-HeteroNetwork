@@ -37,11 +37,24 @@ def main():
     standard_drift=list(standard_nodes) if args.reconcile_all or not inventory.exists() else []
     gpu_host_drift=args.reconcile_all or not inventory.exists()
     gpu_acceptance_drift=args.reconcile_all or not inventory.exists()
+    gpu_inventory_drift=args.reconcile_all or not inventory.exists()
+    gpu_inventory_acceptance_drift=args.reconcile_all or not inventory.exists()
     git_drift=args.reconcile_all or not inventory.exists()
     console_drift=args.reconcile_all or not inventory.exists()
     onboarding_drift=args.reconcile_all or not inventory.exists()
     if inventory.exists() and not args.reconcile_all:
-        for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('gpu.yaml','gpu-check.log'),('console/configure.yaml','console-check.log'),('git-source.yaml','git-check.log')]:
+        inventory_api=subprocess.run(
+            ['kubectl','get','crd','flashgpudevices.flash.heterocloud.io','-o','name'],
+            env=env,text=True,capture_output=True)
+        inventory_playbooks=[]
+        if inventory_api.returncode == 0:
+            inventory_playbooks=[('gpu-inventory.yaml','gpu-inventory-check.log')]
+        elif 'not found' in inventory_api.stderr.lower() or 'notfound' in inventory_api.stderr.lower():
+            gpu_inventory_drift=True
+            gpu_inventory_acceptance_drift=True
+        else:
+            raise RuntimeError('Unable to inspect the Flash GPU inventory API: '+inventory_api.stderr.strip())
+        for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('gpu.yaml','gpu-check.log'),*inventory_playbooks,('console/configure.yaml','console-check.log'),('git-source.yaml','git-check.log')]:
             command=['ansible-playbook','-i',str(inventory),'--check',str(MODULE/'ansible'/playbook)]
             result=subprocess.run(command,env=env,text=True,capture_output=True)
             log=work/logname
@@ -60,12 +73,14 @@ def main():
                 standard_drift=[name for name,stats in report['hosts'].items() if name in standard_nodes and stats['changed']]
             elif playbook=='gpu.yaml':
                 gpu_host_drift=any(stats['changed'] for stats in report['hosts'].values())
+            elif playbook=='gpu-inventory.yaml':
+                gpu_inventory_drift=any(stats['changed'] for stats in report['hosts'].values())
             elif playbook=='console/configure.yaml':
                 console_drift=any(stats['changed'] for stats in report['hosts'].values())
             else:
                 git_drift=any(stats['changed'] for stats in report['hosts'].values())
         result=subprocess.run(['python3',str(ROOT/'scripts/accept-registered-nodes.py'),
-                               '--work-dir',str(work),'--branch',env.get('TF_VAR_git_revision','codex/flash-gpu-iac-20260916'),
+                               '--work-dir',str(work),'--branch',env.get('TF_VAR_git_revision','master'),
                                '--check'],env=env,text=True,capture_output=True)
         log=work/'onboarding-check.log'
         log.write_text(result.stdout+result.stderr)
@@ -74,16 +89,29 @@ def main():
             raise RuntimeError('Onboarding proof check failed; see private onboarding-check.log')
         onboarding_drift=result.returncode==2
         result=subprocess.run(['python3',str(ROOT/'scripts/verify-gpu-runtime.py'),
-                               '--require-node','uc-k8sp5=2','--check'],env=env,text=True,capture_output=True)
+                               '--require-node','uc-k8sp5=2',
+                               '--require-type','uc-k8sp5=nvidia-geforce-gtx-1080-ti',
+                               '--check'],env=env,text=True,capture_output=True)
         log=work/'gpu-acceptance-check.log'
         log.write_text(result.stdout+result.stderr)
         log.chmod(0o600)
         if result.returncode not in [0,2]:
             raise RuntimeError('GPU acceptance check failed; see private gpu-acceptance-check.log')
         gpu_acceptance_drift=result.returncode==2
-        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
+        if inventory_api.returncode == 0:
+            result=subprocess.run(['python3',str(ROOT/'scripts/verify_gpu_inventory.py'),
+                                   '--require-node','uc-k8sp5=2',
+                                   '--require-type','uc-k8sp5=nvidia-geforce-gtx-1080-ti',
+                                   '--check'],env=env,text=True,capture_output=True)
+            log=work/'gpu-inventory-acceptance-check.log'
+            log.write_text(result.stdout+result.stderr)
+            log.chmod(0o600)
+            if result.returncode not in [0,2]:
+                raise RuntimeError('GPU inventory acceptance check failed; see private gpu-inventory-acceptance-check.log')
+            gpu_inventory_acceptance_drift=result.returncode==2
+        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
     if args.action=='check':
-        return 2 if drift or standard_drift or gpu_host_drift or gpu_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
+        return 2 if drift or standard_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
     tf=[args.terraform,'-chdir='+str(MODULE)]
     subprocess.run(tf+['init','-input=false'],env=env,check=True)
     replace=['-replace=terraform_data.host_configuration['+json.dumps(name)+']' for name in drift]
@@ -92,6 +120,10 @@ def main():
         replace.append('-replace=terraform_data.gpu_host_configuration')
     if gpu_acceptance_drift:
         replace.append('-replace=terraform_data.gpu_acceptance')
+    if gpu_inventory_drift:
+        replace.append('-replace=terraform_data.gpu_inventory_configuration')
+    if gpu_inventory_acceptance_drift:
+        replace.append('-replace=terraform_data.gpu_inventory_acceptance')
     if git_drift:
         replace.append('-replace=terraform_data.git_source')
     if console_drift:

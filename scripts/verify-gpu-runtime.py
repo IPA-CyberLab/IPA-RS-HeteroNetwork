@@ -10,6 +10,7 @@ import time
 PRESENT_LABEL = "nvidia.com/gpu.present"
 READY_LABEL = "flash.heterocloud.io/gpu-ready"
 COUNT_LABEL = "flash.heterocloud.io/gpu-count"
+TYPE_LABEL = "flash.heterocloud.io/gpu-type"
 RESOURCE = "nvidia.com/gpu"
 APPLICATIONS = ("gpu-runtime", "nvidia-device-plugin")
 SMOKE_IMAGE = (
@@ -28,19 +29,30 @@ def get_json(*args: str) -> dict:
     return json.loads(run(*args, "-o", "json").stdout)
 
 
-def expected_nodes(required: dict[str, int]) -> dict[str, int]:
+def expected_nodes(
+    required: dict[str, int], required_types: dict[str, str]
+) -> tuple[dict[str, int], dict[str, str]]:
     nodes = get_json("get", "nodes", "-l", f"{PRESENT_LABEL}=true")
     actual: dict[str, int] = {}
+    actual_types: dict[str, str] = {}
     for node in nodes["items"]:
         name = node["metadata"]["name"]
-        raw = node["metadata"].get("labels", {}).get(COUNT_LABEL, "")
+        labels = node["metadata"].get("labels", {})
+        raw = labels.get(COUNT_LABEL, "")
         if not re.fullmatch(r"[1-9][0-9]*", raw):
             raise RuntimeError(f"{name} has an invalid {COUNT_LABEL} label")
+        gpu_type = labels.get(TYPE_LABEL, "")
+        if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", gpu_type):
+            raise RuntimeError(f"{name} has an invalid {TYPE_LABEL} label")
         actual[name] = int(raw)
+        actual_types[name] = gpu_type
     for name, count in required.items():
         if actual.get(name) != count:
             raise RuntimeError(f"{name} must advertise {count} physical GPUs; observed {actual.get(name)}")
-    return actual
+    for name, gpu_type in required_types.items():
+        if actual_types.get(name) != gpu_type:
+            raise RuntimeError(f"{name} must advertise GPU type {gpu_type}; observed {actual_types.get(name)}")
+    return actual, actual_types
 
 
 def capacity_ready(nodes: dict[str, int], require_acceptance_label: bool) -> tuple[bool, str]:
@@ -79,7 +91,7 @@ def wait_for_capacity(nodes: dict[str, int], deadline: float) -> None:
     raise RuntimeError(message)
 
 
-def smoke_node(name: str, namespace: str, deadline: float) -> dict:
+def smoke_node(name: str, gpu_type: str, namespace: str, deadline: float) -> dict:
     safe_name = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
     pod_name = f"gpu-exclusive-smoke-{safe_name}"[:63].rstrip("-")
     run("delete", "pod", pod_name, "-n", namespace, "--ignore-not-found=true", "--wait=true")
@@ -90,7 +102,10 @@ def smoke_node(name: str, namespace: str, deadline: float) -> dict:
         "spec": {
             "restartPolicy": "Never",
             "runtimeClassName": "nvidia",
-            "nodeSelector": {"kubernetes.io/hostname": name},
+            "nodeSelector": {
+                "kubernetes.io/hostname": name,
+                TYPE_LABEL: gpu_type,
+            },
             "containers": [{
                 "name": "probe",
                 "image": SMOKE_IMAGE,
@@ -140,22 +155,38 @@ def parse_required(values: list[str]) -> dict[str, int]:
     return required
 
 
+def parse_required_types(values: list[str]) -> dict[str, str]:
+    required: dict[str, str] = {}
+    for value in values:
+        name, separator, gpu_type = value.partition("=")
+        if (
+            not separator
+            or not name
+            or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", gpu_type)
+        ):
+            raise ValueError(f"invalid --require-type value: {value!r}")
+        required[name] = gpu_type
+    return required
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--namespace", default="nvidia-device-plugin")
     parser.add_argument("--timeout-seconds", type=int, default=900)
     parser.add_argument("--require-node", action="append", default=[])
+    parser.add_argument("--require-type", action="append", default=[])
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     required = parse_required(args.require_node)
+    required_types = parse_required_types(args.require_type)
     if args.check:
         try:
-            nodes = expected_nodes(required)
+            nodes, gpu_types = expected_nodes(required, required_types)
         except RuntimeError as error:
             print(json.dumps({"ready": False, "nodes": {}, "message": str(error)}, sort_keys=True))
             return 2
     else:
-        nodes = expected_nodes(required)
+        nodes, gpu_types = expected_nodes(required, required_types)
     if not nodes:
         if args.check:
             print(json.dumps({"ready": False, "nodes": {}, "message": "no eligible GPU node was discovered"}, sort_keys=True))
@@ -163,19 +194,19 @@ def main() -> int:
         raise RuntimeError("no eligible GPU node was discovered")
     ready, message = capacity_ready(nodes, args.check)
     if args.check:
-        print(json.dumps({"ready": ready, "nodes": nodes, "message": message}, sort_keys=True))
+        print(json.dumps({"ready": ready, "nodes": nodes, "gpu_types": gpu_types, "message": message}, sort_keys=True))
         return 0 if ready else 2
 
     deadline = time.monotonic() + args.timeout_seconds
     wait_for_applications(deadline)
     wait_for_capacity(nodes, deadline)
-    results = [smoke_node(name, args.namespace, deadline) for name in sorted(nodes)]
+    results = [smoke_node(name, gpu_types[name], args.namespace, deadline) for name in sorted(nodes)]
     for name in sorted(nodes):
         run("label", "node", name, f"{READY_LABEL}=true", "--overwrite")
     ready, message = capacity_ready(nodes, True)
     if not ready:
         raise RuntimeError(message)
-    print(json.dumps({"ready": True, "nodes": nodes, "smoke": results}, sort_keys=True))
+    print(json.dumps({"ready": True, "nodes": nodes, "gpu_types": gpu_types, "smoke": results}, sort_keys=True))
     return 0
 
 

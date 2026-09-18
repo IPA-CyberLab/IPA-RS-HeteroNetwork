@@ -15,7 +15,7 @@ variable "work_dir" {
 
 variable "git_revision" {
   type    = string
-  default = "codex/flash-gpu-iac-20260916"
+  default = "master"
 }
 
 variable "git_repository_url" {

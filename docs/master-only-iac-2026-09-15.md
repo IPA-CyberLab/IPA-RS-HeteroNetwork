@@ -20,7 +20,7 @@
   SSH秘密鍵、sudoパスワード、ノードidentityの内容をstateやGitへ保存しない。
 
 内部Gitの同期元は `git://10.250.0.2:19419/heteronetwork-infrastructure.git`、
-branchは `codex/master-only-iac-20260915`。
+branchは `master`。
 GitHubへの書き込みが403で拒否されたため、Terraformで既存の `uc-k8sp5` に配信を用意した。
 HeteroNetworkのアドレスだけで待ち受け、専用アカウントと読み取り専用systemd環境を使い、
 リモートpushを提供しない。master専用3台にはGitサービスを配置していない。

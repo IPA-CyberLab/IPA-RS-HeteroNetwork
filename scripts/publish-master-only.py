@@ -18,6 +18,8 @@ def files():
            'scripts/heteronetwork-console-e2e.sh','scripts/heteronetwork-console-browser-e2e.mjs',
            'scripts/verify-overlay-client-console.py','scripts/reconcile-console-e2e-user.py',
            'scripts/verify-gpu-runtime.py',
+           'scripts/gpu_inventory.py','scripts/test_gpu_inventory.py',
+           'scripts/verify_gpu_inventory.py','scripts/test_verify_gpu_inventory.py',
            'docs/master-only-iac-2026-09-15.md',
            'docs/standard-node-setup-2026-09-15.md',
            'docs/onboarding-e2e-gate-2026-09-15.md',
@@ -45,7 +47,7 @@ def files():
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--work-dir',required=True)
-    parser.add_argument('--branch',default='codex/flash-gpu-iac-20260916')
+    parser.add_argument('--branch',default='master')
     args=parser.parse_args()
     work=Path(args.work_dir).expanduser().resolve()
     work.mkdir(parents=True,exist_ok=True)

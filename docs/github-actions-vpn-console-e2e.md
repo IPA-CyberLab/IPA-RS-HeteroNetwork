@@ -17,9 +17,9 @@ refresh cookie must be HttpOnly and the restored page must not show the
 expired-session message. The temporary HeteroNetwork client is deleted even
 after a failed check.
 
-The `heteronet-e2e` GitHub Environment is restricted to `master` and the
-infrastructure branch. It stores the SSH key, sudo password, and dedicated
-console password as environment secrets. The workflow writes the SSH key and
+The `heteronet-e2e` GitHub Environment is restricted to `master`. It stores
+the SSH key, sudo password, and dedicated console password as environment
+secrets. The workflow writes the SSH key and
 console credential JSON only under `$RUNNER_TEMP` with owner-only permissions,
 passes credential values over encrypted stdin rather than process arguments,
 and shreds both files in an `always()` cleanup step. Node receives only the
