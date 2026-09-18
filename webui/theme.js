@@ -12,4 +12,70 @@
 
   document.documentElement.dataset.theme = theme;
   document.documentElement.lang = locale;
+
+  // Start the small, same-origin configuration request while the browser is
+  // still parsing the document. The full Cloudscape bundle is intentionally
+  // not on the critical path for showing a usable login action.
+  var configPromise = fetch("/ui/config", {
+    headers: { Accept: "application/json" },
+    credentials: "same-origin"
+  }).then(function (response) {
+    if (!response.ok) {
+      throw new Error("Web UI configuration request failed");
+    }
+    return response.json();
+  }).catch(function () {
+    // The application retries and renders the detailed error state. Avoid an
+    // unhandled rejection in the early shell.
+    return null;
+  });
+  window.__heteronetworkConfigPromise = configPromise;
+
+  window.__heteronetworkHideLoginBootstrap = function () {
+    var shell = document.getElementById("hn-login-bootstrap");
+    if (shell) shell.remove();
+  };
+
+  function prepareLogin(config) {
+    if (!config || !config.auth_enabled
+        || (config.local_agent && config.bootstrap_required)
+        || sessionStorage.getItem("heteronetwork_access_token")
+        || sessionStorage.getItem("heteronetwork_operator_token")
+        || (!config.login_endpoint
+          && !(config.device_login_endpoint && config.device_login_poll_endpoint))) {
+      return;
+    }
+    var shell = document.getElementById("hn-login-bootstrap");
+    var button = document.getElementById("hn-login-bootstrap-button");
+    if (!shell || !button) return;
+
+    var provider = typeof config.provider === "string" && config.provider
+      ? config.provider.charAt(0).toUpperCase() + config.provider.slice(1)
+      : "SSO";
+    button.textContent = provider + "でログイン";
+    button.disabled = false;
+    shell.hidden = false;
+    button.addEventListener("click", function () {
+      if (button.disabled) return;
+      if (config.device_login_endpoint && config.device_login_poll_endpoint) {
+        var authWindow = window.open("/ui/auth/wait", "_blank");
+        window.__heteronetworkPendingLogin = { authWindow: authWindow };
+        button.disabled = true;
+        button.textContent = "ログインを開始しています";
+        window.dispatchEvent(new Event("heteronetwork:login-requested"));
+        return;
+      }
+      window.location.assign(config.login_endpoint);
+    });
+  }
+
+  configPromise.then(function (config) {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", function () {
+        prepareLogin(config);
+      }, { once: true });
+    } else {
+      prepareLogin(config);
+    }
+  });
 }());

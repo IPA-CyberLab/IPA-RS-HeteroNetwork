@@ -42,6 +42,78 @@ body {
   width: min(100%, 560px);
 }
 
+.login-bootstrap[hidden] {
+  display: none;
+}
+
+.login-bootstrap__brand h1,
+.login-bootstrap__brand p,
+.login-bootstrap__card h2,
+.login-bootstrap__card p,
+.login-bootstrap__session {
+  margin: 0;
+}
+
+.login-bootstrap__brand h1 {
+  font-size: 32px;
+  line-height: 1.2;
+}
+
+.login-bootstrap__brand p,
+.login-bootstrap__card p,
+.login-bootstrap__session {
+  color: #5f6b7a;
+}
+
+.login-bootstrap__card {
+  margin-block: 24px;
+  padding: 24px;
+  border: 1px solid #eaeded;
+  border-radius: 2px;
+  background: #fff;
+  box-shadow: 0 1px 1px rgb(0 28 36 / 30%);
+}
+
+.login-bootstrap__card h2 {
+  font-size: 24px;
+}
+
+.login-bootstrap__card p {
+  margin-block: 8px 20px;
+}
+
+.login-bootstrap__card button {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #0972d3;
+  border-radius: 2px;
+  background: #0972d3;
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.login-bootstrap__card button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.login-bootstrap__session {
+  font-size: 14px;
+}
+
+.awsui-dark-mode .login-bootstrap__brand p,
+.awsui-dark-mode .login-bootstrap__card p,
+.awsui-dark-mode .login-bootstrap__session {
+  color: #b6bec9;
+}
+
+.awsui-dark-mode .login-bootstrap__card {
+  border-color: #414d5c;
+  background: #192534;
+}
+
 .auth-wait-page {
   min-height: 100vh;
   margin: 0;

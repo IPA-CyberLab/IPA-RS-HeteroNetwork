@@ -14,7 +14,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import TopNavigation from "@cloudscape-design/components/top-navigation";
 import { applyMode, Mode } from "@cloudscape-design/global-styles";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { api } from "./api.js";
 import { ErrorAlert, Loading } from "./components.jsx";
 import { AclPage } from "./pages/acl-page.jsx";
@@ -46,6 +46,10 @@ function LoginPage({ config, error, onLogin, onBootstrap, busy }) {
   const provider = config?.provider
     ? config.provider.charAt(0).toUpperCase() + config.provider.slice(1)
     : "SSO";
+
+  useLayoutEffect(() => {
+    window.__heteronetworkHideLoginBootstrap?.();
+  }, []);
 
   return (
     <main className="login-page">
@@ -138,6 +142,10 @@ export function App() {
   const [theme, setTheme] = useState(
     () => localStorage.getItem("heteronetwork_theme") || "light",
   );
+
+  useLayoutEffect(() => {
+    if (session) window.__heteronetworkHideLoginBootstrap?.();
+  }, [session]);
 
   const notify = useCallback((content, type = "success") => {
     const id = `${Date.now()}-${Math.random()}`;
@@ -276,11 +284,15 @@ export function App() {
     setActiveView(view);
   };
 
-  const startLogin = async () => {
+  const startLogin = useCallback(async () => {
     setError(null);
     if (config.device_login_endpoint && config.device_login_poll_endpoint) {
       setLoading(true);
-      const authWindow = window.open("/ui/auth/wait", "_blank");
+      const pending = window.__heteronetworkPendingLogin;
+      window.__heteronetworkPendingLogin = null;
+      const authWindow = pending?.authWindow && !pending.authWindow.closed
+        ? pending.authWindow
+        : window.open("/ui/auth/wait", "_blank");
       try {
         const response = await fetch(config.device_login_endpoint, {
           method: "POST",
@@ -334,7 +346,25 @@ export function App() {
       return;
     }
     setError(new Error("サーバー側ログインを利用できません。"));
-  };
+  }, [config]);
+
+  useEffect(() => {
+    const beginPendingLogin = () => {
+      const pending = window.__heteronetworkPendingLogin;
+      if (!pending || !config || loading) return;
+      if (session) {
+        pending.authWindow?.close();
+        window.__heteronetworkPendingLogin = null;
+        return;
+      }
+      void startLogin();
+    };
+    window.addEventListener("heteronetwork:login-requested", beginPendingLogin);
+    beginPendingLogin();
+    return () => {
+      window.removeEventListener("heteronetwork:login-requested", beginPendingLogin);
+    };
+  }, [config, loading, session, startLogin]);
 
   const signOut = async () => {
     const provider = config?.provider;

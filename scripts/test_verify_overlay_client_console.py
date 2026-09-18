@@ -83,7 +83,7 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
                 self.responses = iter([
-                    Response(b'<div id="root"></div><script src="/ui/app.js"></script>'),
+                    Response(b'<div id="root"></div><script src="/ui/app.js" async></script>'),
                     Response(b'{"auth_enabled":true,"provider":"keycloak"}'),
                 ])
 

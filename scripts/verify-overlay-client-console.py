@@ -532,7 +532,7 @@ def gateway_console_ui_is_ready(gateway):
         with opener.open(request, timeout=1) as response:
             document = response.read(128 * 1024)
             if (response.status != 200 or b'<div id="root"></div>' not in document
-                    or b'<script src="/ui/app.js"></script>' not in document):
+                    or b'<script src="/ui/app.js" async></script>' not in document):
                 return False
         request = urllib.request.Request(
             f"http://{gateway}:{CONSOLE_PORT}/ui/config",

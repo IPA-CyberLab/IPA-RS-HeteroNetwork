@@ -36,6 +36,11 @@ export class HeteroNetworkApi {
   }
 
   async loadConfig() {
+    const prefetched = await globalThis.__heteronetworkConfigPromise;
+    if (prefetched && typeof prefetched === "object") {
+      this.config = prefetched;
+      return this.config;
+    }
     const response = await fetch("/ui/config", {
       headers: { Accept: "application/json" },
       credentials: "same-origin",

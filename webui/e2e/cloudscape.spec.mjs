@@ -187,7 +187,15 @@ async function installMockBackend(page) {
   });
 }
 
-async function installDelayedLoginBackend(page) {
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function installDelayedLoginBackend(page, options = {}) {
   await page.context().route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const assets = {
@@ -203,6 +211,10 @@ async function installDelayedLoginBackend(page) {
       "/ui/fonts/noto-sans-jp-ui.ttf": ["noto-sans-jp-ui.ttf", "font/ttf"],
     };
     if (assets[url.pathname]) {
+      if (url.pathname === "/ui/app.js" && options.appGate) {
+        options.appGate.started.resolve();
+        await options.appGate.release.promise;
+      }
       const [asset, contentType] = assets[url.pathname];
       await route.fulfill({ path: path.join(webuiDir, asset), contentType });
       return;
@@ -220,13 +232,59 @@ async function installDelayedLoginBackend(page) {
       return;
     }
     if (url.pathname === "/v1/web-ui/auth/device") {
-      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      options.deviceStarted?.resolve();
+      await new Promise((resolve) => setTimeout(resolve, options.deviceDelayMs ?? 5_000));
       await route.fulfill({ status: 503, json: { error: "test completed" } });
       return;
     }
     await route.fulfill({ status: 404, body: "not found" });
   });
 }
+
+test("login action works before the full Cloudscape bundle is available", async ({ page }) => {
+  const appGate = { started: deferred(), release: deferred() };
+  const deviceStarted = deferred();
+  await installDelayedLoginBackend(page, { appGate, deviceStarted, deviceDelayMs: 0 });
+
+  try {
+    const openedAt = Date.now();
+    await page.goto("/ui/", { waitUntil: "domcontentloaded", timeout: 3_000 });
+    await appGate.started.promise;
+
+    const earlyLogin = page.locator("#hn-login-bootstrap");
+    await expect(earlyLogin).toBeVisible({ timeout: Math.max(1, 3_000 - (Date.now() - openedAt)) });
+    expect(Date.now() - openedAt).toBeLessThan(3_000);
+    const popupPromise = page.waitForEvent("popup");
+    await earlyLogin.getByRole("button", { name: "Keycloakでログイン" }).click();
+    const popup = await popupPromise;
+    await expect(popup).toHaveURL(/\/ui\/auth\/wait$/);
+
+    appGate.release.resolve();
+    await deviceStarted.promise;
+    await popup.close();
+  } finally {
+    appGate.release.resolve();
+  }
+});
+
+test("early login action stays hidden when the tab already has a session", async ({ page }) => {
+  const appGate = { started: deferred(), release: deferred() };
+  await page.addInitScript(() => {
+    sessionStorage.setItem("heteronetwork_operator_token", "existing-session");
+  });
+  await installDelayedLoginBackend(page, { appGate });
+
+  try {
+    const configured = page.waitForResponse((response) => (
+      new URL(response.url()).pathname === "/ui/config" && response.status() === 200
+    ));
+    await page.goto("/ui/", { waitUntil: "domcontentloaded" });
+    await configured;
+    await expect(page.locator("#hn-login-bootstrap")).toBeHidden();
+  } finally {
+    appGate.release.resolve();
+  }
+});
 
 test("device login shows a local waiting page before Keycloak responds", async ({ page }) => {
   await installDelayedLoginBackend(page);

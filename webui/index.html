@@ -11,7 +11,23 @@
     <link rel="stylesheet" href="/ui/styles.css">
   </head>
   <body>
+    <main id="hn-login-bootstrap" class="login-page login-bootstrap" hidden>
+      <div class="login-page__content">
+        <div class="login-bootstrap__brand">
+          <h1>HeteroNetwork</h1>
+          <p>ネットワーク管理コンソール</p>
+        </div>
+        <section class="login-bootstrap__card" aria-labelledby="hn-login-bootstrap-title">
+          <h2 id="hn-login-bootstrap-title">ログイン</h2>
+          <p>設定済みのIDプロバイダーで続行します。</p>
+          <button id="hn-login-bootstrap-button" type="button" disabled>
+            Keycloakでログイン
+          </button>
+        </section>
+        <p class="login-bootstrap__session">セッションはコントロールプレーンで保護されます</p>
+      </div>
+    </main>
     <div id="root"></div>
-    <script src="/ui/app.js"></script>
+    <script src="/ui/app.js" async></script>
   </body>
 </html>
