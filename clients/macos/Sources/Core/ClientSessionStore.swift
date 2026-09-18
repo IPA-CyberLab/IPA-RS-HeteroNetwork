@@ -19,18 +19,38 @@ public enum ClientSessionStoreError: LocalizedError {
 }
 
 public final class ClientSessionStore {
-    private let accessGroup: String?
+    private let sessionService: String
+    private let sessionAccount: String
+    private let pendingService: String
+    private let pendingAccount: String
     private let encoder = HeteroNetworkCoding.makeEncoder()
     private let decoder = HeteroNetworkCoding.makeDecoder()
 
-    public init(accessGroup: String? = nil) {
-        self.accessGroup = accessGroup
+    public convenience init() {
+        self.init(
+            sessionService: HeteroNetworkConstants.keychainService,
+            sessionAccount: HeteroNetworkConstants.keychainAccount,
+            pendingService: HeteroNetworkConstants.pendingKeychainService,
+            pendingAccount: HeteroNetworkConstants.pendingKeychainAccount
+        )
+    }
+
+    init(
+        sessionService: String,
+        sessionAccount: String,
+        pendingService: String,
+        pendingAccount: String
+    ) {
+        self.sessionService = sessionService
+        self.sessionAccount = sessionAccount
+        self.pendingService = pendingService
+        self.pendingAccount = pendingAccount
     }
 
     public func load() throws -> ClientSession? {
         var query = baseQuery(
-            service: HeteroNetworkConstants.keychainService,
-            account: HeteroNetworkConstants.keychainAccount
+            service: sessionService,
+            account: sessionAccount
         )
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -55,8 +75,8 @@ public final class ClientSessionStore {
         }
         let data = try encoder.encode(session)
         let query = baseQuery(
-            service: HeteroNetworkConstants.keychainService,
-            account: HeteroNetworkConstants.keychainAccount
+            service: sessionService,
+            account: sessionAccount
         )
         let attributes: [String: Any] = [kSecValueData as String: data]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
@@ -67,7 +87,6 @@ public final class ClientSessionStore {
 
         var item = query
         item[kSecValueData as String] = data
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         let addStatus = SecItemAdd(item as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
             throw ClientSessionStoreError.keychain(addStatus)
@@ -77,8 +96,8 @@ public final class ClientSessionStore {
     public func delete() throws {
         let status = SecItemDelete(
             baseQuery(
-                service: HeteroNetworkConstants.keychainService,
-                account: HeteroNetworkConstants.keychainAccount
+                service: sessionService,
+                account: sessionAccount
             ) as CFDictionary
         )
         guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -88,8 +107,8 @@ public final class ClientSessionStore {
 
     public func loadPendingRegistration() throws -> PendingClientRegistration? {
         var query = baseQuery(
-            service: HeteroNetworkConstants.pendingKeychainService,
-            account: HeteroNetworkConstants.pendingKeychainAccount
+            service: pendingService,
+            account: pendingAccount
         )
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -115,8 +134,8 @@ public final class ClientSessionStore {
         }
         let data = try encoder.encode(pending)
         let query = baseQuery(
-            service: HeteroNetworkConstants.pendingKeychainService,
-            account: HeteroNetworkConstants.pendingKeychainAccount
+            service: pendingService,
+            account: pendingAccount
         )
         let attributes: [String: Any] = [kSecValueData as String: data]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
@@ -127,7 +146,6 @@ public final class ClientSessionStore {
 
         var item = query
         item[kSecValueData as String] = data
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         let addStatus = SecItemAdd(item as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
             throw ClientSessionStoreError.keychain(addStatus)
@@ -137,8 +155,8 @@ public final class ClientSessionStore {
     public func deletePendingRegistration() throws {
         let status = SecItemDelete(
             baseQuery(
-                service: HeteroNetworkConstants.pendingKeychainService,
-                account: HeteroNetworkConstants.pendingKeychainAccount
+                service: pendingService,
+                account: pendingAccount
             ) as CFDictionary
         )
         guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -165,15 +183,10 @@ public final class ClientSessionStore {
     }
 
     private func baseQuery(service: String, account: String) -> [String: Any] {
-        var query: [String: Any] = [
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecUseDataProtectionKeychain as String: true,
         ]
-        if let accessGroup, !accessGroup.isEmpty {
-            query[kSecAttrAccessGroup as String] = accessGroup
-        }
-        return query
     }
 }

@@ -46,8 +46,9 @@ open HeteroNetwork.xcodeproj
 The app build runs `scripts/build-root-helper.sh` and embeds the resulting
 architecture-specific helper in the app resources. The Go module pins the same
 reviewed `wireguard-go` revision used by the prior WireGuardKit build. The app
-uses the normal per-application Keychain and does not require an App Group or
-Network Extension entitlement.
+uses generic-password items in the user's file-based login Keychain. It does
+not opt into the entitlement-gated Data Protection Keychain and does not
+require an App Group, shared Keychain, or Network Extension entitlement.
 
 ## Enroll
 
@@ -60,7 +61,7 @@ Network Extension entitlement.
 5. Open `http://console.heteronetwork.internal/ui/` from the app.
 
 The Ed25519 identity and WireGuard private keys are generated on the Mac and
-stored as device-only Keychain items. The SSH registration request contains
+stored in the user's login Keychain. The SSH registration request contains
 only their public keys and a proof-of-possession signature. The WireGuard
 private key is passed to the root helper through a randomly named, mode `0600`
 file and an owner-only Unix socket; it is never placed in a process argument or
