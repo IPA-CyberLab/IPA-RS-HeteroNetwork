@@ -1,0 +1,218 @@
+name: macOS release live E2E
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag whose macOS asset will be installed
+        required: true
+        type: string
+      source_ref:
+        description: Commit or tag containing the matching E2E driver
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    heteronet-macos-live-overlay-e2e-${{
+      github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_ref
+    }}
+  cancel-in-progress: false
+
+jobs:
+  live-overlay:
+    name: Install release and join the live overlay
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'release' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: macos-15
+    timeout-minutes: 20
+    environment: heteronet-e2e
+    env:
+      RELEASE_TAG: >-
+        ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.release_tag }}
+      SOURCE_REF: >-
+        ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_ref }}
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_REF }}
+
+      - name: Validate release inputs
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            v[0-9]*) ;;
+            *) echo 'Release tag must start with v followed by a digit.' >&2; exit 1 ;;
+          esac
+          source_sha="$(git rev-parse HEAD)"
+          test -n "$source_sha"
+          echo "SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
+
+      - name: Materialize protected sponsor access
+        env:
+          HNN_E2E_SSH_PRIVATE_KEY: ${{ secrets.HNN_E2E_SSH_PRIVATE_KEY }}
+          HNN_E2E_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$HNN_E2E_SSH_PRIVATE_KEY"
+          test -n "$HNN_E2E_BECOME_PASSWORD"
+          e2e_root="$RUNNER_TEMP/heteronetwork-macos-live-e2e"
+          install -d -m 0700 "$e2e_root"
+          umask 077
+          printf '%s\n' "$HNN_E2E_SSH_PRIVATE_KEY" > "$e2e_root/id_ed25519"
+          printf '%s\n' "$HNN_E2E_BECOME_PASSWORD" > "$e2e_root/sudo-password"
+          cat > "$e2e_root/known_hosts" <<'EOF'
+          163.220.236.45 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK038K5HfhW5BFKcXXK22/AunAU2mk2osPM98e0eZ1VI
+          EOF
+          chmod 0600 "$e2e_root/id_ed25519" "$e2e_root/sudo-password" "$e2e_root/known_hosts"
+          echo "MACOS_E2E_ROOT=$e2e_root" >> "$GITHUB_ENV"
+          echo 'HETERONETWORK_LIVE_E2E=1' >> "$GITHUB_ENV"
+
+      - name: Install the published release with the public shell installer
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 60 --retry 3 --retry-all-errors \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${SOURCE_SHA}/install-client.sh" \
+            | HETERONETWORK_VERSION="$RELEASE_TAG" sh -s -- --no-launch
+          test -x "$HOME/Applications/HeteroNetwork.app/Contents/MacOS/HeteroNetwork"
+          test -x /Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper
+
+      - name: Compile the live driver against the installed release framework
+        run: |
+          set -euo pipefail
+          framework_dir="$HOME/Applications/HeteroNetwork.app/Contents/Frameworks"
+          test -d "$framework_dir/HeteroNetworkCore.framework"
+          xcrun swiftc -parse-as-library \
+            -F "$framework_dir" \
+            -framework HeteroNetworkCore \
+            -Xlinker -rpath -Xlinker "$framework_dir" \
+            clients/macos/LiveE2E/LiveE2E.swift \
+            -o "$MACOS_E2E_ROOT/macos-live-e2e"
+          codesign --force --sign - "$MACOS_E2E_ROOT/macos-live-e2e"
+
+      - name: Create a registration and sponsor the installed macOS client
+        run: |
+          set -euo pipefail
+          umask 077
+          "$MACOS_E2E_ROOT/macos-live-e2e" request "$MACOS_E2E_ROOT/request-uri"
+          python3 scripts/macos-client-live-e2e.py sponsor \
+            --request-file "$MACOS_E2E_ROOT/request-uri" \
+            --profile-file "$MACOS_E2E_ROOT/import-profile" \
+            --ssh-key-file "$MACOS_E2E_ROOT/id_ed25519" \
+            --known-hosts-file "$MACOS_E2E_ROOT/known_hosts" \
+            --sudo-password-file "$MACOS_E2E_ROOT/sudo-password" \
+            --host 163.220.236.45 \
+            --user mizuame
+          touch "$MACOS_E2E_ROOT/sponsored"
+
+      - name: Import through Keychain and establish the real macOS VPN
+        run: |
+          set -euo pipefail
+          umask 077
+          helper=/Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper
+          "$MACOS_E2E_ROOT/macos-live-e2e" import \
+            "$MACOS_E2E_ROOT/import-profile" "$MACOS_E2E_ROOT/tunnel.json"
+          sudo "$helper" start "$MACOS_E2E_ROOT/tunnel.json" \
+            > "$MACOS_E2E_ROOT/start-status.json"
+          python3 - "$MACOS_E2E_ROOT/start-status.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              status = json.load(source)
+          assert status.get("ok") is True
+          assert status.get("status") == "connected"
+          assert isinstance(status.get("interface"), str) and status["interface"]
+          print('{"installed_release_helper_connected":true}')
+          PY
+
+      - name: Verify split DNS and the console within three seconds
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 scripts/macos-client-live-e2e.py verify \
+            --helper /Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper \
+            --deadline-seconds 90 \
+            --max-open-seconds 3 \
+            --output "$MACOS_E2E_ROOT/report.json"
+
+      - name: Remove the live client registration
+        run: |
+          set -euo pipefail
+          helper=/Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper
+          "$MACOS_E2E_ROOT/macos-live-e2e" remove "$MACOS_E2E_ROOT/import-profile"
+          touch "$MACOS_E2E_ROOT/removed"
+          "$helper" stop > "$MACOS_E2E_ROOT/stop-status.json"
+
+      - name: Publish sanitized macOS E2E result
+        if: always()
+        run: |
+          if test -s "${MACOS_E2E_ROOT:-}/report.json"; then
+            {
+              echo '### macOS release install and live overlay E2E'
+              echo '```json'
+              cat "$MACOS_E2E_ROOT/report.json"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Remove registration, tunnel, Keychain items, and private inputs
+        if: always()
+        run: |
+          set +e
+          cleanup_status=0
+          e2e_root="${MACOS_E2E_ROOT:-$RUNNER_TEMP/heteronetwork-macos-live-e2e}"
+          helper=/Library/PrivilegedHelperTools/jp.go.ipa.cyberlab.heteronetwork.root-helper
+          driver="$e2e_root/macos-live-e2e"
+          if test -x "$driver" && test -s "$e2e_root/import-profile" \
+            && ! test -e "$e2e_root/removed"
+          then
+            rm -f "$e2e_root/cleanup-tunnel.json"
+            if "$driver" configure "$e2e_root/import-profile" \
+                "$e2e_root/cleanup-tunnel.json" >/dev/null \
+              && sudo "$helper" start "$e2e_root/cleanup-tunnel.json" >/dev/null \
+              && "$driver" remove "$e2e_root/import-profile" >/dev/null
+            then
+              touch "$e2e_root/removed"
+            else
+              echo 'Live macOS client cleanup could not confirm remote registration removal.' >&2
+              cleanup_status=1
+            fi
+          fi
+          if test -x "$helper"; then
+            "$helper" stop >/dev/null 2>&1 || cleanup_status=1
+          fi
+          if test -x "$driver"; then
+            "$driver" purge >/dev/null 2>&1 || cleanup_status=1
+          fi
+          sudo rm -f "$helper"
+          sudo rm -rf /var/run/heteronetwork-client
+          rm -rf "$HOME/Applications/HeteroNetwork.app"
+          python3 scripts/macos-client-live-e2e.py wipe \
+            "$e2e_root/id_ed25519" \
+            "$e2e_root/sudo-password" \
+            "$e2e_root/request-uri" \
+            "$e2e_root/import-profile" \
+            "$e2e_root/tunnel.json" \
+            "$e2e_root/cleanup-tunnel.json" \
+            "$e2e_root/start-status.json" \
+            "$e2e_root/stop-status.json" \
+            "$e2e_root/report.json" || cleanup_status=1
+          rm -rf "$e2e_root"
+          exit "$cleanup_status"
