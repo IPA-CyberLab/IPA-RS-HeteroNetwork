@@ -191,7 +191,7 @@ jobs:
             echo 'Unauthenticated GitHub API response:' >&2
             grep -Ei '^(HTTP/|x-ratelimit-|content-length:)' \
               "$diagnostic/catalog.headers" >&2 || true
-            python3 - "$diagnostic/catalog.json" "$RELEASE_TAG" <<'PY' || true
+            python3 -c '
             import json
             import sys
 
@@ -206,7 +206,7 @@ jobs:
                 }, file=sys.stderr)
             except Exception as error:
                 print({"catalog_diagnostic_error": str(error)[:300]}, file=sys.stderr)
-            PY
+            ' "$diagnostic/catalog.json" "$RELEASE_TAG" || true
             archive="$diagnostic/heteronetwork-client-macos-arm64.zip"
             checksum="$archive.sha256"
             release_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
