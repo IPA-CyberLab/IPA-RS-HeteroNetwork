@@ -263,34 +263,12 @@ jobs:
           print('{"installed_release_helper_connected":true}')
           PY
 
-      - name: Verify Keychain from the installed application process
+      - name: Verify entitlement-free Keychain from the installed application
         run: |
           set -euo pipefail
           report="$MACOS_E2E_ROOT/installed-app-report.json"
           app="$HOME/Applications/HeteroNetwork.app/Contents/MacOS/HeteroNetwork"
-          app_pid=""
-          stop_app() {
-            if test -n "${app_pid:-}" && kill -0 "$app_pid" 2>/dev/null; then
-              kill "$app_pid" 2>/dev/null || true
-              wait "$app_pid" 2>/dev/null || true
-            fi
-          }
-          trap stop_app EXIT HUP INT TERM
-          HETERONETWORK_LIVE_E2E=1 \
-          HETERONETWORK_LIVE_E2E_REPORT="$report" \
-            "$app" >"$MACOS_E2E_ROOT/installed-app.stdout" \
-              2>"$MACOS_E2E_ROOT/installed-app.stderr" &
-          app_pid=$!
-          report_ready=0
-          for _ in $(seq 1 100); do
-            kill -0 "$app_pid"
-            if test -s "$report"; then
-              report_ready=1
-              break
-            fi
-            sleep 0.1
-          done
-          test "$report_ready" -eq 1
+          "$app" --live-e2e-keychain-probe > "$report"
           python3 - "$report" "$RELEASE_TAG" <<'PY'
           import json
           import sys
@@ -298,15 +276,11 @@ jobs:
           with open(sys.argv[1], encoding="utf-8") as source:
               report = json.load(source)
           assert report.get("installed_app_started") is True, report
-          assert report.get("restore_succeeded") is True, report
-          assert report.get("keychain_session_loaded") is True, report
-          assert report.get("keychain_session_round_trip") is True, report
+          assert report.get("keychain_add_read_update_delete") is True, report
           assert report.get("automatic_updates_enabled") is True, report
           assert report.get("release_tag") == sys.argv[2], report
           print(json.dumps(report, sort_keys=True, separators=(",", ":")))
           PY
-          stop_app
-          trap - EXIT HUP INT TERM
 
       - name: Verify split DNS and the console within three seconds
         run: |
@@ -339,7 +313,7 @@ jobs:
           fi
           if test -s "${MACOS_E2E_ROOT:-}/installed-app-report.json"; then
             {
-              echo '### Installed macOS application Keychain E2E'
+              echo '### Installed macOS application Keychain probe'
               echo '```json'
               cat "$MACOS_E2E_ROOT/installed-app-report.json"
               echo

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import os
 import SwiftUI
 
@@ -10,6 +11,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         subsystem: Bundle.main.bundleIdentifier ?? "HeteroNetwork",
         category: "Application"
     )
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard InstalledAppKeychainProbe.isRequested else { return }
+        let status = InstalledAppKeychainProbe.run()
+        fflush(stdout)
+        fflush(stderr)
+        exit(status)
+    }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let importURL = urls.first(where: {

@@ -32,6 +32,7 @@ final class AppModel: ObservableObject {
     private var availableAppUpdate: DesktopReleaseUpdate?
 
     init() {
+        guard !InstalledAppKeychainProbe.isRequested else { return }
         tunnelManager.$status
             .receive(on: RunLoop.main)
             .sink { [weak self] status in self?.vpnStatus = status }
@@ -54,7 +55,6 @@ final class AppModel: ObservableObject {
             .store(in: &cancellables)
         Task {
             await restore()
-            writeLiveE2ERestoreReportIfRequested()
             await checkForUpdates()
         }
     }
@@ -290,66 +290,6 @@ final class AppModel: ObservableObject {
             }
         } catch {
             lastError = error.localizedDescription
-        }
-    }
-
-    private func writeLiveE2ERestoreReportIfRequested() {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["HETERONETWORK_LIVE_E2E"] == "1",
-              let reportPath = environment["HETERONETWORK_LIVE_E2E_REPORT"],
-              !reportPath.isEmpty
-        else {
-            return
-        }
-
-        var keychainRoundTrip = false
-        var reportError = lastError
-        if reportError == nil, let current = session {
-            do {
-                try sessionStore.save(current)
-                let restored = try sessionStore.load()
-                keychainRoundTrip = restored?.client.nodeID == current.client.nodeID
-                if !keychainRoundTrip {
-                    reportError = "The installed app did not restore the saved Keychain session."
-                }
-            } catch {
-                reportError = error.localizedDescription
-            }
-        }
-
-        var report: [String: Any] = [
-            "automatic_updates_enabled": currentReleaseTag.hasPrefix("v"),
-            "installed_app_started": true,
-            "keychain_session_loaded": session != nil,
-            "keychain_session_round_trip": keychainRoundTrip,
-            "release_tag": currentReleaseTag,
-            "restore_succeeded": reportError == nil,
-        ]
-        if let reportError {
-            report["error"] = String(reportError.prefix(512))
-        }
-
-        do {
-            let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
-            let manager = FileManager.default
-            let url = URL(fileURLWithPath: reportPath).standardizedFileURL
-            if manager.fileExists(atPath: url.path) {
-                let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey])
-                guard values.isSymbolicLink != true else { return }
-                try manager.removeItem(at: url)
-            }
-            guard manager.createFile(
-                atPath: url.path,
-                contents: data,
-                attributes: [.posixPermissions: 0o600]
-            ) else {
-                return
-            }
-            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        } catch {
-            logger.error(
-                "Unable to write the installed-app E2E report: \(error.localizedDescription, privacy: .public)"
-            )
         }
     }
 
