@@ -357,7 +357,7 @@ case "$platform" in
         fi
         run_as_root /usr/bin/install -d -o root -g wheel -m 0755 \
             /Library/PrivilegedHelperTools
-        if run_as_root /usr/bin/test -L "$macos_helper_path"; then
+        if run_as_root /bin/test -L "$macos_helper_path"; then
             fail 'refusing to replace a linked privileged helper'
         fi
         helper_stage="$macos_helper_path.new.$$"

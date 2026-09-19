@@ -12,7 +12,7 @@ data plane running when the control plane is temporarily unavailable.
 Run this in macOS Terminal or Windows Git Bash:
 
 ```sh
-curl -fsSL https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases/download/v0.1.15-dev.13/install-heteronetwork-client.sh | sh
+curl -fsSL https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroNetwork/master/install-client.sh | sh
 ```
 
 The installer detects the host architecture, downloads the newest published
