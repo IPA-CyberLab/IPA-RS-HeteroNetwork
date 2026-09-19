@@ -30,6 +30,8 @@ struct MenuBarContent: View {
                 Label("Settings", systemImage: "gearshape")
             }
             Divider()
+            updateControl
+            Divider()
             Button {
                 NSApp.terminate(nil)
             } label: {
@@ -38,6 +40,42 @@ struct MenuBarContent: View {
         }
         .padding(12)
         .frame(width: 260)
+    }
+
+    @ViewBuilder
+    private var updateControl: some View {
+        switch model.updateStatus {
+        case .checking:
+            Label("Checking for updates…", systemImage: "arrow.triangle.2.circlepath")
+        case .available(let tag):
+            Button {
+                Task { await model.installAvailableUpdate() }
+            } label: {
+                Label("Update to \(tag)", systemImage: "arrow.down.circle")
+            }
+        case .downloading(let tag):
+            Label("Downloading \(tag)…", systemImage: "arrow.down.circle")
+        case .restarting(let tag):
+            Label("Restarting into \(tag)…", systemImage: "arrow.clockwise.circle")
+        case .failed:
+            Button {
+                Task {
+                    if model.canRetryAvailableUpdate {
+                        await model.installAvailableUpdate()
+                    } else {
+                        await model.checkForUpdates()
+                    }
+                }
+            } label: {
+                Label("Retry Update", systemImage: "arrow.clockwise")
+            }
+        case .idle, .upToDate, .unavailableForDevelopmentBuild:
+            Button {
+                Task { await model.checkForUpdates() }
+            } label: {
+                Label("Check for Updates", systemImage: "arrow.clockwise")
+            }
+        }
     }
 
     @ViewBuilder

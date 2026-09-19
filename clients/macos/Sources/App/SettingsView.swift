@@ -98,6 +98,7 @@ struct SettingsView: View {
                         || model.isBusy
                 )
             }
+            updateSection
             errorSection
         }
         .formStyle(.grouped)
@@ -137,10 +138,75 @@ struct SettingsView: View {
                 }
                 .disabled(model.isBusy || isTransitioning)
             }
+            updateSection
             errorSection
         }
         .formStyle(.grouped)
         .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var updateSection: some View {
+        Section("Updates") {
+            LabeledContent("Installed release", value: model.currentReleaseTag)
+                .textSelection(.enabled)
+            switch model.updateStatus {
+            case .idle:
+                Text("Updates are checked automatically at launch and every six hours.")
+                    .foregroundStyle(.secondary)
+            case .checking:
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Checking for updates…")
+                }
+            case .upToDate(let tag):
+                Label("\(tag) is up to date", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            case .available(let tag):
+                Button {
+                    Task { await model.installAvailableUpdate() }
+                } label: {
+                    Label("Update to \(tag) and Restart", systemImage: "arrow.down.circle")
+                }
+                .buttonStyle(.borderedProminent)
+            case .downloading(let tag):
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Downloading and verifying \(tag)…")
+                }
+            case .restarting(let tag):
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Restarting into \(tag)…")
+                }
+            case .unavailableForDevelopmentBuild:
+                Text("Automatic updates are enabled in published builds.")
+                    .foregroundStyle(.secondary)
+            case .failed(let message):
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                Button {
+                    Task {
+                        if model.canRetryAvailableUpdate {
+                            await model.installAvailableUpdate()
+                        } else {
+                            await model.checkForUpdates()
+                        }
+                    }
+                } label: {
+                    Label("Retry Update", systemImage: "arrow.clockwise")
+                }
+            }
+            if !model.updateStatus.isActive {
+                Button {
+                    Task { await model.checkForUpdates() }
+                } label: {
+                    Label("Check Now", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.isBusy)
+            }
+        }
     }
 
     @ViewBuilder

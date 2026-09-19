@@ -35,6 +35,13 @@ the normal macOS administrator prompt before the helper creates the tunnel.
 Once running, status, gateway updates, and disconnect requests use an
 owner-only Unix socket and do not prompt again.
 
+Published builds check GitHub Releases at launch and every six hours. The app
+downloads only the matching architecture, verifies the release SHA-256,
+embedded release tag, bundle identifier, helper self-test, and code signature,
+then replaces the per-user app atomically and restarts it. The root helper is
+updated through the normal administrator prompt on the next connection when
+its embedded version changes.
+
 ## Generate and build
 
 ```bash

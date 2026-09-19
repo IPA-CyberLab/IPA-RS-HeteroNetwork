@@ -14,6 +14,7 @@ settings:
     CODE_SIGN_STYLE: Automatic
     CURRENT_PROJECT_VERSION: 1
     MARKETING_VERSION: 0.1.0
+    HETERONETWORK_RELEASE_TAG: development
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     SWIFT_STRICT_CONCURRENCY: minimal
     ENABLE_USER_SCRIPT_SANDBOXING: NO
@@ -48,6 +49,7 @@ targets:
       path: Config/App-Info.plist
       properties:
         CFBundleDisplayName: HeteroNetwork
+        HeteroNetworkReleaseTag: $(HETERONETWORK_RELEASE_TAG)
         LSApplicationCategoryType: public.app-category.utilities
         LSUIElement: true
         CFBundleURLTypes:

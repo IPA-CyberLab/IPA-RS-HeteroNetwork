@@ -12,11 +12,13 @@ final class AppModel: ObservableObject {
     @Published var registrationRequest = ""
     @Published var importInput = ""
     @Published var lastError: String?
+    @Published private(set) var updateStatus: AppUpdateStatus = .idle
 
     let tunnelManager = TunnelManager()
 
     private let controlPlane = ControlPlaneClient()
     private let sessionStore = ClientSessionStore()
+    private let appUpdateService = AppUpdateService()
     private let logger = Logger(
         subsystem: "jp.go.ipa.cyberlab.heteronetwork",
         category: "TunnelMaintenance"
@@ -27,6 +29,7 @@ final class AppModel: ObservableObject {
     private var consecutiveProbeFailures = 0
     private var profileActivatedAt = Date.distantPast
     private var isMaintainingTunnel = false
+    private var availableAppUpdate: DesktopReleaseUpdate?
 
     init() {
         tunnelManager.$status
@@ -43,10 +46,29 @@ final class AppModel: ObservableObject {
                 Task { await self?.maintainTunnel() }
             }
             .store(in: &cancellables)
-        Task { await restore() }
+        Timer.publish(every: 6 * 60 * 60, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                Task { await self?.checkForUpdates() }
+            }
+            .store(in: &cancellables)
+        Task {
+            await restore()
+            writeLiveE2ERestoreReportIfRequested()
+            await checkForUpdates()
+        }
     }
 
     var isConfigured: Bool { session != nil }
+
+    var canRetryAvailableUpdate: Bool {
+        availableAppUpdate != nil && !updateStatus.isActive
+    }
+
+    var currentReleaseTag: String {
+        Bundle.main.object(forInfoDictionaryKey: "HeteroNetworkReleaseTag") as? String
+            ?? "development"
+    }
 
     var gatewayName: String {
         tunnelManager.activeGatewayNodeID
@@ -207,6 +229,49 @@ final class AppModel: ObservableObject {
         lastError = nil
     }
 
+    func checkForUpdates() async {
+        guard !isBusy, !updateStatus.isActive else { return }
+        guard currentReleaseTag.hasPrefix("v") else {
+            updateStatus = .unavailableForDevelopmentBuild
+            return
+        }
+        updateStatus = .checking
+        do {
+            let update = try await appUpdateService.availableUpdate(
+                currentTag: currentReleaseTag
+            )
+            guard let update else {
+                availableAppUpdate = nil
+                updateStatus = .upToDate(currentReleaseTag)
+                return
+            }
+            availableAppUpdate = update
+            updateStatus = .available(update.tag)
+            await installAvailableUpdate()
+        } catch {
+            updateStatus = .failed(error.localizedDescription)
+        }
+    }
+
+    func installAvailableUpdate() async {
+        guard !isBusy,
+              !updateStatus.isActive,
+              let update = availableAppUpdate
+        else {
+            return
+        }
+        updateStatus = .downloading(update.tag)
+        do {
+            let prepared = try await appUpdateService.prepare(update)
+            updateStatus = .restarting(update.tag)
+            try appUpdateService.activate(prepared)
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            NSApp.terminate(nil)
+        } catch {
+            updateStatus = .failed(error.localizedDescription)
+        }
+    }
+
     private func restore() async {
         do {
             session = try sessionStore.load()
@@ -225,6 +290,66 @@ final class AppModel: ObservableObject {
             }
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    private func writeLiveE2ERestoreReportIfRequested() {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["HETERONETWORK_LIVE_E2E"] == "1",
+              let reportPath = environment["HETERONETWORK_LIVE_E2E_REPORT"],
+              !reportPath.isEmpty
+        else {
+            return
+        }
+
+        var keychainRoundTrip = false
+        var reportError = lastError
+        if reportError == nil, let current = session {
+            do {
+                try sessionStore.save(current)
+                let restored = try sessionStore.load()
+                keychainRoundTrip = restored?.client.nodeID == current.client.nodeID
+                if !keychainRoundTrip {
+                    reportError = "The installed app did not restore the saved Keychain session."
+                }
+            } catch {
+                reportError = error.localizedDescription
+            }
+        }
+
+        var report: [String: Any] = [
+            "automatic_updates_enabled": currentReleaseTag.hasPrefix("v"),
+            "installed_app_started": true,
+            "keychain_session_loaded": session != nil,
+            "keychain_session_round_trip": keychainRoundTrip,
+            "release_tag": currentReleaseTag,
+            "restore_succeeded": reportError == nil,
+        ]
+        if let reportError {
+            report["error"] = String(reportError.prefix(512))
+        }
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            let manager = FileManager.default
+            let url = URL(fileURLWithPath: reportPath).standardizedFileURL
+            if manager.fileExists(atPath: url.path) {
+                let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey])
+                guard values.isSymbolicLink != true else { return }
+                try manager.removeItem(at: url)
+            }
+            guard manager.createFile(
+                atPath: url.path,
+                contents: data,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                return
+            }
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            logger.error(
+                "Unable to write the installed-app E2E report: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

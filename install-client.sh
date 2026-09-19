@@ -332,6 +332,19 @@ case "$platform" in
         rm -rf "$staged_path" "$backup_app"
         ditto "$source_app" "$staged_path"
 
+        if /usr/bin/pgrep -U "$(id -u)" -x HeteroNetwork >/dev/null 2>&1; then
+            /usr/bin/osascript \
+                -e 'tell application id "jp.go.ipa.cyberlab.heteronetwork" to quit' \
+                >/dev/null 2>&1 || true
+            stop_attempt=0
+            while /usr/bin/pgrep -U "$(id -u)" -x HeteroNetwork >/dev/null 2>&1; do
+                stop_attempt=$((stop_attempt + 1))
+                [ "$stop_attempt" -le 50 ] \
+                    || fail 'Exit the running HeteroNetwork app and run the installer again'
+                sleep 0.1
+            done
+        fi
+
         if [ "$(id -u)" -ne 0 ]; then
             command -v sudo >/dev/null 2>&1 \
                 || fail 'sudo is required to install the macOS network helper'
