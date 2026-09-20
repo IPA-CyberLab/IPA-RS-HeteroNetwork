@@ -486,6 +486,7 @@ case "$platform" in
                 } finally {
                     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
                 }
+                exit 0
             '
         printf 'Installed HeteroNetwork %s at %s\n' "$version" "$install_dir"
         ;;
