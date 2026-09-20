@@ -41,7 +41,6 @@ jobs:
         ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.release_tag }}
       SOURCE_REF: >-
         ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_ref }}
-      E2E_ROOT: ${{ runner.temp }}\heteronet-windows-live-e2e
     steps:
       - name: Check out protected E2E source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -56,7 +55,10 @@ jobs:
           if ($env:RELEASE_TAG -notmatch '^v[0-9][A-Za-z0-9._-]*$') {
             throw "Release tag is invalid."
           }
-          New-Item -ItemType Directory -Path $env:E2E_ROOT -Force | Out-Null
+          $e2eRoot = Join-Path $env:RUNNER_TEMP "heteronet-windows-live-e2e"
+          "E2E_ROOT=$e2eRoot" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Path $e2eRoot -Force | Out-Null
 
       - name: Install .NET 9 SDK
         uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
