@@ -20,9 +20,14 @@ if (!['80', '9781'].includes(values.canonicalPort)) {
 const UI_OPEN_BUDGET_MS = 3_000;
 const report = { started_at_utc: new Date().toISOString(), result: 'failed', canonical: null,
   gateways: [], errors: [] };
+const netLogPath = values.output ? `${values.output}.chromium-netlog.json` : null;
 let browser;
 try {
-  browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
+  const launchArgs = ['--disable-dev-shm-usage'];
+  if (netLogPath) {
+    launchArgs.push(`--log-net-log=${netLogPath}`, '--net-log-capture-mode=Default');
+  }
+  browser = await chromium.launch({ headless: true, args: launchArgs });
   // Exercise the client-visible split-DNS path before pinning each request to
   // a gateway. Direct-IP checks alone cannot detect a broken canonical name.
   {
@@ -192,6 +197,30 @@ try {
   report.failure = String(error.message).replace(/eyJ[A-Za-z0-9_.-]+/g, '[token]');
 } finally {
   await browser?.close();
+  if (netLogPath) {
+    try {
+      if (report.result !== 'passed') {
+        const netLog = JSON.parse(await fs.readFile(netLogPath, 'utf8'));
+        const eventNames = new Map(Object.entries(netLog.constants?.logEventTypes ?? {})
+          .map(([name, id]) => [id, name]));
+        report.chromium_resolver_events = (netLog.events ?? [])
+          .filter(event => {
+            const name = eventNames.get(event.type) ?? '';
+            return (name.includes('HOST_RESOLVER') || name.includes('DNS')) &&
+              JSON.stringify(event.params ?? {}).includes('console.heteronetwork.internal');
+          })
+          .slice(-30)
+          .map(event => ({
+            type: eventNames.get(event.type) ?? event.type,
+            phase: event.phase,
+            params: event.params,
+          }));
+      }
+      await fs.unlink(netLogPath);
+    } catch (netLogError) {
+      report.chromium_netlog_error = String(netLogError.message);
+    }
+  }
   report.finished_at_utc = new Date().toISOString();
   if (values.output) await fs.writeFile(values.output, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
   console.log(JSON.stringify(report));
