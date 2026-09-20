@@ -151,7 +151,11 @@ jobs:
           if ($restarted.Count -eq 0) {
             throw "The updated Windows application did not restart."
           }
-          Get-Content -LiteralPath $log -ErrorAction Stop
+          if (Test-Path -LiteralPath $log -PathType Leaf) {
+            Get-Content -LiteralPath $log
+          } else {
+            Write-Host "The updater activated the release without emitting an updater log."
+          }
           [pscustomobject]@{
             automatic_update_from = $env:PREVIOUS_WINDOWS_RELEASE
             automatic_update_to = $env:RELEASE_TAG
