@@ -147,6 +147,7 @@ internal sealed class WindowsAppUpdateService : IDisposable
         var startInfo = new ProcessStartInfo
         {
             FileName = powershell,
+            WorkingDirectory = support,
             UseShellExecute = false,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
