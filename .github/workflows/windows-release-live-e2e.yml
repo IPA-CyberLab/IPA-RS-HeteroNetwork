@@ -144,8 +144,13 @@ jobs:
           $ErrorActionPreference = "Stop"
           $target = Join-Path $env:LOCALAPPDATA "Programs\HeteroNetwork"
           $executable = Join-Path $target "HeteroNetwork.exe"
-          & $executable --tunnel-connect
-          if ($LASTEXITCODE -ne 0) {
+          $process = Start-Process `
+            -FilePath $executable `
+            -ArgumentList '--tunnel-connect' `
+            -Verb RunAs `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
             $helperLog = Join-Path $env:LOCALAPPDATA "HeteroNetwork\tunnel-helper.log"
             Get-Content -LiteralPath $helperLog -ErrorAction SilentlyContinue
             throw "The published Windows client could not connect."
@@ -231,7 +236,12 @@ jobs:
           if (Test-Path -LiteralPath $executable -PathType Leaf) {
             dotnet run --project $driver --configuration Release -- remove `
               (Join-Path $env:E2E_ROOT "remove-report.json") 2>$null
-            & $executable --tunnel-disconnect 2>$null
+            Start-Process `
+              -FilePath $executable `
+              -ArgumentList '--tunnel-disconnect' `
+              -Verb RunAs `
+              -Wait `
+              -ErrorAction SilentlyContinue | Out-Null
           }
           Get-Process -Name HeteroNetwork -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
