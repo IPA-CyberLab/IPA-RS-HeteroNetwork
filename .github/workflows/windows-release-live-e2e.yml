@@ -214,8 +214,8 @@ jobs:
             wininet_auto_detect = [bool]($connectionFlags -band 8)
           } | ConvertTo-Json -Compress
           $internetSettingsPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-          $proxyOverride = [string](Get-ItemPropertyValue `
-            -LiteralPath $internetSettingsPath -Name ProxyOverride -ErrorAction SilentlyContinue)
+          $internetSettings = Get-ItemProperty -LiteralPath $internetSettingsPath
+          $proxyOverride = [string]$internetSettings.ProxyOverride
           $proxyBypass = @($proxyOverride -split ';' | Where-Object { $_ })
           if ($proxyBypass -notcontains '*.heteronetwork.internal') {
             $proxyBypass += '*.heteronetwork.internal'
