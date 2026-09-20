@@ -193,6 +193,17 @@ jobs:
           if ($answer.Count -ne 1 -or $answer[0] -ne $gateway.vpn_ip) {
             throw "Windows split DNS did not resolve the console through the active gateway."
           }
+          $nativeDnsStarted = [Diagnostics.Stopwatch]::StartNew()
+          $nativeDns = [Net.Dns]::GetHostAddressesAsync('console.heteronetwork.internal')
+          if (-not $nativeDns.Wait([TimeSpan]::FromSeconds(3))) {
+            throw "Windows getaddrinfo did not resolve the console within three seconds."
+          }
+          $nativeDnsStarted.Stop()
+          $nativeAddresses = @($nativeDns.Result | ForEach-Object IPAddressToString)
+          if ($nativeAddresses -notcontains $gateway.vpn_ip) {
+            throw "Windows getaddrinfo did not return the active gateway."
+          }
+          Write-Host "Windows getaddrinfo resolved the console in $($nativeDnsStarted.ElapsedMilliseconds) ms."
           $started = [Diagnostics.Stopwatch]::StartNew()
           $response = Invoke-WebRequest `
             -Uri 'http://console.heteronetwork.internal/ui/' `
@@ -215,6 +226,7 @@ jobs:
             client_vpn_ip = $importReport.client_vpn_ip
             gateway_vpn_ip = $gateway.vpn_ip
             dns_answer = $answer[0]
+            native_dns_ms = $nativeDnsStarted.ElapsedMilliseconds
             http_open_ms = $started.ElapsedMilliseconds
             chromium = (Get-Content -LiteralPath $browserReport -Raw | ConvertFrom-Json).canonical
           } | ConvertTo-Json -Depth 5 -Compress | Set-Content `

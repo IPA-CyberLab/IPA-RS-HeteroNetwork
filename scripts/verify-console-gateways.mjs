@@ -60,6 +60,9 @@ try {
         } finally {
           await direct.close();
         }
+        // Keep the resolver alive briefly after the three-second acceptance
+        // deadline so its terminal event is available in the failure report.
+        await new Promise(resolve => setTimeout(resolve, 7_000));
         throw error;
       }
       const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
@@ -203,16 +206,45 @@ try {
         const netLog = JSON.parse(await fs.readFile(netLogPath, 'utf8'));
         const eventNames = new Map(Object.entries(netLog.constants?.logEventTypes ?? {})
           .map(([name, id]) => [id, name]));
-        report.chromium_resolver_events = (netLog.events ?? [])
+        const networkEvents = netLog.events ?? [];
+        const resolverSourceIds = new Set();
+        for (const event of networkEvents) {
+          if (JSON.stringify(event.params ?? {}).includes('console.heteronetwork.internal')) {
+            if (event.source?.id !== undefined) resolverSourceIds.add(event.source.id);
+            if (event.params?.source_dependency?.id !== undefined) {
+              resolverSourceIds.add(event.params.source_dependency.id);
+            }
+          }
+        }
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const event of networkEvents) {
+            const sourceId = event.source?.id;
+            const dependencyId = event.params?.source_dependency?.id;
+            if ((sourceId !== undefined && resolverSourceIds.has(sourceId)) ||
+                (dependencyId !== undefined && resolverSourceIds.has(dependencyId))) {
+              for (const id of [sourceId, dependencyId]) {
+                if (id !== undefined && !resolverSourceIds.has(id)) {
+                  resolverSourceIds.add(id);
+                  changed = true;
+                }
+              }
+            }
+          }
+        }
+        report.chromium_resolver_events = networkEvents
           .filter(event => {
             const name = eventNames.get(event.type) ?? '';
             return (name.includes('HOST_RESOLVER') || name.includes('DNS')) &&
-              JSON.stringify(event.params ?? {}).includes('console.heteronetwork.internal');
+              resolverSourceIds.has(event.source?.id);
           })
-          .slice(-30)
+          .slice(-100)
           .map(event => ({
             type: eventNames.get(event.type) ?? event.type,
             phase: event.phase,
+            time: event.time,
+            source: event.source,
             params: event.params,
           }));
       }
