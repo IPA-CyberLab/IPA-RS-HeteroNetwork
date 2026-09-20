@@ -29,6 +29,7 @@ public sealed class WindowsTunnelManager
     private const string ServiceDescription =
         "Gateway-only WireGuard tunnel managed by HeteroNetwork.";
     private const string NrptComment = "HeteroNetwork managed split DNS";
+    private const string HostsComment = "# HeteroNetwork managed console";
     private const int OverlayMtu = 1280;
     private static readonly TimeSpan ProbeBudget = TimeSpan.FromSeconds(3);
     private readonly ClientSessionStore sessionStore;
@@ -196,6 +197,7 @@ public sealed class WindowsTunnelManager
                 ApplicationExecutablePath(),
                 configurationPath,
                 cancellationToken).ConfigureAwait(false);
+            UpdateManagedHosts(profile.GatewayVpnIp);
             await ConfigureSplitDnsAsync(profile.GatewayVpnIp, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -203,6 +205,7 @@ public sealed class WindowsTunnelManager
         {
             await EmbeddedTunnelService.RemoveAsync(ServiceName, cancellationToken)
                 .ConfigureAwait(false);
+            UpdateManagedHosts(null);
             await RemoveSplitDnsAsync(cancellationToken).ConfigureAwait(false);
             throw;
         }
@@ -212,6 +215,7 @@ public sealed class WindowsTunnelManager
     {
         await EmbeddedTunnelService.RemoveAsync(ServiceName, cancellationToken)
             .ConfigureAwait(false);
+        UpdateManagedHosts(null);
         await RemoveSplitDnsAsync(cancellationToken).ConfigureAwait(false);
         var configurationPath = ConfigurationPath();
         if (File.Exists(configurationPath))
@@ -324,7 +328,8 @@ public sealed class WindowsTunnelManager
             + $"Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{NrptComment}' }} "
             + "| Remove-DnsClientNrptRule -Force\r\n"
             + $"Add-DnsClientNrptRule -Namespace '{HeteroNetworkConstants.OverlayDnsNamespace}' "
-            + $"-NameServers '{gatewayVpnIp}' -Comment '{NrptComment}'";
+            + $"-NameServers '{gatewayVpnIp}' -Comment '{NrptComment}'\r\n"
+            + "Clear-DnsClientCache";
         return RunPowerShellAsync(command, cancellationToken);
     }
 
@@ -333,9 +338,88 @@ public sealed class WindowsTunnelManager
         var command =
             "$ErrorActionPreference = 'Stop'\r\n"
             + $"Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{NrptComment}' }} "
-            + "| Remove-DnsClientNrptRule -Force";
+            + "| Remove-DnsClientNrptRule -Force\r\n"
+            + "Clear-DnsClientCache";
         return RunPowerShellAsync(command, cancellationToken);
     }
+
+    private static void UpdateManagedHosts(string? gatewayVpnIp)
+    {
+        if (gatewayVpnIp is not null && !IPAddress.TryParse(gatewayVpnIp, out _))
+        {
+            throw new InvalidOperationException("The gateway hosts address is invalid.");
+        }
+
+        var hostsPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "drivers",
+            "etc",
+            "hosts");
+        var original = File.Exists(hostsPath) ? File.ReadAllBytes(hostsPath) : [];
+        var marker = Encoding.ASCII.GetBytes(HostsComment);
+        using var updated = new MemoryStream(original.Length + 128);
+        var offset = 0;
+        while (offset < original.Length)
+        {
+            var lineEnd = offset;
+            while (lineEnd < original.Length
+                   && original[lineEnd] != (byte)'\r'
+                   && original[lineEnd] != (byte)'\n')
+            {
+                lineEnd++;
+            }
+
+            var separatorEnd = lineEnd;
+            if (separatorEnd < original.Length && original[separatorEnd] == (byte)'\r')
+            {
+                separatorEnd++;
+            }
+
+            if (separatorEnd < original.Length && original[separatorEnd] == (byte)'\n')
+            {
+                separatorEnd++;
+            }
+
+            if (!ContainsSequence(original.AsSpan(offset, lineEnd - offset), marker))
+            {
+                updated.Write(original, offset, separatorEnd - offset);
+            }
+
+            offset = separatorEnd;
+        }
+
+        if (gatewayVpnIp is not null)
+        {
+            if (updated.Length > 0)
+            {
+                updated.Position = updated.Length - 1;
+                var finalByte = updated.ReadByte();
+                updated.Position = updated.Length;
+                if (finalByte != (byte)'\r' && finalByte != (byte)'\n')
+                {
+                    updated.Write("\r\n"u8);
+                }
+            }
+
+            var entry = Encoding.ASCII.GetBytes(
+                $"{gatewayVpnIp}\t{HeteroNetworkConstants.OverlayDnsName}\t{HostsComment}\r\n");
+            updated.Write(entry);
+        }
+
+        using var hosts = new FileStream(
+            hostsPath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.Read,
+            4096,
+            FileOptions.WriteThrough);
+        updated.Position = 0;
+        updated.CopyTo(hosts);
+        hosts.Flush(true);
+    }
+
+    private static bool ContainsSequence(ReadOnlySpan<byte> value, ReadOnlySpan<byte> sequence) =>
+        value.IndexOf(sequence) >= 0;
 
     private static Task RunPowerShellAsync(
         string command,
@@ -495,7 +579,7 @@ public sealed class WindowsTunnelManager
         try
         {
             using var response = await client.GetAsync(
-                "http://console.heteronetwork.internal:9781/ui/",
+                HeteroNetworkConstants.OverlayWebUiUri,
                 HttpCompletionOption.ResponseHeadersRead,
                 cancellationToken).ConfigureAwait(false);
             return response.StatusCode == HttpStatusCode.OK
