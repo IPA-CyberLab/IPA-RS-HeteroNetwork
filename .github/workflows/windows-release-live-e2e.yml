@@ -213,16 +213,9 @@ jobs:
           [pscustomobject]@{
             wininet_auto_detect = [bool]($connectionFlags -band 8)
           } | ConvertTo-Json -Compress
-          $internetSettingsPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-          $internetSettings = Get-ItemProperty -LiteralPath $internetSettingsPath
-          $proxyOverride = [string]$internetSettings.ProxyOverride
-          $proxyBypass = @($proxyOverride -split ';' | Where-Object { $_ })
-          if ($proxyBypass -notcontains '*.heteronetwork.internal') {
-            $proxyBypass += '*.heteronetwork.internal'
+          if ($connectionFlags -band 8) {
+            throw "The client left unused Windows proxy auto-detection enabled."
           }
-          New-ItemProperty -LiteralPath $internetSettingsPath `
-            -Name ProxyOverride -PropertyType String -Value ($proxyBypass -join ';') `
-            -Force | Out-Null
           $started = [Diagnostics.Stopwatch]::StartNew()
           $response = Invoke-WebRequest `
             -Uri 'http://console.heteronetwork.internal/ui/' `

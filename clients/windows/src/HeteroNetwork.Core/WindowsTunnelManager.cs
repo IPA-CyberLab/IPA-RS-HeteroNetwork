@@ -200,6 +200,7 @@ public sealed class WindowsTunnelManager
             UpdateManagedHosts(profile.GatewayVpnIp);
             await ConfigureSplitDnsAsync(profile.GatewayVpnIp, cancellationToken)
                 .ConfigureAwait(false);
+            WindowsProxySettings.DisableUnusedAutoDetect();
         }
         catch
         {
@@ -207,6 +208,7 @@ public sealed class WindowsTunnelManager
                 .ConfigureAwait(false);
             UpdateManagedHosts(null);
             await RemoveSplitDnsAsync(cancellationToken).ConfigureAwait(false);
+            WindowsProxySettings.RestoreManagedAutoDetect();
             throw;
         }
     }
@@ -217,6 +219,7 @@ public sealed class WindowsTunnelManager
             .ConfigureAwait(false);
         UpdateManagedHosts(null);
         await RemoveSplitDnsAsync(cancellationToken).ConfigureAwait(false);
+        WindowsProxySettings.RestoreManagedAutoDetect();
         var configurationPath = ConfigurationPath();
         if (File.Exists(configurationPath))
         {
