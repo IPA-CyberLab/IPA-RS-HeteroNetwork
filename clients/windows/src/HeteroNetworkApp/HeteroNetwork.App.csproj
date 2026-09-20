@@ -13,7 +13,15 @@
     <AssemblyName>HeteroNetwork</AssemblyName>
     <RootNamespace>HeteroNetwork.App</RootNamespace>
     <Version>0.1.0</Version>
+    <HeteroNetworkReleaseTag Condition="'$(HeteroNetworkReleaseTag)' == ''">development</HeteroNetworkReleaseTag>
+    <InformationalVersion>$(HeteroNetworkReleaseTag)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="HeteroNetworkReleaseTag"
+                      Value="$(HeteroNetworkReleaseTag)" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\HeteroNetwork.Core\HeteroNetwork.Core.csproj" />

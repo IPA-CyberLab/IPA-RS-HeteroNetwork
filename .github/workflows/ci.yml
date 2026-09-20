@@ -307,7 +307,9 @@ jobs:
 
       - name: Build, test, and publish self-contained Windows client
         shell: pwsh
-        run: ./clients/windows/build.ps1 -SelfContained
+        run: >-
+          ./clients/windows/build.ps1 -SelfContained
+          -ReleaseTag "${{ github.event.release.tag_name }}"
 
       - name: Package Windows client release asset
         shell: pwsh
@@ -317,6 +319,10 @@ jobs:
           $executable = Join-Path $published "HeteroNetwork.exe"
           if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
             throw "The published Windows client is missing."
+          }
+          $productVersion = (Get-Item -LiteralPath $executable).VersionInfo.ProductVersion
+          if ($productVersion -ne "${{ github.event.release.tag_name }}") {
+            throw "The Windows client does not contain the release tag."
           }
           $asset = "heteronetwork-client-windows-x64.zip"
           $assetDirectory = Join-Path $env:RUNNER_TEMP "desktop-assets"

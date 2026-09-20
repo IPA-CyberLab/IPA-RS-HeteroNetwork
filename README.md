@@ -17,7 +17,8 @@ curl -fsSL https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroNetwork/m
 
 The installer detects the host architecture, downloads the newest published
 client, verifies its SHA-256 checksum, installs it for the current user, and
-opens the app. Sign in with Keycloak and select **Connect**.
+opens the app. Published macOS and Windows clients check for verified updates at
+startup and every six hours. Sign in with Keycloak and select **Connect**.
 
 macOS asks for administrator access when it installs the network helper and
 starts a tunnel. Windows includes the required .NET and WireGuard runtime in

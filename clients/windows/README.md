@@ -36,6 +36,13 @@ The release is self-contained, so this installation does not require a separate
 directory, creates a Start Menu shortcut, and starts the app. Smart App Control
 can require a release built with a trusted Authenticode certificate.
 
+Published builds check for updates at startup and every six hours. The client
+downloads the newest Windows release, verifies its GitHub release URL and
+SHA-256 checksum, validates the embedded release tag and WireGuard runtime, then
+replaces the installation atomically and restarts. If the VPN is connected, the
+verified update waits until the user disconnects so the tunnel service is not
+interrupted unexpectedly.
+
 ## Build and run
 
 From PowerShell:

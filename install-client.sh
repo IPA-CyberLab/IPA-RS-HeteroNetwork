@@ -412,8 +412,44 @@ case "$platform" in
                 $stage = Join-Path $parent ".$name.new.$PID"
                 $backup = Join-Path $parent ".$name.old.$PID"
                 New-Item -ItemType Directory -Force -Path $parent | Out-Null
-                if (Get-Process -Name HeteroNetwork -ErrorAction SilentlyContinue) {
-                    throw "Exit HeteroNetwork before installing an update."
+                $currentSession = [Diagnostics.Process]::GetCurrentProcess().SessionId
+                $userProcesses = @(
+                    Get-Process -Name HeteroNetwork -ErrorAction SilentlyContinue |
+                    Where-Object { $_.SessionId -eq $currentSession }
+                )
+                foreach ($process in $userProcesses) {
+                    $null = $process.CloseMainWindow()
+                }
+                $deadline = [DateTimeOffset]::UtcNow.AddSeconds(5)
+                do {
+                    $userProcesses = @(
+                        Get-Process -Name HeteroNetwork -ErrorAction SilentlyContinue |
+                        Where-Object { $_.SessionId -eq $currentSession }
+                    )
+                    if ($userProcesses.Count -eq 0) { break }
+                    Start-Sleep -Milliseconds 100
+                } while ([DateTimeOffset]::UtcNow -lt $deadline)
+                foreach ($process in $userProcesses) {
+                    Stop-Process -Id $process.Id -Force
+                }
+
+                $tunnelService = Get-Service -Name "WireGuardTunnel`$HeteroNetwork" `
+                    -ErrorAction SilentlyContinue
+                if ($tunnelService) {
+                    $installedExecutable = Join-Path $target "HeteroNetwork.exe"
+                    if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
+                        throw "Disconnect HeteroNetwork before replacing this installation."
+                    }
+                    $disconnect = Start-Process `
+                        -FilePath $installedExecutable `
+                        -ArgumentList "--tunnel-disconnect" `
+                        -Verb RunAs `
+                        -WindowStyle Hidden `
+                        -Wait `
+                        -PassThru
+                    if ($disconnect.ExitCode -ne 0) {
+                        throw "HeteroNetwork could not disconnect before the update."
+                    }
                 }
                 Remove-Item -LiteralPath $stage, $backup -Recurse -Force -ErrorAction SilentlyContinue
                 try {

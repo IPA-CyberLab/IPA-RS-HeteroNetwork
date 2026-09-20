@@ -163,6 +163,12 @@ public partial class MainWindow : Window
     private void DismissError_Click(object sender, RoutedEventArgs e) =>
         viewModel.ClearError();
 
+    private async void CheckForUpdates_Click(object sender, RoutedEventArgs e) =>
+        await viewModel.CheckForUpdatesAsync();
+
+    private async void InstallUpdate_Click(object sender, RoutedEventArgs e) =>
+        await viewModel.InstallUpdateAsync();
+
     private void CopyToClipboard(string value)
     {
         try

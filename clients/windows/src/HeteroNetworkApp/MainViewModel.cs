@@ -18,7 +18,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private readonly ControlPlaneClient controlPlane = new();
     private readonly WindowsTunnelManager tunnelManager;
     private readonly DispatcherTimer statusTimer;
+    private readonly DispatcherTimer updateTimer;
     private readonly SemaphoreSlim backgroundGate = new(1, 1);
+    private readonly SemaphoreSlim updateGate = new(1, 1);
+    private readonly CancellationTokenSource lifetimeCancellation = new();
+    private readonly WindowsAppUpdateService updateService = new();
     private readonly Dictionary<string, DateTimeOffset> failedGateways = [];
     private ClientSession? session;
     private PendingClientRegistration? pendingRegistration;
@@ -30,6 +34,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private int consecutiveProbeFailures;
     private DateTimeOffset profileActivatedAt = DateTimeOffset.MinValue;
     private bool disposed;
+    private bool updateOperationActive;
+    private string updateStatusDisplay = "Automatic update has not been checked yet.";
+    private PreparedWindowsAppUpdate? preparedUpdate;
 
     public MainViewModel()
     {
@@ -41,11 +48,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         };
         statusTimer.Tick += StatusTimer_Tick;
         statusTimer.Start();
-        _ = RestoreAsync();
+        updateTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromHours(6),
+        };
+        updateTimer.Tick += UpdateTimer_Tick;
+        updateTimer.Start();
+        _ = InitializeAsync();
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public event EventHandler<string>? ActivationAccepted;
+    public event EventHandler? UpdateActivationRequested;
 
     public bool IsConfigured => session is not null;
     public bool IsNotConfigured => !IsConfigured;
@@ -85,6 +99,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string ClientId => session?.Client.NodeId ?? "-";
     public string LastRefresh => session?.RefreshedAt.ToLocalTime().ToString("g") ?? "-";
     public string ConnectionAction => IsConnected || IsTransitioning ? "Disconnect" : "Connect";
+    public string CurrentReleaseTag => AppReleaseIdentity.CurrentTag;
+    public string UpdateStatusDisplay => updateStatusDisplay;
+    public bool IsUpdateReady => preparedUpdate is not null;
+    public bool CanCheckForUpdates => !isBusy && !updateOperationActive;
+    public bool CanInstallUpdate =>
+        preparedUpdate is not null && !isBusy && !updateOperationActive;
+    public string FooterDisplay =>
+        $"HeteroNetwork {CurrentReleaseTag} · Keys protected with Windows DPAPI · Split DNS for heteronetwork.internal";
 
     public string StatusDisplay => status switch
     {
@@ -236,6 +258,80 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             failedGateways.Clear();
             RaiseState();
         });
+        TryActivatePreparedUpdate();
+    }
+
+    public async Task CheckForUpdatesAsync()
+    {
+        if (disposed || isBusy || !await updateGate.WaitAsync(0))
+        {
+            return;
+        }
+
+        updateOperationActive = true;
+        RaiseUpdateState();
+        try
+        {
+            if (!AppReleaseIdentity.AutomaticUpdatesEnabled)
+            {
+                updateStatusDisplay = "Automatic updates are enabled in published releases.";
+                return;
+            }
+
+            updateStatusDisplay = "Checking for updates…";
+            RaiseUpdateState();
+            var update = await updateService.AvailableUpdateAsync(
+                CurrentReleaseTag,
+                lifetimeCancellation.Token).ConfigureAwait(true);
+            if (update is null)
+            {
+                preparedUpdate = null;
+                updateStatusDisplay = $"{CurrentReleaseTag} is up to date.";
+                return;
+            }
+
+            updateStatusDisplay = $"Downloading and verifying {update.Tag}…";
+            RaiseUpdateState();
+            preparedUpdate = await updateService.PrepareAsync(
+                update,
+                lifetimeCancellation.Token).ConfigureAwait(true);
+            updateStatusDisplay = IsConnected
+                ? $"{update.Tag} is ready and will install after the VPN disconnects."
+                : $"{update.Tag} is verified and ready to install.";
+        }
+        catch (OperationCanceledException) when (lifetimeCancellation.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            updateStatusDisplay = $"Automatic update failed: {error.Message}";
+        }
+        finally
+        {
+            updateOperationActive = false;
+            updateGate.Release();
+            RaiseUpdateState();
+        }
+
+        TryActivatePreparedUpdate();
+    }
+
+    public async Task InstallUpdateAsync()
+    {
+        if (preparedUpdate is null)
+        {
+            await CheckForUpdatesAsync();
+            return;
+        }
+
+        if (IsConnected)
+        {
+            await DisconnectAsync();
+            return;
+        }
+
+        TryActivatePreparedUpdate();
     }
 
     public async Task RefreshAsync()
@@ -319,8 +415,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         disposed = true;
         statusTimer.Stop();
         statusTimer.Tick -= StatusTimer_Tick;
+        updateTimer.Stop();
+        updateTimer.Tick -= UpdateTimer_Tick;
+        lifetimeCancellation.Cancel();
         controlPlane.Dispose();
+        updateService.Dispose();
         backgroundGate.Dispose();
+    }
+
+    private async Task InitializeAsync()
+    {
+        await RestoreAsync();
+        await CheckForUpdatesAsync();
     }
 
     private async Task RestoreAsync()
@@ -368,6 +474,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             status = tunnelManager.GetStatus();
             RaiseState();
+            if ((status is TunnelConnectionStatus.Disconnected
+                    or TunnelConnectionStatus.NotConfigured)
+                && preparedUpdate is not null)
+            {
+                TryActivatePreparedUpdate();
+                return;
+            }
             if (status != TunnelConnectionStatus.Connected || session is null)
             {
                 return;
@@ -382,6 +495,36 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         finally
         {
             backgroundGate.Release();
+        }
+    }
+
+    private async void UpdateTimer_Tick(object? sender, EventArgs e) =>
+        await CheckForUpdatesAsync();
+
+    private void TryActivatePreparedUpdate()
+    {
+        if (disposed
+            || preparedUpdate is not { } prepared
+            || isBusy
+            || updateOperationActive
+            || status is not (TunnelConnectionStatus.Disconnected
+                or TunnelConnectionStatus.NotConfigured))
+        {
+            return;
+        }
+
+        try
+        {
+            updateStatusDisplay = $"Restarting into {prepared.Release.Tag}…";
+            RaiseUpdateState();
+            updateService.Activate(prepared);
+            preparedUpdate = null;
+            UpdateActivationRequested?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception error)
+        {
+            updateStatusDisplay = $"Automatic update failed: {error.Message}";
+            RaiseUpdateState();
         }
     }
 
@@ -549,6 +692,17 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         OnPropertyChanged(nameof(ClusterName));
         OnPropertyChanged(nameof(ClientId));
         OnPropertyChanged(nameof(LastRefresh));
+        RaiseUpdateState();
+    }
+
+    private void RaiseUpdateState()
+    {
+        OnPropertyChanged(nameof(CurrentReleaseTag));
+        OnPropertyChanged(nameof(UpdateStatusDisplay));
+        OnPropertyChanged(nameof(IsUpdateReady));
+        OnPropertyChanged(nameof(CanCheckForUpdates));
+        OnPropertyChanged(nameof(CanInstallUpdate));
+        OnPropertyChanged(nameof(FooterDisplay));
     }
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null) =>

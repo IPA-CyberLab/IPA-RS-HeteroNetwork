@@ -75,6 +75,8 @@ public partial class App : System.Windows.Application
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
         RegisterUrlProtocol();
         var viewModel = new MainViewModel();
+        viewModel.UpdateActivationRequested += (_, _) =>
+            Dispatcher.BeginInvoke(new Action(ExitApplication));
         mainWindow = new MainWindow(viewModel);
         MainWindow = mainWindow;
         mainWindow.Show();

@@ -4,6 +4,8 @@ param(
     [string]$Configuration = "Release",
     [switch]$NoPublish,
     [switch]$SelfContained,
+    [ValidatePattern("^(development|v[0-9][A-Za-z0-9._-]*)$")]
+    [string]$ReleaseTag = "development",
     [string]$SigningCertificateThumbprint,
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$SigningCertificateStore = "CurrentUser",
@@ -16,6 +18,7 @@ $ProgressPreference = "SilentlyContinue"
 $clientRoot = $PSScriptRoot
 $solution = Join-Path $clientRoot "HeteroNetwork.Windows.slnx"
 $wireGuardBootstrap = Join-Path $clientRoot "bootstrap-wireguard.ps1"
+$releaseProperty = "-p:HeteroNetworkReleaseTag=$ReleaseTag"
 
 function Invoke-DotNet {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -120,8 +123,15 @@ if ($LASTEXITCODE -ne 0) {
     throw "The embedded WireGuard runtime bootstrap failed."
 }
 
-Invoke-DotNet @("restore", $solution)
-Invoke-DotNet @("build", $solution, "--configuration", $Configuration, "--no-restore")
+Invoke-DotNet @("restore", $solution, $releaseProperty)
+Invoke-DotNet @(
+    "build",
+    $solution,
+    "--configuration",
+    $Configuration,
+    "--no-restore",
+    $releaseProperty
+)
 
 if ($normalizedThumbprint) {
     $testSigningTargets = Get-ChildItem `
@@ -147,7 +157,8 @@ Invoke-DotNet @(
     "--configuration",
     $Configuration,
     "--no-build",
-    "--no-restore"
+    "--no-restore",
+    $releaseProperty
 )
 
 if (-not $NoPublish) {
@@ -159,7 +170,8 @@ if (-not $NoPublish) {
         $appProject,
         "--runtime",
         "win-x64",
-        "-p:SelfContained=$selfContainedValue"
+        "-p:SelfContained=$selfContainedValue",
+        $releaseProperty
     )
     Invoke-DotNet @(
         "publish",
@@ -172,7 +184,8 @@ if (-not $NoPublish) {
         $selfContainedValue,
         "--no-restore",
         "--output",
-        $output
+        $output,
+        $releaseProperty
     )
     if ($normalizedThumbprint) {
         Invoke-CodeSign `
@@ -194,6 +207,10 @@ if (-not $NoPublish) {
         -PassThru
     if ($selfTest.ExitCode -ne 0) {
         throw "The embedded WireGuard runtime self-test failed with exit code $($selfTest.ExitCode)."
+    }
+    $publishedVersion = (Get-Item -LiteralPath $publishedExecutable).VersionInfo.ProductVersion
+    if ($publishedVersion -ne $ReleaseTag) {
+        throw "Published release tag mismatch: expected $ReleaseTag, got $publishedVersion."
     }
     Write-Host "Embedded WireGuard runtime self-test passed."
     Write-Host "Published: $(Join-Path $output 'HeteroNetwork.exe')"

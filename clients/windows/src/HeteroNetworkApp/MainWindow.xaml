@@ -241,6 +241,38 @@
         </StackPanel>
 
         <Border Style="{StaticResource CardStyle}"
+                Margin="0,16,0,0">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel Margin="0,0,18,0">
+              <TextBlock Text="Application updates"
+                         FontSize="17"
+                         FontWeight="SemiBold" />
+              <TextBlock Text="{Binding UpdateStatusDisplay}"
+                         Foreground="{StaticResource MutedInkBrush}"
+                         Margin="0,7,0,0" />
+            </StackPanel>
+            <StackPanel Grid.Column="1"
+                        Orientation="Horizontal"
+                        VerticalAlignment="Center">
+              <Button Style="{StaticResource SecondaryButton}"
+                      Content="Check now"
+                      IsEnabled="{Binding CanCheckForUpdates}"
+                      Click="CheckForUpdates_Click" />
+              <Button Style="{StaticResource PrimaryButton}"
+                      Content="Install update"
+                      IsEnabled="{Binding CanInstallUpdate}"
+                      Visibility="{Binding IsUpdateReady, Converter={StaticResource BooleanToVisibilityConverter}}"
+                      Click="InstallUpdate_Click"
+                      Margin="10,0,0,0" />
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <Border Style="{StaticResource CardStyle}"
                 Margin="0,16,0,0"
                 Background="#FFF1F2"
                 BorderBrush="#FECDD3"
@@ -271,7 +303,7 @@
     <Border Grid.Row="2" Background="#E9EDF5" Padding="30,10">
       <TextBlock Foreground="{StaticResource MutedInkBrush}"
                  FontSize="11"
-                 Text="HeteroNetwork 0.1.0 · Keys protected with Windows DPAPI · Split DNS for heteronetwork.internal" />
+                 Text="{Binding FooterDisplay}" />
     </Border>
   </Grid>
 </Window>
