@@ -178,6 +178,9 @@ internal sealed class WindowsAppUpdateService : IDisposable
         }
     }
 
+    public void Discard(PreparedWindowsAppUpdate prepared) =>
+        TryDeleteDirectory(prepared.StagedDirectory);
+
     public void Dispose() => httpClient.Dispose();
 
     private static string ValidateTargetDirectory()

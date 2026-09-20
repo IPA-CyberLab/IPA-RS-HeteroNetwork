@@ -285,6 +285,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                 lifetimeCancellation.Token).ConfigureAwait(true);
             if (update is null)
             {
+                if (preparedUpdate is { } obsolete)
+                {
+                    updateService.Discard(obsolete);
+                }
                 preparedUpdate = null;
                 updateStatusDisplay = $"{CurrentReleaseTag} is up to date.";
                 return;
@@ -418,6 +422,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         updateTimer.Stop();
         updateTimer.Tick -= UpdateTimer_Tick;
         lifetimeCancellation.Cancel();
+        if (preparedUpdate is { } abandoned)
+        {
+            updateService.Discard(abandoned);
+            preparedUpdate = null;
+        }
         controlPlane.Dispose();
         updateService.Dispose();
         backgroundGate.Dispose();
