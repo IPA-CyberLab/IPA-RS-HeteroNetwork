@@ -34,10 +34,23 @@ try {
     const context = await browser.newContext({ serviceWorkers: 'block' });
     try {
       const page = await context.newPage();
+      const canonicalEvents = [];
+      const eventStartedAt = performance.now();
+      const recordCanonicalEvent = (kind, request, status = undefined) => {
+        const url = new URL(request.url());
+        if (url.hostname !== 'console.heteronetwork.internal') return;
+        canonicalEvents.push({ kind, path: url.pathname, resource: request.resourceType(), status,
+          at_ms: Math.ceil(performance.now() - eventStartedAt) });
+      };
+      page.on('request', request => recordCanonicalEvent('request', request));
+      page.on('response', response => recordCanonicalEvent(
+        'response', response.request(), response.status()));
+      page.on('requestfinished', request => recordCanonicalEvent('finished', request));
       page.on('pageerror', error => report.errors.push(error.message));
       page.on('requestfailed', request => {
         const failure = request.failure();
         report.canonical_request_failure = failure?.errorText ?? 'unknown';
+        recordCanonicalEvent('failed', request);
       });
       const openedAt = performance.now();
       const canonicalOrigin = values.canonicalPort === '80'
@@ -59,6 +72,31 @@ try {
           report.canonical_diagnostic = { direct_gateway_error: String(directError.message) };
         } finally {
           await direct.close();
+        }
+        report.canonical_events = canonicalEvents.slice(-50);
+        report.canonical_page = await page.evaluate(() => ({
+          ready_state: document.readyState,
+          title: document.title,
+          body_bytes: document.body?.innerHTML.length ?? 0,
+        })).catch(pageError => ({ inspection_error: String(pageError.message) }));
+        let noProxyBrowser;
+        let noProxyContext;
+        try {
+          noProxyBrowser = await chromium.launch({ headless: true,
+            args: ['--disable-dev-shm-usage', '--no-proxy-server'] });
+          noProxyContext = await noProxyBrowser.newContext({ serviceWorkers: 'block' });
+          const noProxyPage = await noProxyContext.newPage();
+          const noProxyStartedAt = performance.now();
+          const noProxyResponse = await noProxyPage.goto(`${canonicalOrigin}/ui/`, {
+            waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+          });
+          report.no_proxy_diagnostic = { http: noProxyResponse?.status() ?? null,
+            open_ms: Math.ceil(performance.now() - noProxyStartedAt) };
+        } catch (noProxyError) {
+          report.no_proxy_diagnostic = { error: String(noProxyError.message) };
+        } finally {
+          await noProxyContext?.close();
+          await noProxyBrowser?.close();
         }
         // Keep the resolver alive briefly after the three-second acceptance
         // deadline so its terminal event is available in the failure report.

@@ -204,6 +204,15 @@ jobs:
             throw "Windows getaddrinfo did not return the active gateway."
           }
           Write-Host "Windows getaddrinfo resolved the console in $($nativeDnsStarted.ElapsedMilliseconds) ms."
+          $connectionSettings = Get-ItemProperty `
+            -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections' `
+            -ErrorAction SilentlyContinue
+          $connectionFlags = if ($connectionSettings.DefaultConnectionSettings.Length -gt 8) {
+            [int]$connectionSettings.DefaultConnectionSettings[8]
+          } else { 0 }
+          [pscustomobject]@{
+            wininet_auto_detect = [bool]($connectionFlags -band 8)
+          } | ConvertTo-Json -Compress
           $started = [Diagnostics.Stopwatch]::StartNew()
           $response = Invoke-WebRequest `
             -Uri 'http://console.heteronetwork.internal/ui/' `
