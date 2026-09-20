@@ -8,6 +8,7 @@ on:
       - "clients/windows/**"
       - "install-client.sh"
       - ".github/workflows/windows-client.yml"
+      - ".github/workflows/windows-release-live-e2e.yml"
       - ".github/workflows/windows-release-update-e2e.yml"
       - ".github/workflows/ci.yml"
   pull_request:
@@ -15,6 +16,7 @@ on:
       - "clients/windows/**"
       - "install-client.sh"
       - ".github/workflows/windows-client.yml"
+      - ".github/workflows/windows-release-live-e2e.yml"
       - ".github/workflows/windows-release-update-e2e.yml"
       - ".github/workflows/ci.yml"
 
@@ -60,6 +62,14 @@ jobs:
           ./clients/windows/build.ps1 -SelfContained
           -ReleaseTag "v0.0.0-ci.${{ github.run_number }}"
 
+      - name: Build the live Windows VPN driver
+        shell: pwsh
+        run: >-
+          dotnet build
+          clients/windows/LiveE2E/HeteroNetwork.Windows.LiveE2E.csproj
+          --configuration Release
+          --nologo
+
       - name: Validate published update identity
         shell: pwsh
         run: |
@@ -80,4 +90,3 @@ jobs:
           if ($process.ExitCode -ne 0) {
             throw "The published client self-test failed with $($process.ExitCode)."
           }
-

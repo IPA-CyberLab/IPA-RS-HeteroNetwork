@@ -1,0 +1,237 @@
+name: Windows release live VPN E2E
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag whose Windows client will be tested
+        required: true
+        type: string
+      source_ref:
+        description: Commit or branch containing the matching live E2E driver
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: heteronet-windows-release-live-e2e
+  cancel-in-progress: false
+
+jobs:
+  live-windows-client:
+    name: Install, join, resolve DNS, and open Chromium
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'release' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: windows-2025
+    timeout-minutes: 25
+    environment: heteronet-e2e
+    env:
+      RELEASE_TAG: >-
+        ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.release_tag }}
+      SOURCE_REF: >-
+        ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_ref }}
+      E2E_ROOT: ${{ runner.temp }}\heteronet-windows-live-e2e
+    steps:
+      - name: Check out protected E2E source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_REF }}
+
+      - name: Validate release inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:RELEASE_TAG -notmatch '^v[0-9][A-Za-z0-9._-]*$') {
+            throw "Release tag is invalid."
+          }
+          New-Item -ItemType Directory -Path $env:E2E_ROOT -Force | Out-Null
+
+      - name: Install .NET 9 SDK
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install Chromium
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm ci
+          npx playwright install chromium
+
+      - name: Materialize protected sponsor access
+        shell: pwsh
+        env:
+          HNN_E2E_SSH_PRIVATE_KEY: ${{ secrets.HNN_E2E_SSH_PRIVATE_KEY }}
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:HNN_E2E_SSH_PRIVATE_KEY -or -not $env:HNN_IAC_BECOME_PASSWORD) {
+            throw "Protected HeteroNetwork E2E inputs are unavailable."
+          }
+          $key = Join-Path $env:E2E_ROOT "id_ed25519"
+          $knownHosts = Join-Path $env:E2E_ROOT "known_hosts"
+          [IO.File]::WriteAllText(
+            $key,
+            $env:HNN_E2E_SSH_PRIVATE_KEY.TrimEnd() + "`n",
+            [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText(
+            $knownHosts,
+            "163.220.236.45 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK038K5HfhW5BFKcXXK22/AunAU2mk2osPM98e0eZ1VI`n",
+            [Text.UTF8Encoding]::new($false))
+          & icacls.exe $key /inheritance:r /grant:r "${env:USERNAME}:(R)" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Could not restrict the SSH private key ACL." }
+
+      - name: Install the published Windows client
+        shell: bash
+        run: |
+          set -euo pipefail
+          HETERONETWORK_VERSION="$RELEASE_TAG" sh install-client.sh --no-launch
+
+      - name: Generate and sponsor a device registration
+        shell: pwsh
+        env:
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $driver = "clients/windows/LiveE2E/HeteroNetwork.Windows.LiveE2E.csproj"
+          $requestPath = Join-Path $env:E2E_ROOT "registration.txt"
+          $importPath = Join-Path $env:E2E_ROOT "import.txt"
+          dotnet run --project $driver --configuration Release -- prepare $requestPath
+          if ($LASTEXITCODE -ne 0) { throw "Could not generate the registration request." }
+          $request = [IO.File]::ReadAllText($requestPath).Trim()
+          if ($request -notmatch '^heteronetwork://register\?request=[A-Za-z0-9_-]+$') {
+            throw "The registration request is invalid."
+          }
+          $key = Join-Path $env:E2E_ROOT "id_ed25519"
+          $knownHosts = Join-Path $env:E2E_ROOT "known_hosts"
+          $remote = "sudo -S -p '' /opt/heteronetwork/bin/ipars client register '$request'"
+          $output = ($env:HNN_IAC_BECOME_PASSWORD + "`n") | & ssh.exe `
+            -i $key `
+            -o IdentitiesOnly=yes `
+            -o BatchMode=yes `
+            -o StrictHostKeyChecking=yes `
+            -o "UserKnownHostsFile=$knownHosts" `
+            -o ConnectTimeout=10 `
+            mizuame@163.220.236.45 `
+            $remote
+          if ($LASTEXITCODE -ne 0) { throw "Client sponsorship failed." }
+          $profiles = @($output | Where-Object { $_ -match '^heteronetwork://import\?profile=' })
+          if ($profiles.Count -ne 1) { throw "Client sponsorship returned an invalid profile." }
+          [IO.File]::WriteAllText(
+            $importPath,
+            $profiles[0] + "`n",
+            [Text.UTF8Encoding]::new($false))
+          dotnet run --project $driver --configuration Release -- import $importPath
+          if ($LASTEXITCODE -ne 0) { throw "Could not import the sponsored profile." }
+
+      - name: Connect the real WireGuard tunnel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = Join-Path $env:LOCALAPPDATA "Programs\HeteroNetwork"
+          $executable = Join-Path $target "HeteroNetwork.exe"
+          & $executable --tunnel-connect
+          if ($LASTEXITCODE -ne 0) {
+            $helperLog = Join-Path $env:LOCALAPPDATA "HeteroNetwork\tunnel-helper.log"
+            Get-Content -LiteralPath $helperLog -ErrorAction SilentlyContinue
+            throw "The published Windows client could not connect."
+          }
+
+      - name: Verify NRPT, DNS, HTTP, and Chromium through the VPN
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $importReport = Get-Content `
+            -LiteralPath (Join-Path $env:E2E_ROOT "import.txt.report.json") `
+            -Raw | ConvertFrom-Json
+          $gateway = @($importReport.gateways | Where-Object {
+            $_.node_id -eq $importReport.selected_gateway_node_id
+          })[0]
+          if (-not $gateway -or $gateway.vpn_ip -notmatch '^10\.250\.\d{1,3}\.\d{1,3}$') {
+            throw "The imported profile did not select a private gateway."
+          }
+          $service = Get-Service -Name 'WireGuardTunnel$HeteroNetwork' -ErrorAction Stop
+          if ($service.Status -ne 'Running') { throw "The WireGuard tunnel service is not running." }
+          $rule = @(Get-DnsClientNrptRule | Where-Object {
+            $_.Comment -eq 'HeteroNetwork managed split DNS'
+          })
+          if ($rule.Count -ne 1 `
+              -or $rule[0].Namespace -notcontains '.heteronetwork.internal' `
+              -or $rule[0].NameServers -notcontains $gateway.vpn_ip) {
+            throw "The managed HeteroNetwork NRPT rule is missing or invalid."
+          }
+          Clear-DnsClientCache
+          $answer = @(Resolve-DnsName console.heteronetwork.internal -Type A -DnsOnly `
+            -ErrorAction Stop | Where-Object Type -eq 'A' | Select-Object -ExpandProperty IPAddress)
+          if ($answer.Count -ne 1 -or $answer[0] -ne $gateway.vpn_ip) {
+            throw "Windows split DNS did not resolve the console through the active gateway."
+          }
+          $started = [Diagnostics.Stopwatch]::StartNew()
+          $response = Invoke-WebRequest `
+            -Uri 'http://console.heteronetwork.internal/ui/' `
+            -UseBasicParsing `
+            -NoProxy `
+            -TimeoutSec 3
+          $started.Stop()
+          if ($response.StatusCode -ne 200 -or $started.ElapsedMilliseconds -gt 3000) {
+            throw "The canonical console did not open within three seconds."
+          }
+          $gateways = @($importReport.gateways.vpn_ip) -join ','
+          $browserReport = Join-Path $env:E2E_ROOT "browser-report.json"
+          node scripts/verify-console-gateways.mjs `
+            --gateways $gateways `
+            --output $browserReport
+          if ($LASTEXITCODE -ne 0) { throw "Chromium could not open the private console." }
+          [pscustomobject]@{
+            result = 'passed'
+            client_vpn_ip = $importReport.client_vpn_ip
+            gateway_vpn_ip = $gateway.vpn_ip
+            dns_answer = $answer[0]
+            http_open_ms = $started.ElapsedMilliseconds
+            chromium = (Get-Content -LiteralPath $browserReport -Raw | ConvertFrom-Json).canonical
+          } | ConvertTo-Json -Depth 5 -Compress | Set-Content `
+            -LiteralPath (Join-Path $env:E2E_ROOT "result.json") `
+            -Encoding utf8NoBOM
+
+      - name: Publish sanitized Windows VPN result
+        if: always()
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:E2E_ROOT "result.json"
+          if (Test-Path -LiteralPath $report -PathType Leaf) {
+            "### Windows live VPN E2E" | Out-File `
+              -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            Get-Content -LiteralPath $report | Out-File `
+              -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+
+      - name: Remove the live client and private inputs
+        if: always()
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:LOCALAPPDATA "Programs\HeteroNetwork"
+          $executable = Join-Path $target "HeteroNetwork.exe"
+          $driver = "clients/windows/LiveE2E/HeteroNetwork.Windows.LiveE2E.csproj"
+          if (Test-Path -LiteralPath $executable -PathType Leaf) {
+            dotnet run --project $driver --configuration Release -- remove `
+              (Join-Path $env:E2E_ROOT "remove-report.json") 2>$null
+            & $executable --tunnel-disconnect 2>$null
+          }
+          Get-Process -Name HeteroNetwork -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $env:E2E_ROOT -Recurse -Force -ErrorAction SilentlyContinue
