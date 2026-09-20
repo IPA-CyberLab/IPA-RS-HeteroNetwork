@@ -101,7 +101,7 @@ jobs:
             exit 0
           fi
           HETERONETWORK_VERSION="$PREVIOUS_WINDOWS_RELEASE" \
-            sh -x install-client.sh --no-launch
+            sh install-client.sh --no-launch
 
       - name: Wait for the installed application to replace itself
         shell: pwsh
@@ -162,7 +162,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          HETERONETWORK_VERSION="$RELEASE_TAG" sh -x install-client.sh --no-launch
+          HETERONETWORK_VERSION="$RELEASE_TAG" sh install-client.sh --no-launch
           executable="$(cygpath -u "$LOCALAPPDATA")/Programs/HeteroNetwork/HeteroNetwork.exe"
           test -f "$executable"
           "$executable" --wireguard-self-test
