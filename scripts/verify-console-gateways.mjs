@@ -8,10 +8,14 @@ process.umask(0o077);
 const { values } = parseArgs({ options: {
   gateways: { type: 'string' }, output: { type: 'string' },
   fallbackResolv: { type: 'string' },
+  canonicalPort: { type: 'string', default: '9781' },
 } });
 const gateways = values.gateways?.split(',');
 if (!gateways?.length || gateways.some(ip => !/^10\.250\.\d{1,3}\.\d{1,3}$/.test(ip))) {
   throw new Error('--gateways must contain registered overlay IPv4 addresses');
+}
+if (!['80', '9781'].includes(values.canonicalPort)) {
+  throw new Error('--canonicalPort must be 80 or 9781');
 }
 const UI_OPEN_BUDGET_MS = 3_000;
 const report = { started_at_utc: new Date().toISOString(), result: 'failed', canonical: null,
@@ -27,7 +31,10 @@ try {
       const page = await context.newPage();
       page.on('pageerror', error => report.errors.push(error.message));
       const openedAt = performance.now();
-      const main = await page.goto('http://console.heteronetwork.internal:9781/ui/', {
+      const canonicalOrigin = values.canonicalPort === '80'
+        ? 'http://console.heteronetwork.internal'
+        : `http://console.heteronetwork.internal:${values.canonicalPort}`;
+      const main = await page.goto(`${canonicalOrigin}/ui/`, {
         waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
       });
       const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
@@ -35,7 +42,8 @@ try {
       const openMs = Math.ceil(performance.now() - openedAt);
       if (main.status() !== 200) throw new Error(`canonical console UI HTTP ${main.status()}`);
       if (openMs > UI_OPEN_BUDGET_MS) throw new Error(`canonical console UI opened in ${openMs} ms`);
-      report.canonical = { port: 9781, ui_http: 200, login_button_rendered: true, open_ms: openMs };
+      report.canonical = { port: Number(values.canonicalPort), ui_http: 200,
+        login_button_rendered: true, open_ms: openMs };
     } finally {
       await context.close();
     }

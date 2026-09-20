@@ -199,6 +199,7 @@ jobs:
           $browserReport = Join-Path $env:E2E_ROOT "browser-report.json"
           node scripts/verify-console-gateways.mjs `
             --gateways $gateways `
+            --canonicalPort 80 `
             --output $browserReport
           if ($LASTEXITCODE -ne 0) { throw "Chromium could not open the private console." }
           [pscustomobject]@{
