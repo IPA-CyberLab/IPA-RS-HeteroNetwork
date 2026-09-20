@@ -195,6 +195,15 @@ jobs:
           if ($response.StatusCode -ne 200 -or $started.ElapsedMilliseconds -gt 3000) {
             throw "The canonical console did not open within three seconds."
           }
+          $internetSettings = Get-ItemProperty `
+            -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' `
+            -ErrorAction SilentlyContinue
+          [pscustomobject]@{
+            wininet_proxy_enabled = [bool]$internetSettings.ProxyEnable
+            wininet_auto_configured = [bool]$internetSettings.AutoConfigURL
+            environment_proxy_present = [bool](
+              $env:HTTP_PROXY -or $env:HTTPS_PROXY -or $env:ALL_PROXY)
+          } | ConvertTo-Json -Compress
           $gateways = @($importReport.gateways.vpn_ip) -join ','
           $browserReport = Join-Path $env:E2E_ROOT "browser-report.json"
           node scripts/verify-console-gateways.mjs `

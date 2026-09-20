@@ -30,13 +30,33 @@ try {
     try {
       const page = await context.newPage();
       page.on('pageerror', error => report.errors.push(error.message));
+      page.on('requestfailed', request => {
+        const failure = request.failure();
+        report.canonical_request_failure = failure?.errorText ?? 'unknown';
+      });
       const openedAt = performance.now();
       const canonicalOrigin = values.canonicalPort === '80'
         ? 'http://console.heteronetwork.internal'
         : `http://console.heteronetwork.internal:${values.canonicalPort}`;
-      const main = await page.goto(`${canonicalOrigin}/ui/`, {
-        waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
-      });
+      let main;
+      try {
+        main = await page.goto(`${canonicalOrigin}/ui/`, {
+          waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+        });
+      } catch (error) {
+        const direct = await context.newPage();
+        try {
+          const response = await direct.goto(`http://${gateways[0]}/v1/web-ui/healthz`, {
+            waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+          });
+          report.canonical_diagnostic = { direct_gateway_http: response?.status() ?? null };
+        } catch (directError) {
+          report.canonical_diagnostic = { direct_gateway_error: String(directError.message) };
+        } finally {
+          await direct.close();
+        }
+        throw error;
+      }
       const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
       await page.getByRole('button', { name: 'Keycloakでログイン' }).waitFor({ timeout: remaining });
       const openMs = Math.ceil(performance.now() - openedAt);
