@@ -213,6 +213,16 @@ jobs:
           [pscustomobject]@{
             wininet_auto_detect = [bool]($connectionFlags -band 8)
           } | ConvertTo-Json -Compress
+          $internetSettingsPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+          $proxyOverride = [string](Get-ItemPropertyValue `
+            -LiteralPath $internetSettingsPath -Name ProxyOverride -ErrorAction SilentlyContinue)
+          $proxyBypass = @($proxyOverride -split ';' | Where-Object { $_ })
+          if ($proxyBypass -notcontains '*.heteronetwork.internal') {
+            $proxyBypass += '*.heteronetwork.internal'
+          }
+          New-ItemProperty -LiteralPath $internetSettingsPath `
+            -Name ProxyOverride -PropertyType String -Value ($proxyBypass -join ';') `
+            -Force | Out-Null
           $started = [Diagnostics.Stopwatch]::StartNew()
           $response = Invoke-WebRequest `
             -Uri 'http://console.heteronetwork.internal/ui/' `
