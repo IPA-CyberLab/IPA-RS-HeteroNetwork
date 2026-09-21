@@ -214,3 +214,4 @@
         name: heteronetwork-control-plane.service
         daemon_reload: true
         state: restarted
+      when: hnn_console_control_plane_unit.stdout | default('') | trim == 'loaded'
