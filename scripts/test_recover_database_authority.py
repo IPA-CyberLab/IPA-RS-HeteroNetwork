@@ -36,6 +36,7 @@ class DatabaseAuthorityRecoveryTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.bundle = self.root / "bundle"
         self.archive = self.root / "bundle.tar.gz"
+        self.proxy_archive = self.root / "proxy-bundle.tar.gz"
         self.backups = self.root / "backups"
         environment = {
             **os.environ,
@@ -78,6 +79,16 @@ class DatabaseAuthorityRecoveryTest(unittest.TestCase):
         if apply:
             command.append("--apply")
         return subprocess.run(command, check=False, capture_output=True, text=True)
+
+    def publish_proxy(self):
+        return subprocess.run([
+            "python3", RECOVERY,
+            "--bundle", self.bundle,
+            "--archive", self.archive,
+            "--backup-dir", self.backups,
+            "--proxy-archive", self.proxy_archive,
+            "--apply",
+        ], check=False, capture_output=True, text=True)
 
     def protected_hashes(self):
         paths = [
@@ -136,6 +147,38 @@ class DatabaseAuthorityRecoveryTest(unittest.TestCase):
             "revision": 2,
         })
         self.assertEqual(len(list(self.backups.iterdir())), 1)
+
+        self.proxy_archive.write_bytes(b"stale proxy topology")
+        self.proxy_archive.chmod(0o600)
+        published = self.publish_proxy()
+        self.assertEqual(published.returncode, 0, published.stderr)
+        self.assertEqual(json.loads(published.stdout)["proxy_bundle"], "changed")
+        published_hash = digest(self.proxy_archive)
+        with tarfile.open(self.proxy_archive, "r:gz") as proxy:
+            files = {
+                member.name.removeprefix("./")
+                for member in proxy.getmembers()
+                if member.isfile()
+            }
+            self.assertEqual(files, {
+                ".proxy-only",
+                "manifest.env",
+                "cluster-id",
+                "ca/ca.crt",
+                "secrets/application.password",
+            })
+            self.assertEqual(proxy.extractfile("./.proxy-only").read(), b"1\n")
+            self.assertEqual(
+                proxy.extractfile("./manifest.env").read(),
+                (self.bundle / "manifest.env").read_bytes(),
+            )
+            self.assertNotIn("./ca/ca.key", proxy.getnames())
+            self.assertNotIn("./secrets/superuser.password", proxy.getnames())
+
+        repeated_publish = self.publish_proxy()
+        self.assertEqual(repeated_publish.returncode, 0, repeated_publish.stderr)
+        self.assertEqual(json.loads(repeated_publish.stdout)["proxy_bundle"], "unchanged")
+        self.assertEqual(digest(self.proxy_archive), published_hash)
 
     def test_refuses_to_change_invalid_protected_credentials(self):
         original_manifest = (self.bundle / "manifest.env").read_bytes()

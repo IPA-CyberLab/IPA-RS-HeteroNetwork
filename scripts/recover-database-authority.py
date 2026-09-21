@@ -41,6 +41,13 @@ SECRET_NAMES = (
     "keycloak",
     "keycloak-bootstrap-admin",
 )
+PROXY_BUNDLE_FILES = {
+    ".proxy-only": 0o600,
+    "manifest.env": 0o600,
+    "cluster-id": 0o600,
+    "ca/ca.crt": 0o644,
+    "secrets/application.password": 0o600,
+}
 
 
 class RecoveryError(Exception):
@@ -409,6 +416,39 @@ def replace_archive(path, source):
             temporary.unlink()
 
 
+def publish_proxy_archive(bundle, destination):
+    secure_directory(destination.parent)
+    stage_root = Path(tempfile.mkdtemp(prefix=".database-proxy-", dir=destination.parent))
+    stage_bundle = stage_root / "bundle"
+    staged_archive = stage_root / "proxy-bundle.tar.gz"
+    try:
+        stage_bundle.mkdir(mode=0o700)
+        (stage_bundle / "ca").mkdir(mode=0o700)
+        (stage_bundle / "secrets").mkdir(mode=0o700)
+        values = {
+            ".proxy-only": b"1\n",
+            "manifest.env": read_limited(bundle / "manifest.env", private=True),
+            "cluster-id": read_limited(bundle / "cluster-id", private=True),
+            "ca/ca.crt": read_limited(bundle / "ca/ca.crt"),
+            "secrets/application.password": read_limited(
+                bundle / "secrets/application.password", private=True),
+        }
+        for relative, mode in PROXY_BUNDLE_FILES.items():
+            atomic_write(stage_bundle / relative, values[relative], mode)
+        pack_bundle(stage_bundle, staged_archive)
+        staged_value = read_limited(staged_archive, private=True)
+        if destination.exists():
+            current_value = read_limited(destination, private=True)
+            if current_value == staged_value:
+                return False
+        replace_archive(destination, staged_archive)
+        require(read_limited(destination, private=True) == staged_value,
+                "published proxy bundle did not converge")
+        return True
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
+
 def apply_recovery(bundle, archive, backup_root, authority):
     require(len(authority["retired"]) == EXPECTED_RETIRED_MEMBERS,
             "protected authority does not require the reviewed recovery")
@@ -445,26 +485,45 @@ def main():
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--backup-dir", type=Path, required=True)
+    parser.add_argument("--proxy-archive", type=Path)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     require(args.bundle.is_absolute() and args.archive.is_absolute() and args.backup_dir.is_absolute(),
             "protected recovery paths must be absolute")
+    require(args.proxy_archive is None or args.proxy_archive.is_absolute(),
+            "protected proxy archive path must be absolute")
+    require(args.proxy_archive is None or args.apply,
+            "publishing the protected proxy archive requires apply mode")
     def execute():
         authority = inspect_authority(args.bundle, args.archive)
-        if not authority["retired"]:
-            return {"result": "unchanged", "revision": authority["revision"], "retired_members": 0}
-        if not args.apply:
-            return {
+        if authority["retired"] and not args.apply:
+            result = {
                 "result": "migration-required",
                 "revision": authority["revision"],
                 "retired_members": len(authority["retired"]),
             }
-        revision = apply_recovery(args.bundle, args.archive, args.backup_dir, authority)
-        return {
-            "result": "changed",
-            "revision": revision,
-            "retired_members": EXPECTED_RETIRED_MEMBERS,
-        }
+        elif authority["retired"]:
+            revision = apply_recovery(args.bundle, args.archive, args.backup_dir, authority)
+            result = {
+                "result": "changed",
+                "revision": revision,
+                "retired_members": EXPECTED_RETIRED_MEMBERS,
+            }
+        else:
+            result = {
+                "result": "unchanged",
+                "revision": authority["revision"],
+                "retired_members": 0,
+            }
+        if args.proxy_archive is not None:
+            current = inspect_authority(args.bundle, args.archive)
+            require(not current["retired"],
+                    "proxy bundle cannot be published before authority recovery")
+            result["proxy_bundle"] = (
+                "changed" if publish_proxy_archive(args.bundle, args.proxy_archive)
+                else "unchanged"
+            )
+        return result
 
     if not args.apply:
         result = execute()

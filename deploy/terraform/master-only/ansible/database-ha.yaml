@@ -7,6 +7,7 @@
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
     hnn_database_bundle: /etc/heteronetwork/postgres-autopilot/bundle
     hnn_database_archive: /etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+    hnn_database_proxy_archive: /etc/heteronetwork/postgres-autopilot/proxy-bundle.tar.gz
     hnn_database_authority_backup: /var/backups/heteronetwork/iac-database-ha/authority
   tasks:
     - name: Inspect the protected database recovery authority without exposing it
@@ -84,6 +85,28 @@
           - (hnn_database_recovery_acceptance.stdout | from_json).result == 'unchanged'
           - (hnn_database_recovery_acceptance.stdout | from_json).retired_members == 0
         fail_msg: Protected database authority did not converge to the recovered topology
+
+    - name: Publish the current least-privilege proxy credential bundle
+      ansible.builtin.script:
+        cmd: >-
+          {{ hnn_repo_root }}/scripts/recover-database-authority.py
+          --bundle {{ hnn_database_bundle }}
+          --archive {{ hnn_database_archive }}
+          --backup-dir {{ hnn_database_authority_backup }}
+          --proxy-archive {{ hnn_database_proxy_archive }}
+          --apply
+        executable: /usr/bin/python3
+      register: hnn_database_proxy_publication
+      changed_when: (hnn_database_proxy_publication.stdout | from_json).proxy_bundle == 'changed'
+      no_log: true
+
+    - name: Require the current proxy credential bundle
+      ansible.builtin.assert:
+        that:
+          - (hnn_database_proxy_publication.stdout | from_json).result == 'unchanged'
+          - (hnn_database_proxy_publication.stdout | from_json).retired_members == 0
+          - (hnn_database_proxy_publication.stdout | from_json).proxy_bundle in ['changed', 'unchanged']
+        fail_msg: Current database proxy credential bundle was not published
 
 - name: Maintain the recovered PostgreSQL HA topology
   hosts: postgres_members:postgres_dcs_only
