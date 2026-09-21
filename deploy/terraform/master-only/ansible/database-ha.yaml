@@ -5,104 +5,85 @@
   vars:
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_database_bundle: /etc/heteronetwork/postgres-autopilot/bundle
+    hnn_database_archive: /etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+    hnn_database_authority_backup: /var/backups/heteronetwork/iac-database-ha/authority
   tasks:
     - name: Inspect the protected database recovery authority without exposing it
-      ansible.builtin.shell: |
-        set -euo pipefail
-        bundle=/etc/heteronetwork/postgres-autopilot/bundle
-        archive=/etc/heteronetwork/postgres-autopilot/bundle.tar.gz
-        python3 - "$bundle" "$archive" <<'PY'
-        from pathlib import Path
-        import sys
-        import tarfile
-
-        bundle = Path(sys.argv[1])
-        archive = Path(sys.argv[2])
-
-        def manifest(raw):
-            values = {}
-            for line in raw.decode("utf-8").splitlines():
-                key, separator, value = line.partition("=")
-                if not separator or not key or key in values:
-                    raise ValueError("invalid manifest")
-                values[key] = value
-            return values
-
-        def mapping(values, name):
-            value = values.get(name, "")
-            rows = value.split(",") if value else []
-            result = {}
-            for row in rows:
-                key, separator, address = row.partition("=")
-                if not separator or not key or not address or key in result:
-                    raise SystemExit(1)
-                result[key] = address
-            return result
-
-        expanded_raw = (bundle / "manifest.env").read_bytes()
-        expanded = manifest(expanded_raw)
-        with tarfile.open(archive, "r:gz") as source:
-            member = source.getmember("./manifest.env")
-            extracted = source.extractfile(member)
-            if extracted is None:
-                raise ValueError("archive manifest missing")
-            archived_raw = extracted.read()
-        archived = manifest(archived_raw)
-
-        expected_members = {
-            "db-b": "100.96.127.54",
-            "db-e": "100.111.33.52",
-        }
-        expected_dcs = {
-            "db-b": "100.96.127.54",
-            "db-e": "100.111.33.52",
-            "db-g": "100.94.130.38",
-        }
-        expanded_members = mapping(expanded, "HETERONETWORK_DB_MEMBERS")
-        expanded_identities = mapping(expanded, "HETERONETWORK_DB_MEMBER_IDENTITIES")
-        expected_member_names = set(expected_members)
-        required_files = [
-            bundle / "ca" / "ca.crt",
-            bundle / "ca" / "ca.key",
-            *(
-                bundle / "nodes" / name / filename
-                for name in expected_dcs
-                for filename in ("ca.crt", "node.crt", "node.key")
-            ),
-        ]
-        flags = {
-            "expanded_members": expanded_members == expected_members,
-            "expanded_member_superset": all(expanded_members.get(name) == address for name, address in expected_members.items()),
-            "retired_members": len(set(expanded_members) - expected_member_names),
-            "expanded_dcs": mapping(expanded, "HETERONETWORK_DB_DCS_MEMBERS") == expected_dcs,
-            "expanded_bootstrap": mapping(expanded, "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") == expected_dcs,
-            "expanded_identities": set(expanded_identities) == expected_member_names,
-            "expanded_identity_superset": expected_member_names <= set(expanded_identities),
-            "retired_identities": len(set(expanded_identities) - expected_member_names),
-            "desired_credential_files": all(path.is_file() and not path.is_symlink() for path in required_files),
-            "archived_members": mapping(archived, "HETERONETWORK_DB_MEMBERS") == expected_members,
-            "archived_dcs": mapping(archived, "HETERONETWORK_DB_DCS_MEMBERS") == expected_dcs,
-            "archived_bootstrap": mapping(archived, "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") == expected_dcs,
-            "archived_identities": set(mapping(archived, "HETERONETWORK_DB_MEMBER_IDENTITIES")) == set(expected_members),
-            "archive_equal": archived_raw == expanded_raw,
-        }
-        print(",".join(
-            f"{name}={'true' if value else 'false'}" if isinstance(value, bool) else f"{name}={value}"
-            for name, value in flags.items()
-        ))
-        PY
-      args:
-        executable: /bin/bash
+      ansible.builtin.script:
+        cmd: >-
+          {{ hnn_repo_root }}/scripts/recover-database-authority.py
+          --bundle {{ hnn_database_bundle }}
+          --archive {{ hnn_database_archive }}
+          --backup-dir {{ hnn_database_authority_backup }}
+        executable: /usr/bin/python3
       register: hnn_database_recovery_audit
       changed_when: false
       check_mode: false
       no_log: true
 
-    - name: "Require the protected recovery authority ({{ hnn_database_recovery_audit.stdout }})"
+    - name: Record the sanitized protected authority audit
+      ansible.builtin.set_fact:
+        hnn_database_recovery_state: "{{ hnn_database_recovery_audit.stdout | from_json }}"
+      no_log: true
+
+    - name: "Require the reviewed recovery state ({{ hnn_database_recovery_state.result }}, retired={{ hnn_database_recovery_state.retired_members }})"
       ansible.builtin.assert:
         that:
-          - "'false' not in hnn_database_recovery_audit.stdout"
-        fail_msg: Protected database recovery authority does not match the declared topology
+          - hnn_database_recovery_state.result in ['unchanged', 'migration-required']
+          - >-
+            (hnn_database_recovery_state.result == 'unchanged' and
+             hnn_database_recovery_state.retired_members == 0) or
+            (hnn_database_recovery_state.result == 'migration-required' and
+             hnn_database_recovery_state.retired_members == 4)
+        fail_msg: Protected database recovery authority is outside the reviewed migration state
+
+    - name: Retire the reviewed obsolete database authority entries
+      when: hnn_database_recovery_state.result == 'migration-required'
+      block:
+        - name: Pause automatic database topology reconciliation
+          ansible.builtin.systemd_service:
+            name: heteronetwork-postgres-autopilot.service
+            state: stopped
+
+        - name: Apply the transactional protected authority recovery
+          ansible.builtin.script:
+            cmd: >-
+              {{ hnn_repo_root }}/scripts/recover-database-authority.py
+              --bundle {{ hnn_database_bundle }}
+              --archive {{ hnn_database_archive }}
+              --backup-dir {{ hnn_database_authority_backup }}
+              --apply
+            executable: /usr/bin/python3
+          register: hnn_database_recovery_apply
+          changed_when: (hnn_database_recovery_apply.stdout | from_json).result == 'changed'
+          no_log: true
+      always:
+        - name: Resume automatic database topology reconciliation
+          ansible.builtin.systemd_service:
+            name: heteronetwork-postgres-autopilot.service
+            state: started
+            enabled: true
+
+    - name: Verify the recovered database authority without exposing it
+      ansible.builtin.script:
+        cmd: >-
+          {{ hnn_repo_root }}/scripts/recover-database-authority.py
+          --bundle {{ hnn_database_bundle }}
+          --archive {{ hnn_database_archive }}
+          --backup-dir {{ hnn_database_authority_backup }}
+        executable: /usr/bin/python3
+      register: hnn_database_recovery_acceptance
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Require the protected authority to contain only db-b and db-e
+      ansible.builtin.assert:
+        that:
+          - (hnn_database_recovery_acceptance.stdout | from_json).result == 'unchanged'
+          - (hnn_database_recovery_acceptance.stdout | from_json).retired_members == 0
+        fail_msg: Protected database authority did not converge to the recovered topology
 
 - name: Maintain the recovered PostgreSQL HA topology
   hosts: postgres_members:postgres_dcs_only
