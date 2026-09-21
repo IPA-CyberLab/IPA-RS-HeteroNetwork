@@ -196,15 +196,23 @@
       when:
         - not ansible_check_mode
         - inventory_hostname in groups['enrollment_issuer']
+    - name: Recover the public control plane after console networking settles
+      ansible.builtin.systemd_service:
+        name: heteronetwork-control-plane.service
+        daemon_reload: true
+        state: started
+      when:
+        - not ansible_check_mode
+        - hnn_console_control_plane_unit.stdout | trim == 'loaded'
     - name: Require promoted control planes to finish database startup
       ansible.builtin.uri:
         url: 'http://{{ hnn_console_ip }}:19088/healthz'
         status_code: 200
-        timeout: 5
+        timeout: 3
       register: hnn_console_control_plane_check
       until: hnn_console_control_plane_check.status | default(0) == 200
-      retries: 60
-      delay: 5
+      retries: 30
+      delay: 2
       when:
         - not ansible_check_mode
         - hnn_console_control_plane_unit.stdout | trim == 'loaded'
