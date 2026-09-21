@@ -398,7 +398,6 @@
       register: hnn_database_proxy_audit
       changed_when: false
       check_mode: false
-      no_log: true
 
     - name: Record the sanitized proxy-client recovery state
       ansible.builtin.set_fact:
@@ -515,7 +514,6 @@
           register: hnn_database_proxy_acceptance
           changed_when: false
           check_mode: false
-          no_log: true
 
         - name: Require the installed proxy-only credentials to be current
           ansible.builtin.assert:

@@ -34,9 +34,13 @@ SAFE_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 SAFE_NODE_ID = re.compile(r"node-[0-9a-f]{16,128}\Z")
 
 
+class RecoveryError(ValueError):
+    """A fail-closed validation error whose message contains no input data."""
+
+
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise RecoveryError(message)
 
 
 def regular_file(path, maximum):
@@ -314,6 +318,12 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except RecoveryError as error:
+        print(json.dumps({
+            "result": "rejected",
+            "reason": str(error),
+        }, separators=(",", ":")), file=sys.stderr)
+        sys.exit(1)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, tarfile.TarError):
         print("Database proxy-client recovery failed validation; no secrets were printed.", file=sys.stderr)
         sys.exit(1)

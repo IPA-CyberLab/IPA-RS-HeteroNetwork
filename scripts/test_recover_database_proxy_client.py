@@ -2,6 +2,8 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -162,6 +164,31 @@ class RecoverDatabaseProxyClientTests(unittest.TestCase):
             RECOVERY.recover(
                 self.bundle, self.archive, self.state, self.backup,
                 self.retired_archive, apply=True)
+
+    def test_cli_reports_only_a_bounded_validation_reason(self):
+        private_input = "not-a-node-id-private-input"
+        self.state.write_text(json.dumps({
+            "registered_node": {
+                "node_id": private_input,
+                "cluster_id": self.cluster_id,
+            },
+        }))
+        result = subprocess.run([
+            sys.executable,
+            SCRIPT,
+            "--bundle", self.bundle,
+            "--archive", self.archive,
+            "--agent-state", self.state,
+            "--backup-dir", self.backup,
+            "--retired-archive", self.retired_archive,
+        ], check=False, capture_output=True, text=True)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(
+            {"result": "rejected", "reason": "Agent node identity is invalid"},
+            json.loads(result.stderr),
+        )
+        self.assertNotIn(private_input, result.stderr)
 
 
 if __name__ == "__main__":
