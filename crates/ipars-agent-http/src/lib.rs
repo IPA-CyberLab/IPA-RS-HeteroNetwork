@@ -2035,30 +2035,8 @@ async fn select_healthy_web_ui_with_scope(
             "no Web UI endpoint is cached; enter an initial IP address or URL".to_string(),
         ));
     }
-    let selected = selected_web_ui_url(state).await;
-    if let Some(candidate) = selected.as_deref().and_then(|selected| {
-        candidates
-            .iter()
-            .find(|candidate| candidate.url == selected)
-    }) {
-        if let Ok(config) = fetch_web_ui_config(
-            &state.control_plane_client,
-            candidate,
-            expected_cluster_id.as_deref(),
-        )
-        .await
-        {
-            record_web_ui_health(state, candidate.url.clone(), true).await;
-            set_selected_web_ui(state, Some(candidate.url.clone())).await;
-            return Ok((candidate.clone(), config));
-        }
-    }
-
     let mut probes = JoinSet::new();
-    for candidate in candidates
-        .into_iter()
-        .filter(|candidate| Some(candidate.url.as_str()) != selected.as_deref())
-    {
+    for candidate in candidates {
         let client = state.control_plane_client.clone();
         let expected_cluster_id = expected_cluster_id.clone();
         probes.spawn(async move {
@@ -6279,6 +6257,50 @@ mod tests {
             "healthy HA endpoint was blocked by a stalled endpoint"
         );
         assert!(backend.device_authorization_form.lock().await.is_some());
+        stalled_task.abort();
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_ui_config_does_not_wait_for_a_stalled_selected_endpoint(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (stalled_url, stalled_task) = spawn_stalled_http_service().await?;
+        let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::with_control_plane_urls(
+            runtime,
+            vec![stalled_url.clone(), backend_url.clone()],
+        )
+        .enable_local_web_ui(true);
+        set_selected_web_ui(&state, Some(stalled_url)).await;
+        let app = router(state.clone());
+        let started_at = Instant::now();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/ui/config")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "healthy HA endpoint was blocked by the stale selected endpoint"
+        );
+        let config: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(config["bootstrap_required"], false);
+        assert_eq!(config["selected_web_ui_endpoint"], backend_url);
+        assert_eq!(selected_web_ui_url(&state).await, Some(backend_url));
+
         stalled_task.abort();
         backend_task.abort();
         Ok(())
