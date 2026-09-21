@@ -367,7 +367,7 @@ public sealed class WindowsTunnelManager
             allowFailure: false).ConfigureAwait(false);
     }
 
-    private static Task ConfigureSplitDnsAsync(
+    private static async Task ConfigureSplitDnsAsync(
         string gatewayVpnIp,
         CancellationToken cancellationToken)
     {
@@ -381,19 +381,19 @@ public sealed class WindowsTunnelManager
             + $"Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{NrptComment}' }} "
             + "| Remove-DnsClientNrptRule -Force\r\n"
             + $"Add-DnsClientNrptRule -Namespace '{HeteroNetworkConstants.OverlayDnsNamespace}' "
-            + $"-NameServers '{gatewayVpnIp}' -Comment '{NrptComment}'\r\n"
-            + "Clear-DnsClientCache";
-        return RunPowerShellAsync(command, cancellationToken);
+            + $"-NameServers '{gatewayVpnIp}' -Comment '{NrptComment}'";
+        await RunPowerShellAsync(command, cancellationToken).ConfigureAwait(false);
+        FlushDnsResolverCache();
     }
 
-    private static Task RemoveSplitDnsAsync(CancellationToken cancellationToken)
+    private static async Task RemoveSplitDnsAsync(CancellationToken cancellationToken)
     {
         var command =
             "$ErrorActionPreference = 'Stop'\r\n"
             + $"Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{NrptComment}' }} "
-            + "| Remove-DnsClientNrptRule -Force\r\n"
-            + "Clear-DnsClientCache";
-        return RunPowerShellAsync(command, cancellationToken);
+            + "| Remove-DnsClientNrptRule -Force";
+        await RunPowerShellAsync(command, cancellationToken).ConfigureAwait(false);
+        FlushDnsResolverCache();
     }
 
     private static void UpdateManagedHosts(string? gatewayVpnIp)
@@ -474,22 +474,48 @@ public sealed class WindowsTunnelManager
     private static bool ContainsSequence(ReadOnlySpan<byte> value, ReadOnlySpan<byte> sequence) =>
         value.IndexOf(sequence) >= 0;
 
-    private static Task RunPowerShellAsync(
+    private static async Task RunPowerShellAsync(
         string command,
         CancellationToken cancellationToken)
     {
         var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
-        return RunProcessAsync(
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.System),
-                "WindowsPowerShell",
-                "v1.0",
-                "powershell.exe"),
-            ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-            TimeSpan.FromSeconds(20),
-            cancellationToken,
-            allowFailure: false);
+        var executable = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe");
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await RunProcessAsync(
+                    executable,
+                    ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                    attempt == 0 ? TimeSpan.FromSeconds(20) : TimeSpan.FromSeconds(40),
+                    cancellationToken,
+                    allowFailure: false).ConfigureAwait(false);
+                return;
+            }
+            catch (TimeoutException) when (attempt == 0)
+            {
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
+
+    private static void FlushDnsResolverCache()
+    {
+        if (!DnsFlushResolverCache())
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "Windows could not flush the DNS resolver cache.");
+        }
+    }
+
+    [DllImport("dnsapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DnsFlushResolverCache();
 
     private static async Task RunProcessAsync(
         string fileName,
