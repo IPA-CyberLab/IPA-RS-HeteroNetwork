@@ -35,6 +35,7 @@ for policy in policies:
 (dest / 'placement-policy.yaml').write_text(yaml.safe_dump_all(policies,sort_keys=False))
 
 standard=json.loads((Path(__file__).parent/'standard-nodes.json').read_text())
+edge_nodes=json.loads((Path(__file__).parent/'edge-nodes.json').read_text())
 standard_dest=ROOT/'deploy/gitops/standard-nodes'
 standard_dest.mkdir(exist_ok=True)
 standard_resources=[]
@@ -42,7 +43,7 @@ for name in standard:
     standard_resources.append({'apiVersion':'v1','kind':'Node','metadata':{'name':name,
         'labels':{'kubernetes.io/hostname':name,'node-role.kubernetes.io/control-plane':'',
                   'heteronetwork.io/control-plane-only':'false','networking.heteronetwork.io/public-ingress':'true',
-                  'database.heteronetwork.io/proxy-ready':'true'},
+                  'database.heteronetwork.io/proxy-ready':'true','monitoring.heteronetwork.io/ha':'true'},
         'annotations':{'networking.heteronetwork.io/public-ingress-enabled':'true',
                        'argocd.argoproj.io/sync-options':'Prune=false,Delete=false','argocd.argoproj.io/sync-wave':'0'}},
         'spec':{'unschedulable':False}})
@@ -52,4 +53,10 @@ for name in standard:
         'spec':{'name':name,'allowScheduling':True,'disks':{'iac-default-disk':{
             'path':'/var/lib/longhorn','diskType':'filesystem','allowScheduling':True,
             'evictionRequested':False,'storageReserved':68719476736,'tags':[]}}}})
+for edge in ('bootstrap', 'enrollment_issuer'):
+    name=edge_nodes[edge]['name']
+    standard_resources.append({'apiVersion':'v1','kind':'Node','metadata':{'name':name,
+        'labels':{'monitoring.heteronetwork.io/ha':'true'},
+        'annotations':{'argocd.argoproj.io/sync-options':'Prune=false,Delete=false',
+                       'argocd.argoproj.io/sync-wave':'0'}}})
 (standard_dest/'nodes.yaml').write_text(yaml.safe_dump_all(standard_resources,sort_keys=False))
