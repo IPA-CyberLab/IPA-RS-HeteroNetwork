@@ -362,13 +362,16 @@
           - inventory_hostname == 'ichikawap1'
           - vpn_ip == '10.250.0.10'
 
-    - name: Create the protected proxy-client recovery directory
+    - name: Create the protected proxy-client directories
       ansible.builtin.file:
-        path: "{{ hnn_database_proxy_recovery }}"
+        path: "{{ item }}"
         state: directory
         owner: root
         group: root
         mode: '0700'
+      loop:
+        - "{{ hnn_database_proxy_recovery }}"
+        - /var/backups/heteronetwork/iac-standard
 
     - name: Install the reviewed proxy-client recovery helpers
       ansible.builtin.copy:
