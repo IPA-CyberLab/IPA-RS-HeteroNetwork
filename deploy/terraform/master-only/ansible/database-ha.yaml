@@ -6,18 +6,30 @@
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
   tasks:
-    - name: Require the protected manifest to declare the recovered topology
+    - name: Inspect the protected database recovery authority without exposing it
       ansible.builtin.shell: |
         set -euo pipefail
         bundle=/etc/heteronetwork/postgres-autopilot/bundle
-        set -a
-        source "$bundle/manifest.env"
-        set +a
-        python3 - <<'PY'
-        import os
+        archive=/etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+        python3 - "$bundle" "$archive" <<'PY'
+        from pathlib import Path
+        import sys
+        import tarfile
 
-        def mapping(name):
-            value = os.environ.get(name, "")
+        bundle = Path(sys.argv[1])
+        archive = Path(sys.argv[2])
+
+        def manifest(raw):
+            values = {}
+            for line in raw.decode("utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if not separator or not key or key in values:
+                    raise ValueError("invalid manifest")
+                values[key] = value
+            return values
+
+        def mapping(values, name):
+            value = values.get(name, "")
             rows = value.split(",") if value else []
             result = {}
             for row in rows:
@@ -27,44 +39,50 @@
                 result[key] = address
             return result
 
-        if mapping("HETERONETWORK_DB_MEMBERS") != {
+        expanded_raw = (bundle / "manifest.env").read_bytes()
+        expanded = manifest(expanded_raw)
+        with tarfile.open(archive, "r:gz") as source:
+            member = source.getmember("./manifest.env")
+            extracted = source.extractfile(member)
+            if extracted is None:
+                raise ValueError("archive manifest missing")
+            archived_raw = extracted.read()
+        archived = manifest(archived_raw)
+
+        expected_members = {
             "db-b": "100.96.127.54",
             "db-e": "100.111.33.52",
-        }:
-            raise SystemExit(1)
-        if mapping("HETERONETWORK_DB_DCS_MEMBERS") != {
+        }
+        expected_dcs = {
             "db-b": "100.96.127.54",
             "db-e": "100.111.33.52",
             "db-g": "100.94.130.38",
-        }:
-            raise SystemExit(1)
-        if mapping("HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") != mapping(
-            "HETERONETWORK_DB_DCS_MEMBERS"
-        ):
-            raise SystemExit(1)
-        if set(mapping("HETERONETWORK_DB_MEMBER_IDENTITIES")) != {"db-b", "db-e"}:
-            raise SystemExit(1)
+        }
+        flags = {
+            "expanded_members": mapping(expanded, "HETERONETWORK_DB_MEMBERS") == expected_members,
+            "expanded_dcs": mapping(expanded, "HETERONETWORK_DB_DCS_MEMBERS") == expected_dcs,
+            "expanded_bootstrap": mapping(expanded, "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") == expected_dcs,
+            "expanded_identities": set(mapping(expanded, "HETERONETWORK_DB_MEMBER_IDENTITIES")) == set(expected_members),
+            "archived_members": mapping(archived, "HETERONETWORK_DB_MEMBERS") == expected_members,
+            "archived_dcs": mapping(archived, "HETERONETWORK_DB_DCS_MEMBERS") == expected_dcs,
+            "archived_bootstrap": mapping(archived, "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") == expected_dcs,
+            "archived_identities": set(mapping(archived, "HETERONETWORK_DB_MEMBER_IDENTITIES")) == set(expected_members),
+            "archive_equal": archived_raw == expanded_raw,
+        }
+        print(",".join(f"{name}={'true' if value else 'false'}" for name, value in flags.items()))
         PY
       args:
         executable: /bin/bash
+      register: hnn_database_recovery_audit
       changed_when: false
       check_mode: false
       no_log: true
 
-    - name: Require the archived manifest to match the expanded recovery authority
-      ansible.builtin.shell: |
-        set -euo pipefail
-        bundle=/etc/heteronetwork/postgres-autopilot/bundle
-        archive=/etc/heteronetwork/postgres-autopilot/bundle.tar.gz
-        archived="$(mktemp /tmp/heteronetwork-db-manifest.XXXXXX)"
-        trap 'shred -u "$archived" 2>/dev/null || rm -f "$archived"' EXIT
-        tar -xOzf "$archive" ./manifest.env > "$archived"
-        cmp "$archived" "$bundle/manifest.env"
-      args:
-        executable: /bin/bash
-      changed_when: false
-      check_mode: false
-      no_log: true
+    - name: "Require the protected recovery authority ({{ hnn_database_recovery_audit.stdout }})"
+      ansible.builtin.assert:
+        that:
+          - "'false' not in hnn_database_recovery_audit.stdout"
+        fail_msg: Protected database recovery authority does not match the declared topology
 
 - name: Maintain the recovered PostgreSQL HA topology
   hosts: postgres_members:postgres_dcs_only
