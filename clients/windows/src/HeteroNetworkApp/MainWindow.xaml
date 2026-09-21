@@ -200,6 +200,11 @@
                         Click="Connection_Click"
                         Margin="0,0,10,8" />
                 <Button Style="{StaticResource SecondaryButton}"
+                        Content="Disconnect"
+                        Click="Disconnect_Click"
+                        Visibility="{Binding RequiresReconnect, Converter={StaticResource BooleanToVisibilityConverter}}"
+                        Margin="0,0,10,8" />
+                <Button Style="{StaticResource SecondaryButton}"
                         Content="Refresh"
                         Click="Refresh_Click"
                         IsEnabled="{Binding CanRefresh}"
@@ -214,6 +219,22 @@
                          Foreground="{StaticResource MutedInkBrush}"
                          FontSize="12"
                          Text="Windows will ask for administrator approval when the tunnel configuration changes." />
+            </StackPanel>
+          </Border>
+
+          <Border Style="{StaticResource CardStyle}"
+                  Margin="0,0,0,16"
+                  Background="#FFF9E8"
+                  BorderBrush="#F5D77A"
+                  Visibility="{Binding RequiresReconnect, Converter={StaticResource BooleanToVisibilityConverter}}">
+            <StackPanel>
+              <TextBlock Text="Gateway change ready"
+                         FontWeight="SemiBold"
+                         FontSize="15" />
+              <TextBlock Margin="0,5,0,0"
+                         Foreground="#725A13"
+                         Text="{Binding ReconnectNotice}"
+                         TextWrapping="Wrap" />
             </StackPanel>
           </Border>
 

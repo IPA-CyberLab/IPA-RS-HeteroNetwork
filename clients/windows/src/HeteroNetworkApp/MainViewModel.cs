@@ -31,6 +31,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private string registrationRequest = string.Empty;
     private string importInput = string.Empty;
     private string? lastError;
+    private string? pendingGatewayNodeId;
     private int consecutiveProbeFailures;
     private DateTimeOffset profileActivatedAt = DateTimeOffset.MinValue;
     private bool disposed;
@@ -68,6 +69,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string? LastError => lastError;
     public bool WireGuardMissing => !tunnelManager.IsWireGuardInstalled;
     public bool IsConnected => status == TunnelConnectionStatus.Connected;
+    public bool RequiresReconnect => IsConnected
+        && !string.IsNullOrWhiteSpace(pendingGatewayNodeId);
+    public string ReconnectNotice => RequiresReconnect
+        ? "The active gateway stopped responding. Select Reconnect to switch gateways. Windows will ask for administrator approval once."
+        : string.Empty;
     public bool HasPendingRegistration => pendingRegistration is not null;
     public bool CanGenerateRegistration => !isBusy && session is null;
     public bool CanImport => !isBusy
@@ -98,7 +104,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string ClusterName => session?.Client.ClusterId ?? "-";
     public string ClientId => session?.Client.NodeId ?? "-";
     public string LastRefresh => session?.RefreshedAt.ToLocalTime().ToString("g") ?? "-";
-    public string ConnectionAction => IsConnected || IsTransitioning ? "Disconnect" : "Connect";
+    public string ConnectionAction => RequiresReconnect
+        ? "Reconnect"
+        : IsConnected || IsTransitioning ? "Disconnect" : "Connect";
     public string CurrentReleaseTag => AppReleaseIdentity.CurrentTag;
     public string UpdateStatusDisplay => updateStatusDisplay;
     public bool IsUpdateReady => preparedUpdate is not null;
@@ -208,12 +216,32 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         await RunBusyAsync(async () =>
         {
             var cached = session;
+            var previousGateway = cached.SelectedGatewayNodeId;
+            var stagedGateway = pendingGatewayNodeId;
+            if (stagedGateway is not null)
+            {
+                cached.SelectedGatewayNodeId = stagedGateway;
+            }
+
             _ = TunnelProfile.FromSession(cached, PreferredGatewayIndex(cached));
             sessionStore.Save(cached);
-            status = TunnelConnectionStatus.Connecting;
+            status = stagedGateway is not null && status == TunnelConnectionStatus.Connected
+                ? TunnelConnectionStatus.Reconnecting
+                : TunnelConnectionStatus.Connecting;
             RaiseState();
-            await tunnelManager.ConnectAsync().ConfigureAwait(true);
+            try
+            {
+                await tunnelManager.ConnectAsync().ConfigureAwait(true);
+            }
+            catch
+            {
+                cached.SelectedGatewayNodeId = previousGateway;
+                sessionStore.Save(cached);
+                throw;
+            }
+
             status = tunnelManager.GetStatus();
+            pendingGatewayNodeId = null;
             profileActivatedAt = DateTimeOffset.UtcNow;
             consecutiveProbeFailures = 0;
             try
@@ -256,6 +284,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             status = tunnelManager.GetStatus();
             consecutiveProbeFailures = 0;
             failedGateways.Clear();
+            pendingGatewayNodeId = null;
             RaiseState();
         });
         TryActivatePreparedUpdate();
@@ -355,9 +384,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             }
 
             _ = TunnelProfile.FromSession(session, PreferredGatewayIndex(session));
-            await ApplyPreferredGatewayAsync(
+            StagePreferredGateway(
                 session,
-                status == TunnelConnectionStatus.Connected).ConfigureAwait(true);
+                status == TunnelConnectionStatus.Connected);
             sessionStore.Save(session);
             RaiseState();
         });
@@ -386,6 +415,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             ImportInput = string.Empty;
             status = tunnelManager.GetStatus();
             failedGateways.Clear();
+            pendingGatewayNodeId = null;
             consecutiveProbeFailures = 0;
             RaiseState();
         });
@@ -539,6 +569,24 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     private async Task RefreshConnectedSessionAsync(ClientSession current)
     {
+        if (pendingGatewayNodeId is not null)
+        {
+            var selectedGateway = current.SelectedGatewayNodeId;
+            try
+            {
+                session = await controlPlane.RefreshAsync(current).ConfigureAwait(true);
+                session.SelectedGatewayNodeId = selectedGateway;
+            }
+            catch (ControlPlaneException)
+            {
+                session = current;
+            }
+
+            sessionStore.Save(session);
+            RaiseState();
+            return;
+        }
+
         var activeGateway = current.SelectedGatewayNodeId
             ?? current.PeerMap.Peers.FirstOrDefault()?.NodeId;
         if (activeGateway is null)
@@ -580,14 +628,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             session = current;
         }
 
-        await ApplyPreferredGatewayAsync(session, true).ConfigureAwait(true);
+        StagePreferredGateway(session, true);
         sessionStore.Save(session);
         RaiseState();
     }
 
-    private async Task ApplyPreferredGatewayAsync(
+    private void StagePreferredGateway(
         ClientSession current,
-        bool reconnectIfChanged)
+        bool stageReconnectIfChanged)
     {
         var now = DateTimeOffset.UtcNow;
         foreach (var expired in failedGateways
@@ -601,20 +649,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         var previous = current.SelectedGatewayNodeId;
         var preferredIndex = PreferredGatewayIndex(current);
         var preferred = TunnelProfile.FromSession(current, preferredIndex);
-        current.SelectedGatewayNodeId = preferred.GatewayNodeId;
-        if (reconnectIfChanged
+        if (stageReconnectIfChanged
             && previous is not null
             && preferred.GatewayNodeId != previous
             && status == TunnelConnectionStatus.Connected)
         {
-            sessionStore.Save(current);
-            status = TunnelConnectionStatus.Reconnecting;
-            RaiseState();
-            await tunnelManager.ConnectAsync().ConfigureAwait(true);
-            status = tunnelManager.GetStatus();
-            profileActivatedAt = DateTimeOffset.UtcNow;
+            // Timer callbacks must never invoke the elevated tunnel helper. Stage the
+            // healthier gateway and let the user approve one configuration change.
+            pendingGatewayNodeId = preferred.GatewayNodeId;
             consecutiveProbeFailures = 0;
+            RaiseState();
+            return;
         }
+
+        current.SelectedGatewayNodeId = preferred.GatewayNodeId;
     }
 
     private int PreferredGatewayIndex(ClientSession current)
@@ -693,6 +741,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         OnPropertyChanged(nameof(ImportInput));
         OnPropertyChanged(nameof(WireGuardMissing));
         OnPropertyChanged(nameof(IsConnected));
+        OnPropertyChanged(nameof(RequiresReconnect));
+        OnPropertyChanged(nameof(ReconnectNotice));
         OnPropertyChanged(nameof(StatusDisplay));
         OnPropertyChanged(nameof(StatusBrush));
         OnPropertyChanged(nameof(ConnectionAction));

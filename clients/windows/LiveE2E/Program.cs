@@ -18,7 +18,7 @@ internal static class LiveE2E
         if (args.Length != 2 || string.IsNullOrWhiteSpace(args[1]))
         {
             throw new ArgumentException(
-                "Usage: HeteroNetwork.Windows.LiveE2E <prepare|import|remove> <path>");
+                "Usage: HeteroNetwork.Windows.LiveE2E <prepare|import|report|remove> <path>");
         }
 
         switch (args[0])
@@ -28,6 +28,9 @@ internal static class LiveE2E
                 return 0;
             case "import":
                 Import(Path.GetFullPath(args[1]));
+                return 0;
+            case "report":
+                Report(Path.GetFullPath(args[1]));
                 return 0;
             case "remove":
                 await RemoveAsync(Path.GetFullPath(args[1])).ConfigureAwait(false);
@@ -83,6 +86,13 @@ internal static class LiveE2E
         WriteReport(reportPath, session, "removed");
         sessionStore.Delete();
         new PendingClientRegistrationStore().Delete();
+    }
+
+    private static void Report(string reportPath)
+    {
+        var session = new ClientSessionStore().Load()
+            ?? throw new InvalidOperationException("No HeteroNetwork session is available.");
+        WriteReport(reportPath, session, "reported");
     }
 
     private static void WriteReport(string path, ClientSession session, string result)

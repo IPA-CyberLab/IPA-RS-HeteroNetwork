@@ -86,7 +86,8 @@ public partial class MainWindow : Window
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName is nameof(MainViewModel.StatusDisplay)
-            or nameof(MainViewModel.IsConnected))
+            or nameof(MainViewModel.IsConnected)
+            or nameof(MainViewModel.RequiresReconnect))
         {
             UpdateTrayState();
         }
@@ -95,7 +96,7 @@ public partial class MainWindow : Window
     private void UpdateTrayState()
     {
         trayIcon.Text = $"HeteroNetwork — {viewModel.StatusDisplay}";
-        connectionMenuItem.Text = viewModel.IsConnected ? "Disconnect" : "Connect";
+        connectionMenuItem.Text = viewModel.ConnectionAction;
         connectionMenuItem.Enabled = viewModel.IsConfigured && !viewModel.IsBusy;
     }
 
@@ -127,9 +128,16 @@ public partial class MainWindow : Window
     private async void Connection_Click(object sender, RoutedEventArgs e) =>
         await ToggleConnectionAsync();
 
+    private async void Disconnect_Click(object sender, RoutedEventArgs e) =>
+        await viewModel.DisconnectAsync();
+
     private async Task ToggleConnectionAsync()
     {
-        if (viewModel.IsConnected)
+        if (viewModel.RequiresReconnect)
+        {
+            await viewModel.ConnectAsync();
+        }
+        else if (viewModel.IsConnected)
         {
             await viewModel.DisconnectAsync();
         }

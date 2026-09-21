@@ -245,6 +245,72 @@ jobs:
             -LiteralPath (Join-Path $env:E2E_ROOT "result.json") `
             -Encoding utf8NoBOM
 
+      - name: Verify idle failover never reconfigures the VPN
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $driver = "clients/windows/LiveE2E/HeteroNetwork.Windows.LiveE2E.csproj"
+          $importReportPath = Join-Path $env:E2E_ROOT "import.txt.report.json"
+          $importReport = Get-Content -LiteralPath $importReportPath -Raw | ConvertFrom-Json
+          if (@($importReport.gateways).Count -lt 2) {
+            throw "Idle failover E2E requires at least two gateways."
+          }
+          $gateway = @($importReport.gateways | Where-Object {
+            $_.node_id -eq $importReport.selected_gateway_node_id
+          })[0]
+          if (-not $gateway) { throw "The active gateway is missing from the profile." }
+
+          $ruleName = "HeteroNetwork E2E block active gateway $env:GITHUB_RUN_ID"
+          $target = Join-Path $env:LOCALAPPDATA "Programs\HeteroNetwork"
+          $executable = Join-Path $target "HeteroNetwork.exe"
+          $serviceFilter = "Name='WireGuardTunnel`$HeteroNetwork'"
+          $serviceBefore = Get-CimInstance Win32_Service -Filter $serviceFilter
+          if (-not $serviceBefore -or $serviceBefore.State -ne 'Running') {
+            throw "The tunnel service was not running before idle failover E2E."
+          }
+          $app = $null
+          try {
+            New-NetFirewallRule `
+              -DisplayName $ruleName `
+              -Direction Outbound `
+              -Action Block `
+              -RemoteAddress $gateway.vpn_ip `
+              -Profile Any | Out-Null
+            $app = Start-Process `
+              -FilePath $executable `
+              -WorkingDirectory $target `
+              -PassThru
+            Start-Sleep -Seconds 30
+
+            $afterReportPath = Join-Path $env:E2E_ROOT "idle-failover-session.json"
+            dotnet run --project $driver --configuration Release -- report $afterReportPath
+            if ($LASTEXITCODE -ne 0) { throw "Could not inspect the session after idle failover." }
+            $afterReport = Get-Content -LiteralPath $afterReportPath -Raw | ConvertFrom-Json
+            if ($afterReport.selected_gateway_node_id -ne $importReport.selected_gateway_node_id) {
+              throw "The background health timer changed the VPN profile without user approval."
+            }
+            $serviceAfter = Get-CimInstance Win32_Service -Filter $serviceFilter
+            if (-not $serviceAfter `
+                -or $serviceAfter.State -ne 'Running' `
+                -or $serviceAfter.ProcessId -ne $serviceBefore.ProcessId) {
+              throw "The background health timer restarted the VPN service."
+            }
+            [pscustomobject]@{
+              result = 'passed'
+              blocked_gateway = $gateway.vpn_ip
+              observation_seconds = 30
+              service_process_unchanged = $true
+              selected_gateway_unchanged = $true
+            } | ConvertTo-Json -Compress | Set-Content `
+              -LiteralPath (Join-Path $env:E2E_ROOT "idle-failover-result.json") `
+              -Encoding utf8NoBOM
+          } finally {
+            if ($app -and -not $app.HasExited) {
+              Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+            }
+            Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+          }
+
       - name: Publish sanitized Windows VPN result
         if: always()
         shell: pwsh
@@ -255,6 +321,15 @@ jobs:
               -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
             '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
             Get-Content -LiteralPath $report | Out-File `
+              -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+          $idleReport = Join-Path $env:E2E_ROOT "idle-failover-result.json"
+          if (Test-Path -LiteralPath $idleReport -PathType Leaf) {
+            "### Windows idle failover E2E" | Out-File `
+              -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            Get-Content -LiteralPath $idleReport | Out-File `
               -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
             '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           }
