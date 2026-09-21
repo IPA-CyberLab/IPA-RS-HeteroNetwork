@@ -32,7 +32,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/git-source.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/database-ha.yaml" && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -62,6 +62,18 @@ locals {
         }
         standard = {
           hosts = { for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host }) }
+        }
+        postgres_members = {
+          hosts = {
+            for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host })
+            if try(node.postgres_role, "") == "member"
+          }
+        }
+        postgres_dcs_only = {
+          hosts = {
+            for name, node in local.nodes : name => merge(node, { ansible_host = node.ssh_host })
+            if try(node.postgres_role, "") == "dcs-only"
+          }
         }
         enrollment_issuer = {
           hosts = {
@@ -307,6 +319,43 @@ resource "terraform_data" "standard_host_configuration" {
     }
   }
   depends_on = [local_file.inventory, local_file.known_hosts]
+}
+
+resource "terraform_data" "database_ha_configuration" {
+  input = {
+    members = {
+      for name, node in local.standard_nodes : name => {
+        postgres_name = node.postgres_name
+        address       = node.tailscale_ip
+      } if try(node.postgres_role, "") == "member"
+    }
+    dcs_only = {
+      for name, node in local.nodes : name => {
+        postgres_name = node.postgres_name
+        address       = node.tailscale_ip
+      } if try(node.postgres_role, "") == "dcs-only"
+    }
+    protected_bundle_source = "uc-k8sp5"
+  }
+  triggers_replace = [
+    filesha256("${path.module}/ansible/database-ha.yaml"),
+    filesha256("${local.repo_root}/scripts/postgres-ha-node.sh"),
+    sha256(jsonencode(local.nodes)),
+    sha256(jsonencode(local.standard_nodes))
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/database-ha.yaml"
+    environment = {
+      HNN_IAC_INVENTORY        = local_file.inventory.filename
+      ANSIBLE_CALLBACK_PLUGINS = "${abspath(path.module)}/ansible/callback_plugins"
+      ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
+    }
+  }
+  depends_on = [
+    terraform_data.host_configuration,
+    terraform_data.standard_host_configuration
+  ]
 }
 
 resource "terraform_data" "gpu_host_configuration" {

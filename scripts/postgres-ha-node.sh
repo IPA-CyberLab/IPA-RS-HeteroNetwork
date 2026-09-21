@@ -72,6 +72,7 @@ Commands:
   init-bundle OUTPUT_DIR  Create an offline CA, per-node certificates, and cluster secrets
   extend-bundle DIR       Add certificates and update metadata in an existing private bundle
   install-node            Install this PostgreSQL/Patroni member and optional DCS voter
+  install-dcs-only        Install only this node's etcd DCS voter
   reconfigure-node        Apply a new member map without replacing PostgreSQL data
   reconcile-dcs           Add or promote at most one DCS learner
   current-dcs-members     Print the actual DCS membership as name=underlay-ip
@@ -1298,19 +1299,8 @@ install_patroni() {
 }
 
 install_pki_and_secrets() {
-  validate_client_ca_parent
-  local node_bundle="${bundle_dir}/nodes/${node_name}"
-  ensure_private_source_file "$node_bundle/node.key"
-  [[ -f "$node_bundle/node.crt" && ! -L "$node_bundle/node.crt" ]] \
-    || die "node certificate is missing: $node_bundle/node.crt"
-  [[ -f "$node_bundle/ca.crt" && ! -L "$node_bundle/ca.crt" ]] \
-    || die "CA certificate is missing: $node_bundle/ca.crt"
-  openssl verify -CAfile "$node_bundle/ca.crt" "$node_bundle/node.crt" >/dev/null
-
-  install -o root -g heteronetwork-db-ha -m 0644 "$node_bundle/ca.crt" "$state_dir/pki/ca.crt"
-  install -o root -g root -m 0644 "$node_bundle/ca.crt" "$client_ca_path"
-  install -o root -g heteronetwork-db-ha -m 0644 "$node_bundle/node.crt" "$state_dir/pki/node.crt"
-  install -o root -g heteronetwork-db-ha -m 0640 "$node_bundle/node.key" "$state_dir/pki/node.key"
+  install_dcs_pki
+  install -o root -g root -m 0644 "$bundle_dir/ca/ca.crt" "$client_ca_path"
 
   local secret
   for secret in "${BUNDLE_SECRET_NAMES[@]}"; do
@@ -1323,6 +1313,21 @@ install_pki_and_secrets() {
         "$bundle_dir/secrets/${secret}.password" "$state_dir/secrets/${secret}.password"
     fi
   done
+}
+
+install_dcs_pki() {
+  validate_client_ca_parent
+  local node_bundle="${bundle_dir}/nodes/${node_name}"
+  ensure_private_source_file "$node_bundle/node.key"
+  [[ -f "$node_bundle/node.crt" && ! -L "$node_bundle/node.crt" ]] \
+    || die "node certificate is missing: $node_bundle/node.crt"
+  [[ -f "$node_bundle/ca.crt" && ! -L "$node_bundle/ca.crt" ]] \
+    || die "CA certificate is missing: $node_bundle/ca.crt"
+  openssl verify -CAfile "$node_bundle/ca.crt" "$node_bundle/node.crt" >/dev/null
+
+  install -o root -g heteronetwork-db-ha -m 0644 "$node_bundle/ca.crt" "$state_dir/pki/ca.crt"
+  install -o root -g heteronetwork-db-ha -m 0644 "$node_bundle/node.crt" "$state_dir/pki/node.crt"
+  install -o root -g heteronetwork-db-ha -m 0640 "$node_bundle/node.key" "$state_dir/pki/node.key"
 }
 
 render_bootstrap_script() {
@@ -1475,6 +1480,41 @@ install_node() {
   fi
   systemctl enable --now heteronetwork-db.service
   systemctl enable --now heteronetwork-db-proxy.service
+}
+
+install_dcs_only() {
+  require_root
+  validate_node_config
+  node_is_dcs_member \
+    || die "$node_name=$node_address is not a requested DCS voter"
+  verify_interface_address
+  verify_member_routes
+  require_command curl
+  require_command dpkg
+  require_command install
+  require_command openssl
+  require_command systemctl
+  require_command tar
+
+  getent group heteronetwork-db-ha >/dev/null \
+    || groupadd --system heteronetwork-db-ha
+  id -u heteronetwork-dcs >/dev/null 2>&1 \
+    || useradd --system --home "$dcs_data_dir" --shell /usr/sbin/nologin \
+      --gid heteronetwork-db-ha heteronetwork-dcs
+  usermod --home "$dcs_data_dir" heteronetwork-dcs
+
+  install -d -o root -g root -m 0755 /opt/heteronetwork/postgres-ha
+  install -d -o root -g heteronetwork-db-ha -m 0750 "$state_dir" "$state_dir/pki"
+  install -d -o heteronetwork-dcs -g heteronetwork-db-ha -m 0700 "$dcs_data_dir"
+  install_etcd
+  install_dcs_pki
+  render_etcd_config \
+    | install -o root -g heteronetwork-db-ha -m 0640 /dev/stdin "$state_dir/etcd.yml"
+  render_dcs_service \
+    | install -o root -g root -m 0644 /dev/stdin \
+      /etc/systemd/system/heteronetwork-db-dcs.service
+  systemctl daemon-reload
+  systemctl enable --now heteronetwork-db-dcs.service
 }
 
 install_proxy() {
@@ -2524,6 +2564,9 @@ case "${1:-}" in
     ;;
   install-node)
     install_node
+    ;;
+  install-dcs-only)
+    install_dcs_only
     ;;
   reconfigure-node)
     reconfigure_node

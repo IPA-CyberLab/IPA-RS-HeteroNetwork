@@ -1,0 +1,197 @@
+- name: Maintain the recovered PostgreSQL HA topology
+  hosts: postgres_members:postgres_dcs_only
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    hnn_database_state: /var/backups/heteronetwork/iac-database-ha
+    hnn_database_bundle: /etc/heteronetwork/postgres-autopilot/bundle
+  tasks:
+    - name: Create protected database reconciliation directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      loop:
+        - "{{ hnn_database_state }}"
+        - "{{ hnn_database_state }}/dcs-bundle"
+        - "{{ hnn_database_state }}/dcs-bundle/ca"
+        - "{{ hnn_database_state }}/dcs-bundle/nodes"
+        - "{{ hnn_database_state }}/dcs-bundle/nodes/{{ postgres_name }}"
+
+    - name: Install the versioned PostgreSQL HA helper
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/postgres-ha-node.sh"
+        dest: /opt/heteronetwork/libexec/postgres-ha-node.sh
+        owner: root
+        group: root
+        mode: '0755'
+      register: hnn_database_helper
+
+    - name: Inspect PostgreSQL member service state
+      ansible.builtin.stat:
+        path: /etc/systemd/system/heteronetwork-db.service
+      register: hnn_database_member_unit
+
+    - name: Inspect DCS voter service state
+      ansible.builtin.stat:
+        path: /etc/systemd/system/heteronetwork-db-dcs.service
+      register: hnn_database_dcs_unit
+
+    - name: Read the protected member bundle from the recovery authority
+      ansible.builtin.slurp:
+        src: /etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+      delegate_to: uc-k8sp5
+      register: hnn_database_member_bundle_source
+      no_log: true
+      check_mode: false
+      when: postgres_role == 'member'
+
+    - name: Transfer the protected member bundle
+      ansible.builtin.copy:
+        content: "{{ hnn_database_member_bundle_source.content | b64decode }}"
+        dest: "{{ hnn_database_state }}/bundle.tar.gz"
+        owner: root
+        group: root
+        mode: '0600'
+      register: hnn_database_member_bundle
+      no_log: true
+      when: postgres_role == 'member'
+
+    - name: Create the full member bundle directory
+      ansible.builtin.file:
+        path: "{{ hnn_database_bundle }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: postgres_role == 'member'
+
+    - name: Expand the reviewed member bundle
+      ansible.builtin.unarchive:
+        src: "{{ hnn_database_state }}/bundle.tar.gz"
+        dest: "{{ hnn_database_bundle }}"
+        remote_src: true
+        owner: root
+        group: root
+      no_log: true
+      when:
+        - postgres_role == 'member'
+        - not ansible_check_mode
+        - hnn_database_member_bundle.changed or not hnn_database_member_unit.stat.exists
+
+    - name: Remove an obsolete client-only bundle marker
+      ansible.builtin.file:
+        path: "{{ hnn_database_bundle }}/.proxy-only"
+        state: absent
+      when: postgres_role == 'member'
+
+    - name: Select DCS credentials needed by this voter
+      ansible.builtin.set_fact:
+        hnn_database_dcs_files:
+          - {src: manifest.env, mode: '0600'}
+          - {src: ca/ca.crt, mode: '0644'}
+          - {src: "nodes/{{ postgres_name }}/ca.crt", mode: '0644'}
+          - {src: "nodes/{{ postgres_name }}/node.crt", mode: '0644'}
+          - {src: "nodes/{{ postgres_name }}/node.key", mode: '0600'}
+      when: postgres_role == 'dcs-only'
+
+    - name: Read protected DCS credentials from the recovery authority
+      ansible.builtin.slurp:
+        src: "/etc/heteronetwork/postgres-autopilot/bundle/{{ item.src }}"
+      loop: "{{ hnn_database_dcs_files | default([]) }}"
+      delegate_to: uc-k8sp5
+      register: hnn_database_dcs_source
+      no_log: true
+      check_mode: false
+      when: postgres_role == 'dcs-only'
+
+    - name: Transfer only this voter's protected DCS credentials
+      ansible.builtin.copy:
+        content: "{{ item.content | b64decode }}"
+        dest: "{{ hnn_database_state }}/dcs-bundle/{{ item.item.src }}"
+        owner: root
+        group: root
+        mode: "{{ item.item.mode }}"
+      loop: "{{ hnn_database_dcs_source.results | default([]) }}"
+      register: hnn_database_dcs_bundle
+      no_log: true
+      when: postgres_role == 'dcs-only'
+
+    - name: Reconcile the declared PostgreSQL or DCS role
+      ansible.builtin.shell: |
+        set -a
+        if [[ "{{ postgres_role }}" == member ]]; then
+          source "{{ hnn_database_bundle }}/manifest.env"
+          export HETERONETWORK_DB_BUNDLE_DIR="{{ hnn_database_bundle }}"
+          export HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS="{{ vpn_ip }}"
+          export HETERONETWORK_DB_PROXY_LISTEN_ADDRESS="{{ vpn_ip }}"
+        else
+          source "{{ hnn_database_state }}/dcs-bundle/manifest.env"
+          export HETERONETWORK_DB_BUNDLE_DIR="{{ hnn_database_state }}/dcs-bundle"
+        fi
+        set +a
+        export HETERONETWORK_DB_NODE_NAME="{{ postgres_name }}"
+        export HETERONETWORK_DB_NODE_ADDRESS="{{ tailscale_ip }}"
+        export HETERONETWORK_DB_INTERFACE=tailscale0
+        export HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=existing
+        if [[ "{{ postgres_role }}" == member ]]; then
+          /opt/heteronetwork/libexec/postgres-ha-node.sh reconfigure-node
+        else
+          /opt/heteronetwork/libexec/postgres-ha-node.sh install-dcs-only
+        fi
+      args:
+        executable: /bin/bash
+      register: hnn_database_reconcile
+      changed_when: true
+      no_log: true
+      when: >-
+        not ansible_check_mode and (
+          hnn_database_helper.changed or
+          (postgres_role == 'member' and (
+            hnn_database_member_bundle.changed or
+            not hnn_database_member_unit.stat.exists
+          )) or
+          (postgres_role == 'dcs-only' and (
+            hnn_database_dcs_bundle.results | default([]) |
+            selectattr('changed') | list | length > 0 or
+            not hnn_database_dcs_unit.stat.exists
+          ))
+        )
+
+    - name: Restart a reconfigured DCS voter one at a time
+      ansible.builtin.systemd_service:
+        name: heteronetwork-db-dcs.service
+        state: restarted
+        enabled: true
+        daemon_reload: true
+      when: hnn_database_reconcile.changed | default(false)
+
+    - name: Require the declared DCS voter to be healthy
+      ansible.builtin.command:
+        argv:
+          - /opt/heteronetwork/postgres-ha/etcdctl
+          - "--endpoints=https://{{ tailscale_ip }}:12379"
+          - --dial-timeout=3s
+          - --command-timeout=10s
+          - --cacert=/etc/heteronetwork/postgres-ha/pki/ca.crt
+          - --cert=/etc/heteronetwork/postgres-ha/pki/node.crt
+          - --key=/etc/heteronetwork/postgres-ha/pki/node.key
+          - endpoint
+          - health
+      changed_when: false
+      check_mode: false
+
+    - name: Require the declared PostgreSQL member services
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - heteronetwork-db.service
+          - heteronetwork-db-proxy.service
+      changed_when: false
+      check_mode: false
+      when: postgres_role == 'member'

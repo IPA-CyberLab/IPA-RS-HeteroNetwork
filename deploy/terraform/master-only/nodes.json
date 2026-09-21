@@ -7,6 +7,9 @@
   "uc-k8sp2": {
     "ssh_host": "163.220.236.52",
     "vpn_ip": "10.250.0.5",
+    "tailscale_ip": "100.94.130.38",
+    "postgres_role": "dcs-only",
+    "postgres_name": "db-g",
     "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKtl6i9wPFRFl9rjKBmDlNR01+g0gesVkgPUw1/46w1d"
   },
   "uc-k8s3p": {

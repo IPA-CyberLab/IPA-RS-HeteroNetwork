@@ -1,7 +1,10 @@
 {
   "uc-k8sp4": {
     "ssh_host": "163.220.236.54",
+    "vpn_ip": "10.250.0.11",
     "tailscale_ip": "100.111.33.52",
+    "postgres_role": "member",
+    "postgres_name": "db-e",
     "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIpcThKJiGUIaAviR+fO2r3NIPh8XZhM0cmR8vqIpNwD"
   }
 }
