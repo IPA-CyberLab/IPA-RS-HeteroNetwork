@@ -85,13 +85,42 @@
       when:
         - not ansible_check_mode
         - hnn_console_control_plane_unit.stdout | trim == 'loaded'
-    - name: Activate the reconciled console binary
+    - name: Activate the reconciled console binary on directly reachable gateways
       ansible.builtin.systemd_service:
         name: heteronetwork-agent.service
         daemon_reload: true
         enabled: true
         state: restarted
-      when: not ansible_check_mode
+      when:
+        - not ansible_check_mode
+        - inventory_hostname not in groups['enrollment_issuer']
+    - name: Schedule Agent activation without severing the overlay-only SSH session
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-run
+          - --quiet
+          - --collect
+          - --unit=heteronetwork-agent-iac-activate
+          - --on-active=3s
+          - /usr/bin/systemctl
+          - restart
+          - heteronetwork-agent.service
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - inventory_hostname in groups['enrollment_issuer']
+    - name: Drop the overlay-only SSH connection before Agent activation
+      ansible.builtin.meta: reset_connection
+      when:
+        - not ansible_check_mode
+        - inventory_hostname in groups['enrollment_issuer']
+    - name: Reconnect after overlay-only Agent activation
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 90
+      when:
+        - not ansible_check_mode
+        - inventory_hostname in groups['enrollment_issuer']
     - name: Read the registered gateway address privately
       ansible.builtin.slurp:
         src: /var/lib/heteronetwork/agent.json
@@ -155,6 +184,18 @@
       notify: Restart console proxy
     - name: Apply the listener change before opening the compatibility port
       ansible.builtin.meta: flush_handlers
+    - name: Drop the overlay-only SSH connection after applying listener changes
+      ansible.builtin.meta: reset_connection
+      when:
+        - not ansible_check_mode
+        - inventory_hostname in groups['enrollment_issuer']
+    - name: Reconnect after applying overlay-only listener changes
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 90
+      when:
+        - not ansible_check_mode
+        - inventory_hostname in groups['enrollment_issuer']
     - name: Require promoted control planes to finish database startup
       ansible.builtin.uri:
         url: 'http://{{ hnn_console_ip }}:19088/healthz'
@@ -199,11 +240,27 @@
       delay: 2
       when: not ansible_check_mode
   handlers:
-    - name: Restart console Agent
+    - name: Restart console Agent directly
+      listen: Restart console Agent
       ansible.builtin.systemd_service:
         name: heteronetwork-agent.service
         daemon_reload: true
         state: restarted
+      when: inventory_hostname not in groups['enrollment_issuer']
+    - name: Schedule overlay-only console Agent restart
+      listen: Restart console Agent
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-run
+          - --quiet
+          - --collect
+          - --unit=heteronetwork-agent-iac-handler
+          - --on-active=3s
+          - /usr/bin/systemctl
+          - restart
+          - heteronetwork-agent.service
+      changed_when: true
+      when: inventory_hostname in groups['enrollment_issuer']
     - name: Restart console proxy
       ansible.builtin.systemd_service:
         name: heteronetwork-console-proxy.service
