@@ -28,7 +28,6 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       SOURCE_COMMIT: ${{ inputs.source_commit }}
-      DEPLOY_ROOT: ${{ runner.temp }}/heteronet-console-deploy
       ANSIBLE_STDOUT_CALLBACK: hnn_json
       ANSIBLE_CALLBACK_PLUGINS: ${{ github.workspace }}/deploy/terraform/master-only/ansible/callback_plugins
     steps:
@@ -44,6 +43,8 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9][A-Za-z0-9._-]{0,127}$ ]]
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           umask 077
+          DEPLOY_ROOT="$RUNNER_TEMP/heteronet-console-deploy"
+          printf 'DEPLOY_ROOT=%s\n' "$DEPLOY_ROOT" >> "$GITHUB_ENV"
           mkdir "$DEPLOY_ROOT"
           python3 -m venv "$DEPLOY_ROOT/venv"
           "$DEPLOY_ROOT/venv/bin/pip" install --disable-pip-version-check ansible-core==2.19.5
