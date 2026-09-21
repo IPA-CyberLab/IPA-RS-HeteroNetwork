@@ -324,8 +324,31 @@ def browser_check(work, gateway, gateways, output):
         capture_output=True, text=True, timeout=600, env=browser_environment(),
     )
     if result.returncode:
-        failure = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError("real client browser E2E failed: " + failure[-1000:])
+        diagnostic = None
+        if inner_output.is_file():
+            try:
+                browser_report = json.loads(inner_output.read_text())
+                diagnostic = {
+                    key: browser_report[key]
+                    for key in (
+                        "failure", "canonical", "canonical_request_failure",
+                        "canonical_diagnostic", "canonical_page",
+                        "no_proxy_diagnostic", "keycloak_failure", "gateways",
+                        "errors",
+                    )
+                    if key in browser_report
+                }
+                resolver_events = browser_report.get("chromium_resolver_events", [])
+                if resolver_events:
+                    diagnostic["resolver_events"] = resolver_events[-10:]
+            except (OSError, json.JSONDecodeError) as error:
+                diagnostic = {"report_error": str(error)[:300]}
+        if diagnostic is None:
+            output = result.stderr.strip() or result.stdout.strip()
+            diagnostic = {"process_output": output[:2000]}
+        raise RuntimeError(
+            "real client browser E2E failed: "
+            + json.dumps(diagnostic, separators=(",", ":"))[:6000])
     report = json.loads(inner_output.read_text())
     if report.get("result") != "passed" or report.get("canonical", {}).get("open_ms", 3001) > 3000:
         raise RuntimeError("real client browser E2E did not satisfy the 3-second gate")
