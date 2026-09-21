@@ -36,17 +36,37 @@
     if (shell) shell.remove();
   };
 
+  function hasSession() {
+    return sessionStorage.getItem("heteronetwork_access_token")
+      || sessionStorage.getItem("heteronetwork_operator_token");
+  }
+
+  function showPendingLogin() {
+    if (hasSession()) return;
+    var shell = document.getElementById("hn-login-bootstrap");
+    if (shell) shell.hidden = false;
+  }
+
+  // Render the small disabled login shell as soon as HTML and CSS are ready.
+  // Configuration enables the button; the full Cloudscape bundle can continue
+  // downloading without consuming the three-second first-render budget.
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", showPendingLogin, { once: true });
+  } else {
+    showPendingLogin();
+  }
+
   function prepareLogin(config) {
-    if (!config || !config.auth_enabled
-        || (config.local_agent && config.bootstrap_required)
-        || sessionStorage.getItem("heteronetwork_access_token")
-        || sessionStorage.getItem("heteronetwork_operator_token")
-        || (!config.login_endpoint
-          && !(config.device_login_endpoint && config.device_login_poll_endpoint))) {
-      return;
-    }
     var shell = document.getElementById("hn-login-bootstrap");
     var button = document.getElementById("hn-login-bootstrap-button");
+    if (!config || !config.auth_enabled
+        || (config.local_agent && config.bootstrap_required)
+        || hasSession()
+        || (!config.login_endpoint
+          && !(config.device_login_endpoint && config.device_login_poll_endpoint))) {
+      if (shell) shell.hidden = true;
+      return;
+    }
     if (!shell || !button) return;
 
     var provider = typeof config.provider === "string" && config.provider

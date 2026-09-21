@@ -220,6 +220,8 @@ async function installDelayedLoginBackend(page, options = {}) {
       return;
     }
     if (url.pathname === "/ui/config") {
+      options.configStarted?.resolve();
+      if (options.configGate) await options.configGate.promise;
       await route.fulfill({
         json: {
           auth_enabled: true,
@@ -263,6 +265,29 @@ test("login action works before the full Cloudscape bundle is available", async 
     await deviceStarted.promise;
     await popup.close();
   } finally {
+    appGate.release.resolve();
+  }
+});
+
+test("disabled login shell renders while configuration is still loading", async ({ page }) => {
+  const appGate = { started: deferred(), release: deferred() };
+  const configStarted = deferred();
+  const configGate = deferred();
+  await installDelayedLoginBackend(page, { appGate, configStarted, configGate });
+
+  try {
+    const openedAt = Date.now();
+    await page.goto("/ui/", { waitUntil: "domcontentloaded", timeout: 3_000 });
+    await Promise.all([appGate.started.promise, configStarted.promise]);
+    const earlyLogin = page.locator("#hn-login-bootstrap");
+    await expect(earlyLogin).toBeVisible({ timeout: Math.max(1, 3_000 - (Date.now() - openedAt)) });
+    await expect(earlyLogin.getByRole("button", { name: "Keycloakでログイン" })).toBeDisabled();
+    expect(Date.now() - openedAt).toBeLessThan(3_000);
+
+    configGate.resolve();
+    await expect(earlyLogin.getByRole("button", { name: "Keycloakでログイン" })).toBeEnabled();
+  } finally {
+    configGate.resolve();
     appGate.release.resolve();
   }
 });
