@@ -5,6 +5,7 @@
   serial: 1
   vars:
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
     hnn_database_state: /var/backups/heteronetwork/iac-database-ha
     hnn_database_bundle: /etc/heteronetwork/postgres-autopilot/bundle
   tasks:
