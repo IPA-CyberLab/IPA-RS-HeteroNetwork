@@ -6,15 +6,10 @@
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
   tasks:
-    - name: Require the archived and expanded manifests to match the recovered topology
+    - name: Require the protected manifest to declare the recovered topology
       ansible.builtin.shell: |
         set -euo pipefail
         bundle=/etc/heteronetwork/postgres-autopilot/bundle
-        archive=/etc/heteronetwork/postgres-autopilot/bundle.tar.gz
-        archived="$(mktemp /tmp/heteronetwork-db-manifest.XXXXXX)"
-        trap 'shred -u "$archived" 2>/dev/null || rm -f "$archived"' EXIT
-        tar -xOzf "$archive" ./manifest.env > "$archived"
-        cmp "$archived" "$bundle/manifest.env"
         set -a
         source "$bundle/manifest.env"
         set +a
@@ -50,6 +45,21 @@
         if set(mapping("HETERONETWORK_DB_MEMBER_IDENTITIES")) != {"db-b", "db-e"}:
             raise SystemExit(1)
         PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Require the archived manifest to match the expanded recovery authority
+      ansible.builtin.shell: |
+        set -euo pipefail
+        bundle=/etc/heteronetwork/postgres-autopilot/bundle
+        archive=/etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+        archived="$(mktemp /tmp/heteronetwork-db-manifest.XXXXXX)"
+        trap 'shred -u "$archived" 2>/dev/null || rm -f "$archived"' EXIT
+        tar -xOzf "$archive" ./manifest.env > "$archived"
+        cmp "$archived" "$bundle/manifest.env"
       args:
         executable: /bin/bash
       changed_when: false

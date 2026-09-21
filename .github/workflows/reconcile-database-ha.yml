@@ -84,13 +84,14 @@ jobs:
           import sys
           value = json.load(open(sys.argv[1], encoding="utf-8"))
           hosts = value.get("hosts", {})
+          errors = value.get("errors", [])
           print(json.dumps({
-              "result": "passed",
+              "result": "failed" if errors else "passed",
               "changed_hosts": sorted(name for name, stats in hosts.items() if stats.get("changed", 0)),
               "failed_hosts": sorted(name for name, stats in hosts.items()
                                      if stats.get("failures", 0) or stats.get("unreachable", 0)),
-              "errors": len(value.get("errors", [])),
-              "failure_tasks": sorted({error.get("task", "unknown") for error in value.get("errors", [])}),
+              "errors": len(errors),
+              "failure_tasks": sorted({error.get("task", "unknown") for error in errors}),
           }, separators=(",", ":")))
           PY
             fi
