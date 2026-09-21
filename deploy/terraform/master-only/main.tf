@@ -78,6 +78,9 @@ locals {
         enrollment_issuer = {
           hosts = {
             ichikawap1 = {
+              ssh_host                = local.enrollment_issuer.ssh_host
+              vpn_ip                  = local.enrollment_issuer.vpn_ip
+              ssh_host_key            = local.enrollment_issuer.ssh_host_key
               ansible_host            = local.enrollment_issuer.ssh_host
               ansible_ssh_common_args = "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -o 'ProxyCommand=ssh -i ${pathexpand(var.ssh_private_key_path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -W %h:%p mizuame@${local.bootstrap.ssh_host}'"
             }
@@ -95,6 +98,9 @@ locals {
             { for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host }) },
             {
               ichikawap1 = {
+                ssh_host                = local.enrollment_issuer.ssh_host
+                vpn_ip                  = local.enrollment_issuer.vpn_ip
+                ssh_host_key            = local.enrollment_issuer.ssh_host_key
                 ansible_host            = local.enrollment_issuer.ssh_host
                 ansible_ssh_common_args = "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -o 'ProxyCommand=ssh -i ${pathexpand(var.ssh_private_key_path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -W %h:%p mizuame@${local.bootstrap.ssh_host}'"
               }

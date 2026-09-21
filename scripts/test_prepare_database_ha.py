@@ -39,6 +39,8 @@ class DatabaseHaPreparationTests(unittest.TestCase):
         self.assertNotIn("name", groups["postgres_members"]["hosts"]["uc-k8sp5"])
         self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp4"]["postgres_name"], "db-e")
         self.assertEqual(groups["postgres_dcs_only"]["hosts"]["uc-k8sp2"]["postgres_name"], "db-g")
+        self.assertEqual(groups["enrollment_issuer"]["hosts"]["ichikawap1"]["vpn_ip"],
+                         "10.250.0.10")
         for name in ("inventory.json", "known_hosts"):
             self.assertEqual((self.work / name).stat().st_mode & 0o777, 0o600)
 

@@ -155,6 +155,7 @@ def inventory(repo_root, work_dir, ssh_key, checksums):
                 }},
                 "enrollment_issuer": {"hosts": {
                     issuer["name"]: {
+                        **{key: value for key, value in issuer.items() if key != "name"},
                         "ansible_host": issuer["ssh_host"],
                         "ansible_ssh_common_args": proxy,
                     }

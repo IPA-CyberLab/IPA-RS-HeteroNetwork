@@ -81,6 +81,7 @@ jobs:
           bash -n scripts/postgres-ha-node.sh
           scripts/postgres-ha-node.sh self-test
           python3 -B -m unittest discover -s scripts -p test_recover_database_authority.py -v
+          python3 -B -m unittest discover -s scripts -p test_recover_database_proxy_client.py -v
           bash -n scripts/postgres-ha-autopilot.sh
           scripts/postgres-ha-autopilot.sh self-test
 

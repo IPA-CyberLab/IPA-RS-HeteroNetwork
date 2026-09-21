@@ -35,7 +35,7 @@ if not (bundle / '.proxy-only').exists():
 manifest = dict(line.split('=', 1) for line in (bundle / 'manifest.env').read_text().splitlines() if '=' in line)
 # Existing members publish authenticated client/health endpoints over the overlay.
 # Their underlying database replication and DCS addresses remain in the bundle.
-client_addresses = {'db-a': '10.250.0.10', 'db-b': '10.250.0.2'}
+client_addresses = {'db-b': '10.250.0.2', 'db-e': '10.250.0.11'}
 backends = ','.join(name + '=' + client_addresses.get(name, address)
                     for name, address in (entry.split('=', 1) for entry in manifest['HETERONETWORK_DB_MEMBERS'].split(',')))
 env = os.environ.copy()

@@ -103,6 +103,8 @@ class ConsoleReleasePreparationTests(unittest.TestCase):
         self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp5"]["postgres_name"], "db-b")
         self.assertIn("ProxyCommand=ssh", groups["enrollment_issuer"]["hosts"]
                       ["ichikawap1"]["ansible_ssh_common_args"])
+        self.assertEqual(groups["enrollment_issuer"]["hosts"]
+                         ["ichikawap1"]["vpn_ip"], "10.250.0.10")
         for name in ("known_hosts", "inventory.json", "native-bin.tar.gz"):
             self.assertEqual((self.work / name).stat().st_mode & 0o777, 0o600)
 

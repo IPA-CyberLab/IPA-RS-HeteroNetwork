@@ -155,11 +155,6 @@
       notify: Restart console proxy
     - name: Apply the listener change before opening the compatibility port
       ansible.builtin.meta: flush_handlers
-    - name: Drop the overlay-only SSH connection after applying listener changes
-      ansible.builtin.meta: reset_connection
-      when:
-        - not ansible_check_mode
-        - inventory_hostname in groups['enrollment_issuer']
     - name: Reconnect after applying overlay-only listener changes
       ansible.builtin.wait_for_connection:
         delay: 5

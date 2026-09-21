@@ -321,6 +321,234 @@
       check_mode: false
       when: postgres_role == 'member'
 
+- name: Demote the retired enrollment database member to a proxy-only client
+  hosts: enrollment_issuer
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_database_bundle: /etc/heteronetwork/postgres-autopilot/bundle
+    hnn_database_member_archive: /etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+    hnn_database_proxy_archive: /etc/heteronetwork/postgres-autopilot/proxy-bundle.tar.gz
+    hnn_database_proxy_recovery: /var/backups/heteronetwork/iac-database-ha/proxy-client
+  tasks:
+    - name: Require the declared enrollment proxy address
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == 'ichikawap1'
+          - vpn_ip == '10.250.0.10'
+
+    - name: Create the protected proxy-client recovery directory
+      ansible.builtin.file:
+        path: "{{ hnn_database_proxy_recovery }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Install the reviewed proxy-client recovery helpers
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - src: "{{ hnn_repo_root }}/scripts/recover-database-proxy-client.py"
+          dest: /opt/heteronetwork/libexec/recover-database-proxy-client.py
+        - src: "{{ hnn_repo_root }}/scripts/postgres-ha-node.sh"
+          dest: /opt/heteronetwork/libexec/postgres-ha-node.sh
+        - src: "{{ hnn_repo_root }}/deploy/terraform/master-only/ansible/standard-proxy.py"
+          dest: /opt/heteronetwork/libexec/standard-proxy.py
+
+    - name: Read the sanitized proxy bundle from the recovery authority
+      ansible.builtin.slurp:
+        src: /etc/heteronetwork/postgres-autopilot/proxy-bundle.tar.gz
+      delegate_to: uc-k8sp5
+      register: hnn_database_proxy_source
+      no_log: true
+      check_mode: false
+
+    - name: Transfer only the proxy-client database credential bundle
+      ansible.builtin.copy:
+        content: "{{ hnn_database_proxy_source.content | b64decode }}"
+        dest: "{{ hnn_database_proxy_recovery }}/proxy-bundle.tar.gz"
+        owner: root
+        group: root
+        mode: '0600'
+      register: hnn_database_proxy_transfer
+      no_log: true
+
+    - name: Audit the retired database member without exposing credentials
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/recover-database-proxy-client.py
+          - --bundle
+          - "{{ hnn_database_bundle }}"
+          - --archive
+          - "{{ hnn_database_proxy_recovery }}/proxy-bundle.tar.gz"
+          - --agent-state
+          - /var/lib/heteronetwork/agent.json
+          - --backup-dir
+          - "{{ hnn_database_proxy_recovery }}/backup"
+          - --retired-archive
+          - "{{ hnn_database_member_archive }}"
+      register: hnn_database_proxy_audit
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Record the sanitized proxy-client recovery state
+      ansible.builtin.set_fact:
+        hnn_database_proxy_state: "{{ hnn_database_proxy_audit.stdout | from_json }}"
+      no_log: true
+
+    - name: Require a reviewed proxy-client recovery state
+      ansible.builtin.assert:
+        that:
+          - hnn_database_proxy_state.result in ['unchanged', 'migration-required']
+          - hnn_database_proxy_state.mode in ['retired-member', 'proxy-only', 'missing']
+          - hnn_database_proxy_state.members == ['db-b', 'db-e']
+        fail_msg: Enrollment database client is outside the reviewed recovery state
+
+    - name: Reconcile the retired database member as a proxy-only client
+      block:
+        - name: Pause enrollment database and control-plane reconciliation
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            state: stopped
+          loop:
+            - heteronetwork-control-plane.service
+            - heteronetwork-postgres-autopilot.service
+          when: hnn_database_proxy_state.result == 'migration-required'
+
+        - name: Stop retired database member services
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            state: stopped
+            enabled: false
+          loop:
+            - heteronetwork-db.service
+            - heteronetwork-db-dcs.service
+            - heteronetwork-db-underlay-health.service
+          failed_when: false
+          when: hnn_database_proxy_state.result == 'migration-required'
+
+        - name: Apply the transactional proxy-client recovery
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/python3
+              - /opt/heteronetwork/libexec/recover-database-proxy-client.py
+              - --bundle
+              - "{{ hnn_database_bundle }}"
+              - --archive
+              - "{{ hnn_database_proxy_recovery }}/proxy-bundle.tar.gz"
+              - --agent-state
+              - /var/lib/heteronetwork/agent.json
+              - --backup-dir
+              - "{{ hnn_database_proxy_recovery }}/backup"
+              - --retired-archive
+              - "{{ hnn_database_member_archive }}"
+              - --apply
+          register: hnn_database_proxy_apply
+          changed_when: (hnn_database_proxy_apply.stdout | from_json).result == 'changed'
+          no_log: true
+          when: hnn_database_proxy_state.result == 'migration-required'
+
+        - name: Retain the current proxy bundle for automatic reconciliation
+          ansible.builtin.copy:
+            src: "{{ hnn_database_proxy_recovery }}/proxy-bundle.tar.gz"
+            remote_src: true
+            dest: "{{ hnn_database_proxy_archive }}"
+            owner: root
+            group: root
+            mode: '0600'
+          no_log: true
+
+        - name: Reconcile the enrollment database client proxy
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/python3
+              - /opt/heteronetwork/libexec/standard-proxy.py
+              - --ip
+              - "{{ vpn_ip }}"
+          register: hnn_database_proxy_install
+          changed_when: (hnn_database_proxy_install.stdout | from_json).changed
+          no_log: true
+
+        - name: Keep the enrollment database client proxy running
+          ansible.builtin.systemd_service:
+            name: heteronetwork-db-proxy.service
+            state: started
+            enabled: true
+
+        - name: Verify the enrollment proxy configuration is converged
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/python3
+              - /opt/heteronetwork/libexec/standard-proxy.py
+              - --ip
+              - "{{ vpn_ip }}"
+              - --check
+          register: hnn_database_proxy_check
+          changed_when: false
+          failed_when: (hnn_database_proxy_check.stdout | from_json).changed
+          no_log: true
+
+        - name: Audit the installed proxy-only credential bundle
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/python3
+              - /opt/heteronetwork/libexec/recover-database-proxy-client.py
+              - --bundle
+              - "{{ hnn_database_bundle }}"
+              - --archive
+              - "{{ hnn_database_proxy_recovery }}/proxy-bundle.tar.gz"
+              - --agent-state
+              - /var/lib/heteronetwork/agent.json
+              - --backup-dir
+              - "{{ hnn_database_proxy_recovery }}/backup"
+              - --retired-archive
+              - "{{ hnn_database_member_archive }}"
+          register: hnn_database_proxy_acceptance
+          changed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: Require the installed proxy-only credentials to be current
+          ansible.builtin.assert:
+            that:
+              - (hnn_database_proxy_acceptance.stdout | from_json).result == 'unchanged'
+              - (hnn_database_proxy_acceptance.stdout | from_json).mode == 'proxy-only'
+              - (hnn_database_proxy_acceptance.stdout | from_json).members == ['db-b', 'db-e']
+            fail_msg: Enrollment database proxy credentials did not converge
+      always:
+        - name: Resume enrollment database topology reconciliation
+          ansible.builtin.systemd_service:
+            name: heteronetwork-postgres-autopilot.service
+            state: started
+            enabled: true
+          when: hnn_database_proxy_state.result == 'migration-required'
+
+    - name: Start the enrollment control plane with the recovered database client
+      ansible.builtin.systemd_service:
+        name: heteronetwork-control-plane.service
+        state: started
+      when: not ansible_check_mode
+
+    - name: Require the enrollment control plane to use the recovered proxy
+      ansible.builtin.uri:
+        url: 'http://{{ vpn_ip }}:19088/healthz'
+        status_code: 200
+        timeout: 3
+      register: hnn_database_enrollment_control_plane
+      until: hnn_database_enrollment_control_plane.status | default(0) == 200
+      retries: 30
+      delay: 2
+      when: not ansible_check_mode
+
 - name: Verify the recovered topology and restore the enrollment control plane
   hosts: bootstrap
   gather_facts: false
