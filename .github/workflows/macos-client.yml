@@ -150,6 +150,8 @@ jobs:
           test -x "$helper"
           test "$(/usr/libexec/PlistBuddy -c 'Print :HeteroNetworkReleaseTag' "$app/Contents/Info.plist")" \
             = "$RELEASE_TAG"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :HeteroNetworkReleaseFeedFallback' "$app/Contents/Info.plist")" \
+            = true
           xcrun lipo "$app/Contents/MacOS/HeteroNetwork" -verify_arch "$MACHINE_ARCH"
           xcrun lipo "$helper" -verify_arch "$MACHINE_ARCH"
           "$helper" self-test

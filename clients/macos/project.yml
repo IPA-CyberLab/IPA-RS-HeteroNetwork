@@ -50,6 +50,7 @@ targets:
       properties:
         CFBundleDisplayName: HeteroNetwork
         HeteroNetworkReleaseTag: $(HETERONETWORK_RELEASE_TAG)
+        HeteroNetworkReleaseFeedFallback: true
         LSApplicationCategoryType: public.app-category.utilities
         LSUIElement: true
         CFBundleURLTypes:

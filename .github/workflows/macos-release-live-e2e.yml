@@ -150,6 +150,26 @@ jobs:
             exit 0
           fi
           test "$previous_tag" = "$PREVIOUS_MACOS_RELEASE"
+          atom_fallback_forced=false
+          hosts_backup="$RUNNER_TEMP/hosts.before-heteronetwork-update"
+          restore_update_dns() {
+            if test "$atom_fallback_forced" = true; then
+              sudo tee /etc/hosts < "$hosts_backup" >/dev/null
+              sudo dscacheutil -flushcache >/dev/null 2>&1 || true
+              sudo killall -HUP mDNSResponder >/dev/null 2>&1 || true
+            fi
+          }
+          trap restore_update_dns EXIT
+          feed_fallback=$(/usr/libexec/PlistBuddy \
+            -c 'Print :HeteroNetworkReleaseFeedFallback' "$info" 2>/dev/null || true)
+          if test "$feed_fallback" = true; then
+            cp /etc/hosts "$hosts_backup"
+            printf '127.0.0.1 api.github.com\n::1 api.github.com\n' \
+              | sudo tee -a /etc/hosts >/dev/null
+            sudo dscacheutil -flushcache >/dev/null 2>&1 || true
+            sudo killall -HUP mDNSResponder >/dev/null 2>&1 || true
+            atom_fallback_forced=true
+          fi
           rm -f "$HOME/Library/Application Support/HeteroNetwork/updater.log"
           "$app/Contents/MacOS/HeteroNetwork" \
             > "$MACOS_E2E_ROOT/upgrade.stdout" \
@@ -230,6 +250,8 @@ jobs:
             exit 1
           fi
           wait "$previous_pid" 2>/dev/null || true
+          restore_update_dns
+          trap - EXIT
           codesign --verify --deep --strict "$app"
           restarted=0
           for _ in $(seq 1 50); do
@@ -250,8 +272,8 @@ jobs:
             sleep 0.1
           done
           ! /usr/bin/pgrep -U "$(id -u)" -x HeteroNetwork >/dev/null 2>&1
-          printf '{"automatic_update_from":"%s","automatic_update_to":"%s"}\n' \
-            "$PREVIOUS_MACOS_RELEASE" "$RELEASE_TAG" \
+          printf '{"automatic_update_from":"%s","automatic_update_to":"%s","atom_fallback_forced":%s}\n' \
+            "$PREVIOUS_MACOS_RELEASE" "$RELEASE_TAG" "$atom_fallback_forced" \
             | tee "$MACOS_E2E_ROOT/upgrade-report.json"
 
       - name: Install the published release with the public shell installer
