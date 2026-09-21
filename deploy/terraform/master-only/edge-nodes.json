@@ -3,6 +3,9 @@
     "name": "uc-k8sp5",
     "ssh_host": "163.220.236.45",
     "vpn_ip": "10.250.0.2",
+    "tailscale_ip": "100.96.127.54",
+    "postgres_role": "member",
+    "postgres_name": "db-b",
     "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK038K5HfhW5BFKcXXK22/AunAU2mk2osPM98e0eZ1VI"
   },
   "enrollment_issuer": {

@@ -95,7 +95,12 @@ class ConsoleReleasePreparationTests(unittest.TestCase):
                 self.assertEqual(archive.extractfile(member).read(), self.files[f"bin/{name}"])
         rendered = json.loads((self.work / "inventory.json").read_text())
         groups = rendered["all"]["children"]
-        self.assertEqual(sum(len(group["hosts"]) for group in groups.values()), 6)
+        self.assertEqual({
+            name for group in groups.values() for name in group["hosts"]
+        }, {"ichikawap1", "uc-k8s3p", "uc-k8sp1", "uc-k8sp2", "uc-k8sp4", "uc-k8sp5"})
+        self.assertEqual(set(groups["postgres_members"]["hosts"]), {"uc-k8sp4", "uc-k8sp5"})
+        self.assertEqual(set(groups["postgres_dcs_only"]["hosts"]), {"uc-k8sp2"})
+        self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp5"]["postgres_name"], "db-b")
         self.assertIn("ProxyCommand=ssh", groups["enrollment_issuer"]["hosts"]
                       ["ichikawap1"]["ansible_ssh_common_args"])
         for name in ("known_hosts", "inventory.json", "native-bin.tar.gz"):

@@ -1,3 +1,61 @@
+- name: Validate the protected recovery authority before changing a host
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Require the archived and expanded manifests to match the recovered topology
+      ansible.builtin.shell: |
+        set -euo pipefail
+        bundle=/etc/heteronetwork/postgres-autopilot/bundle
+        archive=/etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+        archived="$(mktemp /tmp/heteronetwork-db-manifest.XXXXXX)"
+        trap 'shred -u "$archived" 2>/dev/null || rm -f "$archived"' EXIT
+        tar -xOzf "$archive" ./manifest.env > "$archived"
+        cmp "$archived" "$bundle/manifest.env"
+        set -a
+        source "$bundle/manifest.env"
+        set +a
+        python3 - <<'PY'
+        import os
+
+        def mapping(name):
+            value = os.environ.get(name, "")
+            rows = value.split(",") if value else []
+            result = {}
+            for row in rows:
+                key, separator, address = row.partition("=")
+                if not separator or not key or not address or key in result:
+                    raise SystemExit(1)
+                result[key] = address
+            return result
+
+        if mapping("HETERONETWORK_DB_MEMBERS") != {
+            "db-b": "100.96.127.54",
+            "db-e": "100.111.33.52",
+        }:
+            raise SystemExit(1)
+        if mapping("HETERONETWORK_DB_DCS_MEMBERS") != {
+            "db-b": "100.96.127.54",
+            "db-e": "100.111.33.52",
+            "db-g": "100.94.130.38",
+        }:
+            raise SystemExit(1)
+        if mapping("HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") != mapping(
+            "HETERONETWORK_DB_DCS_MEMBERS"
+        ):
+            raise SystemExit(1)
+        if set(mapping("HETERONETWORK_DB_MEMBER_IDENTITIES")) != {"db-b", "db-e"}:
+            raise SystemExit(1)
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+      check_mode: false
+      no_log: true
+
 - name: Maintain the recovered PostgreSQL HA topology
   hosts: postgres_members:postgres_dcs_only
   gather_facts: false
@@ -90,6 +148,42 @@
         state: absent
       when: postgres_role == 'member'
 
+    - name: Render the declared primary proxy configuration
+      ansible.builtin.shell: |
+        set -a
+        source "{{ hnn_database_bundle }}/manifest.env"
+        set +a
+        export HETERONETWORK_DB_BUNDLE_DIR="{{ hnn_database_bundle }}"
+        export HETERONETWORK_DB_NODE_NAME="{{ postgres_name }}"
+        export HETERONETWORK_DB_NODE_ADDRESS="{{ tailscale_ip }}"
+        export HETERONETWORK_DB_INTERFACE=tailscale0
+        export HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS="{{ vpn_ip }}"
+        export HETERONETWORK_DB_PROXY_LISTEN_ADDRESS="{{ vpn_ip }}"
+        /opt/heteronetwork/libexec/postgres-ha-node.sh render-proxy-config
+      args:
+        executable: /bin/bash
+      register: hnn_database_declared_proxy
+      changed_when: false
+      no_log: true
+      when: postgres_role == 'member'
+
+    - name: Read the active primary proxy configuration
+      ansible.builtin.slurp:
+        src: /etc/heteronetwork/postgres-ha/haproxy.cfg
+      register: hnn_database_active_proxy
+      no_log: true
+      failed_when: false
+      when: postgres_role == 'member'
+
+    - name: Detect database proxy topology drift
+      ansible.builtin.set_fact:
+        hnn_database_proxy_drift: >-
+          {{ not (hnn_database_active_proxy.content is defined) or
+             (hnn_database_active_proxy.content | b64decode) !=
+             (hnn_database_declared_proxy.stdout ~ '\n') }}
+      no_log: true
+      when: postgres_role == 'member'
+
     - name: Select DCS credentials needed by this voter
       ansible.builtin.set_fact:
         hnn_database_dcs_files:
@@ -154,7 +248,8 @@
           hnn_database_helper.changed or
           (postgres_role == 'member' and (
             hnn_database_member_bundle.changed or
-            not hnn_database_member_unit.stat.exists
+            not hnn_database_member_unit.stat.exists or
+            hnn_database_proxy_drift | default(true) | bool
           )) or
           (postgres_role == 'dcs-only' and (
             hnn_database_dcs_bundle.results | default([]) |
@@ -196,3 +291,72 @@
       changed_when: false
       check_mode: false
       when: postgres_role == 'member'
+
+- name: Verify the recovered topology and restore the enrollment control plane
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_database_bundle: /etc/heteronetwork/postgres-autopilot/bundle
+  tasks:
+    - name: Require the declared bootstrap database identity
+      ansible.builtin.assert:
+        that:
+          - postgres_role == 'member'
+          - postgres_name == 'db-b'
+          - tailscale_ip == '100.96.127.54'
+
+    - name: Verify DCS quorum, primary selection, replication, and synchronous writes
+      ansible.builtin.shell: |
+        set -a
+        source "{{ hnn_database_bundle }}/manifest.env"
+        set +a
+        export HETERONETWORK_DB_BUNDLE_DIR="{{ hnn_database_bundle }}"
+        export HETERONETWORK_DB_NODE_NAME="{{ postgres_name }}"
+        export HETERONETWORK_DB_NODE_ADDRESS="{{ tailscale_ip }}"
+        export HETERONETWORK_DB_INTERFACE=tailscale0
+        export HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS="{{ vpn_ip }}"
+        export HETERONETWORK_DB_PROXY_LISTEN_ADDRESS="{{ vpn_ip }}"
+        /opt/heteronetwork/libexec/postgres-ha-node.sh verify
+      args:
+        executable: /bin/bash
+      register: hnn_database_acceptance
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Require the complete database acceptance result
+      ansible.builtin.assert:
+        that:
+          - "'HA verification passed:' in hnn_database_acceptance.stdout"
+        fail_msg: Recovered PostgreSQL topology did not pass its full acceptance check
+
+    - name: Restart enrollment control plane against the reconciled primary proxy
+      ansible.builtin.systemd_service:
+        name: heteronetwork-control-plane.service
+        state: restarted
+      when: not ansible_check_mode
+
+    - name: Require the enrollment control plane to finish database startup
+      ansible.builtin.uri:
+        url: 'http://{{ vpn_ip }}:19088/health'
+        status_code: 200
+        timeout: 5
+      register: hnn_database_control_plane
+      until: hnn_database_control_plane.status | default(0) == 200
+      retries: 60
+      delay: 5
+      when: not ansible_check_mode
+
+    - name: Require automatic Keycloak placement to recover on the bootstrap edge
+      ansible.builtin.uri:
+        url: 'http://{{ vpn_ip }}:18079/realms/heterocloud/.well-known/openid-configuration'
+        status_code: 200
+        timeout: 5
+      register: hnn_database_keycloak_edge
+      until: hnn_database_keycloak_edge.status | default(0) == 200
+      retries: 60
+      delay: 5
+      when: not ansible_check_mode

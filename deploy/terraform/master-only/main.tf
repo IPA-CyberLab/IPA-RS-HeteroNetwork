@@ -47,22 +47,27 @@ locals {
           hosts = { for name, node in local.nodes : name => merge(node, { ansible_host = node.ssh_host }) }
         }
         bootstrap = {
-          hosts = { uc-k8sp5 = {
+          hosts = { uc-k8sp5 = merge(local.bootstrap, {
             ansible_host            = local.bootstrap.ssh_host
             gpu_expected_count      = local.gpu_expected_nodes.uc-k8sp5.count
             gpu_expected_type       = local.gpu_expected_nodes.uc-k8sp5.type
             gpu_expected_model      = local.gpu_expected_nodes.uc-k8sp5.model
             gpu_expected_memory_mib = local.gpu_expected_nodes.uc-k8sp5.memory_mib
-          } }
+          }) }
         }
         standard = {
           hosts = { for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host }) }
         }
         postgres_members = {
-          hosts = {
-            for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host })
-            if try(node.postgres_role, "") == "member"
-          }
+          hosts = merge(
+            {
+              for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host })
+              if try(node.postgres_role, "") == "member"
+            },
+            try(local.bootstrap.postgres_role, "") == "member" ? {
+              (local.bootstrap.name) = merge(local.bootstrap, { ansible_host = local.bootstrap.ssh_host })
+            } : {}
+          )
         }
         postgres_dcs_only = {
           hosts = {
@@ -318,12 +323,20 @@ resource "terraform_data" "standard_host_configuration" {
 
 resource "terraform_data" "database_ha_configuration" {
   input = {
-    members = {
-      for name, node in local.standard_nodes : name => {
-        postgres_name = node.postgres_name
-        address       = node.tailscale_ip
-      } if try(node.postgres_role, "") == "member"
-    }
+    members = merge(
+      {
+        for name, node in local.standard_nodes : name => {
+          postgres_name = node.postgres_name
+          address       = node.tailscale_ip
+        } if try(node.postgres_role, "") == "member"
+      },
+      try(local.bootstrap.postgres_role, "") == "member" ? {
+        (local.bootstrap.name) = {
+          postgres_name = local.bootstrap.postgres_name
+          address       = local.bootstrap.tailscale_ip
+        }
+      } : {}
+    )
     dcs_only = {
       for name, node in local.nodes : name => {
         postgres_name = node.postgres_name

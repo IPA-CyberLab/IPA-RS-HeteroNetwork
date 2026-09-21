@@ -31,7 +31,9 @@
       when:
         - not ansible_check_mode
         - hnn_console_binaries.results | selectattr('stat.checksum', 'defined') | map(attribute='stat.checksum') | list | sort != hnn_native_binary_sha256.values() | list | sort
-      notify: Restart console Agent
+      notify:
+        - Restart console Agent
+        - Restart public control plane
     - name: Verify console networking binaries
       ansible.builtin.stat:
         path: '/opt/heteronetwork/bin/{{ item.key }}'
@@ -74,12 +76,12 @@
         group: root
         mode: '0644'
       when: hnn_console_control_plane_unit.stdout | trim == 'loaded'
-    - name: Activate the reconciled control plane identity policy and binary
+      notify: Restart public control plane
+    - name: Keep the public control plane running when this host owns it
       ansible.builtin.systemd_service:
         name: heteronetwork-control-plane.service
         daemon_reload: true
-        enabled: true
-        state: restarted
+        state: started
       when:
         - not ansible_check_mode
         - hnn_console_control_plane_unit.stdout | trim == 'loaded'
@@ -153,6 +155,18 @@
       notify: Restart console proxy
     - name: Apply the listener change before opening the compatibility port
       ansible.builtin.meta: flush_handlers
+    - name: Require promoted control planes to finish database startup
+      ansible.builtin.uri:
+        url: 'http://{{ hnn_console_ip }}:19088/health'
+        status_code: 200
+        timeout: 5
+      register: hnn_console_control_plane_check
+      until: hnn_console_control_plane_check.status | default(0) == 200
+      retries: 60
+      delay: 5
+      when:
+        - not ansible_check_mode
+        - hnn_console_control_plane_unit.stdout | trim == 'loaded'
     - name: Keep both console services running across boots
       ansible.builtin.systemd_service:
         name: '{{ item }}'
@@ -193,5 +207,10 @@
     - name: Restart console proxy
       ansible.builtin.systemd_service:
         name: heteronetwork-console-proxy.service
+        daemon_reload: true
+        state: restarted
+    - name: Restart public control plane
+      ansible.builtin.systemd_service:
+        name: heteronetwork-control-plane.service
         daemon_reload: true
         state: restarted

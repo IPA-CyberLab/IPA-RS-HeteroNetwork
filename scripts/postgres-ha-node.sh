@@ -19,7 +19,7 @@ readonly DEFAULT_NETWORK_PLANE="underlay-v1"
 readonly PATRONI_VERSION="4.1.4"
 readonly ETCD_VERSION="v3.6.11"
 readonly ETCD_LINUX_AMD64_SHA256="8756f7a4eaf921668a83de0bf13c0f65cae9186a165696e3ae8396afe6f557ed"
-readonly MIN_DATABASE_MEMBER_COUNT="3"
+readonly MIN_DATABASE_MEMBER_COUNT="2"
 readonly MAX_DATABASE_MEMBER_COUNT="32"
 readonly MIN_DCS_MEMBER_COUNT="3"
 readonly MAX_DCS_MEMBER_COUNT="9"
@@ -83,7 +83,7 @@ Commands:
   self-test               Run non-privileged config renderer and validation checks
 
 Required environment for init-bundle:
-  HETERONETWORK_DB_MEMBERS       3-32 name=underlay-ip entries, comma separated
+  HETERONETWORK_DB_MEMBERS       2-32 name=underlay-ip entries, comma separated
   HETERONETWORK_DB_MEMBER_IDENTITIES
                                   Matching name=HeteroNetwork-node-id entries
 
@@ -297,6 +297,18 @@ managed_dcs_member_rows() {
   done < <(dcs_bootstrap_member_rows)
 }
 
+certificate_node_rows() {
+  local -A database_names=()
+  local name address
+  while read -r name address; do
+    database_names["$name"]=1
+    printf '%s %s\n' "$name" "$address"
+  done < <(member_rows)
+  while read -r name address; do
+    [[ -n "${database_names[$name]:-}" ]] || printf '%s %s\n' "$name" "$address"
+  done < <(managed_dcs_member_rows)
+}
+
 retiring_dcs_member_rows() {
   local name address desired_name desired_address found
   while read -r name address; do
@@ -437,20 +449,30 @@ validate_common_config() {
       || "$dcs_bootstrap_members" == "$dcs_members" ]] \
     || die "a fresh DCS must bootstrap with the complete requested topology"
   local -A database_members=()
+  local -A database_addresses=()
   local -A desired_dcs_members=()
   local -A actual_dcs_members=()
   local name address
   while read -r name address; do
     database_members["$name"]="$address"
+    database_addresses["$address"]="$name"
   done < <(member_rows)
   while read -r name address; do
-    [[ "${database_members[$name]:-}" == "$address" ]] \
-      || die "DCS member $name=$address is not present in HETERONETWORK_DB_MEMBERS"
+    [[ -z "${database_members[$name]:-}" \
+      || "${database_members[$name]}" == "$address" ]] \
+      || die "DCS member $name uses a different database address"
+    [[ -z "${database_addresses[$address]:-}" \
+      || "${database_addresses[$address]}" == "$name" ]] \
+      || die "DCS member $name reuses the address of database member ${database_addresses[$address]}"
     desired_dcs_members["$name"]="$address"
   done < <(dcs_member_rows)
   while read -r name address; do
-    [[ "${database_members[$name]:-}" == "$address" ]] \
-      || die "DCS bootstrap member $name=$address is not present in HETERONETWORK_DB_MEMBERS"
+    [[ -z "${database_members[$name]:-}" \
+      || "${database_members[$name]}" == "$address" ]] \
+      || die "DCS bootstrap member $name uses a different database address"
+    [[ -z "${database_addresses[$address]:-}" \
+      || "${database_addresses[$address]}" == "$name" ]] \
+      || die "DCS bootstrap member $name reuses the address of database member ${database_addresses[$address]}"
     actual_dcs_members["$name"]="$address"
   done < <(dcs_bootstrap_member_rows)
   local retiring_count=0 joining_count=0
@@ -506,6 +528,26 @@ validate_node_config() {
     ((found == 1)) \
       || die "$node_name=$node_address must be present in HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS"
   fi
+}
+
+validate_dcs_node_config() {
+  validate_common_config
+  validate_name "$node_name"
+  validate_ipv4 "$node_address"
+  [[ -n "$interface" ]] || die "HETERONETWORK_DB_INTERFACE is required"
+  [[ "$interface" != "heteronetwork0" ]] \
+    || die "database services must not bind to the HeteroNetwork overlay interface"
+  [[ -n "$bundle_dir" ]] || die "HETERONETWORK_DB_BUNDLE_DIR is required"
+  validate_absolute_path "$bundle_dir"
+
+  local found=0 name address
+  while read -r name address; do
+    if [[ "$name" == "$node_name" && "$address" == "$node_address" ]]; then
+      found=1
+    fi
+  done < <(dcs_bootstrap_member_rows)
+  ((found == 1)) \
+    || die "$node_name=$node_address is not present in HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS"
 }
 
 validate_proxy_config() {
@@ -1169,7 +1211,7 @@ init_bundle() {
   local name address
   while read -r name address; do
     issue_node_certificate "$output" "$name" "$address"
-  done < <(member_rows)
+  done < <(certificate_node_rows)
 
   write_bundle_manifest "$output"
   printf 'Created private HA bundle at %s.\n' "$output"
@@ -1194,7 +1236,7 @@ extend_bundle() {
   local name address
   while read -r name address; do
     issue_node_certificate "$output" "$name" "$address"
-  done < <(member_rows)
+  done < <(certificate_node_rows)
   write_bundle_manifest "$output"
   bundle_dir="$original_bundle_dir"
   printf 'Extended private HA bundle at %s to topology revision %s.\n' \
@@ -1218,7 +1260,7 @@ validate_bundle() {
   local name address
   while read -r name address; do
     validate_node_certificate "$output" "$name" "$address"
-  done < <(member_rows)
+  done < <(certificate_node_rows)
   bundle_dir="$original_bundle_dir"
 }
 
@@ -1484,7 +1526,7 @@ install_node() {
 
 install_dcs_only() {
   require_root
-  validate_node_config
+  validate_dcs_node_config
   node_is_dcs_member \
     || die "$node_name=$node_address is not a requested DCS voter"
   verify_interface_address
@@ -2366,12 +2408,34 @@ self_test() {
   ); then
     die "even DCS member count self-test unexpectedly succeeded"
   fi
-  if (
+  (
     dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-z=100.64.10.99"
+    dcs_bootstrap_members="$dcs_members"
+    validate_common_config
+    node_name="db-z"
+    node_address="100.64.10.99"
+    validate_dcs_node_config
+    [[ "$(certificate_node_rows | tail -n 1)" == "db-z 100.64.10.99" ]]
+  )
+  if (
+    dcs_members="db-a=100.64.10.99,db-b=100.64.10.2,db-z=100.64.10.7"
+    dcs_bootstrap_members="$dcs_members"
     validate_common_config >/dev/null 2>&1
   ); then
-    die "DCS member outside the database set self-test unexpectedly succeeded"
+    die "DCS member address drift from its database member was accepted"
   fi
+  (
+    members="db-b=100.96.127.54,db-e=100.111.33.52"
+    member_identities="db-b=node-b,db-e=node-e"
+    proxy_backends="$members"
+    dcs_members="db-b=100.96.127.54,db-e=100.111.33.52,db-g=100.94.130.38"
+    dcs_bootstrap_members="$dcs_members"
+    validate_common_config
+    [[ "$(database_member_count)" == "2" ]]
+    [[ "$(dcs_member_count)" == "3" ]]
+    [[ "$(synchronous_standby_count)" == "1" ]]
+    [[ "$(certificate_node_rows | wc -l | tr -d ' ')" == "3" ]]
+  )
   if (
     dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-f=100.64.10.6"
     validate_common_config >/dev/null 2>&1

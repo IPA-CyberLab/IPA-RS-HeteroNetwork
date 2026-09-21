@@ -130,7 +130,24 @@ def inventory(repo_root, work_dir, ssh_key, checksums):
                     for name, node in standard_nodes.items()
                 }},
                 "bootstrap": {"hosts": {
-                    bootstrap["name"]: {"ansible_host": bootstrap["ssh_host"]}
+                    bootstrap["name"]: {**bootstrap, "ansible_host": bootstrap["ssh_host"]}
+                }},
+                "postgres_members": {"hosts": {
+                    **{
+                        name: {**node, "ansible_host": node["ssh_host"]}
+                        for name, node in standard_nodes.items()
+                        if node.get("postgres_role") == "member"
+                    },
+                    **({
+                        bootstrap["name"]: {
+                            **bootstrap, "ansible_host": bootstrap["ssh_host"]
+                        }
+                    } if bootstrap.get("postgres_role") == "member" else {}),
+                }},
+                "postgres_dcs_only": {"hosts": {
+                    name: {**node, "ansible_host": node["ssh_host"]}
+                    for name, node in nodes.items()
+                    if node.get("postgres_role") == "dcs-only"
                 }},
                 "enrollment_issuer": {"hosts": {
                     issuer["name"]: {
@@ -178,9 +195,9 @@ def prepare(manifest_path, archive_path, work_dir, ssh_key, expected_version, ex
         "commit": manifest["commit"],
         "native_archive_sha256": native["sha256"],
         "binary_sha256": checksums,
-        "targets": sorted(
+        "targets": sorted(set(
             name for group in rendered["all"]["children"].values()
-            for name in group["hosts"]),
+            for name in group["hosts"])),
     }
 
 

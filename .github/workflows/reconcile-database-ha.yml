@@ -1,0 +1,101 @@
+name: Reconcile database HA topology
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact reviewed master commit to apply
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: heteronet-database-ha-production
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile and verify db-b, db-e, and db-g
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: heteronet-e2e
+    steps:
+      - name: Check out exact reviewed source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+
+      - name: Validate immutable source input
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" origin/master
+          root="$RUNNER_TEMP/heteronetwork-database-ha"
+          install -d -m 0700 "$root"
+          python3 -m venv "$root/venv"
+          "$root/venv/bin/pip" install --disable-pip-version-check --no-input 'ansible-core==2.19.5'
+          echo "DATABASE_HA_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Materialize protected operator access
+        env:
+          HNN_E2E_SSH_PRIVATE_KEY: ${{ secrets.HNN_E2E_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$HNN_E2E_SSH_PRIVATE_KEY"
+          umask 077
+          printf '%s\n' "$HNN_E2E_SSH_PRIVATE_KEY" > "$DATABASE_HA_ROOT/id_ed25519"
+          python3 scripts/prepare-database-ha.py \
+            --work-dir "$DATABASE_HA_ROOT/inputs" \
+            --ssh-key "$DATABASE_HA_ROOT/id_ed25519" \
+            > "$DATABASE_HA_ROOT/preparation.json"
+
+      - name: Reconcile the declared topology serially
+        env:
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+          ANSIBLE_CALLBACK_PLUGINS: ${{ github.workspace }}/deploy/terraform/master-only/ansible/callback_plugins
+          ANSIBLE_STDOUT_CALLBACK: hnn_json
+        run: |
+          set -euo pipefail
+          test -n "$HNN_IAC_BECOME_PASSWORD"
+          "$DATABASE_HA_ROOT/venv/bin/ansible-playbook" \
+            -i "$DATABASE_HA_ROOT/inputs/inventory.json" \
+            deploy/terraform/master-only/ansible/database-ha.yaml \
+            > "$DATABASE_HA_ROOT/ansible-result.json"
+
+      - name: Publish sanitized reconciliation result
+        run: |
+          {
+            echo '### Database HA reconciliation'
+            echo '```json'
+            cat "$DATABASE_HA_ROOT/preparation.json"
+            python3 - "$DATABASE_HA_ROOT/ansible-result.json" <<'PY'
+          import json
+          import sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          hosts = value.get("hosts", {})
+          print(json.dumps({
+              "result": "passed",
+              "changed_hosts": sorted(name for name, stats in hosts.items() if stats.get("changed", 0)),
+              "failed_hosts": sorted(name for name, stats in hosts.items()
+                                     if stats.get("failures", 0) or stats.get("unreachable", 0)),
+              "errors": len(value.get("errors", [])),
+          }, separators=(",", ":")))
+          PY
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove materialized private inputs
+        if: always()
+        run: |
+          root="${DATABASE_HA_ROOT:-$RUNNER_TEMP/heteronetwork-database-ha}"
+          if test -d "$root"; then
+            find "$root" -type f -exec shred -u {} + 2>/dev/null || rm -rf "$root"
+            rm -rf "$root"
+          fi

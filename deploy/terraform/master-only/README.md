@@ -82,11 +82,14 @@ identity and join the existing Kubernetes cluster with short-lived credentials
 issued on `uc-k8sp5`; no new cluster is initialized.
 
 `terraform_data.database_ha_configuration` also preserves the recovered HA
-topology. It maintains `uc-k8sp4` as PostgreSQL member `db-e` and
-`uc-k8sp2` as etcd-only voter `db-g`, using the protected revisioned bundle on
-`uc-k8sp5`. The dedicated master remains free of PostgreSQL and application
-Pods. Only its own DCS certificate is transferred; database passwords and the
-CA private key are not copied to that host.
+topology. It maintains `uc-k8sp5` as PostgreSQL member `db-b`, `uc-k8sp4` as
+PostgreSQL member `db-e`, and `uc-k8sp2` as etcd-only voter `db-g`, using the
+protected revisioned bundle on `uc-k8sp5`. The dedicated master remains free
+of PostgreSQL and application Pods. Only its own DCS certificate is transferred;
+database passwords and the CA private key are not copied to that host. The
+protected `Reconcile database HA topology` workflow applies an exact reviewed
+master commit serially, verifies DCS quorum and synchronous replication, and
+waits for the enrollment Control Plane and Keycloak edge to recover.
 
 ## Apply
 

@@ -37,11 +37,20 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Install trusted Node path for release verification
+        run: |
+          # The native artifact validator intentionally ignores inherited PATH.
+          # Hosted runners install Node outside the fixed system path it trusts.
+          if ! env -i PATH=/bin:/usr/bin node --version >/dev/null 2>&1; then
+            sudo install -m 0755 "$(node -p 'process.execPath')" /usr/bin/node
+          fi
+
       - name: Test release artifact contract
         run: |
           node --test scripts/release-artifact-manifest.test.mjs scripts/release-channels.test.mjs scripts/package-native-release.test.mjs scripts/bind-sudo-release-artifact.test.mjs
           python3 -B -m unittest discover -s scripts -p test_sudo_quorum_v2_artifact.py -v
           python3 -B -m unittest discover -s scripts -p test_prepare_console_release.py -v
+          python3 -B -m unittest discover -s scripts -p test_prepare_database_ha.py -v
 
       - name: Test desktop client installer
         run: |
@@ -51,11 +60,6 @@ jobs:
 
       - name: Validate native staging boundaries
         run: |
-          # The validator deliberately ignores inherited PATH and NODE_OPTIONS.
-          # Hosted runners keep Node outside the system path used on supported VMs.
-          if ! env -i PATH=/bin:/usr/bin node --version >/dev/null 2>&1; then
-            sudo install -m 0755 "$(node -p 'process.execPath')" /usr/bin/node
-          fi
           python3 scripts/native-release-stage.test.py
           node --check scripts/native-release-stage.catalog.mjs
 
