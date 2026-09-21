@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Xml;
+using System.Xml.Linq;
 
 namespace HeteroNetwork.Core;
 
@@ -117,6 +119,102 @@ public static class DesktopReleaseCatalog
             newest.ChecksumUrl);
     }
 
+    /// <summary>
+    /// Selects an update from GitHub's public releases Atom feed when the
+    /// unauthenticated API quota is unavailable. Asset names stay fixed by the
+    /// release contract and the caller still verifies the published checksum.
+    /// </summary>
+    public static DesktopReleaseUpdate? AvailableUpdateFromAtom(
+        ReadOnlySpan<byte> data,
+        string currentTag,
+        string assetName = WindowsAssetName)
+    {
+        if (!IsSafeReleaseTag(currentTag)
+            || !string.Equals(assetName, WindowsAssetName, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        XDocument document;
+        try
+        {
+            using var stream = new MemoryStream(data.ToArray(), writable: false);
+            using var reader = XmlReader.Create(stream, new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null,
+                IgnoreComments = true,
+                IgnoreProcessingInstructions = true,
+            });
+            document = XDocument.Load(reader, LoadOptions.None);
+        }
+        catch (XmlException error)
+        {
+            throw new DesktopReleaseCatalogException(
+                "GitHub returned an invalid desktop release feed.",
+                error);
+        }
+
+        XNamespace atom = "http://www.w3.org/2005/Atom";
+        if (document.Root?.Name != atom + "feed")
+        {
+            throw new DesktopReleaseCatalogException(
+                "GitHub returned an invalid desktop release feed.");
+        }
+
+        var candidates = new List<Candidate>();
+        foreach (var entry in document.Root.Elements(atom + "entry"))
+        {
+            var updated = entry.Element(atom + "updated")?.Value;
+            var alternate = entry.Elements(atom + "link")
+                .FirstOrDefault(link =>
+                    string.Equals(
+                        (string?)link.Attribute("rel"),
+                        "alternate",
+                        StringComparison.OrdinalIgnoreCase));
+            if (!TryParseTimestamp(updated, out var publishedAt)
+                || !Uri.TryCreate(
+                    (string?)alternate?.Attribute("href"),
+                    UriKind.Absolute,
+                    out var releasePage)
+                || ReleaseTagFromPageUrl(releasePage) is not { } tag)
+            {
+                continue;
+            }
+
+            var archiveUrl = ExpectedDownloadUrl(tag, assetName);
+            var checksumUrl = ExpectedDownloadUrl(tag, $"{assetName}.sha256");
+            candidates.Add(new Candidate(
+                tag,
+                publishedAt,
+                archiveUrl,
+                checksumUrl));
+        }
+
+        var newest = candidates
+            .OrderByDescending(candidate => candidate.PublishedAt)
+            .ThenByDescending(candidate => candidate.Tag, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (newest is null
+            || string.Equals(newest.Tag, currentTag, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var current = candidates.FirstOrDefault(candidate =>
+            string.Equals(candidate.Tag, currentTag, StringComparison.Ordinal));
+        if (current is not null && current.PublishedAt >= newest.PublishedAt)
+        {
+            return null;
+        }
+
+        return new DesktopReleaseUpdate(
+            newest.Tag,
+            assetName,
+            newest.ArchiveUrl,
+            newest.ChecksumUrl);
+    }
+
     public static bool IsSafeReleaseTag(string? value)
     {
         if (string.IsNullOrEmpty(value)
@@ -153,6 +251,28 @@ public static class DesktopReleaseCatalog
             && string.IsNullOrEmpty(url.Fragment)
             && string.Equals(url.AbsolutePath, expectedPath, StringComparison.Ordinal);
     }
+
+    private static string? ReleaseTagFromPageUrl(Uri url)
+    {
+        var prefix = $"/{RepositoryOwner}/{RepositoryName}/releases/tag/";
+        if (!url.IsAbsoluteUri
+            || !string.Equals(url.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(url.Host, "github.com", StringComparison.OrdinalIgnoreCase)
+            || !url.IsDefaultPort
+            || !string.IsNullOrEmpty(url.UserInfo)
+            || !string.IsNullOrEmpty(url.Query)
+            || !string.IsNullOrEmpty(url.Fragment)
+            || !url.AbsolutePath.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var tag = url.AbsolutePath[prefix.Length..];
+        return IsSafeReleaseTag(tag) ? tag : null;
+    }
+
+    private static Uri ExpectedDownloadUrl(string tag, string assetName) =>
+        new($"https://github.com/{RepositoryOwner}/{RepositoryName}/releases/download/{tag}/{assetName}");
 
     private sealed record GitHubRelease(
         [property: JsonPropertyName("tag_name")] string? TagName,

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using HeteroNetwork.Core;
 
@@ -80,6 +81,64 @@ public sealed class DesktopReleaseCatalogTests
             DesktopReleaseCatalog.AvailableUpdate("{"u8, "v1.0.0"));
     }
 
+    [Fact]
+    public void AtomFallbackSelectsNewestReleaseAndBuildsTrustedUrls()
+    {
+        var feed = AtomFeed(
+            AtomEntry("v1.2.0", "2026-09-20T00:00:00Z"),
+            AtomEntry("v1.3.0", "2026-09-21T00:00:00Z"));
+
+        var update = Assert.IsType<DesktopReleaseUpdate>(
+            DesktopReleaseCatalog.AvailableUpdateFromAtom(feed, "v1.2.0"));
+
+        Assert.Equal("v1.3.0", update.Tag);
+        Assert.Equal(Asset, update.AssetName);
+        Assert.Equal(DownloadUrl("v1.3.0", Asset), update.ArchiveUrl.AbsoluteUri);
+        Assert.Equal(
+            DownloadUrl("v1.3.0", $"{Asset}.sha256"),
+            update.ChecksumUrl.AbsoluteUri);
+    }
+
+    [Fact]
+    public void AtomFallbackDoesNotDowngradeNewerInstalledRelease()
+    {
+        var feed = AtomFeed(
+            AtomEntry("v2.0.0", "2026-09-21T00:00:00Z"),
+            AtomEntry("v1.9.0", "2026-09-20T00:00:00Z"));
+
+        Assert.Null(DesktopReleaseCatalog.AvailableUpdateFromAtom(feed, "v2.0.0"));
+    }
+
+    [Fact]
+    public void AtomFallbackIgnoresUntrustedAndUnsafeReleaseLinks()
+    {
+        var feed = AtomFeed(
+            AtomEntry(
+                "v9.0.0",
+                "2026-09-22T00:00:00Z",
+                "https://example.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases/tag/v9.0.0"),
+            AtomEntry(
+                "unsafe",
+                "2026-09-21T00:00:00Z",
+                "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases/tag/not-a-release"),
+            AtomEntry("v1.2.0", "2026-09-20T00:00:00Z"));
+
+        var update = Assert.IsType<DesktopReleaseUpdate>(
+            DesktopReleaseCatalog.AvailableUpdateFromAtom(feed, "v1.1.0"));
+        Assert.Equal("v1.2.0", update.Tag);
+    }
+
+    [Theory]
+    [InlineData("<feed><entry>")]
+    [InlineData("<!DOCTYPE feed [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><feed>&xxe;</feed>")]
+    public void AtomFallbackRejectsMalformedOrDtdFeeds(string feed)
+    {
+        Assert.Throws<DesktopReleaseCatalogException>(() =>
+            DesktopReleaseCatalog.AvailableUpdateFromAtom(
+                Encoding.UTF8.GetBytes(feed),
+                "v1.0.0"));
+    }
+
     private static byte[] Catalog(params object[] releases) =>
         JsonSerializer.SerializeToUtf8Bytes(releases);
 
@@ -101,4 +160,21 @@ public sealed class DesktopReleaseCatalogTests
 
     private static string DownloadUrl(string tag, string name) =>
         $"https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases/download/{tag}/{name}";
+
+    private static byte[] AtomFeed(params string[] entries) => Encoding.UTF8.GetBytes($$"""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          {{string.Join("\n", entries)}}
+        </feed>
+        """);
+
+    private static string AtomEntry(
+        string tag,
+        string updated,
+        string? href = null) => $$"""
+        <entry>
+          <updated>{{updated}}</updated>
+          <link rel="alternate" href="{{href ?? $"https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases/tag/{tag}"}}" />
+        </entry>
+        """;
 }

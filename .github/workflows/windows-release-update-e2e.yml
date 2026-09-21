@@ -119,22 +119,52 @@ jobs:
           }
           $log = Join-Path $env:LOCALAPPDATA "HeteroNetwork\Updates\updater.log"
           Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
-          $process = Start-Process `
-            -FilePath $executable `
-            -WorkingDirectory $target `
-            -PassThru
-          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(8)
-          do {
-            Start-Sleep -Milliseconds 250
-            $version = if (Test-Path -LiteralPath $executable -PathType Leaf) {
-              (Get-Item -LiteralPath $executable).VersionInfo.ProductVersion
-            } else {
-              ""
+          $probeAssembly = Join-Path `
+            $env:RUNNER_TEMP `
+            "HeteroNetwork.Core.update-probe-$($env:GITHUB_RUN_ID).dll"
+          Copy-Item `
+            -LiteralPath (Join-Path $target "HeteroNetwork.Core.dll") `
+            -Destination $probeAssembly
+          $catalogType = [Reflection.Assembly]::LoadFile($probeAssembly).GetType(
+            'HeteroNetwork.Core.DesktopReleaseCatalog')
+          $atomFallbackForced = @(
+            $catalogType.GetMethods() | Where-Object Name -eq 'AvailableUpdateFromAtom'
+          ).Count -gt 0
+          $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+          $hostsBackup = Join-Path $env:RUNNER_TEMP 'hosts.before-heteronetwork-update'
+          $version = ""
+          try {
+            if ($atomFallbackForced) {
+              Copy-Item -LiteralPath $hostsPath -Destination $hostsBackup
+              @(
+                '127.0.0.1 api.github.com',
+                '::1 api.github.com'
+              ) | Add-Content -LiteralPath $hostsPath -Encoding ascii
+              Clear-DnsClientCache
             }
-            if ($version -eq $env:RELEASE_TAG) {
-              break
+
+            $process = Start-Process `
+              -FilePath $executable `
+              -WorkingDirectory $target `
+              -PassThru
+            $deadline = [DateTimeOffset]::UtcNow.AddMinutes(8)
+            do {
+              Start-Sleep -Milliseconds 250
+              $version = if (Test-Path -LiteralPath $executable -PathType Leaf) {
+                (Get-Item -LiteralPath $executable).VersionInfo.ProductVersion
+              } else {
+                ""
+              }
+              if ($version -eq $env:RELEASE_TAG) {
+                break
+              }
+            } while ([DateTimeOffset]::UtcNow -lt $deadline)
+          } finally {
+            if ($atomFallbackForced -and (Test-Path -LiteralPath $hostsBackup)) {
+              Copy-Item -LiteralPath $hostsBackup -Destination $hostsPath -Force
+              Clear-DnsClientCache
             }
-          } while ([DateTimeOffset]::UtcNow -lt $deadline)
+          }
           if ($version -ne $env:RELEASE_TAG) {
             Get-Content -LiteralPath $log -ErrorAction SilentlyContinue
             throw "The Windows client did not activate $($env:RELEASE_TAG)."
@@ -159,6 +189,7 @@ jobs:
           [pscustomobject]@{
             automatic_update_from = $env:PREVIOUS_WINDOWS_RELEASE
             automatic_update_to = $env:RELEASE_TAG
+            atom_fallback_forced = $atomFallbackForced
           } | ConvertTo-Json -Compress | Tee-Object `
             -FilePath (Join-Path $env:RUNNER_TEMP "windows-update-report.json")
 

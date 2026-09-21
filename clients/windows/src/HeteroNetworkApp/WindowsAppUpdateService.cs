@@ -36,6 +36,8 @@ internal sealed class WindowsAppUpdateService : IDisposable
     private const int MaximumArchiveEntries = 20_000;
     private static readonly Uri CatalogUrl = new(
         "https://api.github.com/repos/IPA-CyberLab/IPA-RS-HeteroNetwork/releases?per_page=100");
+    private static readonly Uri AtomCatalogUrl = new(
+        "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases.atom");
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly HashSet<string> ReservedWindowsNames = new(
         [
@@ -50,8 +52,6 @@ internal sealed class WindowsAppUpdateService : IDisposable
     {
         httpClient = handler is null ? new HttpClient() : new HttpClient(handler, true);
         httpClient.Timeout = TimeSpan.FromMinutes(10);
-        httpClient.DefaultRequestHeaders.Accept.Add(
-            new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("HeteroNetwork-Windows-updater");
     }
@@ -60,11 +60,41 @@ internal sealed class WindowsAppUpdateService : IDisposable
         string currentTag,
         CancellationToken cancellationToken = default)
     {
-        var data = await DownloadDataAsync(
-            CatalogUrl,
-            MaximumCatalogSize,
-            cancellationToken).ConfigureAwait(false);
-        return DesktopReleaseCatalog.AvailableUpdate(data, currentTag);
+        try
+        {
+            var data = await DownloadDataAsync(
+                CatalogUrl,
+                MaximumCatalogSize,
+                cancellationToken,
+                "application/vnd.github+json").ConfigureAwait(false);
+            return DesktopReleaseCatalog.AvailableUpdate(data, currentTag);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception apiError)
+        {
+            try
+            {
+                var data = await DownloadDataAsync(
+                    AtomCatalogUrl,
+                    MaximumCatalogSize,
+                    cancellationToken,
+                    "application/atom+xml").ConfigureAwait(false);
+                return DesktopReleaseCatalog.AvailableUpdateFromAtom(data, currentTag);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception atomError)
+            {
+                throw new WindowsAppUpdateException(
+                    "Both GitHub release catalogs were unavailable.",
+                    new AggregateException(apiError, atomError));
+            }
+        }
     }
 
     public async Task<PreparedWindowsAppUpdate> PrepareAsync(
@@ -228,10 +258,17 @@ internal sealed class WindowsAppUpdateService : IDisposable
     private async Task<byte[]> DownloadDataAsync(
         Uri url,
         int maximumSize,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? accept = null)
     {
-        using var response = await httpClient.GetAsync(
-            url,
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        if (accept is not null)
+        {
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(accept));
+        }
+
+        using var response = await httpClient.SendAsync(
+            request,
             HttpCompletionOption.ResponseHeadersRead,
             cancellationToken).ConfigureAwait(false);
         ValidateResponse(response, maximumSize);
