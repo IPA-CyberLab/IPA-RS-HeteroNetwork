@@ -157,7 +157,7 @@
       ansible.builtin.meta: flush_handlers
     - name: Require promoted control planes to finish database startup
       ansible.builtin.uri:
-        url: 'http://{{ hnn_console_ip }}:19088/health'
+        url: 'http://{{ hnn_console_ip }}:19088/healthz'
         status_code: 200
         timeout: 5
       register: hnn_console_control_plane_check

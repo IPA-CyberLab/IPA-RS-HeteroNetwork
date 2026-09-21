@@ -15,7 +15,7 @@ state_ip=$(curl --fail --silent --show-error --max-time 3 \
 systemctl is-active --quiet heteronetwork-control-plane.service
 # A 404 on this unprivileged path still confirms the local HTTP listener.
 code=$(curl --silent --show-error --max-time 3 --output /dev/null \
-  --write-out '%{http_code}' "http://$vpn_ip:19088/health")
+  --write-out '%{http_code}' "http://$vpn_ip:19088/healthz")
 [[ "$code" == 200 || "$code" == 404 ]] || exit 1
 target=/etc/systemd/system/heteronetwork-agent.service.d/60-local-control-plane-recovery.conf
 [[ ! -e "$target" && ! -L "$target" ]] || { echo 'override already exists; inspect before retrying' >&2; exit 1; }
