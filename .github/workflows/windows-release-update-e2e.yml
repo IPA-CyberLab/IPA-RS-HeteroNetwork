@@ -119,17 +119,10 @@ jobs:
           }
           $log = Join-Path $env:LOCALAPPDATA "HeteroNetwork\Updates\updater.log"
           Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
-          $probeAssembly = Join-Path `
-            $env:RUNNER_TEMP `
-            "HeteroNetwork.Core.update-probe-$($env:GITHUB_RUN_ID).dll"
-          Copy-Item `
-            -LiteralPath (Join-Path $target "HeteroNetwork.Core.dll") `
-            -Destination $probeAssembly
-          $catalogType = [Reflection.Assembly]::LoadFile($probeAssembly).GetType(
-            'HeteroNetwork.Core.DesktopReleaseCatalog')
-          $atomFallbackSupported = @(
-            $catalogType.GetMethods() | Where-Object Name -eq 'AvailableUpdateFromAtom'
-          ).Count -gt 0
+          $catalogAssembly = [IO.File]::ReadAllBytes(
+            (Join-Path $target "HeteroNetwork.Core.dll"))
+          $atomFallbackSupported = [Text.Encoding]::UTF8.GetString(
+            $catalogAssembly).Contains('AvailableUpdateFromAtom')
           if (-not $atomFallbackSupported) {
             Write-Host "$($env:PREVIOUS_WINDOWS_RELEASE) predates the resilient release feed; skipping upgrade-path E2E."
             return
