@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -32,6 +33,9 @@ public sealed class WindowsTunnelManager
     private const string HostsComment = "# HeteroNetwork managed console";
     private const int OverlayMtu = 1280;
     private static readonly TimeSpan ProbeBudget = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ConnectionSettleTime = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan NetworkQuietTime = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ConnectionReadyTimeout = TimeSpan.FromSeconds(20);
     private readonly ClientSessionStore sessionStore;
 
     public WindowsTunnelManager(ClientSessionStore? sessionStore = null)
@@ -187,6 +191,7 @@ public sealed class WindowsTunnelManager
         var configurationPath = await WriteMachineProtectedConfigurationAsync(
             configuration,
             cancellationToken).ConfigureAwait(false);
+        using var networkChanges = new NetworkChangeMonitor();
 
         try
         {
@@ -201,6 +206,8 @@ public sealed class WindowsTunnelManager
             await ConfigureSplitDnsAsync(profile.GatewayVpnIp, cancellationToken)
                 .ConfigureAwait(false);
             WindowsProxySettings.DisableUnusedAutoDetect();
+            await WaitForStableNetworkAsync(networkChanges, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch
         {
@@ -210,6 +217,27 @@ public sealed class WindowsTunnelManager
             await RemoveSplitDnsAsync(cancellationToken).ConfigureAwait(false);
             WindowsProxySettings.RestoreManagedAutoDetect();
             throw;
+        }
+    }
+
+    private static async Task WaitForStableNetworkAsync(
+        NetworkChangeMonitor networkChanges,
+        CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(ConnectionReadyTimeout);
+        try
+        {
+            while (networkChanges.Elapsed < ConnectionSettleTime
+                   || networkChanges.QuietFor < NetworkQuietTime)
+            {
+                await Task.Delay(100, timeout.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                "The VPN tunnel did not become stable before the connection timeout.");
         }
     }
 
@@ -688,6 +716,40 @@ public sealed class WindowsTunnelManager
             }
 
             File.WriteAllText(Path, value);
+        }
+    }
+
+    private sealed class NetworkChangeMonitor : IDisposable
+    {
+        private readonly long startedAt = Stopwatch.GetTimestamp();
+        private long changedAt = Stopwatch.GetTimestamp();
+
+        public NetworkChangeMonitor()
+        {
+            NetworkChange.NetworkAddressChanged += NetworkAddressChanged;
+            NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
+        }
+
+        public TimeSpan Elapsed => Stopwatch.GetElapsedTime(startedAt);
+
+        public TimeSpan QuietFor => Stopwatch.GetElapsedTime(Interlocked.Read(ref changedAt));
+
+        public void Dispose()
+        {
+            NetworkChange.NetworkAddressChanged -= NetworkAddressChanged;
+            NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
+        }
+
+        private void NetworkAddressChanged(object? sender, EventArgs eventArgs) =>
+            RecordChange();
+
+        private void NetworkAvailabilityChanged(
+            object? sender,
+            NetworkAvailabilityEventArgs eventArgs) => RecordChange();
+
+        private void RecordChange()
+        {
+            Interlocked.Exchange(ref changedAt, Stopwatch.GetTimestamp());
         }
     }
 }
