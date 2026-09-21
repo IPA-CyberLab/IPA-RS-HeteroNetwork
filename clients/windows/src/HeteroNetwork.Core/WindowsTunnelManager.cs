@@ -35,7 +35,7 @@ public sealed class WindowsTunnelManager
     private static readonly TimeSpan ProbeBudget = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan ConnectionSettleTime = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan NetworkQuietTime = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan ConnectionReadyTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ConnectionReadyTimeout = TimeSpan.FromSeconds(30);
     private readonly ClientSessionStore sessionStore;
 
     public WindowsTunnelManager(ClientSessionStore? sessionStore = null)
@@ -206,8 +206,10 @@ public sealed class WindowsTunnelManager
             await ConfigureSplitDnsAsync(profile.GatewayVpnIp, cancellationToken)
                 .ConfigureAwait(false);
             WindowsProxySettings.DisableUnusedAutoDetect();
-            await WaitForStableNetworkAsync(networkChanges, cancellationToken)
-                .ConfigureAwait(false);
+            await WaitForStableConnectionAsync(
+                profile,
+                networkChanges,
+                cancellationToken).ConfigureAwait(false);
         }
         catch
         {
@@ -220,18 +222,38 @@ public sealed class WindowsTunnelManager
         }
     }
 
-    private static async Task WaitForStableNetworkAsync(
+    private async Task WaitForStableConnectionAsync(
+        TunnelProfile profile,
         NetworkChangeMonitor networkChanges,
         CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(ConnectionReadyTimeout);
+        var successfulProbes = 0;
         try
         {
-            while (networkChanges.Elapsed < ConnectionSettleTime
-                   || networkChanges.QuietFor < NetworkQuietTime)
+            while (true)
             {
-                await Task.Delay(100, timeout.Token).ConfigureAwait(false);
+                if (networkChanges.Elapsed < ConnectionSettleTime
+                    || networkChanges.QuietFor < NetworkQuietTime)
+                {
+                    successfulProbes = 0;
+                    await Task.Delay(100, timeout.Token).ConfigureAwait(false);
+                    continue;
+                }
+
+                var networkVersion = networkChanges.Version;
+                var healthy = await ProbeAsync(profile, timeout.Token).ConfigureAwait(false);
+                if (!healthy || networkChanges.Version != networkVersion)
+                {
+                    successfulProbes = 0;
+                }
+                else if (++successfulProbes >= 2)
+                {
+                    return;
+                }
+
+                await Task.Delay(250, timeout.Token).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
@@ -723,12 +745,15 @@ public sealed class WindowsTunnelManager
     {
         private readonly long startedAt = Stopwatch.GetTimestamp();
         private long changedAt = Stopwatch.GetTimestamp();
+        private long version;
 
         public NetworkChangeMonitor()
         {
             NetworkChange.NetworkAddressChanged += NetworkAddressChanged;
             NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
         }
+
+        public long Version => Interlocked.Read(ref version);
 
         public TimeSpan Elapsed => Stopwatch.GetElapsedTime(startedAt);
 
@@ -750,6 +775,7 @@ public sealed class WindowsTunnelManager
         private void RecordChange()
         {
             Interlocked.Exchange(ref changedAt, Stopwatch.GetTimestamp());
+            Interlocked.Increment(ref version);
         }
     }
 }
