@@ -119,117 +119,119 @@ try {
   if (values.fallbackResolv) {
     await fs.copyFile(values.fallbackResolv, '/etc/resolv.conf');
   }
-  browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
   for (const gateway of gateways) {
-    for (const port of [80, 9781]) {
-      const origin = `http://console.heteronetwork.internal${port === 80 ? '' : ':9781'}`;
-      const context = await browser.newContext({ serviceWorkers: 'block' });
-      try {
-        const page = await context.newPage();
-        page.setDefaultTimeout(15_000);
-        page.on('pageerror', error => report.errors.push(error.message));
-        // This selects the network destination only. Status, headers and body
-        // come unchanged from the actual server; no fixture response is used.
-        await context.route(`${origin}/**`, async route => {
-          const original = new URL(route.request().url());
-          const destination = new URL(original);
-          destination.hostname = gateway;
-          const response = await route.fetch({ url: destination.href, maxRedirects: 0,
-            headers: { ...route.request().headers(), host: original.host } });
-          await route.fulfill({ response });
-        });
-        const openedAt = performance.now();
-        const main = await page.goto(`${origin}/ui/`, {
-          waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
-        });
-        if (main.status() !== 200) throw new Error(`${gateway}:${port} UI HTTP ${main.status()}`);
-        const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
-        await page.getByRole('button', { name: 'Keycloakでログイン' }).waitFor({ timeout: remaining });
-        const openMs = Math.ceil(performance.now() - openedAt);
-        if (openMs > UI_OPEN_BUDGET_MS) {
-          throw new Error(`${gateway}:${port} console UI opened in ${openMs} ms`);
-        }
-        const configuration = await page.evaluate(async () => {
-          const response = await fetch('/ui/config');
-          return { status: response.status, config: await response.json() };
-        });
-        const config = configuration.config;
-        if (configuration.status !== 200 || config.auth_enabled !== true || config.provider !== 'keycloak' ||
-            config.issuer_url !== 'https://heterocloud.mizuame.app/id/realms/heterocloud' ||
-            config.device_verification_origin !== 'https://heterocloud.mizuame.app') {
-          throw new Error(`${gateway}:${port} console authentication configuration is invalid`);
-        }
-        const row = { gateway, port, ui_http: 200, config_http: 200,
-          login_button_rendered: true, open_ms: openMs };
-        if (port === 80) {
-          // The Windows client uses the gateway IP without overriding Host.
-          // A failure here makes it repeatedly abandon an otherwise healthy gateway.
-          const probe = await context.newPage();
-          try {
-            const response = await probe.goto(`http://${gateway}/v1/web-ui/healthz`);
-            if (response.status() !== 200 || (await response.json()).status !== 'ok') {
-              throw new Error(`${gateway} native client IP health probe failed: HTTP ${response.status()}`);
+    // Chromium's native resolver override preserves the canonical Host header
+    // while sending every browser request directly to this gateway. Using
+    // Playwright route.fetch here made the runner proxy and buffer large static
+    // responses, which could turn a completed HTTP 200 into ECONNRESET.
+    browser = await chromium.launch({ headless: true, args: [
+      '--disable-dev-shm-usage',
+      '--no-proxy-server',
+      `--host-resolver-rules=MAP console.heteronetwork.internal ${gateway},EXCLUDE localhost`,
+    ] });
+    try {
+      for (const port of [80, 9781]) {
+        const origin = `http://console.heteronetwork.internal${port === 80 ? '' : ':9781'}`;
+        const context = await browser.newContext({ serviceWorkers: 'block' });
+        try {
+          const page = await context.newPage();
+          page.setDefaultTimeout(15_000);
+          page.on('pageerror', error => report.errors.push(error.message));
+          const openedAt = performance.now();
+          const main = await page.goto(`${origin}/ui/`, {
+            waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+          });
+          if (main.status() !== 200) throw new Error(`${gateway}:${port} UI HTTP ${main.status()}`);
+          const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
+          await page.getByRole('button', { name: 'Keycloakでログイン' }).waitFor({ timeout: remaining });
+          const openMs = Math.ceil(performance.now() - openedAt);
+          if (openMs > UI_OPEN_BUDGET_MS) {
+            throw new Error(`${gateway}:${port} console UI opened in ${openMs} ms`);
+          }
+          const configuration = await page.evaluate(async () => {
+            const response = await fetch('/ui/config');
+            return { status: response.status, config: await response.json() };
+          });
+          const config = configuration.config;
+          if (configuration.status !== 200 || config.auth_enabled !== true || config.provider !== 'keycloak' ||
+              config.issuer_url !== 'https://heterocloud.mizuame.app/id/realms/heterocloud' ||
+              config.device_verification_origin !== 'https://heterocloud.mizuame.app') {
+            throw new Error(`${gateway}:${port} console authentication configuration is invalid`);
+          }
+          const row = { gateway, port, ui_http: 200, config_http: 200,
+            login_button_rendered: true, open_ms: openMs };
+          if (port === 80) {
+            // The Windows client uses the gateway IP without overriding Host.
+            // A failure here makes it repeatedly abandon an otherwise healthy gateway.
+            const probe = await context.newPage();
+            try {
+              const response = await probe.goto(`http://${gateway}/v1/web-ui/healthz`);
+              if (response.status() !== 200 || (await response.json()).status !== 'ok') {
+                throw new Error(`${gateway} native client IP health probe failed: HTTP ${response.status()}`);
+              }
+              row.client_ip_health_http = 200;
+            } finally {
+              await probe.close();
             }
-            row.client_ip_health_http = 200;
-          } finally {
-            await probe.close();
           }
+          if (port === 9781) {
+            const opened = page.waitForEvent('popup');
+            const deviceStarted = page.waitForResponse(response => {
+              const url = new URL(response.url());
+              return url.pathname === '/v1/web-ui/auth/device' &&
+                response.request().method() === 'POST';
+            });
+            await page.getByRole('button', { name: 'Keycloakでログイン' }).click();
+            const popup = await opened;
+            const deviceResponse = await deviceStarted;
+            const deviceBody = await deviceResponse.json().catch(() => ({}));
+            if (!deviceResponse.ok()) {
+              throw new Error(`${gateway} device login start returned HTTP ${deviceResponse.status()}: ${deviceBody.error || 'invalid response'}`);
+            }
+            popup.setDefaultTimeout(15_000);
+            popup.on('pageerror', error => report.errors.push(error.message));
+            const popupResponses = [];
+            popup.on('response', response => {
+              if (response.request().resourceType() !== 'document') return;
+              const url = new URL(response.url());
+              popupResponses.push({ status: response.status(), url: `${url.origin}${url.pathname}` });
+            });
+            try {
+              await popup.locator('input[name="username"]').waitFor();
+              await popup.locator('input[name="password"]').waitFor();
+            } catch (error) {
+              const url = new URL(popup.url());
+              report.keycloak_failure = {
+                gateway,
+                url: `${url.origin}${url.pathname}`,
+                title: await popup.title().catch(() => ''),
+                body: (await popup.locator('body').innerText().catch(() => '')).slice(0, 1_000),
+                closed: popup.isClosed(),
+                login_page: (await page.locator('body').innerText().catch(() => '')).slice(0, 1_000),
+                verification_origin: (() => {
+                  try { return new URL(deviceBody.verification_uri).origin; } catch { return ''; }
+                })(),
+                responses: popupResponses,
+              };
+              throw error;
+            }
+            const form = await popup.locator('#kc-login').evaluate(button =>
+              ({ action: button.form.action, method: button.form.method }));
+            const action = new URL(form.action);
+            if (action.origin !== config.device_verification_origin ||
+                action.pathname !== '/id/realms/heterocloud/login-actions/authenticate' ||
+                form.method.toLowerCase() !== 'post') throw new Error(`${gateway} opened the wrong login form`);
+            row.public_keycloak_credential_form = true;
+            await popup.close();
+          }
+          report.gateways.push(row);
+        } finally {
+          await context.close();
         }
-        if (port === 9781) {
-          const opened = page.waitForEvent('popup');
-          const deviceStarted = page.waitForResponse(response => {
-            const url = new URL(response.url());
-            return url.pathname === '/v1/web-ui/auth/device' &&
-              response.request().method() === 'POST';
-          });
-          await page.getByRole('button', { name: 'Keycloakでログイン' }).click();
-          const popup = await opened;
-          const deviceResponse = await deviceStarted;
-          const deviceBody = await deviceResponse.json().catch(() => ({}));
-          if (!deviceResponse.ok()) {
-            throw new Error(`${gateway} device login start returned HTTP ${deviceResponse.status()}: ${deviceBody.error || 'invalid response'}`);
-          }
-          popup.setDefaultTimeout(15_000);
-          popup.on('pageerror', error => report.errors.push(error.message));
-          const popupResponses = [];
-          popup.on('response', response => {
-            if (response.request().resourceType() !== 'document') return;
-            const url = new URL(response.url());
-            popupResponses.push({ status: response.status(), url: `${url.origin}${url.pathname}` });
-          });
-          try {
-            await popup.locator('input[name="username"]').waitFor();
-            await popup.locator('input[name="password"]').waitFor();
-          } catch (error) {
-            const url = new URL(popup.url());
-            report.keycloak_failure = {
-              gateway,
-              url: `${url.origin}${url.pathname}`,
-              title: await popup.title().catch(() => ''),
-              body: (await popup.locator('body').innerText().catch(() => '')).slice(0, 1_000),
-              closed: popup.isClosed(),
-              login_page: (await page.locator('body').innerText().catch(() => '')).slice(0, 1_000),
-              verification_origin: (() => {
-                try { return new URL(deviceBody.verification_uri).origin; } catch { return ''; }
-              })(),
-              responses: popupResponses,
-            };
-            throw error;
-          }
-          const form = await popup.locator('#kc-login').evaluate(button =>
-            ({ action: button.form.action, method: button.form.method }));
-          const action = new URL(form.action);
-          if (action.origin !== config.device_verification_origin ||
-              action.pathname !== '/id/realms/heterocloud/login-actions/authenticate' ||
-              form.method.toLowerCase() !== 'post') throw new Error(`${gateway} opened the wrong login form`);
-          row.public_keycloak_credential_form = true;
-          await popup.close();
-        }
-        report.gateways.push(row);
-      } finally {
-        await context.unrouteAll({ behavior: 'ignoreErrors' });
-        await context.close();
       }
+    } finally {
+      await browser.close();
+      browser = undefined;
     }
   }
   if (report.errors.length) throw new Error('Browser JavaScript errors detected');
