@@ -397,7 +397,19 @@
           - "{{ hnn_database_member_archive }}"
       register: hnn_database_proxy_audit
       changed_when: false
+      failed_when: false
       check_mode: false
+
+    - name: Record the bounded proxy-client audit result
+      ansible.builtin.set_fact:
+        hnn_database_proxy_rejection: >-
+          {{ ((hnn_database_proxy_audit.stderr | from_json).reason | default('unexpected-input'))
+             if hnn_database_proxy_audit.rc != 0 else 'passed' }}
+
+    - name: "Require the retired database audit to pass ({{ hnn_database_proxy_rejection }})"
+      ansible.builtin.assert:
+        that: hnn_database_proxy_audit.rc == 0
+        fail_msg: Retired database credentials did not pass the bounded audit
 
     - name: Record the sanitized proxy-client recovery state
       ansible.builtin.set_fact:

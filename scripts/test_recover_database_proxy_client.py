@@ -190,6 +190,25 @@ class RecoverDatabaseProxyClientTests(unittest.TestCase):
         )
         self.assertNotIn(private_input, result.stderr)
 
+    def test_cli_redacts_unexpected_input_details(self):
+        private_input = "private-malformed-state-value"
+        self.state.write_text("{" + private_input)
+        result = subprocess.run([
+            sys.executable,
+            SCRIPT,
+            "--bundle", self.bundle,
+            "--archive", self.archive,
+            "--agent-state", self.state,
+            "--backup-dir", self.backup,
+        ], check=False, capture_output=True, text=True)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(
+            {"result": "rejected", "reason": "unexpected-input"},
+            json.loads(result.stderr),
+        )
+        self.assertNotIn(private_input, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

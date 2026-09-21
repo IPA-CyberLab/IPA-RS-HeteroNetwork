@@ -325,5 +325,8 @@ if __name__ == "__main__":
         }, separators=(",", ":")), file=sys.stderr)
         sys.exit(1)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, tarfile.TarError):
-        print("Database proxy-client recovery failed validation; no secrets were printed.", file=sys.stderr)
+        print(json.dumps({
+            "result": "rejected",
+            "reason": "unexpected-input",
+        }, separators=(",", ":")), file=sys.stderr)
         sys.exit(1)
