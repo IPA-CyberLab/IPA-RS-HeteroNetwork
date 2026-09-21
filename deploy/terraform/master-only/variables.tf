@@ -30,9 +30,9 @@ variable "control_planes" {
 
 variable "native_binary_sha256" {
   type = map(string)
-  # v0.1.15-dev.27, source 1f2341c60b751331b22b37771511ac6f213c13bc.
+  # v0.1.15-dev.29, source c305077777566d9e3cc768a66b26343c48e0bf1c.
   default = {
-    ipars  = "cf49968e0c34f47896e029bcc1a3cf1a3155497ca5d8a31847ebda8f911e9297"
-    iparsd = "590385d6821dbff351d0caf6c7b3328efe0f3a1b3320f40ee5b2f9da5d4e6440"
+    ipars  = "0c0a90d71d8cf0d5c86f726ca64d10441af3e38dfdc01b0d3780fe5ed0035d6f"
+    iparsd = "54ab285b394a2a49c3fe00808ee61a560f67aa5e58760fb0bb68670ac34c2466"
   }
 }
