@@ -1,0 +1,114 @@
+name: Deploy immutable console release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag to deploy
+        required: true
+        type: string
+      source_commit:
+        description: Exact 40-character source commit bound into the release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: heteronet-console-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Verify artifact and reconcile six gateways
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: heteronet-e2e
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      DEPLOY_ROOT: ${{ runner.temp }}/heteronet-console-deploy
+      ANSIBLE_STDOUT_CALLBACK: hnn_json
+      ANSIBLE_CALLBACK_PLUGINS: ${{ github.workspace }}/deploy/terraform/master-only/ansible/callback_plugins
+    steps:
+      - name: Check out reviewed deployment source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate immutable release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          umask 077
+          mkdir "$DEPLOY_ROOT"
+          python3 -m venv "$DEPLOY_ROOT/venv"
+          "$DEPLOY_ROOT/venv/bin/pip" install --disable-pip-version-check ansible-core==2.19.5
+
+      - name: Materialize protected SSH access
+        shell: bash
+        env:
+          HNN_E2E_SSH_PRIVATE_KEY: ${{ secrets.HNN_E2E_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$HNN_E2E_SSH_PRIVATE_KEY"
+          umask 077
+          printf '%s\n' "$HNN_E2E_SSH_PRIVATE_KEY" > "$DEPLOY_ROOT/id_ed25519"
+
+      - name: Download published native release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="heteronetwork-${RELEASE_TAG#v}-linux-amd64.tar.gz"
+          gh release download "$RELEASE_TAG" \
+            --pattern heteronetwork-release-artifact.json \
+            --pattern "$asset" \
+            --dir "$DEPLOY_ROOT"
+          python3 scripts/prepare-console-release.py \
+            --manifest "$DEPLOY_ROOT/heteronetwork-release-artifact.json" \
+            --archive "$DEPLOY_ROOT/$asset" \
+            --work-dir "$DEPLOY_ROOT/iac" \
+            --ssh-key "$DEPLOY_ROOT/id_ed25519" \
+            --expected-version "$RELEASE_TAG" \
+            --expected-commit "$SOURCE_COMMIT" \
+            | tee "$DEPLOY_ROOT/preparation.json"
+
+      - name: Reconcile console binaries and listeners serially
+        shell: bash
+        env:
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$HNN_IAC_BECOME_PASSWORD"
+          "$DEPLOY_ROOT/venv/bin/ansible-playbook" \
+            -i "$DEPLOY_ROOT/iac/inventory.json" \
+            deploy/terraform/master-only/ansible/console/configure.yaml \
+            | tee "$DEPLOY_ROOT/ansible-result.json"
+
+      - name: Publish sanitized deployment result
+        if: always()
+        shell: bash
+        run: |
+          if test -s "$DEPLOY_ROOT/preparation.json"; then
+            {
+              echo '### Immutable console deployment'
+              echo '```json'
+              jq '{result,version,commit,binary_sha256,targets}' "$DEPLOY_ROOT/preparation.json"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Remove materialized private inputs
+        if: always()
+        shell: bash
+        run: |
+          if test -d "$DEPLOY_ROOT"; then
+            chmod -R u+rwX "$DEPLOY_ROOT" 2>/dev/null || true
+            find "$DEPLOY_ROOT" -type f -exec shred --remove --zero {} + 2>/dev/null || true
+            rm -rf "$DEPLOY_ROOT" || true
+          fi

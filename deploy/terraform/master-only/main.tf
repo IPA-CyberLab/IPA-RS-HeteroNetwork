@@ -2,6 +2,7 @@ locals {
   repo_root      = abspath("${path.module}/../../..")
   nodes          = jsondecode(file("${path.module}/nodes.json"))
   standard_nodes = jsondecode(file("${path.module}/standard-nodes.json"))
+  edge_nodes     = jsondecode(file("${path.module}/edge-nodes.json"))
   gpu_expected_nodes = {
     uc-k8sp5 = {
       count      = 2
@@ -10,10 +11,7 @@ locals {
       memory_mib = 11264
     }
   }
-  enrollment_issuer = {
-    ssh_host     = "10.250.0.10"
-    ssh_host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPW2fAH9gcshjerH7rdbXQU/siGharkb0JZHClS2YuPT"
-  }
+  enrollment_issuer = local.edge_nodes.enrollment_issuer
   managed_app_paths = {
     cluster-dns            = "deploy/gitops/cluster-dns"
     network-policy-engine  = "deploy/gitops/network-policy-engine"
@@ -25,10 +23,7 @@ locals {
     heterocloud       = "deploy/gitops/applications/heterocloud.yaml"
     heterocloud-flash = "deploy/gitops/applications/heterocloud-flash.yaml"
   }
-  bootstrap = {
-    ssh_host     = "163.220.236.45"
-    ssh_host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK038K5HfhW5BFKcXXK22/AunAU2mk2osPM98e0eZ1VI"
-  }
+  bootstrap = local.edge_nodes.bootstrap
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")

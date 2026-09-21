@@ -1,0 +1,14 @@
+{
+  "bootstrap": {
+    "name": "uc-k8sp5",
+    "ssh_host": "163.220.236.45",
+    "vpn_ip": "10.250.0.2",
+    "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK038K5HfhW5BFKcXXK22/AunAU2mk2osPM98e0eZ1VI"
+  },
+  "enrollment_issuer": {
+    "name": "ichikawap1",
+    "ssh_host": "10.250.0.10",
+    "vpn_ip": "10.250.0.10",
+    "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPW2fAH9gcshjerH7rdbXQU/siGharkb0JZHClS2YuPT"
+  }
+}

@@ -41,6 +41,7 @@ jobs:
         run: |
           node --test scripts/release-artifact-manifest.test.mjs scripts/release-channels.test.mjs scripts/package-native-release.test.mjs scripts/bind-sudo-release-artifact.test.mjs
           python3 -B -m unittest discover -s scripts -p test_sudo_quorum_v2_artifact.py -v
+          python3 -B -m unittest discover -s scripts -p test_prepare_console_release.py -v
 
       - name: Test desktop client installer
         run: |
