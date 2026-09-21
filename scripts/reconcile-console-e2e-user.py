@@ -2,19 +2,24 @@
 """Reconcile the dedicated console E2E identity from a private JSON record.
 
 This program is streamed over SSH and runs as root on a Keycloak-capable host.
-It reaches Keycloak through the local HA edge so reconciliation keeps working
+It discovers the HA-assigned replicas from the protected local edge
+configuration and selects a ready replica, so reconciliation keeps working
 while an individual replica is starting or has been withdrawn. It reads one
 JSON line from stdin. Credential values are never accepted in argv, written to
 disk, or included in output.
 """
 
 import json
+import ipaddress
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 
 EXPECTED_EMAIL = "heteronetwork-console-e2e@heteronetwork.invalid"
@@ -22,10 +27,14 @@ EXPECTED_USERNAME = EXPECTED_EMAIL
 MANAGED_FIRST_NAME = "HeteroNetwork Console"
 MANAGED_LAST_NAME = "E2E"
 REALM = "heterocloud"
-SERVER = "http://127.0.0.1:18079"
 KCADM = "/opt/heteronetwork/keycloak/bin/kcadm.sh"
 ADMIN_PASSWORD = Path("/etc/heteronetwork/keycloak/bootstrap-admin.password")
+EDGE_CONFIG = Path("/etc/heteronetwork/keycloak-edge-proxy/haproxy.cfg")
+REPLICA_PORT = 18080
+REPLICA_HEALTH_PATH = f"/realms/{REALM}/.well-known/openid-configuration"
 MAX_INPUT_BYTES = 8192
+MAX_EDGE_CONFIG_BYTES = 65536
+MAX_REPLICAS = 5
 
 
 def fail(message):
@@ -37,6 +46,57 @@ def private_regular_file(path):
     return (stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
             and metadata.st_nlink == 1 and 0 < metadata.st_size <= 4096
             and metadata.st_mode & 0o007 == 0)
+
+
+def protected_edge_config(path):
+    metadata = path.lstat()
+    return (stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
+            and metadata.st_uid == 0 and metadata.st_nlink == 1
+            and 0 < metadata.st_size <= MAX_EDGE_CONFIG_BYTES
+            and metadata.st_mode & 0o022 == 0)
+
+
+def private_replica_address(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    allowed = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("100.64.0.0/10"),
+    )
+    return address.version == 4 and any(address in network for network in allowed)
+
+
+def select_ready_server():
+    if not protected_edge_config(EDGE_CONFIG):
+        fail("protected Keycloak HA edge configuration is unavailable or unsafe")
+    endpoints = []
+    pattern = re.compile(
+        rf"^\s*server\s+replica_[1-9][0-9]*\s+([^\s:]+):{REPLICA_PORT}\s+",
+        re.MULTILINE,
+    )
+    for address in pattern.findall(EDGE_CONFIG.read_text()):
+        if not private_replica_address(address):
+            fail("Keycloak HA edge configuration contains an unsafe replica address")
+        endpoint = f"http://{address}:{REPLICA_PORT}"
+        if endpoint not in endpoints:
+            endpoints.append(endpoint)
+    if not 1 <= len(endpoints) <= MAX_REPLICAS:
+        fail("Keycloak HA edge configuration has an invalid replica count")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for endpoint in endpoints:
+        request = urllib.request.Request(
+            endpoint + REPLICA_HEALTH_PATH, headers={"Host": "localhost"})
+        try:
+            with opener.open(request, timeout=3) as response:
+                if response.status == 200:
+                    return endpoint
+        except (OSError, urllib.error.URLError):
+            continue
+    fail("no assigned Keycloak replica is ready")
 
 
 def run_kcadm(config, environment, *arguments, input_data=None):
@@ -95,6 +155,7 @@ def main():
         fail("Keycloak administration client is unavailable")
     if not private_regular_file(ADMIN_PASSWORD):
         fail("Keycloak bootstrap credential is unavailable or unsafe")
+    server = select_ready_server()
     credential = read_credentials()
     descriptor, config_name = tempfile.mkstemp(prefix="heteronetwork-e2e-kcadm-", dir="/tmp")
     os.close(descriptor)
@@ -108,7 +169,7 @@ def main():
     }
     try:
         run_kcadm(
-            config, environment, "config", "credentials", "--server", SERVER,
+            config, environment, "config", "credentials", "--server", server,
             "--realm", "master", "--user", "admin")
         environment.pop("KC_CLI_PASSWORD", None)
         users = json.loads(run_kcadm(
