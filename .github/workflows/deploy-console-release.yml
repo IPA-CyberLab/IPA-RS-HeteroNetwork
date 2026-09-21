@@ -48,6 +48,10 @@ jobs:
           mkdir "$DEPLOY_ROOT"
           python3 -m venv "$DEPLOY_ROOT/venv"
           "$DEPLOY_ROOT/venv/bin/pip" install --disable-pip-version-check ansible-core==2.19.5
+          # The native manifest validator deliberately ignores inherited PATH.
+          if ! env -i PATH=/bin:/usr/bin node --version >/dev/null 2>&1; then
+            sudo install -m 0755 "$(node -p 'process.execPath')" /usr/bin/node
+          fi
 
       - name: Materialize protected SSH access
         shell: bash
