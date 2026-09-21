@@ -58,18 +58,38 @@
             "db-e": "100.111.33.52",
             "db-g": "100.94.130.38",
         }
+        expanded_members = mapping(expanded, "HETERONETWORK_DB_MEMBERS")
+        expanded_identities = mapping(expanded, "HETERONETWORK_DB_MEMBER_IDENTITIES")
+        expected_member_names = set(expected_members)
+        required_files = [
+            bundle / "ca" / "ca.crt",
+            bundle / "ca" / "ca.key",
+            *(
+                bundle / "nodes" / name / filename
+                for name in expected_dcs
+                for filename in ("ca.crt", "node.crt", "node.key")
+            ),
+        ]
         flags = {
-            "expanded_members": mapping(expanded, "HETERONETWORK_DB_MEMBERS") == expected_members,
+            "expanded_members": expanded_members == expected_members,
+            "expanded_member_superset": all(expanded_members.get(name) == address for name, address in expected_members.items()),
+            "retired_members": len(set(expanded_members) - expected_member_names),
             "expanded_dcs": mapping(expanded, "HETERONETWORK_DB_DCS_MEMBERS") == expected_dcs,
             "expanded_bootstrap": mapping(expanded, "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") == expected_dcs,
-            "expanded_identities": set(mapping(expanded, "HETERONETWORK_DB_MEMBER_IDENTITIES")) == set(expected_members),
+            "expanded_identities": set(expanded_identities) == expected_member_names,
+            "expanded_identity_superset": expected_member_names <= set(expanded_identities),
+            "retired_identities": len(set(expanded_identities) - expected_member_names),
+            "desired_credential_files": all(path.is_file() and not path.is_symlink() for path in required_files),
             "archived_members": mapping(archived, "HETERONETWORK_DB_MEMBERS") == expected_members,
             "archived_dcs": mapping(archived, "HETERONETWORK_DB_DCS_MEMBERS") == expected_dcs,
             "archived_bootstrap": mapping(archived, "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS") == expected_dcs,
             "archived_identities": set(mapping(archived, "HETERONETWORK_DB_MEMBER_IDENTITIES")) == set(expected_members),
             "archive_equal": archived_raw == expanded_raw,
         }
-        print(",".join(f"{name}={'true' if value else 'false'}" for name, value in flags.items()))
+        print(",".join(
+            f"{name}={'true' if value else 'false'}" if isinstance(value, bool) else f"{name}={value}"
+            for name, value in flags.items()
+        ))
         PY
       args:
         executable: /bin/bash
