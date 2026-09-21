@@ -8,6 +8,7 @@ metadata:
     heteronetwork.io/control-plane-only: 'false'
     networking.heteronetwork.io/public-ingress: 'true'
     database.heteronetwork.io/proxy-ready: 'true'
+    monitoring.heteronetwork.io/ha: 'true'
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'true'
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -34,3 +35,23 @@ spec:
       evictionRequested: false
       storageReserved: 68719476736
       tags: []
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: uc-k8sp5
+  labels:
+    monitoring.heteronetwork.io/ha: 'true'
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: '0'
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: ichikawap1
+  labels:
+    monitoring.heteronetwork.io/ha: 'true'
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: '0'

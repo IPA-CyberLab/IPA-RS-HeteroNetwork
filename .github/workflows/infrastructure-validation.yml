@@ -181,7 +181,7 @@ jobs:
             {
               echo '### Live HeteroNetwork overlay E2E'
               echo '```json'
-              sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, console_identity_reconciled, gateway_vpn_ip, wireguard_handshake_at, route_convergence_ms, canonical: .console.canonical, authenticated: .console.authenticated, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
+              sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, console_identity_reconciled, gateway_vpn_ip, wireguard_handshake_at, route_convergence_ms, canonical: .console.canonical, authenticated: .console.authenticated, monitoring: .monitoring.services, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi

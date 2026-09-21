@@ -34,6 +34,19 @@ CONSOLE_IDENTITY_RECONCILER = ROOT / "scripts/reconcile-console-e2e-user.py"
 OVERLAY_MTU = 1280
 CONSOLE_DNS_NAME = "console.heteronetwork.internal"
 CONSOLE_PORT = 9781
+MONITORING_SERVICES = {
+    "grafana.heteronetwork.internal": {
+        "port": 13000,
+        "path": "/",
+        "marker": b"Grafana",
+    },
+    "prometheus.heteronetwork.internal": {
+        "port": 9090,
+        "path": "/",
+        "marker": b"Prometheus",
+    },
+}
+MONITORING_OPEN_TIMEOUT_SECONDS = 3
 
 
 def b64url(value):
@@ -499,7 +512,7 @@ def skip_dns_name(message, offset):
             raise ValueError("DNS name has too many labels")
 
 
-def dns_a_answers(message, query_id):
+def dns_a_answers(message, query_id, query_name=CONSOLE_DNS_NAME):
     if len(message) < 12:
         raise ValueError("truncated DNS response")
     response_id, flags, questions, answers, _, _ = struct.unpack(
@@ -511,7 +524,7 @@ def dns_a_answers(message, query_id):
     if offset + 4 > len(message):
         raise ValueError("truncated DNS question")
     offset += 4
-    if message[12:offset] != dns_a_query(CONSOLE_DNS_NAME, query_id)[12:]:
+    if message[12:offset] != dns_a_query(query_name, query_id)[12:]:
         raise ValueError("unexpected DNS question")
     addresses = []
     for _ in range(answers):
@@ -529,18 +542,72 @@ def dns_a_answers(message, query_id):
     return addresses
 
 
-def overlay_dns_resolves_to_gateway(gateway):
+def overlay_dns_answers(gateway, query_name):
     query_id = secrets.randbits(16)
-    query = dns_a_query(CONSOLE_DNS_NAME, query_id)
+    query = dns_a_query(query_name, query_id)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        client.settimeout(1)
+        client.sendto(query, (gateway, 53))
+        response, source = client.recvfrom(4096)
+    if source[0] != gateway or source[1] != 53:
+        raise ValueError("DNS response came from an unexpected gateway")
+    return dns_a_answers(response, query_id, query_name)
+
+
+def overlay_dns_resolves_to_gateway(gateway):
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
-            client.settimeout(1)
-            client.sendto(query, (gateway, 53))
-            response, source = client.recvfrom(4096)
-        return (source[0] == gateway and source[1] == 53
-                and dns_a_answers(response, query_id) == [gateway])
+        return overlay_dns_answers(gateway, CONSOLE_DNS_NAME) == [gateway]
     except (OSError, ValueError):
         return False
+
+
+def monitoring_endpoint_health(name, address, service):
+    endpoint = ipaddress.ip_address(address)
+    if (endpoint.version != 4
+            or endpoint not in ipaddress.ip_network("10.250.0.0/16")):
+        raise RuntimeError(f"{name} DNS returned an unsafe endpoint")
+    port = service["port"]
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(
+        f"http://{address}:{port}{service['path']}",
+        headers={"Accept": "text/html", "Host": f"{name}:{port}"})
+    started = time.monotonic()
+    with opener.open(request, timeout=MONITORING_OPEN_TIMEOUT_SECONDS) as response:
+        body = response.read(256 * 1024)
+        status = response.status
+    open_ms = round((time.monotonic() - started) * 1000)
+    if status != 200 or service["marker"] not in body:
+        raise RuntimeError(f"{name} did not render from {address}")
+    if open_ms > MONITORING_OPEN_TIMEOUT_SECONDS * 1000:
+        raise RuntimeError(f"{name} exceeded the monitoring UI open deadline")
+    return {"address": address, "http": status, "open_ms": open_ms}
+
+
+def verify_monitoring_gateways(gateways):
+    targets = tuple(sorted(set(gateways.split(","))))
+    if not targets or "" in targets:
+        raise RuntimeError("at least one monitoring DNS gateway is required")
+    report = {"dns": {}, "services": {}}
+    for name, service in MONITORING_SERVICES.items():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            answers = dict(zip(
+                targets,
+                executor.map(lambda gateway: overlay_dns_answers(gateway, name), targets),
+            ))
+        endpoint_sets = {tuple(sorted(set(values))) for values in answers.values()}
+        if len(endpoint_sets) != 1 or not next(iter(endpoint_sets), ()):
+            raise RuntimeError(f"{name} DNS endpoints differ between gateways")
+        endpoints = next(iter(endpoint_sets))
+        if len(endpoints) > 16:
+            raise RuntimeError(f"{name} DNS returned too many endpoints")
+        report["dns"][name] = answers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            health = list(executor.map(
+                lambda address: monitoring_endpoint_health(name, address, service),
+                endpoints,
+            ))
+        report["services"][name] = health
+    return report
 
 
 def gateway_console_ui_is_ready(gateway):
@@ -668,6 +735,7 @@ def main():
         report["peer_map_generated_at"] = refresh_client_peers(
             identity, client_id, peer)
         report["route_convergence_ms"] = wait_for_gateway_routes(args.gateways)
+        report["monitoring"] = verify_monitoring_gateways(args.gateways)
         write_report(args.output, report)
         console = browser_check(work, peer["vpn_ip"], args.gateways, args.output)
         if args.credential_file is not None:

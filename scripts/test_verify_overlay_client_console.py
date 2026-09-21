@@ -109,6 +109,39 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
         self.assertEqual(ready.call_count, 3)
         self.assertGreaterEqual(elapsed, 0)
 
+    def test_monitoring_requires_consistent_healthy_overlay_endpoints(self):
+        endpoints = ["10.250.0.2", "10.250.0.10", "10.250.0.11"]
+        with (
+            patch.object(verify, "overlay_dns_answers", return_value=endpoints) as dns,
+            patch.object(
+                verify,
+                "monitoring_endpoint_health",
+                side_effect=lambda name, address, _: {
+                    "address": address, "http": 200, "open_ms": 5,
+                },
+            ) as health,
+        ):
+            report = verify.verify_monitoring_gateways("10.250.0.2,10.250.0.4")
+        self.assertEqual(dns.call_count, 4)
+        self.assertEqual(health.call_count, 6)
+        self.assertEqual(
+            {item["address"] for item in report["services"]
+             ["grafana.heteronetwork.internal"]},
+            set(endpoints),
+        )
+
+    def test_monitoring_rejects_gateway_dns_disagreement(self):
+        def answers(gateway, _):
+            return ["10.250.0.2"] if gateway == "10.250.0.2" else ["10.250.0.10"]
+
+        with (
+            patch.object(verify, "overlay_dns_answers", side_effect=answers),
+            patch.object(verify, "monitoring_endpoint_health") as health,
+            self.assertRaisesRegex(RuntimeError, "differ between gateways"),
+        ):
+            verify.verify_monitoring_gateways("10.250.0.2,10.250.0.4")
+        health.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

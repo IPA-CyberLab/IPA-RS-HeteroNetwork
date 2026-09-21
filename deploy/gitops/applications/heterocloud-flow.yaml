@@ -22,9 +22,17 @@ spec:
           prometheus:
             nodeSelector:
               monitoring.heteronetwork.io/ha: "true"
+            allowedNodes:
+              - uc-k8sp5
+              - ichikawap1
+              - uc-k8sp4
           grafana:
             nodeSelector:
               monitoring.heteronetwork.io/ha: "true"
+            allowedNodes:
+              - uc-k8sp5
+              - ichikawap1
+              - uc-k8sp4
       parameters:
         - name: monitoring.prometheus.replicaCount
           value: "3"
