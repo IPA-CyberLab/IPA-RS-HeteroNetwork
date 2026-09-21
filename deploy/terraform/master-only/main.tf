@@ -47,7 +47,7 @@ locals {
           hosts = { for name, node in local.nodes : name => merge(node, { ansible_host = node.ssh_host }) }
         }
         bootstrap = {
-          hosts = { uc-k8sp5 = merge(local.bootstrap, {
+          hosts = { uc-k8sp5 = merge({ for key, value in local.bootstrap : key => value if key != "name" }, {
             ansible_host            = local.bootstrap.ssh_host
             gpu_expected_count      = local.gpu_expected_nodes.uc-k8sp5.count
             gpu_expected_type       = local.gpu_expected_nodes.uc-k8sp5.type
@@ -65,7 +65,7 @@ locals {
               if try(node.postgres_role, "") == "member"
             },
             try(local.bootstrap.postgres_role, "") == "member" ? {
-              (local.bootstrap.name) = merge(local.bootstrap, { ansible_host = local.bootstrap.ssh_host })
+              (local.bootstrap.name) = merge({ for key, value in local.bootstrap : key => value if key != "name" }, { ansible_host = local.bootstrap.ssh_host })
             } : {}
           )
         }

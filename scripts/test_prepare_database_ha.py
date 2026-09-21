@@ -36,6 +36,7 @@ class DatabaseHaPreparationTests(unittest.TestCase):
         inventory = json.loads((self.work / "inventory.json").read_text())
         groups = inventory["all"]["children"]
         self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp5"]["postgres_name"], "db-b")
+        self.assertNotIn("name", groups["postgres_members"]["hosts"]["uc-k8sp5"])
         self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp4"]["postgres_name"], "db-e")
         self.assertEqual(groups["postgres_dcs_only"]["hosts"]["uc-k8sp2"]["postgres_name"], "db-g")
         for name in ("inventory.json", "known_hosts"):

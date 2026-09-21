@@ -130,7 +130,10 @@ def inventory(repo_root, work_dir, ssh_key, checksums):
                     for name, node in standard_nodes.items()
                 }},
                 "bootstrap": {"hosts": {
-                    bootstrap["name"]: {**bootstrap, "ansible_host": bootstrap["ssh_host"]}
+                    bootstrap["name"]: {
+                        **{key: value for key, value in bootstrap.items() if key != "name"},
+                        "ansible_host": bootstrap["ssh_host"],
+                    }
                 }},
                 "postgres_members": {"hosts": {
                     **{
@@ -140,7 +143,8 @@ def inventory(repo_root, work_dir, ssh_key, checksums):
                     },
                     **({
                         bootstrap["name"]: {
-                            **bootstrap, "ansible_host": bootstrap["ssh_host"]
+                            **{key: value for key, value in bootstrap.items() if key != "name"},
+                            "ansible_host": bootstrap["ssh_host"],
                         }
                     } if bootstrap.get("postgres_role") == "member" else {}),
                 }},

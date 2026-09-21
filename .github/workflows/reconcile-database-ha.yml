@@ -70,12 +70,16 @@ jobs:
             > "$DATABASE_HA_ROOT/ansible-result.json"
 
       - name: Publish sanitized reconciliation result
+        if: always()
         run: |
           {
             echo '### Database HA reconciliation'
             echo '```json'
-            cat "$DATABASE_HA_ROOT/preparation.json"
-            python3 - "$DATABASE_HA_ROOT/ansible-result.json" <<'PY'
+            if test -s "$DATABASE_HA_ROOT/preparation.json"; then
+              cat "$DATABASE_HA_ROOT/preparation.json"
+            fi
+            if test -s "$DATABASE_HA_ROOT/ansible-result.json"; then
+              python3 - "$DATABASE_HA_ROOT/ansible-result.json" <<'PY'
           import json
           import sys
           value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -86,10 +90,12 @@ jobs:
               "failed_hosts": sorted(name for name, stats in hosts.items()
                                      if stats.get("failures", 0) or stats.get("unreachable", 0)),
               "errors": len(value.get("errors", [])),
+              "failure_tasks": sorted({error.get("task", "unknown") for error in value.get("errors", [])}),
           }, separators=(",", ":")))
           PY
+            fi
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Remove materialized private inputs
         if: always()
