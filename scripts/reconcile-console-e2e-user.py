@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Reconcile the dedicated console E2E identity from a private JSON record.
 
-This program is streamed over SSH and runs as root on the Keycloak host. It
-reads one JSON line from stdin. Credential values are never accepted in argv,
-written to disk, or included in output.
+This program is streamed over SSH and runs as root on a Keycloak-capable host.
+It reaches Keycloak through the local HA edge so reconciliation keeps working
+while an individual replica is starting or has been withdrawn. It reads one
+JSON line from stdin. Credential values are never accepted in argv, written to
+disk, or included in output.
 """
 
 import json
@@ -20,7 +22,7 @@ EXPECTED_USERNAME = EXPECTED_EMAIL
 MANAGED_FIRST_NAME = "HeteroNetwork Console"
 MANAGED_LAST_NAME = "E2E"
 REALM = "heterocloud"
-SERVER = "http://127.0.0.1:18080"
+SERVER = "http://127.0.0.1:18079"
 KCADM = "/opt/heteronetwork/keycloak/bin/kcadm.sh"
 ADMIN_PASSWORD = Path("/etc/heteronetwork/keycloak/bootstrap-admin.password")
 MAX_INPUT_BYTES = 8192
