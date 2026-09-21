@@ -23,7 +23,7 @@ const report = { started_at_utc: new Date().toISOString(), result: 'failed', can
 const netLogPath = values.output ? `${values.output}.chromium-netlog.json` : null;
 let browser;
 try {
-  const launchArgs = ['--disable-dev-shm-usage'];
+  const launchArgs = ['--disable-dev-shm-usage', '--no-proxy-server'];
   if (netLogPath) {
     launchArgs.push(`--log-net-log=${netLogPath}`, '--net-log-capture-mode=Default');
   }
