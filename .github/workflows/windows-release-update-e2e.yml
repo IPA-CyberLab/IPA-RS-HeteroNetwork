@@ -127,9 +127,14 @@ jobs:
             -Destination $probeAssembly
           $catalogType = [Reflection.Assembly]::LoadFile($probeAssembly).GetType(
             'HeteroNetwork.Core.DesktopReleaseCatalog')
-          $atomFallbackForced = @(
+          $atomFallbackSupported = @(
             $catalogType.GetMethods() | Where-Object Name -eq 'AvailableUpdateFromAtom'
           ).Count -gt 0
+          if (-not $atomFallbackSupported) {
+            Write-Host "$($env:PREVIOUS_WINDOWS_RELEASE) predates the resilient release feed; skipping upgrade-path E2E."
+            return
+          }
+          $atomFallbackForced = $true
           $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
           $hostsBackup = Join-Path $env:RUNNER_TEMP 'hosts.before-heteronetwork-update'
           $version = ""
