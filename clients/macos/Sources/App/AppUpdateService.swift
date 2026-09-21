@@ -71,6 +71,9 @@ final class AppUpdateService {
     private static let catalogURL = URL(
         string: "https://api.github.com/repos/IPA-CyberLab/IPA-RS-HeteroNetwork/releases?per_page=100"
     )!
+    private static let atomCatalogURL = URL(
+        string: "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/releases.atom"
+    )!
     private static let maximumCatalogSize = 5 * 1_024 * 1_024
     private static let maximumArchiveSize: UInt64 = 512 * 1_024 * 1_024
     private static let bundleIdentifier = "jp.go.ipa.cyberlab.heteronetwork"
@@ -92,20 +95,43 @@ final class AppUpdateService {
     }
 
     func availableUpdate(currentTag: String) async throws -> DesktopReleaseUpdate? {
-        var request = URLRequest(url: Self.catalogURL)
+        let assetName = try Self.macAssetName()
+        do {
+            let data = try await downloadCatalog(
+                from: Self.catalogURL,
+                accept: "application/vnd.github+json"
+            )
+            return try DesktopReleaseCatalog.availableUpdate(
+                from: data,
+                currentTag: currentTag,
+                assetName: assetName
+            )
+        } catch {
+            let data = try await downloadCatalog(
+                from: Self.atomCatalogURL,
+                accept: "application/atom+xml"
+            )
+            return try DesktopReleaseCatalog.availableUpdate(
+                fromAtom: data,
+                currentTag: currentTag,
+                assetName: assetName
+            )
+        }
+    }
+
+    private func downloadCatalog(from url: URL, accept: String) async throws -> Data {
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.setValue(accept, forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse,
               http.statusCode == 200,
+              response.url?.scheme == "https",
               data.count <= Self.maximumCatalogSize
         else {
             throw AppUpdateError.invalidHTTPResponse
         }
-        return try DesktopReleaseCatalog.availableUpdate(
-            from: data,
-            currentTag: currentTag,
-            assetName: try Self.macAssetName()
-        )
+        return data
     }
 
     func prepare(_ release: DesktopReleaseUpdate) async throws -> PreparedAppUpdate {

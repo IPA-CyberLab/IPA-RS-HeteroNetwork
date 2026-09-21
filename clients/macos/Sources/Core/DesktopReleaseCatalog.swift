@@ -107,6 +107,60 @@ public enum DesktopReleaseCatalog {
         )
     }
 
+    /// Selects an update from GitHub's public releases Atom feed. This is a
+    /// fallback for clients whose unauthenticated API quota is exhausted.
+    /// Release asset names are fixed by the release contract, and downloads
+    /// remain protected by the separately published SHA-256 checksum.
+    public static func availableUpdate(
+        fromAtom data: Data,
+        currentTag: String,
+        assetName: String
+    ) throws -> DesktopReleaseUpdate? {
+        guard isSafeReleaseTag(currentTag), isKnownMacAsset(assetName) else {
+            return nil
+        }
+
+        let entries = try AtomReleaseFeedParser.parse(data)
+        let candidates = entries.compactMap { entry -> Candidate? in
+            guard let publishedAt = parseTimestamp(entry.updated),
+                  let tag = releaseTag(from: entry.alternateURL),
+                  let archiveURL = expectedDownloadURL(tag: tag, assetName: assetName),
+                  let checksumURL = expectedDownloadURL(
+                      tag: tag,
+                      assetName: "\(assetName).sha256"
+                  )
+            else {
+                return nil
+            }
+            return Candidate(
+                tag: tag,
+                publishedAt: publishedAt,
+                archiveURL: archiveURL,
+                checksumURL: checksumURL
+            )
+        }
+
+        guard let newest = candidates.max(by: {
+            if $0.publishedAt == $1.publishedAt { return $0.tag < $1.tag }
+            return $0.publishedAt < $1.publishedAt
+        }) else {
+            return nil
+        }
+        if newest.tag == currentTag { return nil }
+
+        if let current = candidates.first(where: { $0.tag == currentTag }),
+           current.publishedAt >= newest.publishedAt {
+            return nil
+        }
+
+        return DesktopReleaseUpdate(
+            tag: newest.tag,
+            assetName: assetName,
+            archiveURL: newest.archiveURL,
+            checksumURL: newest.checksumURL
+        )
+    }
+
     private static func parseTimestamp(_ value: String?) -> Date? {
         guard let value else { return nil }
         let formatter = ISO8601DateFormatter()
@@ -164,6 +218,39 @@ public enum DesktopReleaseCatalog {
             assetName,
         ]
     }
+
+    private static func releaseTag(from url: URL) -> String? {
+        guard url.scheme == "https",
+              url.host?.lowercased() == "github.com",
+              url.user == nil,
+              url.password == nil,
+              url.port == nil,
+              url.query == nil,
+              url.fragment == nil,
+              url.pathComponents.count == 6,
+              url.pathComponents[0] == "/",
+              url.pathComponents[1] == repositoryOwner,
+              url.pathComponents[2] == repositoryName,
+              url.pathComponents[3] == "releases",
+              url.pathComponents[4] == "tag",
+              isSafeReleaseTag(url.pathComponents[5])
+        else {
+            return nil
+        }
+        return url.pathComponents[5]
+    }
+
+    private static func expectedDownloadURL(tag: String, assetName: String) -> URL? {
+        guard isSafeReleaseTag(tag),
+              let url = URL(
+                  string: "https://github.com/\(repositoryOwner)/\(repositoryName)/releases/download/\(tag)/\(assetName)"
+              ),
+              isExpectedDownloadURL(url, tag: tag, assetName: assetName)
+        else {
+            return nil
+        }
+        return url
+    }
 }
 
 private struct GitHubRelease: Decodable {
@@ -195,4 +282,85 @@ private struct Candidate {
     let publishedAt: Date
     let archiveURL: URL
     let checksumURL: URL
+}
+
+private struct AtomReleaseEntry {
+    let updated: String
+    let alternateURL: URL
+}
+
+private final class AtomReleaseFeedParser: NSObject, XMLParserDelegate {
+    private var entries: [AtomReleaseEntry] = []
+    private var insideEntry = false
+    private var updated = ""
+    private var alternateURL: URL?
+    private var capturesUpdated = false
+
+    static func parse(_ data: Data) throws -> [AtomReleaseEntry] {
+        let delegate = AtomReleaseFeedParser()
+        let parser = XMLParser(data: data)
+        parser.shouldResolveExternalEntities = false
+        parser.delegate = delegate
+        guard parser.parse() else {
+            throw DesktopReleaseCatalogError.invalidResponse
+        }
+        return delegate.entries
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didStartElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?,
+        attributes attributeDict: [String: String] = [:]
+    ) {
+        switch elementName {
+        case "entry":
+            insideEntry = true
+            updated = ""
+            alternateURL = nil
+            capturesUpdated = false
+        case "updated" where insideEntry:
+            updated = ""
+            capturesUpdated = true
+        case "link" where insideEntry:
+            if attributeDict["rel"] == "alternate",
+               let href = attributeDict["href"] {
+                alternateURL = URL(string: href)
+            }
+        default:
+            break
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if capturesUpdated {
+            updated += string
+        }
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didEndElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?
+    ) {
+        switch elementName {
+        case "updated" where insideEntry:
+            capturesUpdated = false
+        case "entry" where insideEntry:
+            if !updated.isEmpty, let alternateURL {
+                entries.append(
+                    AtomReleaseEntry(
+                        updated: updated.trimmingCharacters(in: .whitespacesAndNewlines),
+                        alternateURL: alternateURL
+                    )
+                )
+            }
+            insideEntry = false
+            capturesUpdated = false
+        default:
+            break
+        }
+    }
 }
