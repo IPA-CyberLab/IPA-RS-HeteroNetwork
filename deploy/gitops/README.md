@@ -123,6 +123,12 @@ public nodes. Prometheus also scrapes the Envoy Gateway namespace so the
 control-plane, proxy, and rate-limit metrics remain in the existing Grafana
 stack.
 
-Internal DNS records are declared in
-`deploy/environments/heteronet/values.yaml`. Every HeteroNetwork agent reloads
-the generated JSON zone without restarting the VPN dataplane.
+Static internal DNS records are declared in
+`deploy/environments/heteronet/values.yaml`. Kubernetes-backed records are
+declared in `cluster-dns/overlay-dns-services.json`, or directly on a Service
+with the `networking.heteronetwork.io/overlay-dns-name` annotation. The
+`overlay-dns-service-discovery` controller derives addresses only from ready,
+non-terminating EndpointSlices and the owning nodes' HeteroNetwork VPN IPs.
+It removes records when a Service or its last ready endpoint disappears. A
+node-local sync DaemonSet publishes the effective zone to every agent within
+ten seconds without restarting the VPN dataplane.

@@ -1,0 +1,14 @@
+{
+  "services": [
+    {
+      "dns_name": "grafana.heteronetwork.internal",
+      "namespace": "heterocloud-flow",
+      "service_name": "heterocloud-flow-grafana"
+    },
+    {
+      "dns_name": "prometheus.heteronetwork.internal",
+      "namespace": "heterocloud-flow",
+      "service_name": "heterocloud-flow-prometheus"
+    }
+  ]
+}

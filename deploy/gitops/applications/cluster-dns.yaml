@@ -14,6 +14,13 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: kube-system
+  ignoreDifferences:
+    - group: ""
+      kind: ConfigMap
+      name: heteronetwork-overlay-dns-effective
+      namespace: kube-system
+      jsonPointers:
+        - /data
   syncPolicy:
     automated:
       enabled: true

@@ -10,6 +10,11 @@ configMapGenerator:
     namespace: kube-system
     files:
       - haproxy.cfg=keycloak-haproxy.cfg
+  - name: overlay-dns-service-discovery
+    namespace: kube-system
+    files:
+      - controller.py=overlay-dns-service-discovery.py
+      - services.json=overlay-dns-services.json
 
 resources:
   - coredns.yaml
@@ -17,3 +22,4 @@ resources:
   - postgres-ha-connector.yaml
   - keycloak-ha-connector.yaml
   - service-route.yaml
+  - overlay-dns-service-discovery.yaml

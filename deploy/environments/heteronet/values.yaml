@@ -18,19 +18,10 @@ agent:
 
   overlayDns:
     enabled: true
-    # The console name is synthesized by each gateway's split-DNS listener so
-    # clients always connect to the gateway that currently carries their VPN.
+    # Kubernetes-backed names such as Grafana and Prometheus are discovered
+    # from their ready EndpointSlices by the cluster-dns Application. Only
+    # endpoints without a Kubernetes Service remain declared here.
     records:
-      grafana.heteronetwork.internal:
-        # Monitoring runs only on schedulable standard nodes. Dedicated
-        # control-plane-only nodes must never be advertised as endpoints.
-        - 10.250.0.10
-        - 10.250.0.11
-        - 10.250.0.2
-      prometheus.heteronetwork.internal:
-        - 10.250.0.10
-        - 10.250.0.11
-        - 10.250.0.2
       argocd.heteronetwork.internal:
         - 10.250.0.4
         - 10.250.0.5
@@ -41,38 +32,6 @@ agent:
         - 10.250.0.6
         - 10.250.0.10
     gatewayRecords:
-      grafana.heteronetwork.internal:
-        10.250.0.2:
-          - 10.250.0.2
-          - 10.250.0.10
-          - 10.250.0.11
-        10.250.0.4:
-          - 10.250.0.10
-          - 10.250.0.11
-          - 10.250.0.2
-        10.250.0.5:
-          - 10.250.0.10
-          - 10.250.0.11
-          - 10.250.0.2
-        10.250.0.6:
-          - 10.250.0.10
-          - 10.250.0.11
-          - 10.250.0.2
-        10.250.0.11:
-          - 10.250.0.11
-          - 10.250.0.10
-          - 10.250.0.2
-        10.250.0.10:
-          - 10.250.0.10
-          - 10.250.0.11
-          - 10.250.0.2
-      prometheus.heteronetwork.internal:
-        10.250.0.2: [10.250.0.2, 10.250.0.10, 10.250.0.11]
-        10.250.0.4: [10.250.0.10, 10.250.0.11, 10.250.0.2]
-        10.250.0.5: [10.250.0.10, 10.250.0.11, 10.250.0.2]
-        10.250.0.6: [10.250.0.10, 10.250.0.11, 10.250.0.2]
-        10.250.0.11: [10.250.0.11, 10.250.0.10, 10.250.0.2]
-        10.250.0.10: [10.250.0.10, 10.250.0.11, 10.250.0.2]
       argocd.heteronetwork.internal:
         10.250.0.4: [10.250.0.4, 10.250.0.6, 10.250.0.5]
         10.250.0.5: [10.250.0.5, 10.250.0.6, 10.250.0.4]

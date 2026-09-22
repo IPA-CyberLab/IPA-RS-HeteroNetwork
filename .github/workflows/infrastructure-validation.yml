@@ -5,6 +5,10 @@ on:
   push:
     paths:
       - 'deploy/terraform/master-only/**'
+      - 'deploy/gitops/cluster-dns/**'
+      - 'deploy/gitops/applications/cluster-dns.yaml'
+      - 'deploy/environments/heteronet/values.yaml'
+      - 'scripts/publish-master-only.py'
       - 'scripts/accept-registered-nodes.py'
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/test_verify_standard_node.py'
@@ -29,6 +33,10 @@ on:
   pull_request:
     paths:
       - 'deploy/terraform/master-only/**'
+      - 'deploy/gitops/cluster-dns/**'
+      - 'deploy/gitops/applications/cluster-dns.yaml'
+      - 'deploy/environments/heteronet/values.yaml'
+      - 'scripts/publish-master-only.py'
       - 'scripts/accept-registered-nodes.py'
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/test_verify_standard_node.py'
@@ -70,11 +78,12 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_verify_gpu_inventory.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_flash_crds.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_overlay_client_console.py -v
+          python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py -v
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs
           node --check scripts/heteronetwork-console-browser-e2e.mjs
-          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py scripts/gpu_inventory.py scripts/verify_gpu_inventory.py scripts/verify_flash_crds.py
+          python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py scripts/gpu_inventory.py scripts/verify_gpu_inventory.py scripts/verify_flash_crds.py deploy/gitops/cluster-dns/overlay-dns-service-discovery.py
 
   live-overlay-browser-e2e:
     if: >-
