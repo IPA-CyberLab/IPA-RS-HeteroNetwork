@@ -25,6 +25,14 @@
           - overlay_dns_kubeconfig.stat.readable
         fail_msg: /etc/kubernetes/admin.conf is required for overlay DNS synchronization
 
+    - name: Create the local executable directory
+      ansible.builtin.file:
+        path: /usr/local/libexec
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Install the overlay DNS synchronization program
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../../../gitops/cluster-dns/overlay-dns-service-discovery.py"
