@@ -1,0 +1,99 @@
+---
+- name: Reconcile overlay DNS host synchronization on dedicated masters
+  hosts: master_only
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+  tasks:
+    - name: Locate kubectl
+      ansible.builtin.command: sh -c 'command -v kubectl'
+      register: overlay_dns_kubectl
+      changed_when: false
+
+    - name: Verify the administrative kubeconfig exists
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: overlay_dns_kubeconfig
+
+    - name: Require a readable administrative kubeconfig
+      ansible.builtin.assert:
+        that:
+          - overlay_dns_kubeconfig.stat.exists
+          - overlay_dns_kubeconfig.stat.isreg
+          - overlay_dns_kubeconfig.stat.readable
+        fail_msg: /etc/kubernetes/admin.conf is required for overlay DNS synchronization
+
+    - name: Install the overlay DNS synchronization program
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../gitops/cluster-dns/overlay-dns-service-discovery.py"
+        dest: /usr/local/libexec/heteronetwork-overlay-dns-sync
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart overlay DNS host synchronization
+
+    - name: Install the overlay DNS synchronization service
+      ansible.builtin.template:
+        src: templates/heteronetwork-overlay-dns-sync.service.j2
+        dest: /etc/systemd/system/heteronetwork-overlay-dns-sync.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart overlay DNS host synchronization
+
+    - name: Enable and start overlay DNS host synchronization
+      ansible.builtin.systemd_service:
+        name: heteronetwork-overlay-dns-sync.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Flush overlay DNS synchronization restart
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the first synchronized zone
+      ansible.builtin.command:
+        argv:
+          - "{{ overlay_dns_kubectl.stdout }}"
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - --request-timeout=5s
+          - -n
+          - kube-system
+          - get
+          - configmap
+          - heteronetwork-overlay-dns-effective
+          - -o
+          - jsonpath={.data.records\.json}
+      register: overlay_dns_effective_zone
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: overlay_dns_effective_zone.stdout | length > 0
+
+    - name: Verify the host installed the effective zone
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - >-
+            import json,pathlib;
+            value=json.loads(pathlib.Path('/var/lib/heteronetwork/overlay-dns-records.json').read_text());
+            assert value.get('schema_version') == 1;
+            assert 'grafana.heteronetwork.internal' in value.get('records', {});
+            assert 'prometheus.heteronetwork.internal' in value.get('records', {})
+      changed_when: false
+      retries: 12
+      delay: 5
+      register: overlay_dns_host_zone
+      until: overlay_dns_host_zone.rc == 0
+
+  handlers:
+    - name: Restart overlay DNS host synchronization
+      ansible.builtin.systemd_service:
+        name: heteronetwork-overlay-dns-sync.service
+        enabled: true
+        state: restarted
+        daemon_reload: true

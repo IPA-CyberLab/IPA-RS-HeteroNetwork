@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -367,6 +368,41 @@ class KubernetesApi:
         )
 
 
+class KubectlApi:
+    """Read the effective ConfigMap from a dedicated control-plane host."""
+
+    def __init__(self):
+        self.kubectl = os.environ.get("KUBECTL", "/usr/bin/kubectl")
+        self.kubeconfig = os.environ.get("KUBECONFIG", "/etc/kubernetes/admin.conf")
+
+    def config_map(self, namespace, name):
+        command = [
+            self.kubectl,
+            "--kubeconfig",
+            self.kubeconfig,
+            "--request-timeout=5s",
+            "-n",
+            namespace,
+            "get",
+            "configmap",
+            name,
+            "-o",
+            "json",
+        ]
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=10, check=False
+        )
+        if result.returncode:
+            raise RuntimeError(
+                "kubectl failed to read the effective overlay DNS ConfigMap: "
+                + result.stderr.strip()[-1000:]
+            )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("kubectl returned invalid ConfigMap JSON") from error
+
+
 def canonical_json(document):
     return json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
 
@@ -453,7 +489,7 @@ def sync_once(api, destination):
 
 
 def run_loop(mode):
-    api = KubernetesApi()
+    api = KubectlApi() if mode == "host-sync" else KubernetesApi()
     interval = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "5"))
     if not 1 <= interval <= 300:
         raise RuntimeError("RECONCILE_INTERVAL_SECONDS must be between 1 and 300")
@@ -481,8 +517,10 @@ def run_loop(mode):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in {"controller", "sync"}:
-        raise SystemExit("usage: overlay-dns-service-discovery.py controller|sync")
+    if len(sys.argv) != 2 or sys.argv[1] not in {"controller", "sync", "host-sync"}:
+        raise SystemExit(
+            "usage: overlay-dns-service-discovery.py controller|sync|host-sync"
+        )
     run_loop(sys.argv[1])
 
 

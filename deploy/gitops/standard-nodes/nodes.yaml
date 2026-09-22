@@ -9,6 +9,7 @@ metadata:
     networking.heteronetwork.io/public-ingress: 'true'
     database.heteronetwork.io/proxy-ready: 'true'
     monitoring.heteronetwork.io/ha: 'true'
+    networking.heteronetwork.io/overlay-dns-sync: 'true'
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'true'
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -42,6 +43,7 @@ metadata:
   name: uc-k8sp5
   labels:
     monitoring.heteronetwork.io/ha: 'true'
+    networking.heteronetwork.io/overlay-dns-sync: 'true'
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'
@@ -52,6 +54,7 @@ metadata:
   name: ichikawap1
   labels:
     monitoring.heteronetwork.io/ha: 'true'
+    networking.heteronetwork.io/overlay-dns-sync: 'true'
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'

@@ -264,6 +264,26 @@ resource "terraform_data" "git_source" {
   depends_on = [local_file.inventory, local_file.known_hosts]
 }
 
+resource "terraform_data" "overlay_dns_host_sync" {
+  input = { hosts = sort(keys(local.nodes)) }
+  triggers_replace = [
+    filesha256("${path.module}/ansible/overlay-dns-host-sync.yaml"),
+    filesha256("${path.module}/ansible/templates/heteronetwork-overlay-dns-sync.service.j2"),
+    filesha256("${local.repo_root}/deploy/gitops/cluster-dns/overlay-dns-service-discovery.py"),
+    sha256(jsonencode(local.nodes)),
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/overlay-dns-host-sync.yaml"
+    environment = {
+      HNN_IAC_INVENTORY        = local_file.inventory.filename
+      ANSIBLE_CALLBACK_PLUGINS = "${abspath(path.module)}/ansible/callback_plugins"
+      ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
+    }
+  }
+  depends_on = [terraform_data.git_source]
+}
+
 resource "terraform_data" "console_configuration" {
   input = { hosts = concat(keys(local.nodes), keys(local.standard_nodes), ["uc-k8sp5", "ichikawap1"]), overlay_port = 9781, canonical_port = 80 }
   triggers_replace = [

@@ -131,4 +131,6 @@ with the `networking.heteronetwork.io/overlay-dns-name` annotation. The
 non-terminating EndpointSlices and the owning nodes' HeteroNetwork VPN IPs.
 It removes records when a Service or its last ready endpoint disappears. A
 node-local sync DaemonSet publishes the effective zone to every agent within
-ten seconds without restarting the VPN dataplane.
+ten seconds without restarting the VPN dataplane. Dedicated master-only nodes
+remain free of workload Pods; Terraform installs the equivalent restricted
+`heteronetwork-overlay-dns-sync.service` directly on those hosts.
