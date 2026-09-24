@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: v0.1.77
+    targetRevision: v0.1.78
     path: deploy/helm/heterocloud
     helm:
       releaseName: heterocloud
@@ -18,7 +18,7 @@ spec:
       valuesObject:
         replicaCount: 3
         image:
-          tag: "0.1.77@sha256:b7077c2d5edc8b34815b69658cd069df6530ea88ae48400abfa91b8bd2fb94e6"
+          tag: "0.1.78@sha256:32699928177968fae16eff5e59839f0f506e9085563dded61b2b74a8801666de"
         worker:
           replicaCount: 3
         ownerConsole:
