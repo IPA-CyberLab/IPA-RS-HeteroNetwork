@@ -28,7 +28,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/database-ha.yaml" && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/git-source.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/openbao-storage.yaml" && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -218,6 +218,27 @@ resource "terraform_data" "host_configuration" {
   depends_on = [local_file.known_hosts, local_file.inventory]
 }
 
+resource "terraform_data" "openbao_storage" {
+  input = {
+    hosts = sort(keys(local.nodes))
+    path  = "/var/lib/openbao/raft"
+  }
+  triggers_replace = [
+    filesha256("${path.module}/ansible/openbao-storage.yaml"),
+    sha256(jsonencode(local.nodes))
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/openbao-storage.yaml"
+    environment = {
+      HNN_IAC_INVENTORY        = local_file.inventory.filename
+      ANSIBLE_CALLBACK_PLUGINS = "${abspath(path.module)}/ansible/callback_plugins"
+      ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
+    }
+  }
+  depends_on = [local_file.inventory, local_file.known_hosts]
+}
+
 resource "kubernetes_manifest" "master_only_application" {
   manifest = {
     apiVersion = "argoproj.io/v1alpha1"
@@ -237,7 +258,7 @@ resource "kubernetes_manifest" "master_only_application" {
         server    = "https://kubernetes.default.svc"
         namespace = "kube-system"
       }
-      ignoreDifferences = [{ kind = "Node", jsonPointers = ["/spec/taints"] }]
+      ignoreDifferences = [{ kind = "Node", jsonPointers = ["/spec/taints", "/spec/unschedulable"] }]
       syncPolicy = {
         automated   = { enabled = true, prune = true, selfHeal = true }
         retry       = { limit = 10, backoff = { duration = "5s", factor = 2, maxDuration = "3m" } }
@@ -247,7 +268,17 @@ resource "kubernetes_manifest" "master_only_application" {
   }
   field_manager { name = "heteronetwork-terraform" }
   lifecycle { prevent_destroy = true }
-  depends_on = [terraform_data.host_configuration, terraform_data.git_source, kubernetes_manifest.gitops_project]
+  depends_on = [terraform_data.git_source, kubernetes_manifest.gitops_project]
+}
+
+resource "kubernetes_manifest" "openbao_application" {
+  manifest = yamldecode(file("${local.repo_root}/deploy/gitops/applications/openbao.yaml"))
+  field_manager {
+    name            = "heteronetwork-terraform"
+    force_conflicts = true
+  }
+  lifecycle { prevent_destroy = true }
+  depends_on = [terraform_data.openbao_storage, kubernetes_manifest.master_only_application, kubernetes_manifest.gitops_project]
 }
 
 resource "terraform_data" "git_source" {

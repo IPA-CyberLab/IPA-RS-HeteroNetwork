@@ -36,6 +36,7 @@ def main():
     drift=list(nodes) if args.reconcile_all or not inventory.exists() else []
     standard_drift=list(standard_nodes) if args.reconcile_all or not inventory.exists() else []
     database_drift=args.reconcile_all or not inventory.exists()
+    openbao_storage_drift=args.reconcile_all or not inventory.exists()
     gpu_host_drift=args.reconcile_all or not inventory.exists()
     gpu_acceptance_drift=args.reconcile_all or not inventory.exists()
     gpu_inventory_drift=args.reconcile_all or not inventory.exists()
@@ -56,7 +57,7 @@ def main():
             gpu_inventory_acceptance_drift=True
         else:
             raise RuntimeError('Unable to inspect the Flash GPU inventory API: '+inventory_api.stderr.strip())
-        for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('database-ha.yaml','database-ha-check.log'),('gpu.yaml','gpu-check.log'),*inventory_playbooks,('console/configure.yaml','console-check.log'),('git-source.yaml','git-check.log')]:
+        for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('database-ha.yaml','database-ha-check.log'),('openbao-storage.yaml','openbao-storage-check.log'),('gpu.yaml','gpu-check.log'),*inventory_playbooks,('console/configure.yaml','console-check.log'),('git-source.yaml','git-check.log')]:
             command=['ansible-playbook','-i',str(inventory),'--check',str(MODULE/'ansible'/playbook)]
             result=subprocess.run(command,env=env,text=True,capture_output=True)
             log=work/logname
@@ -75,6 +76,8 @@ def main():
                 standard_drift=[name for name,stats in report['hosts'].items() if name in standard_nodes and stats['changed']]
             elif playbook=='database-ha.yaml':
                 database_drift=any(stats['changed'] for stats in report['hosts'].values())
+            elif playbook=='openbao-storage.yaml':
+                openbao_storage_drift=any(stats['changed'] for stats in report['hosts'].values())
             elif playbook=='gpu.yaml':
                 gpu_host_drift=any(stats['changed'] for stats in report['hosts'].values())
             elif playbook=='gpu-inventory.yaml':
@@ -121,15 +124,17 @@ def main():
         if result.returncode not in [0,2]:
             raise RuntimeError('Flash CRD acceptance check failed; see private flash-crd-acceptance-check.log')
         flash_crd_acceptance_drift=result.returncode==2
-        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'database_ha_drift':database_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'flash_crd_acceptance_drift':flash_crd_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
+        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'database_ha_drift':database_drift,'openbao_storage_drift':openbao_storage_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'flash_crd_acceptance_drift':flash_crd_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
     if args.action=='check':
-        return 2 if drift or standard_drift or database_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or flash_crd_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
+        return 2 if drift or standard_drift or database_drift or openbao_storage_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or flash_crd_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
     tf=[args.terraform,'-chdir='+str(MODULE)]
     subprocess.run(tf+['init','-input=false'],env=env,check=True)
     replace=['-replace=terraform_data.host_configuration['+json.dumps(name)+']' for name in drift]
     replace += ['-replace=terraform_data.standard_host_configuration['+json.dumps(name)+']' for name in standard_drift]
     if database_drift:
         replace.append('-replace=terraform_data.database_ha_configuration')
+    if openbao_storage_drift:
+        replace.append('-replace=terraform_data.openbao_storage')
     if gpu_host_drift:
         replace.append('-replace=terraform_data.gpu_host_configuration')
     if gpu_acceptance_drift:

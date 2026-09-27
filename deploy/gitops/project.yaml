@@ -12,6 +12,7 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
+    - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-SecretManager.git
     - docker.io/envoyproxy
     - https://charts.longhorn.io
     - https://yandex-cloud.github.io/k8s-csi-s3/charts
@@ -46,6 +47,8 @@ spec:
     - namespace: heterocloud-registry
       server: https://kubernetes.default.svc
     - namespace: nvidia-device-plugin
+      server: https://kubernetes.default.svc
+    - namespace: openbao
       server: https://kubernetes.default.svc
   clusterResourceWhitelist:
     - group: "*"

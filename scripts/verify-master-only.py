@@ -73,8 +73,10 @@ def exercise():
         kept=[t for t in node['spec']['taints'] if (t['key'],t.get('value',''),t['effect']) not in REQUIRED]
         node['spec']['taints']=kept
         obj=dry(node,replace=True)
-        assert obj['spec']['unschedulable'] is True and REQUIRED<=taints(obj)
+        assert obj['spec']['unschedulable'] is False and REQUIRED<=taints(obj)
         assert all(t in obj['spec']['taints'] for t in kept)
+        node['spec']['unschedulable']=True
+        assert dry(node,replace=True)['spec']['unschedulable'] is True
         network=[]
         for namespace,name in [('kube-system','kube-proxy'),('kube-flannel','kube-flannel-ds')]:
             ds=get('daemonset',name,'-n',namespace)
@@ -85,7 +87,7 @@ def exercise():
             own=[t for t in obj['spec']['template']['spec']['tolerations'] if t.get('key')=='heteronetwork.io/control-plane-only']
             assert len(own)==2 and {t.get('effect') for t in own}=={'NoExecute','NoSchedule'} and all(t.get('value')=='true' for t in own)
             network.append(namespace+'/'+name)
-        return {'placement_negative_tests':tests,'daemonset_affinity_create_and_or_preservation':True,'node_cordon_and_taints_restore_preserving_controller_taints':True,'network_tolerations_restore':network}
+        return {'placement_negative_tests':tests,'daemonset_affinity_create_and_or_preservation':True,'node_maintenance_cordon_preserved_and_taints_restored':True,'network_tolerations_restore':network}
     finally:
         k(['delete','namespace',ns,'--wait=false'],check=False)
 
@@ -93,30 +95,38 @@ def exercise():
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--exercise-admission',action='store_true')
+    parser.add_argument('--require-openbao',action='store_true')
     parser.add_argument('--output')
     args=parser.parse_args()
     pods=get('pods','-A')['items']
     report={'checked_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'nodes':[]}
     for name,host in NODES.items():
         node=get('node',name)
-        assert node['spec'].get('unschedulable') is True and REQUIRED<=taints(node),name
+        assert node['spec'].get('unschedulable') is False and REQUIRED<=taints(node),name
         assert node['metadata']['labels'].get('heteronetwork.io/control-plane-only')=='true',name
         assert 'node-role.kubernetes.io/control-plane' in node['metadata']['labels'],name
         assert any(c['type']=='Ready' and c['status']=='True' for c in node['status']['conditions']),name
         assert any(a['type']=='InternalIP' and a['address']==host['vpn_ip'] for a in node['status']['addresses']),name
         selected=[p for p in pods if p['spec'].get('nodeName')==name]
-        assert len(selected)==6,(name,'unexpected Pod count',len(selected))
-        rows=[]
+        assert len(selected) in (6,7),(name,'unexpected Pod count',len(selected))
+        rows=[]; openbao=[]
         for pod in selected:
             ns=pod['metadata']['namespace'];pn=pod['metadata']['name']
             cp=ns=='kube-system' and pn in [prefix+'-'+name for prefix in ['etcd','kube-apiserver','kube-controller-manager','kube-scheduler']] and bool(pod['metadata'].get('annotations',{}).get('kubernetes.io/config.mirror'))
             network=(ns=='kube-system' and pn.startswith('kube-proxy-')) or (ns=='kube-flannel' and pn.startswith('kube-flannel-ds-'))
-            assert cp or network,(name,'unexpected workload',ns,pn)
+            secret_manager=(ns=='openbao' and pn in ('openbao-0','openbao-1','openbao-2') and pod['metadata'].get('labels',{}).get('app.kubernetes.io/instance')=='openbao')
+            assert cp or network or secret_manager,(name,'unexpected workload',ns,pn)
             cs=pod['status'].get('containerStatuses',[])
+            if secret_manager:
+                ready=pod['status']['phase']=='Running' and len(cs)==len(pod['spec']['containers']) and all(c['ready'] for c in cs)
+                openbao.append({'namespace':ns,'name':pn,'ready':ready})
+                continue
             assert pod['status']['phase']=='Running' and len(cs)==len(pod['spec']['containers']) and all(c['ready'] for c in cs),(name,pn,'not Ready')
             rows.append({'namespace':ns,'name':pn,'ready':True})
+        assert len(rows)==6 and len(openbao)<=1,(name,'unexpected Pod placement',rows,openbao)
+        if args.require_openbao: assert len(openbao)==1 and openbao[0]['ready'],(name,'OpenBao is absent or sealed',openbao)
         assert get('nodes.longhorn.io',name,'-n','longhorn-system')['spec']['allowScheduling'] is False
-        report['nodes'].append({'name':name,'vpn_ip':host['vpn_ip'],'ready':True,'unschedulable':True,'essential_pods':rows,'application_or_storage_pods':0})
+        report['nodes'].append({'name':name,'vpn_ip':host['vpn_ip'],'ready':True,'unschedulable':False,'essential_pods':rows,'openbao_pods':openbao,'other_workload_pods':0})
     app=get('application','control-plane-only','-n','argocd')
     assert app['spec']['syncPolicy']['automated']['selfHeal'] is True
     assert app['status']['sync']['status']=='Synced' and app['status']['health']['status']=='Healthy',app.get('status')

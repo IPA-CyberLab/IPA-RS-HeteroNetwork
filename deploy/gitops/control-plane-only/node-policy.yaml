@@ -37,8 +37,7 @@ spec:
   - patchType: JSONPatch
     jsonPatch:
       expression: |-
-        [JSONPatch{op: 'add', path: '/spec/unschedulable', value: true},
-         JSONPatch{op: 'add', path: '/spec/taints',
+        [JSONPatch{op: 'add', path: '/spec/taints',
            value: variables.current.filter(t,
              !variables.required.exists(r, r.key == t.key && r.effect == t.effect)) + variables.required
          }]

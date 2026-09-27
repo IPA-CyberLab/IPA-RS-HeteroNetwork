@@ -33,7 +33,7 @@ def files():
            'deploy/kubernetes/control-plane-only-policy.yaml',
            'deploy/environments/heteronet/values.yaml','deploy/gitops/project.yaml']
     paths += ['deploy/gitops/applications/'+n+'.yaml' for n in
-              ['cluster-dns','network-policy-engine','longhorn-prerequisites','flash-web','heterocloud-edge',
+              ['cluster-dns','network-policy-engine','longhorn-prerequisites','flash-web','heterocloud-edge','openbao',
                'heterocloud','heterocloud-flash','heterocloud-flow']]
     paths += ['deploy/gitops/cluster-dns/nodelocaldns.yaml','deploy/gitops/cluster-dns/keycloak-ha-connector.yaml',
               'deploy/gitops/cluster-dns/postgres-ha-connector.yaml','deploy/gitops/cluster-dns/service-route.yaml',

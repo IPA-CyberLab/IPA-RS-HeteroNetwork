@@ -32,7 +32,12 @@ gateways, including the bootstrap and enrollment issuer hosts that are not
 created by the master or standard host resources.
 The Agent wants this proxy so it returns after Agent restarts. The dedicated
 master playbook preserves this Agent companion while disabling native
-application services. No application Pod is added to the dedicated masters.
+application services. OpenBao is the sole allowed non-system Pod on the
+dedicated masters; its encrypted Raft replicas use node-local storage.
+Normal application Pods remain forbidden by admission policy.
+The OpenBao chart, Raft volumes, TLS resources and live verifier are owned by
+[Hetero Secret Manager](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-SecretManager);
+this module prepares host storage and points Argo CD at a fixed commit there.
 The [standard-node deployment record](../../../docs/standard-node-setup-2026-09-15.md)
 describes its client DB/Keycloak proxies, declared six-endpoint Kubernetes pool,
 and Longhorn filesystem disk with 64 GiB reserved for the host OS.
@@ -61,8 +66,11 @@ outside Terraform state and process arguments. The
 [GitHub Actions VPN console E2E record](../../../docs/github-actions-vpn-console-e2e.md)
 documents the checks and secret lifecycle.
 
-Argo CD reconciles the dedicated Node labels, cordon, Longhorn scheduling
-opt-out and admission policies from `deploy/gitops/control-plane-only`.
+Argo CD reconciles the dedicated Node labels, Longhorn scheduling opt-out
+and admission policies from `deploy/gitops/control-plane-only`. The nodes are
+uncordoned so the OpenBao StatefulSet can schedule; required taints and the
+admission policies still reject every other non-system Pod. A maintenance
+cordon is preserved rather than automatically removed.
 The Node mutation policy maintains the three required isolation taints while
 preserving taints owned by Kubernetes controllers. Argo ignores the complete
 taint array to avoid fighting automatic `unschedulable` / health taints.
@@ -161,7 +169,7 @@ python3 scripts/master-only-iac.py plan
 ```
 
 The verifier checks Node Ready and isolation, exactly six essential Ready Pods
-per master, disabled Longhorn scheduling, Argo synchronization, actual Pod and
+per master plus at most one OpenBao Pod, disabled Longhorn scheduling, Argo synchronization, actual Pod and
 binding rejection, DaemonSet mutation with existing OR affinity, essential
 network toleration restoration, and Node mutation preserving controller taints.
 It creates a temporary test namespace and removes it afterward. Browser owner

@@ -13,7 +13,7 @@ metadata:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'
 spec:
-  unschedulable: true
+  unschedulable: false
 ---
 apiVersion: longhorn.io/v1beta2
 kind: Node
@@ -41,7 +41,7 @@ metadata:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'
 spec:
-  unschedulable: true
+  unschedulable: false
 ---
 apiVersion: longhorn.io/v1beta2
 kind: Node
@@ -69,7 +69,7 @@ metadata:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'
 spec:
-  unschedulable: true
+  unschedulable: false
 ---
 apiVersion: longhorn.io/v1beta2
 kind: Node

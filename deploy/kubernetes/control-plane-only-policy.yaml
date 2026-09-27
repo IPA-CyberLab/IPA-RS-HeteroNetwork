@@ -20,8 +20,15 @@ spec:
          'kubernetes.io/config.mirror' in object.metadata.annotations &&
          request.userInfo.username == 'system:node:' + object.spec.nodeName) ||
         (request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-')) ||
-        (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-'))
-      message: "This node runs only Kubernetes control-plane components, Flannel and kube-proxy."
+        (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-')) ||
+        (request.namespace == 'openbao' &&
+         object.metadata.name.matches('^openbao-[0-2]$') &&
+         has(object.metadata.labels) &&
+         object.metadata.labels['app.kubernetes.io/name'] == 'openbao' &&
+         object.metadata.labels['app.kubernetes.io/instance'] == 'openbao' &&
+         object.metadata.labels['component'] == 'server' &&
+         object.spec.serviceAccountName == 'openbao')
+      message: "This node runs only Kubernetes control-plane components, networking, and OpenBao."
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -47,8 +54,9 @@ spec:
     - expression: >-
         !(object.target.name in ['uc-k8sp1', 'uc-k8sp2', 'uc-k8s3p']) ||
         (request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-')) ||
-        (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-'))
-      message: "Application and storage Pods cannot bind to this control-plane-only node."
+        (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-')) ||
+        (request.namespace == 'openbao' && object.metadata.name.matches('^openbao-[0-2]$'))
+      message: "Only control-plane, networking, and OpenBao Pods can bind to this node."
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

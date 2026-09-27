@@ -1,0 +1,66 @@
+- name: Prepare dedicated OpenBao Raft storage on the three control-plane hosts
+  hosts: master_only
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Check the Raft storage filesystem
+      ansible.builtin.command:
+        argv: [findmnt, -no, FSTYPE, -T, /var/lib]
+      register: openbao_filesystem
+      changed_when: false
+      check_mode: false
+
+    - name: Reject remote or unexpected storage filesystems
+      ansible.builtin.assert:
+        that:
+          - openbao_filesystem.stdout | trim == 'ext4'
+        fail_msg: OpenBao Raft storage must use the verified local ext4 filesystem
+
+    - name: Inspect the existing storage paths without following links
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - /var/lib/openbao
+        - /var/lib/openbao/raft
+      register: openbao_storage_paths
+
+    - name: Reject symlinks at Raft storage paths
+      ansible.builtin.assert:
+        that:
+          - not (item.stat.islnk | default(false))
+        fail_msg: OpenBao Raft storage path cannot be a symlink
+      loop: "{{ openbao_storage_paths.results }}"
+
+    - name: Check local filesystem capacity
+      ansible.builtin.command:
+        argv: [df, -B1, --output=avail, /var/lib]
+      register: openbao_free_space
+      changed_when: false
+      check_mode: false
+
+    - name: Require at least 40 GiB free before preparing Raft storage
+      ansible.builtin.assert:
+        that:
+          - (openbao_free_space.stdout_lines[-1] | trim | int) >= 42949672960
+        fail_msg: OpenBao Raft storage requires at least 40 GiB free on the host filesystem
+
+    - name: Create the OpenBao storage parent
+      ansible.builtin.file:
+        path: /var/lib/openbao
+        state: directory
+        owner: '100'
+        group: '1000'
+        mode: '0750'
+
+    - name: Create the node-local Raft directory
+      ansible.builtin.file:
+        path: /var/lib/openbao/raft
+        state: directory
+        owner: '100'
+        group: '1000'
+        mode: '0700'

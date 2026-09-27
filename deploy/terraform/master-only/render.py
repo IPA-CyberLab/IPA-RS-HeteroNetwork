@@ -20,7 +20,7 @@ for name, node in nodes.items():
                 'networking.heteronetwork.io/public-ingress-enabled': 'false',
                 'argocd.argoproj.io/sync-options': 'Prune=false,Delete=false',
                 'argocd.argoproj.io/sync-wave': '0'}},
-        'spec': {'unschedulable': True}})
+        'spec': {'unschedulable': False}})
     resources.append({
         'apiVersion': 'longhorn.io/v1beta2', 'kind': 'Node',
         'metadata': {'name': name, 'namespace': 'longhorn-system', 'annotations': {
