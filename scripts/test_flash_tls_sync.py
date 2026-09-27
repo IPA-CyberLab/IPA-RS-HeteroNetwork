@@ -47,7 +47,8 @@ class SyncTests(unittest.TestCase):
         self.group = self.work / "group"
         self.group.write_text("root:x:0:\nheteronetwork-gateway:x:12345:\n")
         self.extra = self.host / sync.EXTRA
-        self.original = b"# preserve exact bytes\r\n(heterocloud_envoy) {\n respond ok\n}\n# EOF"
+        self.original = (b"# preserve exact bytes\r\n(heterocloud_envoy) {\n respond ok\n}\n"
+                         b"http://heterocloud.mizuame.app {\n respond ok\n}\n# EOF")
         self.extra.write_bytes(self.original)
         self.extra.chmod(0o644)
         self.project(self.pairs[0])
@@ -76,8 +77,8 @@ class SyncTests(unittest.TestCase):
     def test_publish_idempotence_rotation_and_permissions(self):
         self.assertTrue(self.run_sync())
         first = self.extra.read_bytes()
-        self.assertTrue(first.startswith(sync.BEGIN))
-        self.assertIn(self.original, first)
+        self.assertTrue(first.startswith(b"# preserve exact bytes"))
+        self.assertLess(first.index(sync.BEGIN), first.index(b"http://heterocloud.mizuame.app"))
         self.assertIn(b"http://*.flash.heterocloud.mizuame.app:80", first)
         self.assertIn(b"https://*.flash.heterocloud.mizuame.app:443", first)
         self.assertIn(b"(heterocloud_public_tls)", first)
@@ -91,8 +92,8 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(self.run_sync())
         second = self.extra.read_bytes()
         self.assertNotEqual(first, second)
-        self.assertTrue(second.startswith(sync.BEGIN))
-        self.assertIn(self.original, second)
+        self.assertTrue(second.startswith(b"# preserve exact bytes"))
+        self.assertLess(second.index(sync.BEGIN), second.index(b"http://heterocloud.mizuame.app"))
         self.assertTrue(second.endswith(b"# another operator's tail\n"))
         self.assertEqual(second.count(sync.BEGIN), 1)
         certdir = self.host / sync.CERTDIR

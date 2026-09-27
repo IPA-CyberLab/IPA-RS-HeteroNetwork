@@ -169,9 +169,11 @@ def update_content(old, generation):
     else:
         unmanaged = old
     require(HOST.encode() not in unmanaged, "unmanaged wildcard route already exists")
-    # Caddyfile imports are resolved in source order. The certificate snippet
-    # must be declared before the canonical site blocks that import it.
-    new = route(generation) + b"\n" + unmanaged.lstrip(b"\n")
+    # Caddyfile imports are resolved in source order. Insert after the shared
+    # snippets (which the wildcard route imports), before the first site.
+    first_site = b"http://heterocloud.mizuame.app {\n"
+    require(unmanaged.count(first_site) == 1, "canonical first site missing")
+    new = unmanaged.replace(first_site, route(generation) + first_site)
     require(len(new) <= LIMIT, "updated extra exceeds Agent size limit")
     return new
 
