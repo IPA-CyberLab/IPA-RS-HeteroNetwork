@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-SecretManager.git
-    targetRevision: 2e3f857bd23a71d5337cf73a0e98eb8d5f030a75
+    targetRevision: 95e00ccd49f1d952bf9e536bfc205756ce9f5d7f
     path: deploy/chart
     helm:
       releaseName: openbao
