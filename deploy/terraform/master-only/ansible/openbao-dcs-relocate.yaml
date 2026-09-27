@@ -62,17 +62,6 @@
       changed_when: false
       failed_when: tailnet_ip.stdout | trim != '100.65.54.75'
 
-    - name: Require an empty local DCS data directory before joining
-      ansible.builtin.find:
-        paths: /var/lib/heteronetwork-postgres-ha-dcs
-        recurse: true
-        hidden: true
-        file_type: any
-      register: existing_data
-    - ansible.builtin.assert:
-        that: existing_data.matched == 0
-        fail_msg: The replacement voter has an existing data directory
-
     - name: Require the pinned etcd binary already installed
       ansible.builtin.command:
         argv: [/opt/heteronetwork/postgres-ha/etcd, --version]
@@ -89,12 +78,56 @@
     - ansible.builtin.assert:
         that: old_candidate_service.stdout | trim != 'active'
 
+    - name: Reject a symlink at the previous DCS data directory
+      ansible.builtin.stat:
+        path: /var/lib/heteronetwork-postgres-ha-dcs
+        follow: false
+      register: previous_dcs_data
+    - ansible.builtin.assert:
+        that:
+          - previous_dcs_data.stat.isdir | default(false)
+          - not (previous_dcs_data.stat.islnk | default(false))
+
+    - name: Inspect the stopped candidate's previous DCS data
+      ansible.builtin.find:
+        paths: /var/lib/heteronetwork-postgres-ha-dcs
+        recurse: true
+        hidden: true
+        file_type: any
+      register: existing_data
+
     - name: Create a protected backup for the candidate's previous DCS configuration
       ansible.builtin.file:
         path: /var/backups/heteronetwork/iac-database-ha/secret-manager-db-h-prejoin
         state: directory
         owner: root
         group: root
+        mode: '0700'
+
+    - name: Ensure old DCS data has not already been archived
+      ansible.builtin.stat:
+        path: /var/backups/heteronetwork/iac-database-ha/secret-manager-db-h-prejoin/retired-dcs-data
+        follow: false
+      register: retired_dcs_backup
+    - ansible.builtin.assert:
+        that: not retired_dcs_backup.stat.exists
+        fail_msg: An existing retired DCS data archive needs review before joining
+      when: existing_data.matched > 0
+
+    - name: Preserve the stopped former DCS data without reading or deleting it
+      ansible.builtin.command:
+        argv:
+          - mv
+          - /var/lib/heteronetwork-postgres-ha-dcs
+          - /var/backups/heteronetwork/iac-database-ha/secret-manager-db-h-prejoin/retired-dcs-data
+      when: existing_data.matched > 0
+
+    - name: Prepare a clean DCS data directory for db-h
+      ansible.builtin.file:
+        path: /var/lib/heteronetwork-postgres-ha-dcs
+        state: directory
+        owner: heteronetwork-dcs
+        group: heteronetwork-db-ha
         mode: '0700'
 
     - name: Inspect the previous candidate DCS configuration
