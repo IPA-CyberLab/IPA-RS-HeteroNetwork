@@ -453,9 +453,9 @@
     - name: Keep the replacement DCS voter out of retired-member cleanup
       ansible.builtin.assert:
         that:
-          - hnn_database_proxy_state.result == 'unchanged'
           - hnn_database_proxy_state.mode == 'proxy-only'
-        fail_msg: Replacement DCS voter needs a separate proxy recovery before reconciliation
+          - hnn_database_proxy_state.result in ['unchanged', 'migration-required']
+        fail_msg: Replacement DCS voter must remain a proxy-only database client
       when: postgres_role | default('') == 'dcs-only'
 
     - name: Reconcile the retired database member as a proxy-only client
@@ -479,7 +479,9 @@
             - heteronetwork-db-dcs.service
             - heteronetwork-db-underlay-health.service
           failed_when: false
-          when: hnn_database_proxy_state.result == 'migration-required'
+          when:
+            - hnn_database_proxy_state.result == 'migration-required'
+            - item != 'heteronetwork-db-dcs.service' or postgres_role | default('') != 'dcs-only'
 
         - name: Apply the transactional proxy-client recovery
           ansible.builtin.command:
@@ -593,6 +595,18 @@
       delay: 2
       when: not ansible_check_mode
 
+    - name: Require the replacement DCS voter to remain online after proxy refresh
+      ansible.builtin.command:
+        argv: [systemctl, is-active, heteronetwork-db-dcs.service]
+      changed_when: false
+      failed_when: false
+      register: replacement_dcs_service
+      when: postgres_role | default('') == 'dcs-only'
+    - ansible.builtin.assert:
+        that: replacement_dcs_service.stdout | trim == 'active'
+        fail_msg: Replacement DCS voter stopped during proxy refresh
+      when: postgres_role | default('') == 'dcs-only'
+
 - name: Verify the recovered topology and restore the enrollment control plane
   hosts: bootstrap
   gather_facts: false
@@ -661,3 +675,24 @@
       retries: 60
       delay: 5
       when: not ansible_check_mode
+
+- name: Resume database topology reconciliation after the new quorum is verified
+  hosts: postgres_members
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Enable the database topology reconciler
+      ansible.builtin.systemd_service:
+        name: heteronetwork-postgres-autopilot.service
+        state: started
+        enabled: true
+    - name: Require PostgreSQL to remain online after resuming reconciliation
+      ansible.builtin.command:
+        argv: [systemctl, is-active, heteronetwork-db.service]
+      register: database_active
+      changed_when: false
+      failed_when: database_active.stdout | trim != 'active'
