@@ -78,7 +78,7 @@ def exercise():
         node['spec']['unschedulable']=True
         assert dry(node,replace=True)['spec']['unschedulable'] is True
         network=[]
-        for namespace,name in [('kube-system','kube-proxy'),('kube-flannel','kube-flannel-ds')]:
+        for namespace,name in [('kube-system','kube-proxy'),('kube-flannel','kube-flannel-ds'),('kube-system','node-local-dns'),('kube-system','kubernetes-service-route'),('kube-system','kube-router-network-policy')]:
             ds=get('daemonset',name,'-n',namespace)
             ds.pop('status',None)
             ds['metadata'].pop('managedFields',None)

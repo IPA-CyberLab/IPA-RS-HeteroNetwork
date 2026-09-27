@@ -26,7 +26,9 @@ spec:
   - name: nonessential-daemonset
     expression: |-
       !((request.namespace == 'kube-flannel' && object.metadata.name == 'kube-flannel-ds') ||
-        (request.namespace == 'kube-system' && object.metadata.name == 'kube-proxy'))
+        (request.namespace == 'kube-system' && object.metadata.name in
+         ['kube-proxy', 'node-local-dns', 'kubernetes-service-route',
+          'kube-router-network-policy']))
   variables:
   - name: terms
     expression: 'has(object.spec.template.spec.affinity) && has(object.spec.template.spec.affinity.nodeAffinity)
@@ -92,8 +94,11 @@ spec:
     objectSelector: {}
   matchConditions:
   - name: essential-network-daemonset
-    expression: (request.namespace == 'kube-flannel' && object.metadata.name == 'kube-flannel-ds') || (request.namespace
-      == 'kube-system' && object.metadata.name == 'kube-proxy')
+    expression: |-
+      (request.namespace == 'kube-flannel' && object.metadata.name == 'kube-flannel-ds') ||
+      (request.namespace == 'kube-system' && object.metadata.name in
+       ['kube-proxy', 'node-local-dns', 'kubernetes-service-route',
+        'kube-router-network-policy'])
   variables:
   - name: current
     expression: 'has(object.spec.template.spec.tolerations) ? object.spec.template.spec.tolerations : []'
