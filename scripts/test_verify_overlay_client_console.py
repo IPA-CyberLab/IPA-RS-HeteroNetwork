@@ -5,6 +5,7 @@ import importlib.util
 import ipaddress
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -31,6 +32,43 @@ def dns_response(query, address, *, flags=0x8180, response_id=None):
 
 
 class OverlayConsoleConvergenceTests(unittest.TestCase):
+    def test_client_cleanup_uses_sponsor_after_vpn_route_disappears(self):
+        inventory = {"all": {
+            "vars": {"ansible_ssh_private_key_file": "/private/key",
+                     "ansible_ssh_common_args": "-o UserKnownHostsFile=/private/known_hosts",
+                     "ansible_user": "mizuame"},
+            "children": {"bootstrap": {"hosts": {
+                "uc-k8sp5": {"ansible_host": "163.220.236.45"}}}},
+        }}
+        identity = type("Identity", (), {"sign": lambda _, body: b"s" * 64})()
+        client_id = "node-" + "a" * 32
+        peer = {"vpn_ip": "10.250.0.2"}
+        with patch.object(verify.subprocess, "run", side_effect=[
+            subprocess.TimeoutExpired("ssh", 35),
+            subprocess.CompletedProcess([], 0, b'{"status":404,"not_found":true}', b""),
+        ]) as remote, patch.object(verify.time, "sleep") as pause:
+            self.assertTrue(verify.remove_client(identity, client_id, peer, inventory))
+        self.assertEqual(remote.call_count, 2)
+        self.assertEqual(remote.call_args_list[0].args[0][0], "ssh")
+        self.assertIn("mizuame@163.220.236.45", remote.call_args_list[0].args[0])
+        self.assertIn(b'"request_signature"', remote.call_args_list[0].kwargs["input"])
+        pause.assert_called_once_with(2)
+
+    def test_client_cleanup_rejects_unconfirmed_http_error(self):
+        inventory = {"all": {
+            "vars": {"ansible_ssh_private_key_file": "/private/key",
+                     "ansible_ssh_common_args": "-o UserKnownHostsFile=/private/known_hosts",
+                     "ansible_user": "mizuame"},
+            "children": {"bootstrap": {"hosts": {
+                "uc-k8sp5": {"ansible_host": "163.220.236.45"}}}},
+        }}
+        identity = type("Identity", (), {"sign": lambda _, body: b"s" * 64})()
+        with patch.object(verify.subprocess, "run", return_value=
+                          subprocess.CompletedProcess([], 0, b'{"status":401}', b"")):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+                verify.remove_client(identity, "node-" + "a" * 32,
+                                     {"vpn_ip": "10.250.0.2"}, inventory)
+
     def test_dns_answer_must_match_query_and_gateway(self):
         query = verify.dns_a_query(verify.CONSOLE_DNS_NAME, 0x1234)
         self.assertEqual(

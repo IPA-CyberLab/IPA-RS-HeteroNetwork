@@ -47,6 +47,33 @@ MONITORING_SERVICES = {
     },
 }
 MONITORING_OPEN_TIMEOUT_SECONDS = 3
+REMOVE_CLIENT_REMOTE_SCRIPT = """
+import json
+import sys
+import urllib.error
+import urllib.request
+
+client_id, gateway = sys.argv[1:]
+request = urllib.request.Request(
+    f'http://{gateway}/v1/clients/{client_id}',
+    data=sys.stdin.buffer.read(),
+    headers={'Content-Type': 'application/json'},
+    method='DELETE',
+)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(request, timeout=20) as response:
+        print(json.dumps({'status': response.status}))
+except urllib.error.HTTPError as error:
+    try:
+        payload = json.load(error)
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+    print(json.dumps({
+        'status': error.code,
+        'not_found': payload.get('error') == f'node not found: {client_id}',
+    }))
+"""
 
 
 def b64url(value):
@@ -670,14 +697,41 @@ def wait_for_gateway_routes(gateways, timeout=20):
     raise RuntimeError("client console readiness did not remain stable across two probes")
 
 
-def remove_client(identity, client_id, peer):
-    body = signed_client_control_request(identity, client_id, "remove")
-    request = urllib.request.Request(
-        f"http://{peer['vpn_ip']}/v1/clients/{client_id}", data=body,
-        headers={"Content-Type": "application/json"}, method="DELETE")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=5) as response:
-        return response.status == 200
+def remove_client(identity, client_id, peer, inventory):
+    # Removing the VPN client can tear down its return route before the HTTP
+    # response arrives. Send the signed request from the sponsor host, whose
+    # own VPN route survives client deletion, and confirm an already-removed
+    # client by the control plane's exact NodeNotFound response.
+    all_hosts = inventory["all"]
+    variables = all_hosts["vars"]
+    bootstrap = all_hosts["children"]["bootstrap"]["hosts"]["uc-k8sp5"]["ansible_host"]
+    known_hosts = variables["ansible_ssh_common_args"].split(
+        "UserKnownHostsFile=", 1)[1].split()[0]
+    remote = ("python3 -c " + shlex.quote(REMOVE_CLIENT_REMOTE_SCRIPT)
+              + " " + shlex.quote(client_id) + " " + shlex.quote(peer["vpn_ip"]))
+    command = [
+        "ssh", "-i", variables["ansible_ssh_private_key_file"],
+        "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + known_hosts,
+        "-o", "ConnectTimeout=10", f"{variables['ansible_user']}@{bootstrap}", remote,
+    ]
+    for attempt in range(3):
+        body = signed_client_control_request(identity, client_id, "remove")
+        try:
+            result = subprocess.run(command, input=body, capture_output=True, timeout=35)
+            if result.returncode == 0:
+                response = json.loads(result.stdout)
+                if response.get("status") == 200 or (response.get("status") == 404
+                                                    and response.get("not_found") is True):
+                    return True
+                if response.get("status") not in (408, 429, 500, 502, 503, 504):
+                    raise RuntimeError(
+                        f"client removal was rejected with HTTP {response.get('status')}")
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError("temporary E2E client removal was not confirmed after three attempts")
 
 
 def write_report(path, report):
@@ -754,7 +808,7 @@ def main():
             name, process, log = tunnel
             if identity is not None and client_id is not None and peer is not None:
                 try:
-                    report["client_removed"] = remove_client(identity, client_id, peer)
+                    report["client_removed"] = remove_client(identity, client_id, peer, inventory)
                 except Exception as error:
                     report["client_removed"] = False
                     report["client_removal_failure"] = str(error)[:500]
