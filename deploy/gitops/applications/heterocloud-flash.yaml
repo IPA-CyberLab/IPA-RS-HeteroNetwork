@@ -22,6 +22,9 @@ spec:
             - 163.220.236.0/24
           dnsCidrs:
             - 10.96.0.10/32
+          secretManagerCidrs:
+            - 163.220.236.61/32
+            - 163.220.236.54/32
         persistence:
           enabled: true
           storageClass: longhorn-static
