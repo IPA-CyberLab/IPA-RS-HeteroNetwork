@@ -11,6 +11,7 @@ spec:
     - flow.heterocloud.mizuame.app
     - registry.heterocloud.mizuame.app
     - s3.heterocloud.mizuame.app
+    - secrets.heterocloud.mizuame.app
   issuerRef:
     name: flash-web-letsencrypt
     kind: Issuer
