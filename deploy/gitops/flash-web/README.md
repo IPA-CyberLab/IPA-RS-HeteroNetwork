@@ -7,7 +7,7 @@ The Certificate must provision a DNS01-issued `kubernetes.io/tls` Secret named
 `flash-web-tls` in `heterocloud-dns`, with SANs for
 `*.flash.heterocloud.mizuame.app`, `heterocloud.mizuame.app`,
 `flow.heterocloud.mizuame.app`, `registry.heterocloud.mizuame.app`, and
-`s3.heterocloud.mizuame.app`
+`s3.heterocloud.mizuame.app`, and `secrets.heterocloud.mizuame.app`
 and an unencrypted private key. Kustomize intentionally requires those two
 parent files; this helper neither creates nor modifies them.
 `wildcard-route.yaml` provides the wildcard fallback HTTPRoute, not DNS

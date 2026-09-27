@@ -31,6 +31,10 @@ spec:
       recordType: A
       recordTTL: 60
       targets: [163.220.236.61]
+    - dnsName: secrets.heterocloud.mizuame.app
+      recordType: A
+      recordTTL: 60
+      targets: [163.220.236.61]
     - dnsName: '*.flash.heterocloud.mizuame.app'
       recordType: A
       recordTTL: 60

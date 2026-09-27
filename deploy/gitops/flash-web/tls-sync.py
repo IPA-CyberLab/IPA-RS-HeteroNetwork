@@ -24,6 +24,7 @@ PUBLIC_HOSTS = (
     "flow.heterocloud.mizuame.app",
     "registry.heterocloud.mizuame.app",
     "s3.heterocloud.mizuame.app",
+    "secrets.heterocloud.mizuame.app",
 )
 REQUIRED_HOSTS = (HOST, *PUBLIC_HOSTS)
 BEGIN = b"# BEGIN managed flash-web TLS\n"
