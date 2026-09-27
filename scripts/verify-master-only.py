@@ -102,7 +102,7 @@ def main():
     report={'checked_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'nodes':[]}
     for name,host in NODES.items():
         node=get('node',name)
-        assert node['spec'].get('unschedulable') is False and REQUIRED<=taints(node),name
+        assert not node['spec'].get('unschedulable',False) and REQUIRED<=taints(node),name
         assert node['metadata']['labels'].get('heteronetwork.io/control-plane-only')=='true',name
         assert 'node-role.kubernetes.io/control-plane' in node['metadata']['labels'],name
         assert any(c['type']=='Ready' and c['status']=='True' for c in node['status']['conditions']),name
