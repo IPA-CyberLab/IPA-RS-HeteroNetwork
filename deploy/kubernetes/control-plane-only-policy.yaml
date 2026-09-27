@@ -34,7 +34,15 @@ spec:
          object.metadata.labels['app.kubernetes.io/name'] == 'openbao' &&
          object.metadata.labels['app.kubernetes.io/instance'] == 'openbao' &&
          object.metadata.labels['component'] == 'server' &&
-         object.spec.serviceAccountName == 'openbao')
+         object.spec.serviceAccountName == 'openbao') ||
+        (request.namespace == 'openbao' &&
+         object.metadata.name.startsWith('openbao-agent-injector-') &&
+         has(object.metadata.labels) &&
+         object.metadata.labels['app.kubernetes.io/name'] == 'openbao-agent-injector' &&
+         object.metadata.labels['component'] == 'webhook' &&
+         object.spec.serviceAccountName == 'openbao-agent-injector' &&
+         size(object.spec.containers) == 1 &&
+         object.spec.containers[0].image == 'docker.io/hashicorp/vault-k8s:1.7.2')
       message: "This node runs only Kubernetes control-plane components, networking, and OpenBao."
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -66,7 +74,8 @@ spec:
          (object.metadata.name.startsWith('node-local-dns-') ||
           object.metadata.name.startsWith('kubernetes-service-route-') ||
           object.metadata.name.startsWith('kube-router-network-policy-'))) ||
-        (request.namespace == 'openbao' && object.metadata.name.matches('^openbao-[0-2]$'))
+        (request.namespace == 'openbao' && object.metadata.name.matches('^openbao-[0-2]$')) ||
+        (request.namespace == 'openbao' && object.metadata.name.startsWith('openbao-agent-injector-'))
       message: "Only control-plane, networking, and OpenBao Pods can bind to this node."
 ---
 apiVersion: admissionregistration.k8s.io/v1
