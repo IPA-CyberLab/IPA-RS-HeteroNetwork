@@ -149,9 +149,16 @@ def inventory(repo_root, work_dir, ssh_key, checksums):
                     } if bootstrap.get("postgres_role") == "member" else {}),
                 }},
                 "postgres_dcs_only": {"hosts": {
-                    name: {**node, "ansible_host": node["ssh_host"]}
-                    for name, node in nodes.items()
-                    if node.get("postgres_role") == "dcs-only"
+                    **{
+                        name: {**node, "ansible_host": node["ssh_host"]}
+                        for name, node in nodes.items()
+                        if node.get("postgres_role") == "dcs-only"
+                    },
+                    **({issuer["name"]: {
+                        **{key: value for key, value in issuer.items() if key != "name"},
+                        "ansible_host": issuer["ssh_host"],
+                        "ansible_ssh_common_args": proxy,
+                    }} if issuer.get("postgres_role") == "dcs-only" else {}),
                 }},
                 "enrollment_issuer": {"hosts": {
                     issuer["name"]: {

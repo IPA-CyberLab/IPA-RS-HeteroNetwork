@@ -450,6 +450,14 @@
           - hnn_database_proxy_state.members == ['db-b', 'db-e']
         fail_msg: Enrollment database client is outside the reviewed recovery state
 
+    - name: Keep the replacement DCS voter out of retired-member cleanup
+      ansible.builtin.assert:
+        that:
+          - hnn_database_proxy_state.result == 'unchanged'
+          - hnn_database_proxy_state.mode == 'proxy-only'
+        fail_msg: Replacement DCS voter needs a separate proxy recovery before reconciliation
+      when: postgres_role | default('') == 'dcs-only'
+
     - name: Reconcile the retired database member as a proxy-only client
       block:
         - name: Pause enrollment database and control-plane reconciliation

@@ -53,6 +53,52 @@ class SecretManagerDcsMigrationTest(unittest.TestCase):
         self.assertEqual(fixture.digest(self.stage / 'previous/bundle.tar.gz'), before)
         self.assertEqual(fixture.manifest(self.bundle / 'manifest.env')['HETERONETWORK_DB_DCS_MEMBERS'],
                          'db-b=100.96.127.54,db-e=100.111.33.52,db-h=100.65.54.75')
+        authority = MIGRATION.recovery.inspect_authority(self.bundle, self.archive)
+        self.assertEqual(authority['revision'], 3)
+        self.assertEqual(authority['dcs'], MIGRATION.NEW_DCS)
+
+    def test_refuses_to_retire_old_voter_before_new_one_is_promoted(self):
+        peers = {
+            f'https://{address}:12380': {
+                'name': name, 'ID': index, 'isLearner': name == 'db-h',
+            }
+            for index, (name, address) in enumerate(
+                {**MIGRATION.OLD_DCS, 'db-h': MIGRATION.NEW_DCS['db-h']}.items(), 1)
+        }
+        with mock.patch.object(MIGRATION, 'members_by_peer', return_value=peers), \
+             mock.patch.object(MIGRATION, 'etcdctl') as ctl:
+            with self.assertRaisesRegex(RuntimeError, 'not composed of voters'):
+                MIGRATION.retire_old_voter(self.bundle)
+            ctl.assert_not_called()
+
+    def test_refuses_learner_addition_when_unmanaged_voter_exists(self):
+        peers = {
+            f'https://{address}:12380': {'name': name, 'ID': index}
+            for index, (name, address) in enumerate(MIGRATION.OLD_DCS.items(), 1)
+        }
+        peers['https://100.64.0.99:12380'] = {'name': 'unmanaged', 'ID': 99}
+        with mock.patch.object(MIGRATION, 'members_by_peer', return_value=peers), \
+             mock.patch.object(MIGRATION, 'etcdctl') as ctl:
+            with self.assertRaisesRegex(RuntimeError, 'unexpected membership'):
+                MIGRATION.add_learner(self.bundle)
+            ctl.assert_not_called()
+
+    def test_promote_passes_member_id_as_hexadecimal(self):
+        peers = {
+            f'https://{address}:12380': {
+                'name': name, 'ID': 26 if name == 'db-h' else index,
+                'isLearner': name == 'db-h',
+            }
+            for index, (name, address) in enumerate(
+                {**MIGRATION.OLD_DCS, 'db-h': MIGRATION.NEW_DCS['db-h']}.items(), 1)
+        }
+        with mock.patch.object(MIGRATION, 'members_by_peer', side_effect=[
+            peers,
+            {peer: {**member, 'isLearner': False} for peer, member in peers.items()},
+        ]), mock.patch.object(MIGRATION, 'etcdctl') as ctl:
+            MIGRATION.promote_learner(self.bundle)
+            self.assertEqual(ctl.call_args_list[0].args[1:4],
+                             ('member', 'promote', '1a'))
 
 
 if __name__ == '__main__':

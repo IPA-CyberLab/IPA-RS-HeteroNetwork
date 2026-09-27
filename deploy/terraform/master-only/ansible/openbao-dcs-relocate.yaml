@@ -1,0 +1,249 @@
+- name: Pause database topology automation for the reviewed four-member transition
+  hosts: postgres_members
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Keep Patroni and PostgreSQL online while pausing topology reconciliation
+      ansible.builtin.systemd_service:
+        name: heteronetwork-postgres-autopilot.service
+        state: stopped
+        enabled: false
+    - name: Require the database member to remain online
+      ansible.builtin.command:
+        argv: [systemctl, is-active, heteronetwork-db.service]
+      register: database_active
+      changed_when: false
+      failed_when: database_active.stdout | trim != 'active'
+
+- name: Add a learner while the old three DCS voters remain healthy
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the reviewed membership transition helper
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/migrate-secret-manager-dcs.py"
+        dest: /opt/heteronetwork/libexec/migrate-secret-manager-dcs.py
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Add db-h as a non-voting learner
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/migrate-secret-manager-dcs.py
+          - add-learner
+      register: added
+      changed_when: (added.stdout | from_json).phase == 'learner-added'
+    - ansible.builtin.assert:
+        that: (added.stdout | from_json).member_count == 4
+
+- name: Start the new consensus member on ichikawap1
+  hosts: enrollment_issuer
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    replacement_bundle: /var/backups/heteronetwork/iac-database-ha/secret-manager-dcs-replacement/bundle
+  tasks:
+    - name: Require the reviewed candidate Tailnet identity
+      ansible.builtin.command:
+        argv: [tailscale, ip, -4]
+      register: tailnet_ip
+      changed_when: false
+      failed_when: tailnet_ip.stdout | trim != '100.65.54.75'
+
+    - name: Require an empty local DCS data directory before joining
+      ansible.builtin.find:
+        paths: /var/lib/heteronetwork-postgres-ha-dcs
+        recurse: true
+        hidden: true
+        file_type: any
+      register: existing_data
+    - ansible.builtin.assert:
+        that: existing_data.matched == 0
+        fail_msg: The replacement voter has an existing data directory
+
+    - name: Require the pinned etcd binary already installed
+      ansible.builtin.command:
+        argv: [/opt/heteronetwork/postgres-ha/etcd, --version]
+      register: etcd_version
+      changed_when: false
+      failed_when: "'etcd Version: 3.6.11' not in etcd_version.stdout"
+
+    - name: Refuse to overwrite a running consensus member
+      ansible.builtin.command:
+        argv: [systemctl, is-active, heteronetwork-db-dcs.service]
+      register: old_candidate_service
+      changed_when: false
+      failed_when: false
+    - ansible.builtin.assert:
+        that: old_candidate_service.stdout | trim != 'active'
+
+    - name: Create a protected backup for the candidate's previous DCS configuration
+      ansible.builtin.file:
+        path: /var/backups/heteronetwork/iac-database-ha/secret-manager-db-h-prejoin
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Inspect the previous candidate DCS configuration
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - /etc/heteronetwork/postgres-ha/pki
+        - /etc/heteronetwork/postgres-ha/etcd.yml
+        - /etc/systemd/system/heteronetwork-db-dcs.service
+      register: previous_dcs_paths
+
+    - name: Reject symlinks in the previous candidate DCS configuration
+      ansible.builtin.assert:
+        that: not (item.stat.islnk | default(false))
+      loop: "{{ previous_dcs_paths.results }}"
+
+    - name: Back up the previous candidate DCS configuration before replacing it
+      ansible.builtin.command:
+        argv:
+          - cp
+          - -a
+          - "{{ item.item }}"
+          - /var/backups/heteronetwork/iac-database-ha/secret-manager-db-h-prejoin/
+      loop: "{{ previous_dcs_paths.results }}"
+      when: item.stat.exists
+      no_log: true
+
+    - name: Ensure the DCS configuration directory exists
+      ansible.builtin.file:
+        path: /etc/heteronetwork/postgres-ha/pki
+        state: directory
+        owner: root
+        group: heteronetwork-db-ha
+        mode: '0750'
+
+    - name: Read only the replacement node's protected certificate material
+      ansible.builtin.slurp:
+        src: "{{ replacement_bundle }}/nodes/db-h/{{ item.name }}"
+      delegate_to: uc-k8sp5
+      loop:
+        - {name: ca.crt, mode: '0644'}
+        - {name: node.crt, mode: '0644'}
+        - {name: node.key, mode: '0640'}
+      register: replacement_pki
+      no_log: true
+
+    - name: Install the replacement node's certificate material
+      ansible.builtin.copy:
+        content: "{{ item.content | b64decode }}"
+        dest: "/etc/heteronetwork/postgres-ha/pki/{{ item.item.name }}"
+        owner: root
+        group: heteronetwork-db-ha
+        mode: "{{ item.item.mode }}"
+      loop: "{{ replacement_pki.results }}"
+      no_log: true
+
+    - name: Install the four-member learner bootstrap configuration
+      ansible.builtin.template:
+        src: templates/secret-manager-db-h-etcd.yml.j2
+        dest: /etc/heteronetwork/postgres-ha/etcd.yml
+        owner: root
+        group: heteronetwork-db-ha
+        mode: '0640'
+
+    - name: Install the bounded DCS bootstrap service
+      ansible.builtin.copy:
+        src: templates/secret-manager-db-h-etcd.service
+        dest: /etc/systemd/system/heteronetwork-db-dcs.service
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Start the new learner
+      ansible.builtin.systemd_service:
+        name: heteronetwork-db-dcs.service
+        daemon_reload: true
+        state: started
+        enabled: true
+
+    - name: Require the new TLS client listener
+      ansible.builtin.wait_for:
+        host: 100.65.54.75
+        port: 12379
+        delay: 1
+        timeout: 120
+
+- name: Promote the caught-up learner while all three old voters are available
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Promote db-h once etcd reports it has caught up
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/migrate-secret-manager-dcs.py
+          - promote-learner
+      register: promoted
+      until: promoted.rc == 0
+      retries: 30
+      delay: 3
+      changed_when: promoted.rc == 0
+
+- name: Stop the old voter after the replacement has been promoted
+  hosts: uc-k8sp2
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Stop and disable the old DB DCS service
+      ansible.builtin.systemd_service:
+        name: heteronetwork-db-dcs.service
+        state: stopped
+        enabled: false
+
+- name: Remove the retired voter and publish the protected new topology
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Remove db-g only after the three remaining voters pass TLS health checks
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/migrate-secret-manager-dcs.py
+          - retire-old-voter
+      register: retired
+      changed_when: (retired.stdout | from_json).phase == 'old-voter-removed'
+
+    - name: Publish the staged new certificate and topology after quorum convergence
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/migrate-secret-manager-dcs.py
+          - commit
+      register: committed
+      changed_when: (committed.stdout | from_json).phase == 'committed'
+      no_log: true
+
+    - ansible.builtin.assert:
+        that:
+          - (retired.stdout | from_json).member_count == 3
+          - (committed.stdout | from_json).phase == 'committed'

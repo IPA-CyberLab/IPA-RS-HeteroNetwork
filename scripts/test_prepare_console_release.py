@@ -99,7 +99,7 @@ class ConsoleReleasePreparationTests(unittest.TestCase):
             name for group in groups.values() for name in group["hosts"]
         }, {"ichikawap1", "uc-k8s3p", "uc-k8sp1", "uc-k8sp2", "uc-k8sp4", "uc-k8sp5"})
         self.assertEqual(set(groups["postgres_members"]["hosts"]), {"uc-k8sp4", "uc-k8sp5"})
-        self.assertEqual(set(groups["postgres_dcs_only"]["hosts"]), {"uc-k8sp2"})
+        self.assertEqual(set(groups["postgres_dcs_only"]["hosts"]), {"ichikawap1"})
         self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp5"]["postgres_name"], "db-b")
         self.assertIn("ProxyCommand=ssh", groups["enrollment_issuer"]["hosts"]
                       ["ichikawap1"]["ansible_ssh_common_args"])

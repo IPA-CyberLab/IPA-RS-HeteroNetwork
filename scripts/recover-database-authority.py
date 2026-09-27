@@ -24,8 +24,10 @@ EXPECTED_MEMBERS = {
 }
 EXPECTED_DCS = {
     **EXPECTED_MEMBERS,
-    "db-g": "100.94.130.38",
+    "db-h": "100.65.54.75",
 }
+LEGACY_DCS = {**EXPECTED_MEMBERS, "db-g": "100.94.130.38"}
+REPLACEMENT_DCS_REVISION = 3
 EXPECTED_RETIRED_MEMBERS = 4
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_BYTES = 128 * 1024 * 1024
@@ -223,7 +225,7 @@ def openssl(*arguments, capture=False):
     return result.stdout if capture else b""
 
 
-def validate_credentials(bundle):
+def validate_credentials(bundle, expected_dcs):
     ca_cert = bundle / "ca" / "ca.crt"
     ca_key = bundle / "ca" / "ca.key"
     read_limited(ca_cert)
@@ -234,7 +236,7 @@ def validate_credentials(bundle):
         "protected CA key does not match its certificate",
     )
     openssl("verify", "-CAfile", ca_cert, ca_cert)
-    for name, address in EXPECTED_DCS.items():
+    for name, address in expected_dcs.items():
         node = bundle / "nodes" / name
         secure_directory(node)
         node_ca = node / "ca.crt"
@@ -271,7 +273,12 @@ def inspect_authority(bundle, archive):
     identities = parse_mapping(values["HETERONETWORK_DB_MEMBER_IDENTITIES"], identity=True)
     dcs = parse_mapping(values["HETERONETWORK_DB_DCS_MEMBERS"])
     bootstrap = parse_mapping(values["HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS"])
-    require(dcs == EXPECTED_DCS and bootstrap == EXPECTED_DCS,
+    revision = values["HETERONETWORK_DB_TOPOLOGY_REVISION"]
+    require(re.fullmatch(r"[1-9][0-9]{0,17}", revision),
+            "protected topology revision is invalid")
+    revision = int(revision)
+    expected_dcs = (LEGACY_DCS if revision < REPLACEMENT_DCS_REVISION else EXPECTED_DCS)
+    require(dcs == expected_dcs and bootstrap == expected_dcs,
             "protected DCS authority does not match the recovered quorum")
     require(all(members.get(name) == address for name, address in EXPECTED_MEMBERS.items()),
             "protected authority is missing a recovered database member")
@@ -289,17 +296,15 @@ def inspect_authority(bundle, archive):
             "protected authority has an unexpected retired member count")
     require(values["HETERONETWORK_DB_NETWORK_PLANE"] == "underlay-v1",
             "protected authority uses an unexpected network plane")
-    revision = values["HETERONETWORK_DB_TOPOLOGY_REVISION"]
-    require(re.fullmatch(r"[1-9][0-9]{0,17}", revision),
-            "protected topology revision is invalid")
-    validate_credentials(bundle)
+    validate_credentials(bundle, expected_dcs)
     return {
         "values": values,
         "order": order,
         "members": members,
         "identities": identities,
         "retired": retired_members,
-        "revision": int(revision),
+        "revision": revision,
+        "dcs": expected_dcs,
         "manifest": expanded_manifest,
     }
 
@@ -313,7 +318,7 @@ def render_manifest(authority):
         f"{name}={authority['identities'][name]}" for name in EXPECTED_MEMBERS
     )
     values["HETERONETWORK_DB_DCS_MEMBERS"] = ",".join(
-        f"{name}={address}" for name, address in EXPECTED_DCS.items()
+        f"{name}={address}" for name, address in authority["dcs"].items()
     )
     values["HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS"] = values[
         "HETERONETWORK_DB_DCS_MEMBERS"

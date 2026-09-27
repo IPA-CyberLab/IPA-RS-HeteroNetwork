@@ -28,7 +28,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/openbao-storage.yaml" && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/git-source.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -71,20 +71,23 @@ locals {
           )
         }
         postgres_dcs_only = {
-          hosts = {
-            for name, node in local.nodes : name => merge(node, { ansible_host = node.ssh_host })
-            if try(node.postgres_role, "") == "dcs-only"
-          }
+          hosts = merge(
+            { for name, node in local.nodes : name => merge(node, { ansible_host = node.ssh_host })
+            if try(node.postgres_role, "") == "dcs-only" },
+            try(local.enrollment_issuer.postgres_role, "") == "dcs-only" ? {
+              (local.enrollment_issuer.name) = merge({ for key, value in local.enrollment_issuer : key => value if key != "name" }, {
+                ansible_host            = local.enrollment_issuer.ssh_host
+                ansible_ssh_common_args = "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -o 'ProxyCommand=ssh -i ${pathexpand(var.ssh_private_key_path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -W %h:%p mizuame@${local.bootstrap.ssh_host}'"
+              })
+            } : {}
+          )
         }
         enrollment_issuer = {
           hosts = {
-            ichikawap1 = {
-              ssh_host                = local.enrollment_issuer.ssh_host
-              vpn_ip                  = local.enrollment_issuer.vpn_ip
-              ssh_host_key            = local.enrollment_issuer.ssh_host_key
+            ichikawap1 = merge({ for key, value in local.enrollment_issuer : key => value if key != "name" }, {
               ansible_host            = local.enrollment_issuer.ssh_host
               ansible_ssh_common_args = "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -o 'ProxyCommand=ssh -i ${pathexpand(var.ssh_private_key_path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -W %h:%p mizuame@${local.bootstrap.ssh_host}'"
-            }
+            })
           }
         }
         gpu_candidates = {
@@ -398,19 +401,26 @@ resource "terraform_data" "database_ha_configuration" {
         }
       } : {}
     )
-    dcs_only = {
-      for name, node in local.nodes : name => {
+    dcs_only = merge(
+      { for name, node in local.nodes : name => {
         postgres_name = node.postgres_name
         address       = node.tailscale_ip
-      } if try(node.postgres_role, "") == "dcs-only"
-    }
+      } if try(node.postgres_role, "") == "dcs-only" },
+      try(local.enrollment_issuer.postgres_role, "") == "dcs-only" ? {
+        (local.enrollment_issuer.name) = {
+          postgres_name = local.enrollment_issuer.postgres_name
+          address       = local.enrollment_issuer.tailscale_ip
+        }
+      } : {}
+    )
     protected_bundle_source = "uc-k8sp5"
   }
   triggers_replace = [
     filesha256("${path.module}/ansible/database-ha.yaml"),
     filesha256("${local.repo_root}/scripts/postgres-ha-node.sh"),
     sha256(jsonencode(local.nodes)),
-    sha256(jsonencode(local.standard_nodes))
+    sha256(jsonencode(local.standard_nodes)),
+    sha256(jsonencode(local.enrollment_issuer))
   ]
   provisioner "local-exec" {
     working_dir = abspath(path.module)

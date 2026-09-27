@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stage and commit the DB DCS voter move off the Secret Manager hosts.
+"""Move the DB DCS voter off the Secret Manager hosts with quorum checks.
 
-The actual etcd learner/member transition is performed separately. This tool
-never changes live etcd membership and refuses to commit before the new three
-member quorum is healthy. It runs as root on the bundle authority (uc-k8sp5).
+The protected authority is staged before the etcd learner/member transition
+and is committed only after the replacement three-member quorum is healthy.
+This tool runs as root on the bundle authority (uc-k8sp5).
 """
 
 import argparse
@@ -106,10 +106,10 @@ def prepare(bundle, archive, stage, helper):
             'candidate': state['candidate']}
 
 
-def etcdctl(bundle, *args):
+def etcdctl(bundle, *args, endpoints=NEW_DCS):
     command = [
         '/opt/heteronetwork/postgres-ha/etcdctl',
-        '--endpoints=' + ','.join(f'https://{address}:12379' for address in NEW_DCS.values()),
+        '--endpoints=' + ','.join(f'https://{address}:12379' for address in endpoints.values()),
         '--dial-timeout=3s', '--command-timeout=10s',
         '--cacert=' + str(bundle / 'ca/ca.crt'),
         '--cert=' + str(bundle / 'nodes/db-b/node.crt'),
@@ -119,6 +119,77 @@ def etcdctl(bundle, *args):
                             check=False)
     require(result.returncode == 0, 'new DCS quorum is not healthy')
     return result.stdout
+
+
+def members_by_peer(bundle, endpoints):
+    members = json.loads(etcdctl(bundle, 'member', 'list', '--write-out=json',
+                                 endpoints=endpoints))['members']
+    result = {}
+    for member in members:
+        peers = member.get('peerURLs', [])
+        require(len(peers) == 1 and peers[0] not in result,
+                'DCS member has unexpected peer URLs')
+        result[peers[0]] = member
+    return result
+
+
+def expected_peers(members):
+    return {f'https://{address}:12380' for address in members.values()}
+
+
+def add_learner(bundle):
+    current = members_by_peer(bundle, OLD_DCS)
+    old_peers = expected_peers(OLD_DCS)
+    new_peer = f'https://{NEW_DCS["db-h"]}:12380'
+    require(set(current) in (old_peers, old_peers | {new_peer}),
+            'unexpected membership before replacement learner addition')
+    for name, address in OLD_DCS.items():
+        require(current[f'https://{address}:12380']['name'] == name,
+                'existing DCS voter name drift')
+    if new_peer not in current:
+        etcdctl(bundle, 'endpoint', 'health', '--cluster', endpoints=OLD_DCS)
+        etcdctl(bundle, 'member', 'add', 'db-h',
+                '--peer-urls=' + new_peer, '--learner', endpoints=OLD_DCS)
+        current = members_by_peer(bundle, OLD_DCS)
+    require(set(current) == old_peers | {new_peer}
+            and current[new_peer].get('isLearner', False),
+            'replacement learner was not registered')
+    return {'phase': 'learner-added', 'member_count': 4}
+
+
+def promote_learner(bundle):
+    current = members_by_peer(bundle, OLD_DCS)
+    require(set(current) == expected_peers(OLD_DCS) | expected_peers({'db-h': NEW_DCS['db-h']}),
+            'replacement learner membership is incomplete')
+    peer = f'https://{NEW_DCS["db-h"]}:12380'
+    learner = current[peer]
+    require(learner['name'] == 'db-h', 'replacement learner has not joined')
+    if learner.get('isLearner', False):
+        etcdctl(bundle, 'member', 'promote', format(int(learner['ID']), 'x'),
+                endpoints=OLD_DCS)
+    current = members_by_peer(bundle, OLD_DCS)
+    require(not current[peer].get('isLearner', False), 'replacement DCS voter was not promoted')
+    etcdctl(bundle, 'endpoint', 'health', '--cluster',
+            endpoints={**OLD_DCS, 'db-h': NEW_DCS['db-h']})
+    return {'phase': 'learner-promoted', 'member_count': 4}
+
+
+def retire_old_voter(bundle):
+    current = members_by_peer(bundle, NEW_DCS)
+    require(set(current) == expected_peers(OLD_DCS) | expected_peers({'db-h': NEW_DCS['db-h']}),
+            'four-voter transition membership differs from the reviewed topology')
+    for name, address in NEW_DCS.items():
+        member = current[f'https://{address}:12380']
+        require(member['name'] == name and not member.get('isLearner', False),
+                'new DCS quorum is not composed of voters')
+    etcdctl(bundle, 'endpoint', 'health', endpoints=NEW_DCS)
+    old = current[f'https://{OLD_DCS["db-g"]}:12380']
+    require(old['name'] == 'db-g' and not old.get('isLearner', False),
+            'retiring DCS voter identity differs from the reviewed node')
+    etcdctl(bundle, 'member', 'remove', format(int(old['ID']), 'x'),
+            endpoints=NEW_DCS)
+    healthy_new_quorum(bundle)
+    return {'phase': 'old-voter-removed', 'member_count': 3}
 
 
 def healthy_new_quorum(bundle):
@@ -171,7 +242,8 @@ def commit(bundle, archive, stage):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('prepare', 'commit'))
+    parser.add_argument('action', choices=('prepare', 'add-learner', 'promote-learner',
+                                           'retire-old-voter', 'commit'))
     parser.add_argument('--bundle', type=Path, default=DEFAULT_BUNDLE)
     parser.add_argument('--archive', type=Path, default=DEFAULT_ARCHIVE)
     parser.add_argument('--stage', type=Path, default=DEFAULT_STAGE)
@@ -179,8 +251,15 @@ def main():
     args = parser.parse_args()
     require(all(path.is_absolute() for path in (args.bundle, args.archive, args.stage,
                                                 args.helper)), 'all paths must be absolute')
-    result = (prepare(args.bundle, args.archive, args.stage, args.helper)
-              if args.action == 'prepare' else commit(args.bundle, args.archive, args.stage))
+    actions = {
+        'prepare': lambda: prepare(args.bundle, args.archive, args.stage, args.helper),
+        'add-learner': lambda: add_learner(args.bundle),
+        'promote-learner': lambda: promote_learner(args.bundle),
+        'retire-old-voter': lambda: retire_old_voter(args.bundle),
+        'commit': lambda: commit(args.bundle, args.archive, args.stage),
+    }
+    require(os.geteuid() == 0, 'root is required')
+    result = actions[args.action]()
     print(json.dumps(result, sort_keys=True))
 
 

@@ -35,7 +35,7 @@ def prepare(work_dir, ssh_key):
     )
     CONSOLE.require(
         {(value["postgres_name"], value["tailscale_ip"]) for value in voters.values()}
-        == {("db-g", "100.94.130.38")},
+        == {("db-h", "100.65.54.75")},
         "DCS voter inventory does not match the recovered topology",
     )
     CONSOLE.write_private(
