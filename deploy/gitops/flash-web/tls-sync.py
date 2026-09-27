@@ -166,11 +166,12 @@ def update_content(old, generation):
         require(start < end and (start == 0 or old[start - 1:start] == b"\n"),
                 "invalid managed block")
         unmanaged = old[:start] + old[end + len(END):]
-        new = old[:start] + route(generation) + old[end + len(END):]
     else:
         unmanaged = old
-        new = old + b"\n" + route(generation)
     require(HOST.encode() not in unmanaged, "unmanaged wildcard route already exists")
+    # Caddyfile imports are resolved in source order. The certificate snippet
+    # must be declared before the canonical site blocks that import it.
+    new = route(generation) + b"\n" + unmanaged.lstrip(b"\n")
     require(len(new) <= LIMIT, "updated extra exceeds Agent size limit")
     return new
 

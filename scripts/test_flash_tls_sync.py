@@ -76,7 +76,8 @@ class SyncTests(unittest.TestCase):
     def test_publish_idempotence_rotation_and_permissions(self):
         self.assertTrue(self.run_sync())
         first = self.extra.read_bytes()
-        self.assertTrue(first.startswith(self.original + b"\n"))
+        self.assertTrue(first.startswith(sync.BEGIN))
+        self.assertIn(self.original, first)
         self.assertIn(b"http://*.flash.heterocloud.mizuame.app:80", first)
         self.assertIn(b"https://*.flash.heterocloud.mizuame.app:443", first)
         self.assertIn(b"(heterocloud_public_tls)", first)
@@ -90,7 +91,8 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(self.run_sync())
         second = self.extra.read_bytes()
         self.assertNotEqual(first, second)
-        self.assertTrue(second.startswith(self.original + b"\n"))
+        self.assertTrue(second.startswith(sync.BEGIN))
+        self.assertIn(self.original, second)
         self.assertTrue(second.endswith(b"# another operator's tail\n"))
         self.assertEqual(second.count(sync.BEGIN), 1)
         certdir = self.host / sync.CERTDIR
