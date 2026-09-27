@@ -142,6 +142,14 @@ spec:
           operator: Exists
         - effect: NoSchedule
           operator: Exists
+        - key: heteronetwork.io/control-plane-only
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        - key: heteronetwork.io/control-plane-only
+          operator: Equal
+          value: "true"
+          effect: NoExecute
       containers:
         - name: node-cache
           image: registry.k8s.io/dns/k8s-dns-node-cache:1.26.8

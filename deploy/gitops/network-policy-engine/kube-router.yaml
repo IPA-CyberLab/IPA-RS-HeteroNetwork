@@ -135,6 +135,14 @@ spec:
           effect: NoSchedule
         - operator: Exists
           effect: NoExecute
+        - key: heteronetwork.io/control-plane-only
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        - key: heteronetwork.io/control-plane-only
+          operator: Equal
+          value: "true"
+          effect: NoExecute
       containers:
         - name: kube-router
           image: docker.io/cloudnativelabs/kube-router:v2.11.1@sha256:64da9a538d29e13780e256ce3897a52932a68657793bef009063bbeb2762146a
