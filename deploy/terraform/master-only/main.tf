@@ -266,7 +266,10 @@ resource "kubernetes_manifest" "master_only_application" {
       }
     }
   }
-  field_manager { name = "heteronetwork-terraform" }
+  field_manager {
+    name            = "heteronetwork-terraform"
+    force_conflicts = true
+  }
   lifecycle { prevent_destroy = true }
   depends_on = [terraform_data.git_source, kubernetes_manifest.gitops_project]
 }
