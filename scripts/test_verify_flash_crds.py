@@ -38,6 +38,7 @@ def documents():
             "resources": [
                 {"kind": "CustomResourceDefinition", "name": verify.DEVICE_CRD, "status": "Synced"},
                 {"kind": "CustomResourceDefinition", "name": verify.JOB_CRD, "status": "Synced"},
+                {"kind": "CustomResourceDefinition", "name": verify.SERVICE_CRD, "status": "Synced"},
             ],
         },
     }
@@ -62,7 +63,12 @@ def documents():
         },
         "x-kubernetes-validations": [{"rule": verify.OPTIONAL_GPU_TYPE_RULE}],
     })
-    return application, device, job
+    service = crd(verify.SERVICE_CRD, {
+        "properties": {"workload": {"properties": {"secret_files": {
+            "type": "object", "additionalProperties": {"type": "string"},
+        }}}},
+    })
+    return application, device, job, service
 
 
 class VerifyFlashCrdsTests(unittest.TestCase):
@@ -70,32 +76,40 @@ class VerifyFlashCrdsTests(unittest.TestCase):
         result = verify.validate(*documents())
         self.assertTrue(result[verify.DEVICE_CRD]["assignment_contract"])
         self.assertTrue(result[verify.JOB_CRD]["gpu_type_contract"])
+        self.assertTrue(result[verify.SERVICE_CRD]["secret_file_contract"])
 
     def test_rejects_unbounded_or_non_uuid_assignments(self):
-        application, device, job = documents()
+        application, device, job, service = documents()
         assignments = device["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
         del assignments["properties"]["spec"]["properties"]["private_assignments"]["maxItems"]
         with self.assertRaisesRegex(RuntimeError, "bounded lowercase UUID"):
-            verify.validate(application, device, job)
+            verify.validate(application, device, job, service)
 
     def test_rejects_missing_job_gpu_type_rule(self):
-        application, device, job = documents()
+        application, device, job, service = documents()
         schema = job["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
         schema["properties"]["spec"]["x-kubernetes-validations"] = []
         with self.assertRaisesRegex(RuntimeError, "canonical optional GPU type"):
-            verify.validate(application, device, job)
+            verify.validate(application, device, job, service)
 
     def test_rejects_crd_that_is_not_established(self):
-        application, device, job = documents()
+        application, device, job, service = documents()
         job["status"]["conditions"][0]["status"] = "False"
         with self.assertRaisesRegex(RuntimeError, "not Established"):
-            verify.validate(application, device, job)
+            verify.validate(application, device, job, service)
 
     def test_rejects_stale_application_comparison(self):
-        application, device, job = documents()
+        application, device, job, service = documents()
         application["status"]["sync"]["comparedTo"]["source"]["targetRevision"] = "v0.1.31"
         with self.assertRaisesRegex(RuntimeError, "desired revision"):
-            verify.validate(application, device, job)
+            verify.validate(application, device, job, service)
+
+    def test_rejects_schema_that_would_prune_secret_references(self):
+        application, device, job, service = documents()
+        secret_files = service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["workload"]["properties"]["secret_files"]
+        del secret_files["additionalProperties"]
+        with self.assertRaisesRegex(RuntimeError, "preserve secret file references"):
+            verify.validate(application, device, job, service)
 
 
 if __name__ == "__main__":

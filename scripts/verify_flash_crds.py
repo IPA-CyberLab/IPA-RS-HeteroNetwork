@@ -12,6 +12,7 @@ import time
 
 DEVICE_CRD = "flashgpudevices.flash.heterocloud.io"
 JOB_CRD = "flashgpujobs.flash.heterocloud.io"
+SERVICE_CRD = "flashservices.flash.heterocloud.io"
 APPLICATION = "heterocloud-flash"
 VERSION = "v1alpha1"
 UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -60,7 +61,7 @@ def validation_rules(spec: dict, name: str) -> set[str]:
     return {rule.get("rule", "") for rule in rules if isinstance(rule, dict)}
 
 
-def validate(application: dict, device: dict, job: dict) -> dict[str, dict[str, object]]:
+def validate(application: dict, device: dict, job: dict, service: dict) -> dict[str, dict[str, object]]:
     desired_revision = application.get("spec", {}).get("source", {}).get("targetRevision")
     sync = application.get("status", {}).get("sync", {})
     compared_revision = sync.get("comparedTo", {}).get("source", {}).get("targetRevision")
@@ -76,7 +77,7 @@ def validate(application: dict, device: dict, job: dict) -> dict[str, dict[str, 
         (resource.get("kind"), resource.get("name")): resource.get("status")
         for resource in application.get("status", {}).get("resources", [])
     }
-    for name in (DEVICE_CRD, JOB_CRD):
+    for name in (DEVICE_CRD, JOB_CRD, SERVICE_CRD):
         if resources.get(("CustomResourceDefinition", name)) != "Synced":
             raise RuntimeError(f"{APPLICATION} has not synced {name}")
 
@@ -116,15 +117,24 @@ def validate(application: dict, device: dict, job: dict) -> dict[str, dict[str, 
     if count.get("minimum") != 1 or count.get("maximum") != 1:
         raise RuntimeError(f"{JOB_CRD} does not limit jobs to one GPU")
 
+    service_spec = version_schema(service, SERVICE_CRD)
+    try:
+        secret_files = service_spec["properties"]["workload"]["properties"]["secret_files"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(f"{SERVICE_CRD} is missing secret file references") from error
+    if secret_files.get("type") != "object" or secret_files.get("additionalProperties", {}).get("type") != "string":
+        raise RuntimeError(f"{SERVICE_CRD} does not preserve secret file references")
+
     return {
         APPLICATION: {"synced": True, "healthy": True},
         DEVICE_CRD: {"established": True, "assignment_contract": True},
         JOB_CRD: {"established": True, "gpu_type_contract": True, "max_gpus": 1},
+        SERVICE_CRD: {"established": True, "secret_file_contract": True},
     }
 
 
 def inspect() -> dict[str, dict[str, object]]:
-    return validate(get_application(), get_crd(DEVICE_CRD), get_crd(JOB_CRD))
+    return validate(get_application(), get_crd(DEVICE_CRD), get_crd(JOB_CRD), get_crd(SERVICE_CRD))
 
 
 def main() -> int:
