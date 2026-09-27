@@ -21,6 +21,13 @@ spec:
          request.userInfo.username == 'system:node:' + object.spec.nodeName) ||
         (request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-')) ||
         (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-')) ||
+        (request.namespace == 'kube-system' &&
+         has(object.spec.hostNetwork) && object.spec.hostNetwork &&
+         ((object.metadata.name.startsWith('node-local-dns-') &&
+           object.spec.serviceAccountName == 'node-local-dns') ||
+          object.metadata.name.startsWith('kubernetes-service-route-') ||
+          (object.metadata.name.startsWith('kube-router-network-policy-') &&
+           object.spec.serviceAccountName == 'kube-router-network-policy'))) ||
         (request.namespace == 'openbao' &&
          object.metadata.name.matches('^openbao-[0-2]$') &&
          has(object.metadata.labels) &&
@@ -55,6 +62,10 @@ spec:
         !(object.target.name in ['uc-k8sp1', 'uc-k8sp2', 'uc-k8s3p']) ||
         (request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-')) ||
         (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-')) ||
+        (request.namespace == 'kube-system' &&
+         (object.metadata.name.startsWith('node-local-dns-') ||
+          object.metadata.name.startsWith('kubernetes-service-route-') ||
+          object.metadata.name.startsWith('kube-router-network-policy-'))) ||
         (request.namespace == 'openbao' && object.metadata.name.matches('^openbao-[0-2]$'))
       message: "Only control-plane, networking, and OpenBao Pods can bind to this node."
 ---

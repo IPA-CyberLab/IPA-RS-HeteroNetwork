@@ -108,12 +108,12 @@ def main():
         assert any(c['type']=='Ready' and c['status']=='True' for c in node['status']['conditions']),name
         assert any(a['type']=='InternalIP' and a['address']==host['vpn_ip'] for a in node['status']['addresses']),name
         selected=[p for p in pods if p['spec'].get('nodeName')==name]
-        assert len(selected) in (6,7),(name,'unexpected Pod count',len(selected))
+        assert len(selected) in (9,10),(name,'unexpected Pod count',len(selected))
         rows=[]; openbao=[]
         for pod in selected:
             ns=pod['metadata']['namespace'];pn=pod['metadata']['name']
             cp=ns=='kube-system' and pn in [prefix+'-'+name for prefix in ['etcd','kube-apiserver','kube-controller-manager','kube-scheduler']] and bool(pod['metadata'].get('annotations',{}).get('kubernetes.io/config.mirror'))
-            network=(ns=='kube-system' and pn.startswith('kube-proxy-')) or (ns=='kube-flannel' and pn.startswith('kube-flannel-ds-'))
+            network=(ns=='kube-system' and pn.startswith(('kube-proxy-','node-local-dns-','kubernetes-service-route-','kube-router-network-policy-'))) or (ns=='kube-flannel' and pn.startswith('kube-flannel-ds-'))
             secret_manager=(ns=='openbao' and pn in ('openbao-0','openbao-1','openbao-2') and pod['metadata'].get('labels',{}).get('app.kubernetes.io/instance')=='openbao')
             assert cp or network or secret_manager,(name,'unexpected workload',ns,pn)
             cs=pod['status'].get('containerStatuses',[])
@@ -123,7 +123,7 @@ def main():
                 continue
             assert pod['status']['phase']=='Running' and len(cs)==len(pod['spec']['containers']) and all(c['ready'] for c in cs),(name,pn,'not Ready')
             rows.append({'namespace':ns,'name':pn,'ready':True})
-        assert len(rows)==6 and len(openbao)<=1,(name,'unexpected Pod placement',rows,openbao)
+        assert len(rows)==9 and len(openbao)<=1,(name,'unexpected Pod placement',rows,openbao)
         if args.require_openbao: assert len(openbao)==1 and openbao[0]['ready'],(name,'OpenBao is absent or sealed',openbao)
         assert get('nodes.longhorn.io',name,'-n','longhorn-system')['spec']['allowScheduling'] is False
         report['nodes'].append({'name':name,'vpn_ip':host['vpn_ip'],'ready':True,'unschedulable':False,'essential_pods':rows,'openbao_pods':openbao,'other_workload_pods':0})

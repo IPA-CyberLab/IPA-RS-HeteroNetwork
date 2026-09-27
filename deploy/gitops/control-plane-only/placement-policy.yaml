@@ -23,10 +23,14 @@ spec:
       \ object.metadata.annotations &&\n request.userInfo.username == 'system:node:'\
       \ + object.spec.nodeName) ||\n(request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-'))\
       \ || (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-'))\
-      \ || (request.namespace == 'openbao' &&\n object.metadata.name.matches('^openbao-[0-2]$')\
-      \ &&\n has(object.metadata.labels) &&\n object.metadata.labels['app.kubernetes.io/name']\
-      \ == 'openbao' &&\n object.metadata.labels['app.kubernetes.io/instance'] ==\
-      \ 'openbao' &&\n object.metadata.labels['component'] == 'server' &&\n object.spec.serviceAccountName\
+      \ || (request.namespace == 'kube-system' &&\n has(object.spec.hostNetwork) &&\
+      \ object.spec.hostNetwork &&\n ((object.metadata.name.startsWith('node-local-dns-')\
+      \ &&\n   object.spec.serviceAccountName == 'node-local-dns') ||\n  object.metadata.name.startsWith('kubernetes-service-route-')\
+      \ ||\n  (object.metadata.name.startsWith('kube-router-network-policy-') &&\n\
+      \   object.spec.serviceAccountName == 'kube-router-network-policy'))) ||\n(request.namespace\
+      \ == 'openbao' &&\n object.metadata.name.matches('^openbao-[0-2]$') &&\n has(object.metadata.labels)\
+      \ &&\n object.metadata.labels['app.kubernetes.io/name'] == 'openbao' &&\n object.metadata.labels['app.kubernetes.io/instance']\
+      \ == 'openbao' &&\n object.metadata.labels['component'] == 'server' &&\n object.spec.serviceAccountName\
       \ == 'openbao')"
     message: This node runs only Kubernetes control-plane components, networking,
       and OpenBao.
@@ -62,10 +66,12 @@ spec:
       - pods/binding
       - bindings
   validations:
-  - expression: '!(object.target.name in [''uc-k8sp1'', ''uc-k8sp2'', ''uc-k8s3p''])
-      || (request.namespace == ''kube-flannel'' && object.metadata.name.startsWith(''kube-flannel-ds-''))
-      || (request.namespace == ''kube-system'' && object.metadata.name.startsWith(''kube-proxy-''))
-      || (request.namespace == ''openbao'' && object.metadata.name.matches(''^openbao-[0-2]$''))'
+  - expression: "!(object.target.name in ['uc-k8sp1', 'uc-k8sp2', 'uc-k8s3p']) ||\
+      \ (request.namespace == 'kube-flannel' && object.metadata.name.startsWith('kube-flannel-ds-'))\
+      \ || (request.namespace == 'kube-system' && object.metadata.name.startsWith('kube-proxy-'))\
+      \ || (request.namespace == 'kube-system' &&\n (object.metadata.name.startsWith('node-local-dns-')\
+      \ ||\n  object.metadata.name.startsWith('kubernetes-service-route-') ||\n  object.metadata.name.startsWith('kube-router-network-policy-')))\
+      \ ||\n(request.namespace == 'openbao' && object.metadata.name.matches('^openbao-[0-2]$'))"
     message: Only control-plane, networking, and OpenBao Pods can bind to this node.
 ---
 apiVersion: admissionregistration.k8s.io/v1
