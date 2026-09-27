@@ -1,0 +1,34 @@
+- name: Stage the replacement database consensus voter before Secret Manager placement
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the reviewed authority and migration helpers
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/libexec/{{ item }}"
+        owner: root
+        group: root
+        mode: '0700'
+      loop:
+        - recover-database-authority.py
+        - migrate-secret-manager-dcs.py
+
+    - name: Stage the replacement topology and its new voter certificate
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/migrate-secret-manager-dcs.py
+          - prepare
+      register: staged
+      changed_when: (staged.stdout | from_json).phase == 'staged'
+      no_log: true
+
+    - name: Require a staged db-h replacement at the next topology revision
+      ansible.builtin.assert:
+        that:
+          - (staged.stdout | from_json).phase == 'staged'
+          - (staged.stdout | from_json).candidate == 'ichikawap1'
