@@ -34,8 +34,8 @@ spec:
     - dnsName: secrets.heterocloud.mizuame.app
       recordType: A
       recordTTL: 60
-      # This public name must resolve to WireGuard addresses only. The name is
-      # retained because OpenBao OIDC uses it as its registered callback.
+      # Legacy verified HTTPS endpoint for in-cluster clients. User links use
+      # secrets.heteronetwork.internal; this name resolves only to VPN IPs.
       targets: [10.250.0.10, 10.250.0.11]
       providerSpecific:
         - name: external-dns.alpha.kubernetes.io/cloudflare-proxied

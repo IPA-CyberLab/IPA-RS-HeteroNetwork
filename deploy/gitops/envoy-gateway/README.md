@@ -3,11 +3,12 @@
 `public-web-dns.yaml` is the ExternalDNS source of truth for the platform's
 host Caddy front doors on ports 80/443. It is deployment inventory, not an
 automatically discovered list of healthy Kubernetes LoadBalancer addresses.
-The apex is Cloudflare-proxied; the other records are DNS-only. OpenBao keeps
-its OIDC hostname `secrets.heterocloud.mizuame.app`, but its A records point
-only to VPN addresses (`10.250.0.10` and `10.250.0.11`). Public Caddy front
-doors answer 403 for that host; the VPN-only Caddy service serves it on those
-private addresses.
+The apex is Cloudflare-proxied; the other records are DNS-only. OpenBao's
+user-facing name is `secrets.heteronetwork.internal`, discovered from the
+ready private gateway endpoints. The older `secrets.heterocloud.mizuame.app`
+name remains for verified HTTPS access by in-cluster clients; its A records
+point only to VPN addresses (`10.250.0.10` and `10.250.0.11`). Public Caddy
+front doors answer 403 for that host.
 
 Do not publish the same names from HTTPRoute or the internal Envoy
 LoadBalancer Service. Its empty status during an eligibility outage caused

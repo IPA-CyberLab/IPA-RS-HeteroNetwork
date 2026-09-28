@@ -102,6 +102,29 @@ class OverlayDnsServiceDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(status["services"]), 1)
         self.assertIn("argocd.heteronetwork.internal", effective["records"])
 
+    def test_openbao_name_tracks_ready_private_gateway_endpoints(self):
+        rule = [{
+            "dns_name": "secrets.heteronetwork.internal",
+            "namespace": "envoy-gateway-system",
+            "service_name": "openbao-vpn-proxy",
+        }]
+        service_object = service("envoy-gateway-system", "openbao-vpn-proxy")
+        slices = [endpoint_slice("envoy-gateway-system", "openbao-vpn-proxy", [
+            {"nodeName": "node-b", "conditions": {"ready": True}},
+            {"nodeName": "node-c", "conditions": {"ready": True}},
+        ])]
+        effective, _ = discovery.build_effective_zone(
+            self.base, [service_object], slices, self.nodes, rule
+        )
+        self.assertEqual(
+            effective["records"]["secrets.heteronetwork.internal"],
+            ["10.250.0.10", "10.250.0.11"],
+        )
+        effective, _ = discovery.build_effective_zone(
+            self.base, [service_object], [], self.nodes, rule
+        )
+        self.assertNotIn("secrets.heteronetwork.internal", effective["records"])
+
     def test_missing_service_removes_managed_record(self):
         effective, status = discovery.build_effective_zone(
             self.base, [], [], self.nodes, self.rules

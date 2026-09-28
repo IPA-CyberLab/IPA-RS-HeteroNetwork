@@ -9,6 +9,11 @@
       "dns_name": "prometheus.heteronetwork.internal",
       "namespace": "heterocloud-flow",
       "service_name": "heterocloud-flow-prometheus"
+    },
+    {
+      "dns_name": "secrets.heteronetwork.internal",
+      "namespace": "envoy-gateway-system",
+      "service_name": "openbao-vpn-proxy"
     }
   ]
 }
