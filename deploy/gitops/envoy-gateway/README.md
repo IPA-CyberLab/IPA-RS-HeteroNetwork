@@ -3,7 +3,11 @@
 `public-web-dns.yaml` is the ExternalDNS source of truth for the platform's
 host Caddy front doors on ports 80/443. It is deployment inventory, not an
 automatically discovered list of healthy Kubernetes LoadBalancer addresses.
-The apex is Cloudflare-proxied; the other records are DNS-only.
+The apex is Cloudflare-proxied; the other records are DNS-only. OpenBao keeps
+its OIDC hostname `secrets.heterocloud.mizuame.app`, but its A records point
+only to VPN addresses (`10.250.0.10` and `10.250.0.11`). Public Caddy front
+doors answer 403 for that host; the VPN-only Caddy service serves it on those
+private addresses.
 
 Do not publish the same names from HTTPRoute or the internal Envoy
 LoadBalancer Service. Its empty status during an eligibility outage caused
@@ -20,7 +24,7 @@ services. Dynamic tenant L4 LoadBalancer DNS remains separately managed.
 
 Verification:
 
-- Render `kubectl kustomize deploy/gitops/envoy-gateway` and verify the five
+- Render `kubectl kustomize deploy/gitops/envoy-gateway` and verify the six
   DNSEndpoint names have nonempty targets independently of Gateway status.
 - Check ExternalDNS logs and query both authoritative and recursive DNS.
 - Check public `/`, `/login`, `/api/v1/auth/oidc/start`, Flow health, and
