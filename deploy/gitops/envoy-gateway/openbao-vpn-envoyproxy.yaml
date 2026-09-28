@@ -1,0 +1,24 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: openbao-vpn
+  namespace: heterocloud-edge
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        replicas: 2
+        pod:
+          nodeSelector:
+            networking.heteronetwork.io/public-ingress: "true"
+        container:
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      envoyService:
+        type: ClusterIP

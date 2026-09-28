@@ -9,6 +9,10 @@ resources:
   - public-web-dns.yaml
   - gatewayclass.yaml
   - envoyproxy.yaml
+  - openbao-vpn-envoyproxy.yaml
+  - openbao-vpn-gatewayclass.yaml
+  - openbao-vpn-gateway.yaml
+  - openbao-vpn-proxy-service.yaml
   - heterocloud-edge-proxy-service.yaml
   - gateway.yaml
   - client-traffic-policy.yaml
