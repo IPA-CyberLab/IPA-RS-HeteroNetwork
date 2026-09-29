@@ -169,8 +169,8 @@ python3 scripts/master-only-iac.py check
 python3 scripts/master-only-iac.py plan
 ```
 
-The verifier checks Node Ready and isolation, exactly six essential Ready Pods
-per master plus at most one OpenBao Pod, disabled Longhorn scheduling, Argo synchronization, actual Pod and
+The verifier checks Node Ready and isolation, nine essential Ready Pods
+per master plus at most one Secret Manager server and one injector Pod, disabled Longhorn scheduling, Argo synchronization, actual Pod and
 binding rejection, DaemonSet mutation with existing OR affinity, essential
 network toleration restoration, and Node mutation preserving controller taints.
 It creates a temporary test namespace and removes it afterward. Browser owner

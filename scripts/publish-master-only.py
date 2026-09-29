@@ -22,7 +22,7 @@ def files():
            'scripts/verify-gpu-runtime.py',
            'scripts/gpu_inventory.py','scripts/test_gpu_inventory.py',
            'scripts/verify_gpu_inventory.py','scripts/test_verify_gpu_inventory.py',
-           'scripts/verify_flash_crds.py','scripts/test_verify_flash_crds.py',
+           'scripts/verify_flash_crds.py','scripts/test_verify_flash_crds.py','scripts/verify_flash_secret_env.py',
            'docs/master-only-iac-2026-09-15.md',
            'docs/standard-node-setup-2026-09-15.md',
            'docs/onboarding-e2e-gate-2026-09-15.md',

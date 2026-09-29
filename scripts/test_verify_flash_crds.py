@@ -28,11 +28,11 @@ def crd(name, spec):
 
 def documents():
     application = {
-        "spec": {"source": {"targetRevision": "v0.1.32"}},
+        "spec": {"source": {"targetRevision": "v0.1.37"}},
         "status": {
             "sync": {
                 "status": "Synced",
-                "comparedTo": {"source": {"targetRevision": "v0.1.32"}},
+                "comparedTo": {"source": {"targetRevision": "v0.1.37"}},
             },
             "health": {"status": "Healthy"},
             "resources": [
@@ -64,9 +64,10 @@ def documents():
         "x-kubernetes-validations": [{"rule": verify.OPTIONAL_GPU_TYPE_RULE}],
     })
     service = crd(verify.SERVICE_CRD, {
-        "properties": {"workload": {"properties": {"secret_files": {
-            "type": "object", "additionalProperties": {"type": "string"},
-        }}}},
+        "properties": {"workload": {"properties": {
+            "secret_env": {"type": "object", "additionalProperties": {"type": "string"}},
+            "secret_files": {"type": "object", "additionalProperties": {"type": "string"}},
+        }}},
     })
     return application, device, job, service
 
@@ -76,7 +77,8 @@ class VerifyFlashCrdsTests(unittest.TestCase):
         result = verify.validate(*documents())
         self.assertTrue(result[verify.DEVICE_CRD]["assignment_contract"])
         self.assertTrue(result[verify.JOB_CRD]["gpu_type_contract"])
-        self.assertTrue(result[verify.SERVICE_CRD]["secret_file_contract"])
+        self.assertTrue(result[verify.SERVICE_CRD]["secret_env_contract"])
+        self.assertTrue(result[verify.SERVICE_CRD]["legacy_secret_contract"])
 
     def test_rejects_unbounded_or_non_uuid_assignments(self):
         application, device, job, service = documents()
@@ -106,9 +108,16 @@ class VerifyFlashCrdsTests(unittest.TestCase):
 
     def test_rejects_schema_that_would_prune_secret_references(self):
         application, device, job, service = documents()
+        secret_env = service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["workload"]["properties"]["secret_env"]
+        del secret_env["additionalProperties"]
+        with self.assertRaisesRegex(RuntimeError, "preserve secret environment references"):
+            verify.validate(application, device, job, service)
+
+    def test_rejects_schema_that_would_prune_legacy_secret_references(self):
+        application, device, job, service = documents()
         secret_files = service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["workload"]["properties"]["secret_files"]
         del secret_files["additionalProperties"]
-        with self.assertRaisesRegex(RuntimeError, "preserve secret file references"):
+        with self.assertRaisesRegex(RuntimeError, "preserve legacy secret references"):
             verify.validate(application, device, job, service)
 
 
