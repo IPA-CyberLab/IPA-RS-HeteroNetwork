@@ -168,8 +168,13 @@ def main() -> int:
         workload = next(item for item in spec["containers"] if item["name"] == "workload")
         if workload.get("command") != ["/run/flash-helper/launcher"]:
             raise RuntimeError("workload is not launched through the environment helper")
-        digest = kubectl("-n", NAMESPACE, "exec", pod_name, "-c", "workload", "--",
-                         "sh", "-c", f'printf %s "${ENV_NAME}" | sha256sum').split()[0]
+        # kubectl exec starts a separate process with the PodSpec environment.
+        # The launcher adds secrets to PID 1, so inspect that process instead.
+        digest = kubectl(
+            "-n", NAMESPACE, "exec", pod_name, "-c", "workload", "--", "sh", "-c",
+            f"tr '\\000' '\\n' </proc/1/environ | grep '^{ENV_NAME}=' | "
+            "cut -d= -f2- | tr -d '\\n' | sha256sum",
+        ).split()[0]
         if digest != hashlib.sha256(value.encode()).hexdigest():
             raise RuntimeError("workload did not receive the expected environment variable")
         print("Flash secret environment acceptance passed")
