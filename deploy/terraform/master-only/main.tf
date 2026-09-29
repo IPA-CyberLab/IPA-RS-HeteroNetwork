@@ -184,15 +184,16 @@ resource "terraform_data" "flash_crd_acceptance" {
   input = {
     application = "heterocloud-flash"
     revision    = yamldecode(file("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml")).spec.source.targetRevision
-    contract    = "bounded-private-assignments-and-canonical-gpu-type"
+    contract    = "secret-environment-and-legacy-schema"
   }
   triggers_replace = [
     filesha256("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml"),
-    filesha256("${local.repo_root}/scripts/verify_flash_crds.py")
+    filesha256("${local.repo_root}/scripts/verify_flash_crds.py"),
+    filesha256("${local.repo_root}/scripts/verify_flash_secret_env.py")
   ]
   provisioner "local-exec" {
     working_dir = local.repo_root
-    command     = "python3 scripts/verify_flash_crds.py"
+    command     = "python3 scripts/verify_flash_crds.py && python3 scripts/verify_flash_secret_env.py"
     environment = {
       KUBECONFIG = pathexpand(var.kubeconfig_path)
     }

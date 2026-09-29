@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that the live Flash GPU APIs enforce the release schema contract."""
+"""Verify that the live Flash APIs enforce the release schema contract."""
 
 from __future__ import annotations
 
@@ -119,17 +119,21 @@ def validate(application: dict, device: dict, job: dict, service: dict) -> dict[
 
     service_spec = version_schema(service, SERVICE_CRD)
     try:
-        secret_files = service_spec["properties"]["workload"]["properties"]["secret_files"]
+        workload = service_spec["properties"]["workload"]["properties"]
+        secret_env = workload["secret_env"]
+        secret_files = workload["secret_files"]
     except (KeyError, TypeError) as error:
-        raise RuntimeError(f"{SERVICE_CRD} is missing secret file references") from error
+        raise RuntimeError(f"{SERVICE_CRD} is missing secret environment references or legacy fields") from error
+    if secret_env.get("type") != "object" or secret_env.get("additionalProperties", {}).get("type") != "string":
+        raise RuntimeError(f"{SERVICE_CRD} does not preserve secret environment references")
     if secret_files.get("type") != "object" or secret_files.get("additionalProperties", {}).get("type") != "string":
-        raise RuntimeError(f"{SERVICE_CRD} does not preserve secret file references")
+        raise RuntimeError(f"{SERVICE_CRD} does not preserve legacy secret references")
 
     return {
         APPLICATION: {"synced": True, "healthy": True},
         DEVICE_CRD: {"established": True, "assignment_contract": True},
         JOB_CRD: {"established": True, "gpu_type_contract": True, "max_gpus": 1},
-        SERVICE_CRD: {"established": True, "secret_file_contract": True},
+        SERVICE_CRD: {"established": True, "secret_env_contract": True, "legacy_secret_contract": True},
     }
 
 
