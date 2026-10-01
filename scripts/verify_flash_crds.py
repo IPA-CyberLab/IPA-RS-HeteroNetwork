@@ -119,21 +119,28 @@ def validate(application: dict, device: dict, job: dict, service: dict) -> dict[
 
     service_spec = version_schema(service, SERVICE_CRD)
     try:
-        workload = service_spec["properties"]["workload"]["properties"]
+        workload_schema = service_spec["properties"]["workload"]
+        workload = workload_schema["properties"]
         secret_env = workload["secret_env"]
         secret_files = workload["secret_files"]
+        rootfs = workload["rootfs_storage_gib"]
     except (KeyError, TypeError) as error:
-        raise RuntimeError(f"{SERVICE_CRD} is missing secret environment references or legacy fields") from error
+        raise RuntimeError(f"{SERVICE_CRD} is missing the writable disk or secret schema") from error
     if secret_env.get("type") != "object" or secret_env.get("additionalProperties", {}).get("type") != "string":
         raise RuntimeError(f"{SERVICE_CRD} does not preserve secret environment references")
     if secret_files.get("type") != "object" or secret_files.get("additionalProperties", {}).get("type") != "string":
         raise RuntimeError(f"{SERVICE_CRD} does not preserve legacy secret references")
+    if (rootfs.get("type") != "integer" or rootfs.get("minimum") != 1
+            or rootfs.get("maximum") != 1_000_000 or rootfs.get("nullable") is not True
+            or "rootfs_storage_gib" in workload_schema.get("required", [])):
+        raise RuntimeError(f"{SERVICE_CRD} does not support optional bounded writable disk allocation")
 
     return {
         APPLICATION: {"synced": True, "healthy": True},
         DEVICE_CRD: {"established": True, "assignment_contract": True},
         JOB_CRD: {"established": True, "gpu_type_contract": True, "max_gpus": 1},
-        SERVICE_CRD: {"established": True, "secret_env_contract": True, "legacy_secret_contract": True},
+        SERVICE_CRD: {"established": True, "secret_env_contract": True, "legacy_secret_contract": True,
+                      "rootfs_storage_contract": True},
     }
 
 

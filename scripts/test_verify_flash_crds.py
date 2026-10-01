@@ -28,11 +28,11 @@ def crd(name, spec):
 
 def documents():
     application = {
-        "spec": {"source": {"targetRevision": "v0.1.37"}},
+        "spec": {"source": {"targetRevision": "v0.1.38"}},
         "status": {
             "sync": {
                 "status": "Synced",
-                "comparedTo": {"source": {"targetRevision": "v0.1.37"}},
+                "comparedTo": {"source": {"targetRevision": "v0.1.38"}},
             },
             "health": {"status": "Healthy"},
             "resources": [
@@ -67,6 +67,9 @@ def documents():
         "properties": {"workload": {"properties": {
             "secret_env": {"type": "object", "additionalProperties": {"type": "string"}},
             "secret_files": {"type": "object", "additionalProperties": {"type": "string"}},
+            "rootfs_storage_gib": {
+                "type": "integer", "minimum": 1, "maximum": 1_000_000, "nullable": True,
+            },
         }}},
     })
     return application, device, job, service
@@ -79,6 +82,14 @@ class VerifyFlashCrdsTests(unittest.TestCase):
         self.assertTrue(result[verify.JOB_CRD]["gpu_type_contract"])
         self.assertTrue(result[verify.SERVICE_CRD]["secret_env_contract"])
         self.assertTrue(result[verify.SERVICE_CRD]["legacy_secret_contract"])
+        self.assertTrue(result[verify.SERVICE_CRD]["rootfs_storage_contract"])
+
+    def test_rejects_schema_that_would_prune_requested_rootfs(self):
+        application, device, job, service = documents()
+        workload = service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["workload"]
+        del workload["properties"]["rootfs_storage_gib"]
+        with self.assertRaisesRegex(RuntimeError, "writable disk"):
+            verify.validate(application, device, job, service)
 
     def test_rejects_unbounded_or_non_uuid_assignments(self):
         application, device, job, service = documents()
