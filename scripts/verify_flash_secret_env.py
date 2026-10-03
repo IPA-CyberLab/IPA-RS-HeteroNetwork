@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise real Flash secret injection with a disposable workload and value."""
+"""Exercise Flash secret injection and removal with a disposable workload and value."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ def test_spec(service_id: str) -> dict:
     }
 
 
-def wait_for_pod(service_id: str, timeout: int = 240) -> str:
+def wait_for_pod(service_id: str, expected_generation: int = 1, timeout: int = 240) -> str:
     deadline = time.monotonic() + timeout
     selector = f"flash.heterocloud.io/instance={service_id}"
     while time.monotonic() < deadline:
@@ -118,20 +118,25 @@ def wait_for_pod(service_id: str, timeout: int = 240) -> str:
             "-n", NAMESPACE, "get", "flashservice", f"flash-{service_id}", "-o", "json"
         ))
         status = service.get("status", {})
+        if status.get("observed_generation") != expected_generation:
+            time.sleep(3)
+            continue
         if status.get("phase") == "error":
             raise RuntimeError(f"Flash service failed: {status.get('message', 'unknown error')}")
         pods = json.loads(kubectl(
             "-n", NAMESPACE, "get", "pods", "-l", selector, "-o", "json"
         ))["items"]
         for pod in pods:
+            if pod["metadata"].get("labels", {}).get("flash.heterocloud.io/generation") != str(expected_generation):
+                continue
             ready = any(
                 condition.get("type") == "Ready" and condition.get("status") == "True"
                 for condition in pod.get("status", {}).get("conditions", [])
             )
-            if ready:
+            if ready and status.get("phase") == "ready":
                 return pod["metadata"]["name"]
         time.sleep(3)
-    raise RuntimeError("Flash secret workload did not become Ready within 240 seconds")
+    raise RuntimeError(f"Flash secret workload generation {expected_generation} did not become Ready within {timeout} seconds")
 
 
 def main() -> int:
@@ -177,7 +182,29 @@ def main() -> int:
         ).split()[0]
         if digest != hashlib.sha256(value.encode()).hexdigest():
             raise RuntimeError("workload did not receive the expected environment variable")
-        print("Flash secret environment acceptance passed")
+        # Removing the last binding must replace the workload identity. Kubernetes
+        # also persists the deprecated serviceAccount alias; leaving either field
+        # behind can strand the rollout after the controller deletes the identity.
+        kubectl("-n", NAMESPACE, "patch", "flashservice", f"flash-{service_id}",
+                "--type=merge", "-p", json.dumps({"spec": {
+                    "desired_generation": 2, "workload": {"secret_env": {ENV_NAME: None}}
+                }}))
+        replacement_name = wait_for_pod(service_id, expected_generation=2)
+        if replacement_name == pod_name:
+            raise RuntimeError("secret removal did not replace the workload Pod")
+        replacement = json.loads(kubectl(
+            "-n", NAMESPACE, "get", "pod", replacement_name, "-o", "json"
+        ))["spec"]
+        if replacement.get("serviceAccountName") != "default" or replacement.get("serviceAccount") != "default":
+            raise RuntimeError("secret removal retained the old workload identity")
+        if replacement.get("automountServiceAccountToken") is not False:
+            raise RuntimeError("secret removal retained the service account token mount")
+        kubectl("-n", NAMESPACE, "exec", replacement_name, "-c", "workload", "--", "sh", "-c",
+                "test -r /proc/1/environ && ! tr '\\000' '\\n' </proc/1/environ | "
+                f"grep -q '^{ENV_NAME}='")
+        if kubectl("-n", NAMESPACE, "get", "serviceaccount", account, "--ignore-not-found").strip():
+            raise RuntimeError("unused secret service account was not removed")
+        print("Flash secret environment injection and removal acceptance passed")
         return 0
     finally:
         if created:

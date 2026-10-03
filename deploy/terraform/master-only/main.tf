@@ -184,7 +184,7 @@ resource "terraform_data" "flash_crd_acceptance" {
   input = {
     application = "heterocloud-flash"
     revision    = yamldecode(file("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml")).spec.source.targetRevision
-    contract    = "secret-environment-legacy-and-writable-disk-schema"
+    contract    = "secret-environment-injection-removal-and-writable-disk-schema"
   }
   triggers_replace = [
     filesha256("${local.repo_root}/deploy/gitops/applications/heterocloud-flash.yaml"),
