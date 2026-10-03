@@ -35,6 +35,7 @@ spec:
                           values:
                             - uc-k8sp1
                             - uc-k8sp2
+                            - uc-k8s3p
             topologySpread:
               enabled: true
               maxSkew: 1
@@ -103,9 +104,9 @@ spec:
                         - key: kubernetes.io/hostname
                           operator: In
                           values:
-                            - mizuame-nucboxg5
-                            - uc-k8sp1
                             - ichikawap1
+                            - uc-k8sp4
+                            - uc-k8sp5
             topologySpread:
               enabled: true
               maxSkew: 1
@@ -130,8 +131,10 @@ spec:
                 matchLabels:
                   kubernetes.io/metadata.name: heterocloud
               podSelector:
-                matchLabels:
-                  app.kubernetes.io/component: worker
+                matchExpressions:
+                  - key: app.kubernetes.io/component
+                    operator: In
+                    values: [api, owner-console, worker]
             - ipBlock:
                 cidr: 10.250.0.0/24
             # hostNetwork workers use Flannel (.0) for direct Pod routes and
@@ -149,11 +152,11 @@ spec:
             - ipBlock:
                 cidr: 10.244.2.1/32
             - ipBlock:
-                cidr: 10.244.3.0/32 # mizuame-nucboxg5
+                cidr: 10.244.4.0/32 # uc-k8sp5
             - ipBlock:
-                cidr: 10.244.3.1/32
+                cidr: 10.244.4.1/32
             - ipBlock:
-                cidr: 10.244.5.0/32 # uc-k8sv1
+                cidr: 10.244.5.0/32 # uc-k8sp4
             - ipBlock:
                 cidr: 10.244.5.1/32
             - ipBlock:
@@ -173,9 +176,11 @@ spec:
             - 10.96.0.0/12
             # kube-router evaluates egress after Service DNAT to API endpoints.
             - 10.250.0.10/32
+            - 10.250.0.11/32
+            - 10.250.0.2/32
+            - 10.250.0.4/32
             - 10.250.0.5/32
             - 10.250.0.6/32
-            - 10.250.0.8/32
           kubernetesApiPorts:
             - 443
             - 6443

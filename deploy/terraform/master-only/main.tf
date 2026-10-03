@@ -20,9 +20,10 @@ locals {
     heterocloud-edge       = "deploy/gitops/envoy-gateway"
   }
   managed_external_application_files = {
-    heterocloud       = "deploy/gitops/applications/heterocloud.yaml"
-    heterocloud-flash = "deploy/gitops/applications/heterocloud-flash.yaml"
-    heterocloud-flow  = "deploy/gitops/applications/heterocloud-flow.yaml"
+    heterocloud        = "deploy/gitops/applications/heterocloud.yaml"
+    heterocloud-flash  = "deploy/gitops/applications/heterocloud-flash.yaml"
+    heterocloud-flow   = "deploy/gitops/applications/heterocloud-flow.yaml"
+    heterocloud-syouyu = "deploy/gitops/applications/heterocloud-syouyu.yaml"
   }
   bootstrap = local.edge_nodes.bootstrap
   bundle_sha = sha256(join("", concat(

@@ -1,0 +1,60 @@
+---
+# Grow the existing worker root LV; never create a filesystem or use other disks.
+# ansible-playbook -i /path/to/inventory.json -K deploy/ansible/syouyu-worker-capacity.yaml
+- name: Ensure the storage worker has room for the retained 70 GiB Garage volume
+  hosts: uc-k8sp5
+  become: true
+  gather_facts: false
+  vars:
+    syouyu_root_lv: /dev/ubuntu-vg-1/ubuntu-lv
+    syouyu_root_size_gib: 200
+  tasks:
+    - name: Read the filesystem backing Longhorn
+      ansible.builtin.command:
+        argv: [findmnt, --noheadings, --output, 'SOURCE,FSTYPE', --target, /var/lib/longhorn]
+      register: syouyu_mount
+      changed_when: false
+      check_mode: false
+
+    - name: Read allocated and unallocated LVM capacity
+      ansible.builtin.command:
+        argv: [lvs, --reportformat, json, --units, b, --nosuffix, --options, 'lv_size,vg_free', '{{ syouyu_root_lv }}']
+      register: syouyu_lvm
+      changed_when: false
+      check_mode: false
+
+    - name: Calculate the required growth
+      ansible.builtin.set_fact:
+        syouyu_lv_bytes: '{{ ((syouyu_lvm.stdout | from_json).report[0].lv[0].lv_size | float) | int }}'
+        syouyu_vg_free_bytes: '{{ ((syouyu_lvm.stdout | from_json).report[0].lv[0].vg_free | float) | int }}'
+        syouyu_target_bytes: '{{ (syouyu_root_size_gib | int) * 1073741824 }}'
+
+    - name: Require the known ext4 root volume and sufficient unused extents
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == 'uc-k8sp5'
+          - syouyu_mount.stdout.split() == ['/dev/mapper/ubuntu--vg--1-ubuntu--lv', 'ext4']
+          - (syouyu_target_bytes | int) >= (syouyu_lv_bytes | int)
+          - (syouyu_vg_free_bytes | int) >= ((syouyu_target_bytes | int) - (syouyu_lv_bytes | int))
+
+    - name: Grow the existing logical volume without shrinking or formatting
+      ansible.builtin.command:
+        argv: [lvextend, --size, '{{ syouyu_root_size_gib }}G', '{{ syouyu_root_lv }}']
+      when: (syouyu_lv_bytes | int) < (syouyu_target_bytes | int)
+
+    - name: Expand the existing ext4 filesystem to the logical volume
+      ansible.builtin.command:
+        argv: [resize2fs, '{{ syouyu_root_lv }}']
+      register: syouyu_resize
+      changed_when: "'Nothing to do!' not in syouyu_resize.stderr"
+
+    - name: Read resulting storage capacity
+      ansible.builtin.command:
+        argv: [df, -h, /var/lib/longhorn]
+      register: syouyu_capacity
+      changed_when: false
+      check_mode: false
+
+    - name: Report resulting storage capacity
+      ansible.builtin.debug:
+        var: syouyu_capacity.stdout_lines
