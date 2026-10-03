@@ -192,13 +192,22 @@ def main() -> int:
         replacement_name = wait_for_pod(service_id, expected_generation=2)
         if replacement_name == pod_name:
             raise RuntimeError("secret removal did not replace the workload Pod")
-        replacement = json.loads(kubectl(
+        replacement_pod = json.loads(kubectl(
             "-n", NAMESPACE, "get", "pod", replacement_name, "-o", "json"
-        ))["spec"]
+        ))
+        replacement = replacement_pod["spec"]
         if replacement.get("serviceAccountName") != "default" or replacement.get("serviceAccount") != "default":
             raise RuntimeError("secret removal retained the old workload identity")
         if replacement.get("automountServiceAccountToken") is not False:
             raise RuntimeError("secret removal retained the service account token mount")
+        if any(key.startswith("vault.hashicorp.com/")
+               for key in replacement_pod["metadata"].get("annotations", {})):
+            raise RuntimeError("secret removal retained injection annotations")
+        if replacement.get("initContainers"):
+            raise RuntimeError("secret removal retained helper init containers")
+        if any(volume["name"] in {"flash-secret-launcher", "vault-secrets"}
+               for volume in replacement.get("volumes", [])):
+            raise RuntimeError("secret removal retained secret helper volumes")
         kubectl("-n", NAMESPACE, "exec", replacement_name, "-c", "workload", "--", "sh", "-c",
                 "test -r /proc/1/environ && ! tr '\\000' '\\n' </proc/1/environ | "
                 f"grep -q '^{ENV_NAME}='")
