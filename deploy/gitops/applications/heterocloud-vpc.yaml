@@ -24,7 +24,7 @@ spec:
     - ServerSideApply=true
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC.git
-    targetRevision: v0.1.1
+    targetRevision: d0f430c8aee9cc3d243d6b47b0dcbbd90cc2cb70
     path: deploy/helm/heterocloud-vpc
     helm:
       releaseName: heterocloud-vpc

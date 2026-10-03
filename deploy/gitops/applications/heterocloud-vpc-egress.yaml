@@ -24,9 +24,9 @@ spec:
     - ServerSideApply=true
     - RespectIgnoreDifferences=true
   source:
-    repoURL: https://github.com/spidernet-io/egressgateway.git
-    targetRevision: d2b1448d010a8000275b20647832a5d3de505793
-    path: charts
+    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC.git
+    targetRevision: d0f430c8aee9cc3d243d6b47b0dcbbd90cc2cb70
+    path: deploy/helm/egressgateway
     helm:
       releaseName: egressgateway
       values: |

@@ -104,7 +104,7 @@ def test_spec(service_id: str) -> dict:
             "policy": baseline["policy"],
             "project_id": baseline["project_id"],
             "service_instance_id": service_id,
-            "subject_id": baseline["subject_id"],
+            **({"subject_id": baseline["subject_id"]} if baseline.get("subject_id") else {}),
             "workload": workload,
         },
     }

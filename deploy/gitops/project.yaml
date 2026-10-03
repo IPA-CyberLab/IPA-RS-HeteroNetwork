@@ -14,7 +14,6 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-SecretManager.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC.git
-    - https://github.com/spidernet-io/egressgateway.git
     - docker.io/envoyproxy
     - https://charts.longhorn.io
     - https://yandex-cloud.github.io/k8s-csi-s3/charts
