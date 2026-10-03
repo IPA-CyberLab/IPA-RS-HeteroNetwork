@@ -42,6 +42,7 @@ spec:
         protectedCidrs:
         - 163.220.236.0/24
         gatewaySelector:
+          matchLabels: null
           matchExpressions:
           - key: kubernetes.io/hostname
             operator: In
