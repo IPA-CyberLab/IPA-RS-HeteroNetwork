@@ -52,7 +52,20 @@ spec:
         egressCertificate:
           enabled: true
           namespace: heterocloud-vpc-system
+        # Host-networked provider calls use the node bridge or Flannel address.
         controlPlaneCidrs:
+        - 10.244.0.0/32
+        - 10.244.0.1/32
+        - 10.244.1.0/32
+        - 10.244.1.1/32
+        - 10.244.2.0/32
+        - 10.244.2.1/32
+        - 10.244.4.0/32
+        - 10.244.4.1/32
+        - 10.244.5.0/32
+        - 10.244.5.1/32
+        - 10.244.6.0/32
+        - 10.244.6.1/32
         - 10.250.0.2/32
         - 10.250.0.4/32
         - 10.250.0.5/32
