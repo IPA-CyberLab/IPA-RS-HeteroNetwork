@@ -25,7 +25,7 @@ spec:
     - RespectIgnoreDifferences=true
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC.git
-    targetRevision: d0f430c8aee9cc3d243d6b47b0dcbbd90cc2cb70
+    targetRevision: 0c3ecaa7446470b3e74045056513cbdce32a6dde
     path: deploy/helm/egressgateway
     helm:
       releaseName: egressgateway
