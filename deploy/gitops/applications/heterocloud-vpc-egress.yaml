@@ -1,0 +1,94 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  namespace: argocd
+  name: heterocloud-vpc-egress
+spec:
+  project: hetero-platform
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-vpc-system
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+    syncOptions:
+    - CreateNamespace=true
+    - ServerSideApply=true
+    - RespectIgnoreDifferences=true
+  source:
+    repoURL: https://github.com/spidernet-io/egressgateway.git
+    targetRevision: d2b1448d010a8000275b20647832a5d3de505793
+    path: charts
+    helm:
+      releaseName: egressgateway
+      values: |
+        feature:
+          enableIPv4: true
+          enableIPv6: false
+          datapathMode: iptables
+          tunnelIpv4Subnet: 172.30.0.0/16
+          tunnelDetectMethod: interface=heteronetwork0
+          iptables:
+            backendMode: nft
+          clusterCIDR:
+            autoDetect:
+              podCidrMode: k8s
+              clusterIP: true
+              nodeIP: true
+            extraCidr:
+            - 10.250.0.0/16
+            - 163.220.236.0/24
+          gatewayFailover:
+            enable: true
+            tunnelMonitorPeriod: 5
+            tunnelUpdatePeriod: 5
+            eipEvictionTimeout: 15
+        agent:
+          image:
+            tag: v0.6.9
+            digest: sha256:a8ec2f74c9d0ddfde7b4cc5077697f4706515ef6095c8363e6e435b6dba2fe72
+          affinity:
+            nodeAffinity: &id001
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                    - linux
+                  - key: heteronetwork.io/control-plane-only
+                    operator: NotIn
+                    values:
+                    - 'true'
+          updateStrategy:
+            type: RollingUpdate
+            rollingUpdate:
+              maxUnavailable: 1
+        controller:
+          replicas: 2
+          image:
+            tag: v0.6.9
+            digest: sha256:9deda7b68c34d5deb456e7624668e3a68cecb51d11d6759c25514becdb26ecd2
+          affinity:
+            nodeAffinity: *id001
+          tls:
+            method: certmanager
+            certmanager:
+              issuerName: heterocloud-vpc-egress-ca
+  ignoreDifferences:
+  - group: admissionregistration.k8s.io
+    kind: MutatingWebhookConfiguration
+    jqPathExpressions:
+    - .webhooks[].clientConfig.caBundle
+  - group: admissionregistration.k8s.io
+    kind: ValidatingWebhookConfiguration
+    jqPathExpressions:
+    - .webhooks[].clientConfig.caBundle

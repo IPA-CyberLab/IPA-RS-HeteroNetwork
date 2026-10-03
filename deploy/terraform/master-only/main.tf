@@ -20,10 +20,12 @@ locals {
     heterocloud-edge       = "deploy/gitops/envoy-gateway"
   }
   managed_external_application_files = {
-    heterocloud        = "deploy/gitops/applications/heterocloud.yaml"
-    heterocloud-flash  = "deploy/gitops/applications/heterocloud-flash.yaml"
-    heterocloud-flow   = "deploy/gitops/applications/heterocloud-flow.yaml"
-    heterocloud-syouyu = "deploy/gitops/applications/heterocloud-syouyu.yaml"
+    heterocloud            = "deploy/gitops/applications/heterocloud.yaml"
+    heterocloud-flash      = "deploy/gitops/applications/heterocloud-flash.yaml"
+    heterocloud-flow       = "deploy/gitops/applications/heterocloud-flow.yaml"
+    heterocloud-syouyu     = "deploy/gitops/applications/heterocloud-syouyu.yaml"
+    heterocloud-vpc        = "deploy/gitops/applications/heterocloud-vpc.yaml"
+    heterocloud-vpc-egress = "deploy/gitops/applications/heterocloud-vpc-egress.yaml"
   }
   bootstrap = local.edge_nodes.bootstrap
   bundle_sha = sha256(join("", concat(
@@ -165,7 +167,8 @@ resource "kubernetes_manifest" "application_source" {
 }
 
 import {
-  for_each = local.managed_external_application_files
+  # Original applications predate Terraform; new VPC applications are created by it.
+  for_each = { for key, path in local.managed_external_application_files : key => path if !contains(["heterocloud-vpc", "heterocloud-vpc-egress"], key) }
   to       = kubernetes_manifest.external_application[each.key]
   id       = "apiVersion=argoproj.io/v1alpha1,kind=Application,namespace=argocd,name=${each.key}"
 }

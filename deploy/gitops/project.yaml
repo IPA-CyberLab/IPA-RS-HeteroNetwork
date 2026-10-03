@@ -13,6 +13,8 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-SecretManager.git
+    - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC.git
+    - https://github.com/spidernet-io/egressgateway.git
     - docker.io/envoyproxy
     - https://charts.longhorn.io
     - https://yandex-cloud.github.io/k8s-csi-s3/charts
@@ -22,6 +24,10 @@ spec:
     - https://nvidia.github.io/k8s-device-plugin
     - quay.io/jetstack/charts
   destinations:
+    - namespace: heterocloud-vpc
+      server: https://kubernetes.default.svc
+    - namespace: heterocloud-vpc-system
+      server: https://kubernetes.default.svc
     - namespace: cert-manager
       server: https://kubernetes.default.svc
     - namespace: heterocloud-dns

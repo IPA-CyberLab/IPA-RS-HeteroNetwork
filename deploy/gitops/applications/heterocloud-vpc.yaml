@@ -1,0 +1,54 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  namespace: argocd
+  name: heterocloud-vpc
+spec:
+  project: hetero-platform
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-vpc
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+    syncOptions:
+    - CreateNamespace=true
+    - ServerSideApply=true
+  source:
+    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC.git
+    targetRevision: v0.1.1
+    path: deploy/helm/heterocloud-vpc
+    helm:
+      releaseName: heterocloud-vpc
+      values: |
+        image: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-vpc@sha256:3c10455b2db48b62d759ab548bad5336b276c6240b7e0a34963f480c5b3f953d
+        providerPublicKeysJson: '{"heterocloud-provider-1":"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAs9HXnx9AwepDSdl/w+k2tAYieW3aU8PhlJoQBAFo9X4=\n-----END
+          PUBLIC KEY-----\n"}'
+        protectedCidrs:
+        - 163.220.236.0/24
+        gatewaySelector:
+          matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - ichikawap1
+            - uc-k8sp4
+            - uc-k8sp5
+        egressCertificate:
+          enabled: true
+          namespace: heterocloud-vpc-system
+        controlPlaneCidrs:
+        - 10.250.0.2/32
+        - 10.250.0.4/32
+        - 10.250.0.5/32
+        - 10.250.0.6/32
+        - 10.250.0.10/32
+        - 10.250.0.11/32
