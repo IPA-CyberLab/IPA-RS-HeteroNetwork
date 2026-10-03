@@ -44,6 +44,7 @@ spec:
               clusterIP: true
               nodeIP: true
             extraCidr:
+            - 10.244.0.0/16
             - 10.250.0.0/16
             - 163.220.236.0/24
           gatewayFailover:
