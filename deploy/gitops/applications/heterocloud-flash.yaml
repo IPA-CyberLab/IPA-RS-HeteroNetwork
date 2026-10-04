@@ -9,13 +9,14 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
-    targetRevision: v0.1.41
+    targetRevision: v0.1.42
     path: deploy/helm/heterocloud-flash
     helm:
       releaseName: heterocloud-flash
       values: |
         image:
-          tag: "0.1.41@sha256:7a9f9d668bc4eaf9056a69d9f0b520862e84fcc0761733e74e199e5a7ec807ca"
+          tag: "0.1.42@sha256:04a873a32b794cf85e40b3be523e9a73b129403ec7a40e61f1797a3750d98757"
+        workloadHelperImage: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.41@sha256:7a9f9d668bc4eaf9056a69d9f0b520862e84fcc0761733e74e199e5a7ec807ca"
         publicDomain: flash.heterocloud.mizuame.app
         networkPolicy:
           vpcGuardCidrs:
