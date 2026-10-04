@@ -93,6 +93,10 @@
       args:
         executable: /bin/bash
       changed_when: false
+      register: database_proxy_health
+      until: database_proxy_health.rc == 0
+      retries: 12
+      delay: 2
       when: not ansible_check_mode
 
   handlers:
