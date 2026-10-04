@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "incident_date": "2026-10-04",
+  "timezone": "UTC",
+  "fix_source_revisions": [
+    "8244ff0acdd7e6983a22700fb15e6297714740b2",
+    "4936a4c06caeea07ebe01e881f40c10d69f42089"
+  ],
+  "before": {
+    "backend_down_at": "2026-10-04T10:11:50.396701Z",
+    "sessions_terminated": 18,
+    "api_tls_eof_at": "2026-10-04T10:11:50.403Z",
+    "primary_health_from_ichikawap1": {
+      "10.250.0.2": {
+        "200": 20
+      },
+      "10.250.0.11": {
+        "200": 7,
+        "503": 13
+      }
+    }
+  },
+  "apply": {
+    "resource": "terraform_data.database_proxy_configuration",
+    "successful_hosts": [
+      "uc-k8sp4",
+      "uc-k8sp5",
+      "ichikawap1"
+    ],
+    "consecutive_tls_verified_health_successes_per_host": 30,
+    "initial_attempt": "failed acceptance during HAProxy startup health initialization",
+    "second_attempt": "passed after adding bounded acceptance startup retries",
+    "postgresql_restart_requested": false,
+    "application_restart_requested": false,
+    "broad_infrastructure_drift_asserted_absent": false
+  },
+  "after_proxy_checks": {
+    "health": {
+      "10.250.0.2": {
+        "200": 30
+      },
+      "10.250.0.11": {
+        "200": 30
+      }
+    },
+    "heteronetwork-db-proxy": {
+      "backend_down_events": 0,
+      "invalid_bundle_events": 0
+    },
+    "heteronetwork-postgres-autopilot": {
+      "backend_down_events": 0,
+      "invalid_bundle_events": 0
+    }
+  },
+  "continuous_database_session": {
+    "started_at": "2026-10-04T10:48:57.182391+00:00",
+    "proxy": "ichikawap1:25432",
+    "samples": 180,
+    "errors": [],
+    "same_session": true,
+    "postmaster_start_time": "2026-10-01T15:03:42.238246+09:00",
+    "primary": true,
+    "elapsed_seconds": 370.176,
+    "finished_at": "2026-10-04T10:55:07.383848+00:00",
+    "passed": true
+  },
+  "api_log_observation": {
+    "window_start": "2026-10-04T10:48:00Z",
+    "captured_at": "2026-10-04T11:01:03.424250+00:00",
+    "api_logs": [
+      {
+        "pod": "heterocloud-heterocloud-675d974df4-9ghtl",
+        "read_ok": true,
+        "matched_line_counts": {
+          "tls_eof": 0,
+          "database_connection_failure": 0,
+          "container_diagnostic_failure": 0
+        }
+      },
+      {
+        "pod": "heterocloud-heterocloud-675d974df4-9n2rj",
+        "read_ok": true,
+        "matched_line_counts": {
+          "tls_eof": 0,
+          "database_connection_failure": 0,
+          "container_diagnostic_failure": 0
+        }
+      },
+      {
+        "pod": "heterocloud-heterocloud-675d974df4-rvl2h",
+        "read_ok": true,
+        "matched_line_counts": {
+          "tls_eof": 0,
+          "database_connection_failure": 0,
+          "container_diagnostic_failure": 0
+        }
+      }
+    ]
+  },
+  "public_api_final": {
+    "passed": true,
+    "finished_at": "2026-10-04T11:01:24.208796+00:00",
+    "container_list_requests": 60,
+    "all_http_200": true,
+    "both_exec_markers_received": true,
+    "both_services_ready": true,
+    "temporary_credentials_deleted": true
+  },
+  "ci": {
+    "network_acceptance": {
+      "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/37196780031",
+      "source_revision": "2960c050df19bce9127fdda2253c8305ab91fea3",
+      "conclusion": "success",
+      "jobs": [
+        "acceptance-failure-paths",
+        "live-overlay-browser-e2e"
+      ]
+    },
+    "earlier_network_acceptance": {
+      "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/37196428630",
+      "conclusion": "failure",
+      "failure": "console navigation exceeded the 3-second limit during recovery"
+    }
+  }
+}
