@@ -838,7 +838,10 @@ EOF
         "$name" "$address" "$rest_port" "$state_dir" "$service_name"
     done < <(proxy_backend_rows)
   fi
-  if [[ -n "$client_listen_address" ]]; then
+  # A shared overlay address represents the primary proxy, not this member's
+  # role. Duplicate SO_REUSEPORT listeners randomly returned primary=200 or
+  # local replica=503, causing downstream proxies to terminate live sessions.
+  if [[ -n "$client_listen_address" && "$client_listen_address" != "$proxy_listen_address" ]]; then
     cat <<EOF
 
 frontend heteronetwork_patroni_health
@@ -2201,6 +2204,18 @@ self_test() {
   if grep -Eq '^    server db-.* 10\.250\.' "$test_dir/haproxy.cfg"; then
     die "overlay VPN address unexpectedly appeared in a database proxy backend"
   fi
+  (
+    client_listen_address="$proxy_listen_address"
+    render_haproxy_config >"$test_dir/shared-overlay.cfg"
+    [[ "$(grep -Fc "bind $proxy_listen_address:$rest_port" "$test_dir/shared-overlay.cfg")" == "1" ]]
+    grep -Fq 'default_backend heteronetwork_patroni_primary' "$test_dir/shared-overlay.cfg"
+    if grep -Fq 'frontend heteronetwork_patroni_health' "$test_dir/shared-overlay.cfg"; then
+      die "shared overlay endpoint ambiguously routes local and primary health"
+    fi
+    proxy_listen_address=""
+    render_haproxy_config >"$test_dir/local-health.cfg"
+    grep -Fq 'frontend heteronetwork_patroni_health' "$test_dir/local-health.cfg"
+  )
   grep -Fq \
     "SELECT format('CREATE ROLE keycloak LOGIN PASSWORD %L', :'keycloak_password')" \
     "$test_dir/bootstrap-database"

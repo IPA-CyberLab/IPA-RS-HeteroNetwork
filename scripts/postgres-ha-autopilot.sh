@@ -1587,7 +1587,7 @@ def parse_address_map(raw, label, minimum, maximum, require_odd=False):
     return result, order
 
 members, member_order = parse_address_map(
-    members_raw, "database member", 3, member_limit
+    members_raw, "database member", 2, member_limit
 )
 identities = {}
 identity_order = []
@@ -1616,11 +1616,11 @@ dcs_bootstrap, _ = parse_address_map(
     dcs_bootstrap_raw, "DCS bootstrap member", 3, dcs_limit
 )
 for name, address in dcs.items():
-    if members.get(name) != address:
-        raise SystemExit("DCS member is absent from database members")
+    if (name in members or address in members.values()) and members.get(name) != address:
+        raise SystemExit("DCS member address differs from database member")
 for name, address in dcs_bootstrap.items():
-    if members.get(name) != address:
-        raise SystemExit("DCS bootstrap member is absent from database members")
+    if (name in members or address in members.values()) and members.get(name) != address:
+        raise SystemExit("DCS bootstrap member address differs from database member")
 retiring = {
     name for name, address in dcs_bootstrap.items() if dcs.get(name) != address
 }
@@ -2393,7 +2393,7 @@ for entry in identities_raw.split(","):
     seen_names.add(name)
     seen_vpn_ips.add(vpn_ip)
 
-if not 3 <= len(backends) <= limit:
+if not 2 <= len(backends) <= limit:
     raise SystemExit("database proxy backend count is outside the supported range")
 print(",".join(backends))
 PY
@@ -2432,7 +2432,7 @@ proxy_only_overlay_ready() {
   local config="/etc/heteronetwork/postgres-ha/haproxy.cfg"
   [[ -f "$config" && ! -L "$config" ]] || return 1
   grep -Fq "bind $vpn_ip:$manifest_postgres_port" "$config" \
-    && grep -Fq "bind $vpn_ip:$manifest_rest_port" "$config" \
+    && [[ "$(grep -Fc "bind $vpn_ip:$manifest_rest_port" "$config")" == "1" ]] \
     && proxy_config_matches_backends "$expected_backends" \
     && service_hosts_entry_ready \
     && systemctl is-active --quiet heteronetwork-db-proxy.service
@@ -2443,7 +2443,7 @@ member_overlay_proxy_ready() {
   local config="/etc/heteronetwork/postgres-ha/haproxy.cfg"
   [[ -f "$config" && ! -L "$config" ]] || return 1
   grep -Fq "bind $vpn_ip:$manifest_postgres_port" "$config" \
-    && grep -Fq "bind $vpn_ip:$manifest_rest_port" "$config" \
+    && [[ "$(grep -Fc "bind $vpn_ip:$manifest_rest_port" "$config")" == "1" ]] \
     && proxy_config_matches_backends "$manifest_members" \
     && service_hosts_entry_ready \
     && systemctl is-active --quiet heteronetwork-db-proxy.service
@@ -4216,6 +4216,30 @@ JSON
   local proxy_extracted="$state_dir/proxy-extracted"
   safe_extract_bundle "$proxy_bundle_archive" "$proxy_extracted"
   validate_proxy_bundle_directory "$proxy_extracted"
+  (
+    # The database needs a primary and synchronous replica. The third DCS voter
+    # can be a dedicated consensus node with no PostgreSQL instance.
+    local two_member_proxy="$state_dir/two-member-proxy"
+    cp -a "$proxy_extracted" "$two_member_proxy"
+    sed -i \
+      -e 's/^HETERONETWORK_DB_MEMBERS=.*/HETERONETWORK_DB_MEMBERS=db-a=192.0.2.1,db-b=192.0.2.2/' \
+      -e 's/^HETERONETWORK_DB_MEMBER_IDENTITIES=.*/HETERONETWORK_DB_MEMBER_IDENTITIES=db-a=node-a,db-b=node-b/' \
+      -e 's/^HETERONETWORK_DB_DCS_MEMBERS=.*/HETERONETWORK_DB_DCS_MEMBERS=db-a=192.0.2.1,db-b=192.0.2.2,db-h=192.0.2.3/' \
+      -e 's/^HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=.*/HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=db-a=192.0.2.1,db-b=192.0.2.2,db-h=192.0.2.3/' \
+      "$two_member_proxy/manifest.env"
+    validate_proxy_bundle_directory "$two_member_proxy"
+    selected_path="$state_dir/two-member-selected.tsv"
+    printf 'node-a\t10.250.0.2\nnode-b\t10.250.0.3\n' >"$selected_path"
+    [[ "$(overlay_proxy_backends_from_selected_snapshot)" == "db-a=10.250.0.2,db-b=10.250.0.3" ]]
+    sed -i 's/^HETERONETWORK_DB_DCS_MEMBERS=.*/HETERONETWORK_DB_DCS_MEMBERS=db-a=192.0.2.9,db-b=192.0.2.2,db-h=192.0.2.3/' "$two_member_proxy/manifest.env"
+    if validate_proxy_bundle_directory "$two_member_proxy" >/dev/null 2>&1; then
+      die "proxy bundle accepted inconsistent database and DCS addresses"
+    fi
+    sed -i 's/^HETERONETWORK_DB_DCS_MEMBERS=.*/HETERONETWORK_DB_DCS_MEMBERS=db-a=192.0.2.1,db-b=192.0.2.2/' "$two_member_proxy/manifest.env"
+    if validate_proxy_bundle_directory "$two_member_proxy" >/dev/null 2>&1; then
+      die "proxy bundle accepted a two-voter DCS"
+    fi
+  )
   [[ "$(<"$proxy_extracted/$proxy_bundle_marker_name")" == \
     "$PROXY_BUNDLE_FORMAT_VERSION" ]]
   [[ -f "$proxy_extracted/ca/ca.crt" ]]

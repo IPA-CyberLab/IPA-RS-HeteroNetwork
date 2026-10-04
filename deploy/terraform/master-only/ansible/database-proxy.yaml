@@ -1,0 +1,102 @@
+- name: Reconcile database proxy listeners without restarting databases or applications
+  hosts: postgres_members:enrollment_issuer
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the versioned database proxy renderer
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/postgres-ha-node.sh"
+        dest: /opt/heteronetwork/libexec/postgres-ha-node.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Render the proxy from the protected current topology
+      ansible.builtin.shell: |
+        set -Eeuo pipefail
+        set -a
+        source /etc/heteronetwork/postgres-autopilot/bundle/manifest.env
+        set +a
+        export HETERONETWORK_DB_BUNDLE_DIR=/etc/heteronetwork/postgres-autopilot/bundle
+        export HETERONETWORK_DB_NODE_NAME="{{ postgres_name }}"
+        export HETERONETWORK_DB_NODE_ADDRESS="{{ tailscale_ip }}"
+        export HETERONETWORK_DB_INTERFACE=tailscale0
+        export HETERONETWORK_DB_PROXY_LISTEN_ADDRESS="{{ vpn_ip }}"
+        {% if postgres_role == 'member' %}
+        export HETERONETWORK_DB_PROXY_BACKENDS="$HETERONETWORK_DB_MEMBERS"
+        export HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS="{{ vpn_ip }}"
+        {% else %}
+        export HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS=""
+        export HETERONETWORK_DB_PROXY_BACKENDS="{% for name in groups['postgres_members'] | sort %}{{ hostvars[name].postgres_name }}={{ hostvars[name].vpn_ip }}{{ ',' if not loop.last else '' }}{% endfor %}"
+        {% endif %}
+        /bin/bash -s -- render-proxy-config
+      args:
+        executable: /bin/bash
+        stdin: "{{ lookup('file', hnn_repo_root ~ '/scripts/postgres-ha-node.sh') }}"
+      register: database_proxy_render
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Require one unambiguous health listener on the overlay address
+      ansible.builtin.assert:
+        that:
+          - (database_proxy_render.stdout_lines | select('equalto', '    bind ' ~ vpn_ip ~ ':18008') | list | length) == 1
+          - "'default_backend heteronetwork_patroni_primary' in database_proxy_render.stdout"
+        fail_msg: Database proxy health listener is missing or duplicated
+
+    - name: Validate and atomically install the database proxy configuration
+      ansible.builtin.copy:
+        content: "{{ database_proxy_render.stdout }}\n"
+        dest: /etc/heteronetwork/postgres-ha/haproxy.cfg
+        owner: root
+        group: haproxy
+        mode: '0640'
+        backup: true
+        validate: /usr/sbin/haproxy -c -f %s
+      no_log: true
+      notify: Reload database proxy gracefully
+
+    - name: Apply the validated proxy configuration before acceptance checks
+      ansible.builtin.meta: flush_handlers
+
+    - name: Install the reconciler that accepts the recovered proxy-only topology
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/postgres-ha-autopilot.sh"
+        dest: /opt/heteronetwork/libexec/postgres-ha-autopilot.sh
+        owner: root
+        group: root
+        mode: '0755'
+      register: database_proxy_autopilot
+      when: postgres_role != 'member'
+
+    - name: Reload only the proxy client's reconciliation process
+      ansible.builtin.systemd_service:
+        name: heteronetwork-postgres-autopilot.service
+        state: restarted
+      when: database_proxy_autopilot.changed | default(false)
+
+    - name: Require consistent primary health over the actual overlay endpoint
+      ansible.builtin.shell: |
+        set -Eeuo pipefail
+        for attempt in $(seq 1 30); do
+          curl --silent --show-error --fail --output /dev/null \
+            --connect-timeout 3 --max-time 5 \
+            --cacert /etc/heteronetwork/postgres-ha/pki/ca.crt \
+            --connect-to postgres.heteronetwork.internal:18008:{{ vpn_ip }}:18008 \
+            https://postgres.heteronetwork.internal:18008/primary
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: not ansible_check_mode
+
+  handlers:
+    - name: Reload database proxy gracefully
+      ansible.builtin.systemd_service:
+        name: heteronetwork-db-proxy.service
+        state: reloaded
