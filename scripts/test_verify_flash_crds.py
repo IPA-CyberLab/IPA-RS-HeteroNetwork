@@ -67,11 +67,15 @@ def documents():
         "properties": {"workload": {"properties": {
             "secret_env": {"type": "object", "additionalProperties": {"type": "string"}},
             "secret_files": {"type": "object", "additionalProperties": {"type": "string"}},
+            "stopped": {"type": "boolean", "default": False},
             "rootfs_storage_gib": {
                 "type": "integer", "minimum": 1, "maximum": 1_000_000, "nullable": True,
             },
         }}},
     })
+    service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"] = {
+        "properties": {"stopped": {"type": "boolean", "default": False}},
+    }
     return application, device, job, service
 
 
@@ -83,6 +87,17 @@ class VerifyFlashCrdsTests(unittest.TestCase):
         self.assertTrue(result[verify.SERVICE_CRD]["secret_env_contract"])
         self.assertTrue(result[verify.SERVICE_CRD]["legacy_secret_contract"])
         self.assertTrue(result[verify.SERVICE_CRD]["rootfs_storage_contract"])
+        self.assertTrue(result[verify.SERVICE_CRD]["explicit_stop_contract"])
+
+    def test_rejects_pruned_stop_or_default_that_would_stop_existing_services(self):
+        for mutation in ("missing", "stopped_by_default", "nullable"):
+            application, device, job, service = documents()
+            workload = service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["workload"]["properties"]
+            if mutation == "missing": del workload["stopped"]
+            elif mutation == "stopped_by_default": workload["stopped"]["default"] = True
+            else: workload["stopped"]["nullable"] = True
+            with self.assertRaisesRegex(RuntimeError, "explicit stop"):
+                verify.validate(application, device, job, service)
 
     def test_rejects_schema_that_would_prune_requested_rootfs(self):
         application, device, job, service = documents()
