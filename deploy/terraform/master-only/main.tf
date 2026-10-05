@@ -20,12 +20,17 @@ locals {
     heterocloud-edge       = "deploy/gitops/envoy-gateway"
   }
   managed_external_application_files = {
+    envoy-gateway          = "deploy/gitops/applications/envoy-gateway.yaml"
     heterocloud            = "deploy/gitops/applications/heterocloud.yaml"
     heterocloud-flash      = "deploy/gitops/applications/heterocloud-flash.yaml"
     heterocloud-flow       = "deploy/gitops/applications/heterocloud-flow.yaml"
     heterocloud-syouyu     = "deploy/gitops/applications/heterocloud-syouyu.yaml"
     heterocloud-vpc        = "deploy/gitops/applications/heterocloud-vpc.yaml"
     heterocloud-vpc-egress = "deploy/gitops/applications/heterocloud-vpc-egress.yaml"
+  }
+  external_application_manifests = {
+    for key, path in local.managed_external_application_files :
+    key => yamldecode(file("${local.repo_root}/${path}"))
   }
   bootstrap = local.edge_nodes.bootstrap
   bundle_sha = sha256(join("", concat(
@@ -175,13 +180,38 @@ import {
 
 resource "kubernetes_manifest" "external_application" {
   for_each = local.managed_external_application_files
-  manifest = yamldecode(file("${local.repo_root}/${each.value}"))
+  manifest = merge(local.external_application_manifests[each.key], {
+    spec = merge(local.external_application_manifests[each.key].spec, {
+      source = merge(local.external_application_manifests[each.key].spec.source, {
+        helm = merge(local.external_application_manifests[each.key].spec.source.helm,
+        contains(["envoy-gateway", "heterocloud"], each.key) ? { valuesObject = null } : {})
+      })
+    })
+  })
+  # Helm values are arbitrary JSON; the Application CRD preserves their shape.
+  computed_fields = ["metadata.annotations", "metadata.labels", "spec.source.helm"]
   field_manager {
     name            = "heteronetwork-terraform"
     force_conflicts = true
   }
   lifecycle { prevent_destroy = true }
   depends_on = [kubernetes_manifest.gitops_project]
+}
+
+resource "terraform_data" "application_helm_value_cleanup" {
+  for_each = {
+    for key, manifest in local.external_application_manifests : key => manifest
+    if contains(["envoy-gateway", "heterocloud"], key)
+  }
+  input = kubernetes_manifest.external_application[each.key].manifest.metadata.name
+  triggers_replace = [
+    filesha256("${local.repo_root}/${local.managed_external_application_files[each.key]}"),
+    filesha256("${local.repo_root}/scripts/normalize_application_helm_values.py")
+  ]
+  provisioner "local-exec" {
+    working_dir = local.repo_root
+    command     = "python3 scripts/normalize_application_helm_values.py --manifest ${local.managed_external_application_files[each.key]}"
+  }
 }
 
 resource "terraform_data" "flash_crd_acceptance" {
