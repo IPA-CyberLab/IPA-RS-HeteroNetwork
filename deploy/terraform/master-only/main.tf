@@ -235,6 +235,34 @@ resource "terraform_data" "flash_crd_acceptance" {
   depends_on = [kubernetes_manifest.external_application["heterocloud-flash"]]
 }
 
+import {
+  to = kubernetes_manifest.envoy_gateway_rollout_strategy
+  id = "apiVersion=apps/v1,kind=Deployment,namespace=envoy-gateway-system,name=envoy-gateway"
+}
+
+resource "kubernetes_manifest" "envoy_gateway_rollout_strategy" {
+  # The upstream Helm chart omits this field. Keep two of the three controllers
+  # available while allowing old hard anti-affinity Pods to be replaced.
+  manifest = {
+    apiVersion = "apps/v1"
+    kind       = "Deployment"
+    metadata   = { name = "envoy-gateway", namespace = "envoy-gateway-system" }
+    spec = {
+      strategy = {
+        type          = "RollingUpdate"
+        rollingUpdate = { maxSurge = 1, maxUnavailable = 1 }
+      }
+    }
+  }
+  computed_fields = ["metadata.annotations", "metadata.labels", "spec"]
+  field_manager {
+    name            = "heteronetwork-gateway-rollout"
+    force_conflicts = true
+  }
+  lifecycle { prevent_destroy = true }
+  depends_on = [terraform_data.application_helm_value_cleanup["envoy-gateway"]]
+}
+
 resource "terraform_data" "host_configuration" {
   for_each = local.nodes
   input = {

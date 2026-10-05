@@ -119,6 +119,15 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: envoy-gateway-system
+  ignoreDifferences:
+    # The upstream chart has no Deployment strategy setting. Terraform manages
+    # this field so an old hard anti-affinity rule cannot block the migration.
+    - group: apps
+      kind: Deployment
+      name: envoy-gateway
+      namespace: envoy-gateway-system
+      jsonPointers:
+        - /spec/strategy
   syncPolicy:
     automated:
       enabled: true

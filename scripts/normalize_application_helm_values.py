@@ -8,6 +8,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import time
 import yaml
 
 
@@ -21,22 +22,29 @@ def main():
     source = expected["spec"]["source"]
     assert isinstance(source["helm"].get("values"), str)
     base = ["kubectl", "-n", namespace]
-    actual = json.loads(subprocess.check_output(base + ["get", "application", name, "-o", "json"]))
-    helm = actual["spec"]["source"]["helm"]
-    assert actual["spec"]["source"]["targetRevision"] == source["targetRevision"], "revision changed concurrently"
-    assert helm.get("values") == source["helm"]["values"], "declared YAML values have not applied"
-    if "valuesObject" not in helm:
-        print(name + ": YAML Helm values already authoritative")
-        return
-    patch = [
-        {"op": "test", "path": "/metadata/resourceVersion", "value": actual["metadata"]["resourceVersion"]},
-        {"op": "test", "path": "/spec/source/helm/values", "value": source["helm"]["values"]},
-        {"op": "remove", "path": "/spec/source/helm/valuesObject"},
-    ]
-    # Values may contain private configuration; send the patch through stdin.
-    subprocess.run(base + ["patch", "application", name, "--type=json", "--patch-file=/dev/stdin"],
-                   input=json.dumps(patch), text=True, check=True, stdout=subprocess.DEVNULL)
-    print(name + ": removed obsolete Helm valuesObject override")
+    # Argo CD also writes status and changes resourceVersion during a sync.
+    # Re-read and re-check the declared revision on every bounded retry.
+    for attempt in range(8):
+        actual = json.loads(subprocess.check_output(base + ["get", "application", name, "-o", "json"]))
+        helm = actual["spec"]["source"]["helm"]
+        assert actual["spec"]["source"]["targetRevision"] == source["targetRevision"], "revision changed concurrently"
+        assert helm.get("values") == source["helm"]["values"], "declared YAML values have not applied"
+        if "valuesObject" not in helm:
+            print(name + ": YAML Helm values already authoritative")
+            return
+        patch = [
+            {"op": "test", "path": "/metadata/resourceVersion", "value": actual["metadata"]["resourceVersion"]},
+            {"op": "test", "path": "/spec/source/helm/values", "value": source["helm"]["values"]},
+            {"op": "remove", "path": "/spec/source/helm/valuesObject"},
+        ]
+        # Values may contain private configuration; send the patch through stdin.
+        result = subprocess.run(base + ["patch", "application", name, "--type=json", "--patch-file=/dev/stdin"],
+                                input=json.dumps(patch), text=True, capture_output=True)
+        if result.returncode == 0:
+            print(name + ": removed obsolete Helm valuesObject override")
+            return
+        time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(name + ": guarded Helm values migration failed after retries")
 
 
 if __name__ == "__main__":
