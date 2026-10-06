@@ -47,7 +47,7 @@ older answers until their cache expires. Publisher failover can additionally wai
 for its 45-second lease. This is DNS failover, not instantaneous traffic failover,
 and three distinct nodes do not imply three independent ISPs or regions.
 
-All timings, membership, probe name and addresses are configuration, not compiled
+Observation timings, membership, probe name and addresses are configuration, not compiled
 hostnames. After changing `pool.json`, regenerate `workloads.yaml` with
 `python3 deploy/gitops/public-dns-quorum/render.py`. Configuration changes invalidate
 old observations before they can affect the new membership or origin inventory.

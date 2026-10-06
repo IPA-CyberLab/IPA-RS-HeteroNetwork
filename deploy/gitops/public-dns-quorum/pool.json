@@ -5,13 +5,31 @@
   "dns_resource": "heterocloud-web-gateways",
   "state_resource": "public-dns-quorum-state",
   "members": [
-    {"id": "ichikawap1", "node": "ichikawap1", "vote_resource": "public-dns-vote-ichikawap1"},
-    {"id": "uc-k8sp4", "node": "uc-k8sp4", "vote_resource": "public-dns-vote-uc-k8sp4"},
-    {"id": "uc-k8sp5", "node": "uc-k8sp5", "vote_resource": "public-dns-vote-uc-k8sp5"}
+    {
+      "id": "ichikawap1",
+      "node": "ichikawap1",
+      "vote_resource": "public-dns-vote-ichikawap1"
+    },
+    {
+      "id": "uc-k8sp4",
+      "node": "uc-k8sp4",
+      "vote_resource": "public-dns-vote-uc-k8sp4"
+    },
+    {
+      "id": "uc-k8sp5",
+      "node": "uc-k8sp5",
+      "vote_resource": "public-dns-vote-uc-k8sp5"
+    }
   ],
   "origins": [
-    {"id": "ichikawap1", "address": "163.220.236.61"},
-    {"id": "uc-k8sp4", "address": "163.220.236.54"}
+    {
+      "id": "ichikawap1",
+      "address": "163.220.236.61"
+    },
+    {
+      "id": "uc-k8sp4",
+      "address": "163.220.236.54"
+    }
   ],
   "records": [
     "heterocloud.mizuame.app",
@@ -32,6 +50,6 @@
   "interval_seconds": 5,
   "down_samples": 3,
   "up_samples": 2,
-  "enabled": false,
+  "enabled": true,
   "all_down_policy": "retain"
 }
