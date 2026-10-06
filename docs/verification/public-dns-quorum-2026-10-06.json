@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "passed": true,
+  "observed_at": "2026-10-06T09:00:53Z",
+  "unit_tests_passed": 20,
+  "live_majority_dns": {
+    "schema_version": 1,
+    "passed": true,
+    "namespace": "dns-quorum-e2e-eabdf42782",
+    "hostname": "quorum-e2e-eabdf42782.flash.heterocloud.mizuame.app",
+    "checks": [
+      {
+        "name": "three_real_distinct_voters_validate_both_public_https_origins",
+        "passed": true,
+        "nodes": {
+          "ichikawap1": "ichikawap1",
+          "uc-k8sp4": "uc-k8sp4",
+          "uc-k8sp5": "uc-k8sp5"
+        }
+      },
+      {
+        "name": "real_rbac_prevents_voters_from_writing_each_others_votes",
+        "passed": true
+      },
+      {
+        "name": "authoritative_dns_publishes_both_healthy_origins",
+        "passed": true
+      },
+      {
+        "name": "one_isolated_observer_cannot_remove_a_healthy_gateway",
+        "passed": true
+      },
+      {
+        "name": "real_majority_failure_removes_only_the_failed_origin_from_public_dns",
+        "passed": true,
+        "convergence_ms": 24225
+      },
+      {
+        "name": "complete_probe_failure_retains_dns_and_reports_all_down",
+        "passed": true
+      },
+      {
+        "name": "lost_majority_keeps_last_dns_without_reducing_vote_threshold",
+        "passed": true
+      },
+      {
+        "name": "recovered_gateways_are_automatically_readded_to_authoritative_dns",
+        "passed": true
+      },
+      {
+        "name": "publisher_failover_preserves_dns_and_fences_old_writer",
+        "passed": true
+      }
+    ],
+    "production_gateways_stopped": false,
+    "tenant_pods_modified": false,
+    "observed_at": "2026-10-06T08:42:39Z",
+    "fixture_removed": true
+  },
+  "deployment": {
+    "observed_at": "2026-10-06T09:00:53Z",
+    "status": {
+      "schema_version": 1,
+      "config_digest": "6d1fd7ae2a66910072a8c58baf7865fa8bba145bd1e7a8389dd392f4246b574c",
+      "observed_at": 1791277251.227112,
+      "enabled": true,
+      "majority_required": 2,
+      "membership_size": 3,
+      "fresh_voters": 3,
+      "origins": {
+        "ichikawap1": {
+          "healthy_votes": 2,
+          "unhealthy_votes": 1,
+          "decision": "healthy",
+          "active": true,
+          "streak": 10
+        },
+        "uc-k8sp4": {
+          "healthy_votes": 3,
+          "unhealthy_votes": 0,
+          "decision": "healthy",
+          "active": true,
+          "streak": 10
+        }
+      },
+      "published_targets": [
+        "163.220.236.54",
+        "163.220.236.61"
+      ],
+      "all_down": false,
+      "all_down_policy": "retain",
+      "all_down_retained": false
+    },
+    "applications": [
+      {
+        "name": "public-dns-quorum",
+        "sync": "Synced",
+        "health": "Healthy",
+        "revision": "e4b2395fa92ac0fc52fa06184c71258c831b11a6"
+      },
+      {
+        "name": "heterocloud-edge",
+        "sync": "Synced",
+        "health": "Healthy",
+        "revision": "e4b2395fa92ac0fc52fa06184c71258c831b11a6"
+      }
+    ],
+    "existing_workloads_preserved": 7,
+    "existing_pod_uids_restarts_limits_claims_preserved": true,
+    "secret_manager_dns_unchanged": true,
+    "fixture_namespaces_removed": true
+  },
+  "targeted_terraform_no_changes": true,
+  "github_actions": {
+    "run_id": 37438953556,
+    "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/37438953556",
+    "conclusion": "success",
+    "result": "passed",
+    "client_removed": true,
+    "canonical": {
+      "port": 9781,
+      "ui_http": 200,
+      "login_button_rendered": true,
+      "open_ms": 871
+    },
+    "authenticated": {
+      "result": "passed",
+      "authenticated": true,
+      "session_restored": true,
+      "http_only_refresh_cookie": true,
+      "checks": {
+        "Authenticated overview": 200,
+        "Overview after reload": 200,
+        "Refresh cookie in new tab": 200,
+        "Authenticated overview in new tab": 200
+      }
+    },
+    "gateway_open_ms": [
+      743,
+      530,
+      562,
+      530,
+      697,
+      533,
+      563,
+      695,
+      575,
+      2703,
+      536,
+      530
+    ],
+    "monitoring": {
+      "grafana.heteronetwork.internal": [
+        {
+          "address": "10.250.0.10",
+          "http": 200,
+          "open_ms": 843
+        },
+        {
+          "address": "10.250.0.11",
+          "http": 200,
+          "open_ms": 837
+        },
+        {
+          "address": "10.250.0.2",
+          "http": 200,
+          "open_ms": 974
+        }
+      ],
+      "prometheus.heteronetwork.internal": [
+        {
+          "address": "10.250.0.10",
+          "http": 200,
+          "open_ms": 647
+        },
+        {
+          "address": "10.250.0.11",
+          "http": 200,
+          "open_ms": 647
+        },
+        {
+          "address": "10.250.0.2",
+          "http": 200,
+          "open_ms": 646
+        }
+      ]
+    }
+  },
+  "earlier_ci_failure": {
+    "run_id": 37438002976,
+    "stage": "monitoring after VPN route convergence",
+    "failure": "timeout",
+    "client_removed": true
+  },
+  "production_gateway_faults_injected": false,
+  "credentials_in_artifact": false
+}
