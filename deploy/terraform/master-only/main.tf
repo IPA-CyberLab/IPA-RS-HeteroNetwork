@@ -155,13 +155,15 @@ resource "kubernetes_manifest" "application_source" {
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata   = { name = each.key, namespace = "argocd" }
-    spec = {
+    spec = merge({
       source = {
         repoURL        = var.git_repository_url
         targetRevision = var.git_revision
         path           = each.value
       }
-    }
+      }, each.key == "heterocloud-edge" ? {
+      ignoreDifferences = yamldecode(file("${local.repo_root}/deploy/gitops/applications/heterocloud-edge.yaml")).spec.ignoreDifferences
+    } : {})
   }
   field_manager {
     name            = "heteronetwork-terraform"
@@ -169,6 +171,16 @@ resource "kubernetes_manifest" "application_source" {
   }
   lifecycle { prevent_destroy = true }
   depends_on = [terraform_data.git_source, kubernetes_manifest.gitops_project]
+}
+
+resource "kubernetes_manifest" "public_dns_quorum_application" {
+  manifest = yamldecode(file("${local.repo_root}/deploy/gitops/applications/public-dns-quorum.yaml"))
+  field_manager {
+    name            = "heteronetwork-terraform"
+    force_conflicts = true
+  }
+  lifecycle { prevent_destroy = true }
+  depends_on = [kubernetes_manifest.application_source["heterocloud-edge"], terraform_data.git_source, kubernetes_manifest.gitops_project]
 }
 
 import {

@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "namespace": "heterocloud-dns",
+  "dns_namespace": "heterocloud-dns",
+  "dns_resource": "heterocloud-web-gateways",
+  "state_resource": "public-dns-quorum-state",
+  "members": [
+    {"id": "ichikawap1", "node": "ichikawap1", "vote_resource": "public-dns-vote-ichikawap1"},
+    {"id": "uc-k8sp4", "node": "uc-k8sp4", "vote_resource": "public-dns-vote-uc-k8sp4"},
+    {"id": "uc-k8sp5", "node": "uc-k8sp5", "vote_resource": "public-dns-vote-uc-k8sp5"}
+  ],
+  "origins": [
+    {"id": "ichikawap1", "address": "163.220.236.61"},
+    {"id": "uc-k8sp4", "address": "163.220.236.54"}
+  ],
+  "records": [
+    "heterocloud.mizuame.app",
+    "flow.heterocloud.mizuame.app",
+    "registry.heterocloud.mizuame.app",
+    "s3.heterocloud.mizuame.app",
+    "*.flash.heterocloud.mizuame.app"
+  ],
+  "probe": {
+    "hostname": "gateway-health.flash.heterocloud.mizuame.app",
+    "path": "/healthz",
+    "port": 443,
+    "timeout_seconds": 2,
+    "expected_body": "HeteroNetwork public gateway ready\n",
+    "check_http_redirect": true
+  },
+  "fresh_seconds": 30,
+  "interval_seconds": 5,
+  "down_samples": 3,
+  "up_samples": 2,
+  "enabled": false,
+  "all_down_policy": "retain"
+}

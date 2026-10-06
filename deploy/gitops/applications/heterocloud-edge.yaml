@@ -4,7 +4,7 @@ metadata:
   name: heterocloud-edge
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-wave: '2'
 spec:
   project: hetero-platform
   source:
@@ -26,6 +26,18 @@ spec:
         factor: 2
         maxDuration: 3m
     syncOptions:
-      - CreateNamespace=true
-      - ServerSideApply=true
-      - RespectIgnoreDifferences=true
+    - CreateNamespace=true
+    - ServerSideApply=true
+    - RespectIgnoreDifferences=true
+  ignoreDifferences:
+  - group: externaldns.k8s.io
+    kind: DNSEndpoint
+    name: heterocloud-web-gateways
+    namespace: heterocloud-dns
+    jsonPointers:
+    - /spec/endpoints/0/targets
+    - /spec/endpoints/1/targets
+    - /spec/endpoints/2/targets
+    - /spec/endpoints/3/targets
+    - /spec/endpoints/4/targets
+    - /metadata/annotations/dns.heterocloud.io~1quorum-writer

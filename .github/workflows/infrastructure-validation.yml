@@ -6,6 +6,10 @@ on:
     paths:
       - 'deploy/terraform/master-only/**'
       - 'deploy/gitops/cluster-dns/**'
+      - 'deploy/gitops/public-dns-quorum/**'
+      - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
+      - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
+      - 'scripts/verify-public-dns-quorum.py'
       - 'deploy/gitops/applications/cluster-dns.yaml'
       - 'deploy/environments/heteronet/values.yaml'
       - 'scripts/publish-master-only.py'
@@ -34,6 +38,10 @@ on:
     paths:
       - 'deploy/terraform/master-only/**'
       - 'deploy/gitops/cluster-dns/**'
+      - 'deploy/gitops/public-dns-quorum/**'
+      - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
+      - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
+      - 'scripts/verify-public-dns-quorum.py'
       - 'deploy/gitops/applications/cluster-dns.yaml'
       - 'deploy/environments/heteronet/values.yaml'
       - 'scripts/publish-master-only.py'
@@ -72,6 +80,7 @@ jobs:
           persist-credentials: false
       - name: Verify acceptance rejects failed and stale E2E
         run: |
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
           python3 -B -m unittest discover -s scripts -p test_onboarding_acceptance.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_standard_node.py -v
           python3 -B -m unittest discover -s scripts -p test_gpu_inventory.py -v
@@ -79,6 +88,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_verify_flash_crds.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_overlay_client_console.py -v
           python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py -v
+          python3 -B -m unittest discover -s deploy/gitops/public-dns-quorum -p 'test_*.py' -v
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs

@@ -2,7 +2,10 @@
 
 `public-web-dns.yaml` is the ExternalDNS source of truth for the platform's
 host Caddy front doors on ports 80/443. It is deployment inventory, not an
-automatically discovered list of healthy Kubernetes LoadBalancer addresses.
+automatically discovered list of Kubernetes LoadBalancer addresses. The
+`public-dns-quorum` Application now owns the public target selection: three
+independent observers require a fixed majority before excluding or restoring
+an origin. See [configuration and failure semantics](../public-dns-quorum/README.md).
 The apex is Cloudflare-proxied; the other records are DNS-only. OpenBao's
 user-facing name is `secrets.heteronetwork.internal`, discovered from the
 ready private gateway endpoints. The older `secrets.heterocloud.mizuame.app`
@@ -20,8 +23,11 @@ still delete obsolete records.
 Before changing targets, verify the intended hostname using HTTPS with
 `curl --resolve` against each new front door. Keep this list limited to
 commissioned front doors; update it when decommissioning a host. This does
-not implement health-based DNS failover and does not restore failed backend
-services. Dynamic tenant L4 LoadBalancer DNS remains separately managed.
+not itself determine health. The quorum publisher changes only the public target
+arrays; Argo retains DNS names/TTL/provider settings. Secret Manager's private
+records are declared separately and cannot be patched by that publisher.
+This does not restore failed backend services. Dynamic tenant L4 LoadBalancer
+DNS remains separately managed.
 
 Verification:
 

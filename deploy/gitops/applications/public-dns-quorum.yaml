@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: public-dns-quorum
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: git://10.250.0.2:19419/heteronetwork-infrastructure.git
+    targetRevision: master
+    path: deploy/gitops/public-dns-quorum
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-dns
+  ignoreDifferences:
+    - group: ""
+      kind: ConfigMap
+      namespace: heterocloud-dns
+      name: public-dns-vote-ichikawap1
+      jsonPointers: [/data]
+    - group: ""
+      kind: ConfigMap
+      namespace: heterocloud-dns
+      name: public-dns-vote-uc-k8sp4
+      jsonPointers: [/data]
+    - group: ""
+      kind: ConfigMap
+      namespace: heterocloud-dns
+      name: public-dns-vote-uc-k8sp5
+      jsonPointers: [/data]
+    - group: ""
+      kind: ConfigMap
+      namespace: heterocloud-dns
+      name: public-dns-quorum-state
+      jsonPointers: [/data]
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff: {duration: 5s, factor: 2, maxDuration: 3m}
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

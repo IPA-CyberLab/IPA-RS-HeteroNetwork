@@ -1,46 +1,57 @@
+# Public targets are owned by the quorum publisher; private Secret Manager DNS is separate.
 apiVersion: externaldns.k8s.io/v1alpha1
 kind: DNSEndpoint
 metadata:
   name: heterocloud-web-gateways
   namespace: heterocloud-dns
   labels:
-    dns.heterocloud.io/publish: "true"
+    dns.heterocloud.io/publish: 'true'
 spec:
-  # These are host Caddy front doors on 80/443, not the transient addresses
-  # of Envoy's internal 18081 LoadBalancer Service. Change this deployment
-  # inventory when a front door is commissioned or decommissioned.
   endpoints:
-    - dnsName: heterocloud.mizuame.app
-      recordType: A
-      recordTTL: 60
-      # uc-k8s3p (.53) is quarantined from public HTTP ingress while its
-      # control-plane workload is being isolated from memory pressure.
-      targets: [163.220.236.61]
-      providerSpecific:
-        - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
-          value: "true"
-    - dnsName: flow.heterocloud.mizuame.app
-      recordType: A
-      recordTTL: 60
-      targets: [163.220.236.61]
-    - dnsName: registry.heterocloud.mizuame.app
-      recordType: A
-      recordTTL: 60
-      targets: [163.220.236.61]
-    - dnsName: s3.heterocloud.mizuame.app
-      recordType: A
-      recordTTL: 60
-      targets: [163.220.236.61]
-    - dnsName: secrets.heterocloud.mizuame.app
-      recordType: A
-      recordTTL: 60
-      # Legacy verified HTTPS endpoint for in-cluster clients. User links use
-      # secrets.heteronetwork.internal; this name resolves only to VPN IPs.
-      targets: [10.250.0.10, 10.250.0.11]
-      providerSpecific:
-        - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
-          value: "false"
-    - dnsName: '*.flash.heterocloud.mizuame.app'
-      recordType: A
-      recordTTL: 60
-      targets: [163.220.236.61]
+  - dnsName: heterocloud.mizuame.app
+    recordType: A
+    recordTTL: 60
+    targets:
+    - 163.220.236.61
+    providerSpecific:
+    - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
+      value: 'true'
+  - dnsName: flow.heterocloud.mizuame.app
+    recordType: A
+    recordTTL: 60
+    targets:
+    - 163.220.236.61
+  - dnsName: registry.heterocloud.mizuame.app
+    recordType: A
+    recordTTL: 60
+    targets:
+    - 163.220.236.61
+  - dnsName: s3.heterocloud.mizuame.app
+    recordType: A
+    recordTTL: 60
+    targets:
+    - 163.220.236.61
+  - dnsName: '*.flash.heterocloud.mizuame.app'
+    recordType: A
+    recordTTL: 60
+    targets:
+    - 163.220.236.61
+---
+apiVersion: externaldns.k8s.io/v1alpha1
+kind: DNSEndpoint
+metadata:
+  name: heterocloud-secret-manager-vpn
+  namespace: heterocloud-dns
+  labels:
+    dns.heterocloud.io/publish: 'true'
+spec:
+  endpoints:
+  - dnsName: secrets.heterocloud.mizuame.app
+    recordType: A
+    recordTTL: 60
+    targets:
+    - 10.250.0.10
+    - 10.250.0.11
+    providerSpecific:
+    - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
+      value: 'false'
