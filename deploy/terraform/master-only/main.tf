@@ -730,3 +730,38 @@ resource "kubernetes_manifest" "gitops_project" {
   }
   lifecycle { prevent_destroy = true }
 }
+
+resource "kubernetes_manifest" "custom_domains_application" {
+  manifest = yamldecode(file("${local.repo_root}/deploy/gitops/applications/custom-domains.yaml"))
+  field_manager {
+    name            = "heteronetwork-terraform"
+    force_conflicts = true
+  }
+  lifecycle { prevent_destroy = true }
+  depends_on = [terraform_data.git_source, kubernetes_manifest.gitops_project, terraform_data.custom_domains_cert_manager_values]
+}
+
+resource "kubernetes_manifest" "custom_domains_cert_manager" {
+  manifest        = yamldecode(file("${local.repo_root}/deploy/gitops/applications/cert-manager.yaml"))
+  computed_fields = ["metadata.annotations", "metadata.labels", "spec.source.helm"]
+  field_manager {
+    name            = "heteronetwork-terraform"
+    force_conflicts = true
+  }
+  lifecycle { prevent_destroy = true }
+  depends_on = [kubernetes_manifest.gitops_project]
+}
+
+import {
+  to = kubernetes_manifest.custom_domains_cert_manager
+  id = "apiVersion=argoproj.io/v1alpha1,kind=Application,namespace=argocd,name=cert-manager"
+}
+
+resource "terraform_data" "custom_domains_cert_manager_values" {
+  triggers_replace = [filesha256("${local.repo_root}/deploy/gitops/applications/cert-manager.yaml")]
+  provisioner "local-exec" {
+    working_dir = local.repo_root
+    command     = "python3 scripts/normalize_application_helm_values.py --manifest deploy/gitops/applications/cert-manager.yaml"
+  }
+  depends_on = [kubernetes_manifest.custom_domains_cert_manager]
+}

@@ -4,7 +4,7 @@ metadata:
   name: heterocloud
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/sync-wave: '0'
 spec:
   project: hetero-platform
   source:
@@ -14,7 +14,7 @@ spec:
     helm:
       releaseName: heterocloud
       valueFiles:
-        - ../../environments/heteronet/values.yaml
+      - ../../environments/heteronet/values.yaml
       values: |
         replicaCount: 3
         workloadIdentity:
@@ -40,6 +40,15 @@ spec:
           - ip: "10.96.180.79"
             hostnames:
               - console.heteronetwork.internal
+        customDomains:
+          reservedNames:
+            - heterocloud.mizuame.app
+            - flow.heterocloud.mizuame.app
+            - registry.heterocloud.mizuame.app
+            - s3.heterocloud.mizuame.app
+            - secrets.heterocloud.mizuame.app
+          reservedSuffixes:
+            - flash.heterocloud.mizuame.app
   destination:
     server: https://kubernetes.default.svc
     namespace: heterocloud
@@ -55,5 +64,5 @@ spec:
         factor: 2
         maxDuration: 3m
     syncOptions:
-      - CreateNamespace=true
-      - RespectIgnoreDifferences=true
+    - CreateNamespace=true
+    - RespectIgnoreDifferences=true

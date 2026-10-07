@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "workload_namespace": "heterocloud-flash-workloads",
+  "certificate_namespace": "heterocloud-custom-domains",
+  "bundle_namespace": "heterocloud-dns",
+  "bundle_name": "public-custom-domain-tls-bundle",
+  "state_name": "custom-domain-controller-state",
+  "issuer": "flash-custom-domain-letsencrypt",
+  "acme_service_name": "heterocloud-acme-proxy",
+  "acme_service_namespace": "envoy-gateway-system",
+  "dns_namespace": "heterocloud-dns",
+  "dns_resource": "heterocloud-web-gateways",
+  "public_flash_domain": "flash.heterocloud.mizuame.app",
+  "reserved_hostnames": ["heterocloud.mizuame.app", "flow.heterocloud.mizuame.app", "registry.heterocloud.mizuame.app", "s3.heterocloud.mizuame.app", "secrets.heterocloud.mizuame.app"],
+  "interval_seconds": 10,
+  "max_domains": 128
+}

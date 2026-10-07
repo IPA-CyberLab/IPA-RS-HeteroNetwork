@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: custom-domains
+  namespace: argocd
+spec:
+  project: hetero-platform
+  source:
+    repoURL: git://10.250.0.2:19419/heteronetwork-infrastructure.git
+    targetRevision: master
+    path: deploy/gitops/custom-domains
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-custom-domains
+  ignoreDifferences:
+  - kind: ConfigMap
+    namespace: heterocloud-custom-domains
+    name: custom-domain-controller-state
+    jsonPointers:
+    - /data
+  - kind: Secret
+    namespace: heterocloud-dns
+    name: public-custom-domain-tls-bundle
+    jsonPointers:
+    - /data
+    - /metadata/annotations/domains.heterocloud.io~1writer
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+    syncOptions:
+    - CreateNamespace=true
+    - ServerSideApply=true
+    - RespectIgnoreDifferences=true

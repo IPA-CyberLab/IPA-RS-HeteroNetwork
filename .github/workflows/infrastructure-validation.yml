@@ -7,6 +7,10 @@ on:
       - 'deploy/terraform/master-only/**'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
+      - 'deploy/gitops/custom-domains/**'
+      - 'deploy/gitops/flash-web/**'
+      - 'deploy/gitops/applications/custom-domains.yaml'
+      - 'deploy/gitops/applications/cert-manager.yaml'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'scripts/verify-public-dns-quorum.py'
@@ -39,6 +43,10 @@ on:
       - 'deploy/terraform/master-only/**'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
+      - 'deploy/gitops/custom-domains/**'
+      - 'deploy/gitops/flash-web/**'
+      - 'deploy/gitops/applications/custom-domains.yaml'
+      - 'deploy/gitops/applications/cert-manager.yaml'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'scripts/verify-public-dns-quorum.py'
@@ -89,6 +97,9 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_verify_overlay_client_console.py -v
           python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py -v
           python3 -B -m unittest discover -s deploy/gitops/public-dns-quorum -p 'test_*.py' -v
+          python3 -B -m unittest discover -s deploy/gitops/custom-domains -p 'test_*.py' -v
+          python3 -B -m unittest discover -s scripts -p test_flash_tls_sync.py -v
+          python3 -B -m unittest discover -s scripts -p test_custom_domain_tls.py -v
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs

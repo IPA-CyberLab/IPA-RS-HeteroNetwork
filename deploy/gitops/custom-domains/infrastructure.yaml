@@ -1,0 +1,421 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: heterocloud-custom-domains
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: custom-domain-controller-state
+  namespace: heterocloud-custom-domains
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: public-custom-domain-tls-bundle
+  namespace: heterocloud-dns
+  labels:
+    domains.heterocloud.io/bundle: 'true'
+type: Opaque
+data:
+  bundle.json: eyJzY2hlbWFfdmVyc2lvbiI6MSwiaG9zdHMiOltdLCJjZXJ0aWZpY2F0ZXMiOnt9LCJhY21lX3Vwc3RyZWFtIjpudWxsfQ==
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: flash-custom-domain-letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: flash-custom-domain-acme-account
+    solvers:
+    - http01:
+        gatewayHTTPRoute:
+          parentRefs:
+          - name: heterocloud-acme
+            namespace: heterocloud-edge
+            kind: Gateway
+            group: gateway.networking.k8s.io
+            sectionName: http
+          serviceType: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: heterocloud-acme
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: heterocloud-acme
+    namespace: heterocloud-edge
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: heterocloud-acme
+  namespace: heterocloud-edge
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        replicas: 2
+        pod:
+          nodeSelector:
+            networking.heteronetwork.io/public-ingress: 'true'
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      gateway.envoyproxy.io/owning-gateway-name: heterocloud-acme
+        container:
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      envoyService:
+        type: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: heterocloud-acme
+  namespace: heterocloud-edge
+spec:
+  gatewayClassName: heterocloud-acme
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: heterocloud-acme-proxy
+  namespace: envoy-gateway-system
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: envoy
+    gateway.envoyproxy.io/owning-gateway-name: heterocloud-acme
+    gateway.envoyproxy.io/owning-gateway-namespace: heterocloud-edge
+  ports:
+  - name: http
+    port: 80
+    targetPort: 10080
+    protocol: TCP
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+rules:
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  verbs:
+  - get
+  - list
+  - create
+  - patch
+  - delete
+- apiGroups:
+  - ''
+  resources:
+  - secrets
+  verbs:
+  - get
+  - delete
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - patch
+  resourceNames:
+  - custom-domain-controller-state
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: custom-domain-controller
+subjects:
+- kind: ServiceAccount
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-flash-workloads
+rules:
+- apiGroups:
+  - flash.heterocloud.io
+  resources:
+  - flashdomains
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+- apiGroups:
+  - flash.heterocloud.io
+  resources:
+  - flashdomains/status
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - flash.heterocloud.io
+  resources:
+  - flashservices
+  verbs:
+  - get
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - get
+  - delete
+- apiGroups:
+  - gateway.envoyproxy.io
+  resources:
+  - securitypolicies
+  verbs:
+  - get
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-flash-workloads
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: custom-domain-controller
+subjects:
+- kind: ServiceAccount
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-dns
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - secrets
+  verbs:
+  - get
+  - patch
+  resourceNames:
+  - public-custom-domain-tls-bundle
+- apiGroups:
+  - externaldns.k8s.io
+  resources:
+  - dnsendpoints
+  verbs:
+  - get
+  resourceNames:
+  - heterocloud-web-gateways
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-dns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: custom-domain-controller
+subjects:
+- kind: ServiceAccount
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: custom-domain-controller
+  namespace: envoy-gateway-system
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - services
+  verbs:
+  - get
+  resourceNames:
+  - heterocloud-acme-proxy
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-domain-controller
+  namespace: envoy-gateway-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: custom-domain-controller
+subjects:
+- kind: ServiceAccount
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+spec:
+  replicas: 2
+  selector:
+    matchLabels: &id001
+      app.kubernetes.io/name: custom-domain-controller
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      serviceAccountName: custom-domain-controller
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - uc-k8sp4
+                - uc-k8sp5
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels: *id001
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: controller
+        image: python:3.13.7-bookworm@sha256:c900d35aba5fe4c1dc1cd358408baae2902ff2a2926a1d15cc5002c6061ddb2e
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -B
+        - /config/controller.py
+        env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        readinessProbe:
+          exec:
+            command:
+            - python3
+            - -c
+            - import os,time; assert time.time()-os.stat('/tmp/last-success').st_mtime<90
+          periodSeconds: 10
+          timeoutSeconds: 3
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: config
+        configMap:
+          name: custom-domain-controller
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: custom-domain-controller
+  namespace: heterocloud-custom-domains
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: custom-domain-controller
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: custom-domain-solvers
+  namespace: heterocloud-custom-domains
+spec:
+  podSelector:
+    matchLabels:
+      acme.cert-manager.io/http01-solver: 'true'
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: envoy-gateway-system
+    ports:
+    - protocol: TCP
+      port: 8089
+  egress: []

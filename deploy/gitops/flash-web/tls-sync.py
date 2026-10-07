@@ -2,6 +2,9 @@
 """Publish a projected cert-manager Secret to the existing host gateway only."""
 
 import argparse
+import sys
+import importlib.util
+import types
 import contextlib
 import datetime
 import fcntl
@@ -14,6 +17,10 @@ import subprocess
 import tempfile
 import time
 import uuid
+
+_custom_spec = importlib.util.spec_from_file_location("custom_tls", Path(__file__).with_name("custom_tls.py"))
+custom_tls = importlib.util.module_from_spec(_custom_spec)
+_custom_spec.loader.exec_module(custom_tls)
 
 
 EXTRA = "public-gateway-extra.Caddyfile"
@@ -248,7 +255,7 @@ def fingerprint(st):
 
 
 def sync(host="/etc/heteronetwork", secret="/var/run/flash-web-tls",
-         group_file="/host-group"):
+         group_file="/host-group", custom_bundle="/var/run/custom-domain-tls/bundle.json"):
     gid = host_gid(group_file)
     cert, key = secret_pair(secret)
     validate(cert, key)
@@ -264,6 +271,8 @@ def sync(host="/etc/heteronetwork", secret="/var/run/flash-web-tls",
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             old, st = read_file(root, EXTRA)
             new = update_content(old, generation)
+            custom = custom_tls.bundle(custom_bundle, types.SimpleNamespace(**globals()))
+            new = custom_tls.update(types.SimpleNamespace(**globals()), root, new, custom, gid)
             publish_pair(root, generation, cert, key, gid)
             if old == new:
                 return False

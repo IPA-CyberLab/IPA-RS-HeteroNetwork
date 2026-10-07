@@ -11,3 +11,4 @@ configMapGenerator:
   - name: flash-web-tls-sync
     files:
       - tls-sync.py
+      - custom_tls.py
