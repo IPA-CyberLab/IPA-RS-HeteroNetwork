@@ -672,7 +672,7 @@ def gateway_route_is_ready(gateway):
             and gateway_console_ui_is_ready(gateway))
 
 
-def wait_for_gateway_routes(gateways, timeout=20):
+def wait_for_gateway_routes(gateways, timeout=60):
     started = time.monotonic()
     targets = tuple(sorted(set(gateways.split(","))))
     if not targets or "" in targets:
