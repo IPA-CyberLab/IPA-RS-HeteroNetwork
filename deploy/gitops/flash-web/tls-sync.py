@@ -249,6 +249,39 @@ def publish_pair(root, generation, cert, key, gid):
         os.close(parent)
 
 
+def collect_retired_pairs(root, content, grace_seconds=3600):
+    """Remove only immutable generations no longer referenced by published config.
+
+    Keep an hour for in-flight reloads and existing TLS sessions. Never follow
+    symlinks or delete unknown files in the host certificate directory.
+    """
+    try:
+        parent = os.open(CERTDIR, FLAGS | os.O_DIRECTORY, dir_fd=root)
+    except FileNotFoundError:
+        return
+    try:
+        for generation in os.listdir(parent):
+            if not re.fullmatch(r"[0-9a-f]{64}", generation) or generation.encode() in content:
+                continue
+            child = os.open(generation, FLAGS | os.O_DIRECTORY, dir_fd=parent)
+            try:
+                st = os.fstat(child)
+                secure(st, True)
+                if time.time() - st.st_mtime < grace_seconds or set(os.listdir(child)) != {"tls.crt", "tls.key"}:
+                    continue
+                for name in ("tls.crt", "tls.key"):
+                    _, info = read_file(child, name)
+                    secure(info)
+                for name in ("tls.crt", "tls.key"):
+                    os.unlink(name, dir_fd=child)
+            finally:
+                os.close(child)
+            os.rmdir(generation, dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
 def fingerprint(st):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
             st.st_uid, st.st_gid, st.st_mode)
@@ -275,6 +308,7 @@ def sync(host="/etc/heteronetwork", secret="/var/run/flash-web-tls",
             new = custom_tls.update(types.SimpleNamespace(**globals()), root, new, custom, gid)
             publish_pair(root, generation, cert, key, gid)
             if old == new:
+                collect_retired_pairs(root, new)
                 return False
             temporary = ".flash-extra-" + uuid.uuid4().hex
             try:
@@ -284,6 +318,7 @@ def sync(host="/etc/heteronetwork", secret="/var/run/flash-web-tls",
                         "extra file changed concurrently; retry later")
                 os.replace(temporary, EXTRA, src_dir_fd=root, dst_dir_fd=root)
                 os.fsync(root)
+                collect_retired_pairs(root, new)
             finally:
                 try:
                     os.unlink(temporary, dir_fd=root)

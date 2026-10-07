@@ -36,6 +36,17 @@ class CustomDomainTLS(SyncTests):
         self.data['certificates']={};self.run_custom();actual=self.extra.read_bytes()
         self.assertNotIn(b'https://wrong.example:443 {',actual)
         self.assertIn(b'Domain is provisioning',actual)
+    def test_retired_keys_are_collected_only_after_reload_grace(self):
+        import os,time
+        self.run_custom();old_dirs=set((self.host/sync.CERTDIR).iterdir())
+        self.data['hosts']=[];self.data['certificates']={};self.run_custom()
+        self.assertEqual(old_dirs,set((self.host/sync.CERTDIR).iterdir()))
+        before=self.extra.read_bytes()
+        for directory in old_dirs:os.utime(directory,(time.time()-7200,time.time()-7200))
+        self.run_custom()
+        remaining=set((self.host/sync.CERTDIR).iterdir())
+        self.assertEqual(len(remaining),1,'only the currently referenced wildcard pair remains')
+        self.assertEqual(before,self.extra.read_bytes())
     def test_public_proxy_and_reserved_names_are_rejected(self):
         for address in ['163.220.236.54:80','127.0.0.1:80','10.96.0.20:443']:
             self.data['acme_upstream']=address
