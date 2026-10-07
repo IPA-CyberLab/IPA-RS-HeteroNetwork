@@ -105,6 +105,10 @@ def delegated(spec,c,resolvers=None):
         for kind in [1,28]:
             for answer in dns_answers(spec['cname_target'],kind,resolver):expected.add(str(ipaddress.ip_address(answer['data'])))
         values.append(bool(actual) and bool(expected) and actual<=expected and all(ipaddress.ip_address(x).is_global for x in actual))
+    # Recursive resolvers can disagree while positive and negative caches
+    # expire. An inconsistent answer never proves a new binding and must not
+    # revoke a binding that was already verified by both resolvers.
+    if any(values) and not all(values):raise ValueError('DNS resolvers disagree')
     return all(values)
 
 def owned_alias(alias,service,c):
@@ -230,6 +234,7 @@ def reconcile(api,c):
                 hosts.append(host)
                 material=cert_material(api,alias,c)
                 if material:materials[host]=material
+                pending.append((alias,material))
             continue
         if not verified:
             patch_status(api,alias,c,{'phase':'pending_dns','dns_verified':False,'tls_ready':False,'message':'Set the service CNAME, or the displayed TXT proof with matching public addresses. Use DNS-only records.','certificate_expires_at':None});continue

@@ -33,7 +33,7 @@ class DomainTests(unittest.TestCase):
         def answer(name,kind,resolver):return [{'data':self.spec['cname_target']+'.'}] if kind==5 else []
         with patch.object(d,'dns_answers',side_effect=answer):self.assertTrue(d.delegated(self.spec,self.c))
         def inconsistent(name,kind,resolver):return [{'data':self.spec['cname_target']+'.'}] if kind==5 and 'cloudflare' in resolver else []
-        with patch.object(d,'dns_answers',side_effect=inconsistent):self.assertFalse(d.delegated(self.spec,self.c))
+        with patch.object(d,'dns_answers',side_effect=inconsistent),self.assertRaises(ValueError):d.delegated(self.spec,self.c)
     def test_apex_requires_txt_and_matching_public_addresses(self):
         def answer(name,kind,resolver):
             if kind==16:return [{'data':'"'+self.spec['verification_value']+'"'}]
