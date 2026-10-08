@@ -100,6 +100,7 @@ jobs:
           python3 -B -m unittest discover -s deploy/gitops/custom-domains -p 'test_*.py' -v
           python3 -B -m unittest discover -s scripts -p test_flash_tls_sync.py -v
           python3 -B -m unittest discover -s scripts -p test_custom_domain_tls.py -v
+          python3 -B -m unittest discover -s scripts -p test_gateway_health.py -v
       - name: Check verifier syntax
         run: |
           node --check scripts/verify-console-gateways.mjs

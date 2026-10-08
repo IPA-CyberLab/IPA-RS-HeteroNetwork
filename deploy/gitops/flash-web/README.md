@@ -60,8 +60,11 @@ Both files are fsynced into an immutable SHA-256 generation directory under
 `/etc/heteronetwork/flash-web-certs/` before a same-directory atomic replacement
 of the extra file. The hash covers the complete cert/key pair. The helper
 appends one marked wildcard HTTP :80 redirect and HTTPS :443 site; renewal
-replaces only that block. Every byte outside the markers, including appended
-operator content, is retained. Unmanaged wildcard occurrences, malformed
+replaces only that block. The canonical `(heterocloud_envoy)` health directives
+are also managed: application HTTP errors do not withdraw shared upstreams,
+and active health checks use the dedicated gateway direct-response route.
+Three failures are required before withdrawal and two passes before recovery.
+All other bytes outside the markers, including appended operator content, are retained. Unmanaged wildcard occurrences, malformed
 markers, unsafe existing files or tampered generation files stop publication.
 The extra file's owner/group/mode are preserved, with the Agent's 256 KiB limit.
 

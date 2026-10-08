@@ -12,3 +12,4 @@ configMapGenerator:
     files:
       - tls-sync.py
       - custom_tls.py
+      - gateway_health.py

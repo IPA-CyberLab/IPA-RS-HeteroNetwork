@@ -21,6 +21,9 @@ import uuid
 _custom_spec = importlib.util.spec_from_file_location("custom_tls", Path(__file__).with_name("custom_tls.py"))
 custom_tls = importlib.util.module_from_spec(_custom_spec)
 _custom_spec.loader.exec_module(custom_tls)
+_health_spec = importlib.util.spec_from_file_location("gateway_health", Path(__file__).with_name("gateway_health.py"))
+gateway_health = importlib.util.module_from_spec(_health_spec)
+_health_spec.loader.exec_module(gateway_health)
 
 
 EXTRA = "public-gateway-extra.Caddyfile"
@@ -303,7 +306,8 @@ def sync(host="/etc/heteronetwork", secret="/var/run/flash-web-tls",
             secure(os.fstat(lock))
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             old, st = read_file(root, EXTRA)
-            new = update_content(old, generation)
+            new = gateway_health.update(old, "gateway-health." + HOST.removeprefix("*."))
+            new = update_content(new, generation)
             custom = custom_tls.bundle(custom_bundle, types.SimpleNamespace(**globals()))
             new = custom_tls.update(types.SimpleNamespace(**globals()), root, new, custom, gid)
             publish_pair(root, generation, cert, key, gid)
