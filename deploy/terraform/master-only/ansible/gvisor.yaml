@@ -1,0 +1,110 @@
+- name: Configure and verify Flash CPU runtimes on workload workers
+  hosts: standard:bootstrap
+  gather_facts: true
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_gvisor_version: '20260907.0'
+    hnn_gvisor_source_commit: 23fccb36f18343bccad297d9a52455edd81999b3
+    hnn_gvisor_install_sha256: 6ddb1921db7d152c40d964de2435b68d6dde3ddde8ff2dd2218b75665aa06737
+    hnn_gvisor_check_sha256: 74069ea8a27ff355e542230c08678e0f995a0d44892a3ec836a8b9a31742c06e
+  tasks:
+    - name: Require a supported workload worker
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname not in groups['master_only']
+          - ansible_distribution == 'Ubuntu'
+          - ansible_architecture == 'x86_64'
+          - ansible_kernel is version('5.6', '>=')
+        fail_msg: Dedicated masters and unsupported hosts cannot run Flash workloads
+
+    - name: Verify that containerd leaves existing shims running on a restart
+      ansible.builtin.command: systemctl show containerd.service --property=KillMode --value
+      register: hnn_gvisor_kill_mode
+      changed_when: false
+      check_mode: false
+
+    - name: Require a process-only containerd service
+      ansible.builtin.assert:
+        that: hnn_gvisor_kill_mode.stdout == 'process'
+        fail_msg: The containerd service must preserve existing workload processes
+
+    - name: Create the managed runtime installer directory
+      ansible.builtin.file:
+        path: /opt/heteronetwork/libexec/flash
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Fetch the immutable verified runtime installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/{{ hnn_gvisor_source_commit }}/scripts/install-gvisor.sh"
+        dest: /opt/heteronetwork/libexec/flash/install-gvisor.sh
+        checksum: "sha256:{{ hnn_gvisor_install_sha256 }}"
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Fetch the immutable verified runtime checker
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/{{ hnn_gvisor_source_commit }}/scripts/check-gvisor.sh"
+        dest: /opt/heteronetwork/libexec/flash/check-gvisor.sh
+        checksum: "sha256:{{ hnn_gvisor_check_sha256 }}"
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Capture existing container tasks before runtime configuration
+      ansible.builtin.command: ctr --namespace k8s.io tasks list --quiet
+      register: hnn_gvisor_existing_tasks
+      changed_when: false
+      check_mode: false
+
+    - name: Install the pinned sandbox package and configure its containerd handler
+      ansible.builtin.command: /bin/bash /opt/heteronetwork/libexec/flash/install-gvisor.sh
+      environment:
+        GVISOR_VERSION: "{{ hnn_gvisor_version }}"
+      register: hnn_gvisor_install
+      changed_when: "'restarted containerd because its configuration changed' in hnn_gvisor_install.stdout"
+      when: not ansible_check_mode
+
+    - name: Verify the installed runtime and effective containerd configuration
+      ansible.builtin.command: /bin/bash /opt/heteronetwork/libexec/flash/check-gvisor.sh
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Capture container tasks after runtime configuration
+      ansible.builtin.command: ctr --namespace k8s.io tasks list --quiet
+      register: hnn_gvisor_current_tasks
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Require existing container tasks to survive the runtime configuration
+      ansible.builtin.assert:
+        that: hnn_gvisor_existing_tasks.stdout_lines | difference(hnn_gvisor_current_tasks.stdout_lines) | length == 0
+        fail_msg: An existing container task disappeared during runtime configuration
+      when: not ansible_check_mode
+
+    - name: Install the versioned sandbox acceptance probe on the Kubernetes operator
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/verify-gvisor-worker.py"
+        dest: /opt/heteronetwork/libexec/verify-gvisor-worker.py
+        owner: root
+        group: root
+        mode: '0755'
+      delegate_to: uc-k8sp5
+
+    - name: Advertise Flash capacity only after real sandbox execution succeeds
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /opt/heteronetwork/libexec/verify-gvisor-worker.py
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - "--node={{ inventory_hostname }}"
+      delegate_to: uc-k8sp5
+      register: hnn_gvisor_acceptance
+      changed_when: false
+      when: not ansible_check_mode

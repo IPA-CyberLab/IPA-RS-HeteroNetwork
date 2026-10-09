@@ -1,5 +1,13 @@
 # HeteroNetwork host infrastructure
 
+`terraform_data.gvisor_configuration` installs the checksum-pinned Flash runtime
+installer and gVisor package on `uc-k8sp4` and `uc-k8sp5`. These hosts can run CPU
+Flash services independently of the enrollment issuer. Configuration changes
+restart only the containerd process after confirming its unit preserves existing
+shims, and verify that existing container tasks remain. A bounded, nonroot,
+tokenless execution probe must demonstrate gVisor before the worker receives the
+runtime scheduling label. The dedicated Secret Manager masters are excluded.
+
 This module manages the existing `uc-k8sp1`, `uc-k8sp2`, and `uc-k8s3p` hosts.
 The [deployment and verification record](../../../docs/master-only-iac-2026-09-15.md)
 also documents the current workspace's operator connection.
