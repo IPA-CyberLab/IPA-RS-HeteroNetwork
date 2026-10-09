@@ -87,6 +87,20 @@
       notify: Reload kubelet resource reservations
       no_log: true
 
+    - name: Upgrade generated worker command-line reservations that override the config file
+      ansible.builtin.replace:
+        path: /etc/default/kubelet
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+        backup: true
+      loop:
+        - regexp: '--system-reserved=cpu=500m,memory=512Mi(?=["\s]|$)'
+          replace: '--system-reserved=cpu=500m,memory=3Gi'
+        - regexp: '--kube-reserved=cpu=500m,memory=512Mi(?=["\s]|$)'
+          replace: '--kube-reserved=cpu=500m,memory=1Gi'
+      notify: Reload kubelet resource reservations
+      no_log: true
+
     - name: Apply memory reservations before admitting workloads
       ansible.builtin.meta: flush_handlers
 
