@@ -66,10 +66,11 @@ Reverse and HyperEVM: both returned 200, with no gateway errors across
 editor load measurements, not the three-second management-console check.
 Temporary verification credentials were revoked after each check.
 
-HyperEVM's replicas completed on all three workload nodes. Reverse's second
-replica completed on `uc-k8sp4`, and its third was rebuilding on `uc-k8sp5`
-at the last intermediate observation. Completion is verified from replica
-health and engine mode, rather than the configured replica count.
+Both workspaces now have three healthy replicas on three distinct workload
+nodes: `ichikawap1`, `uc-k8sp4`, and `uc-k8sp5`. Reverse's new replicas became
+healthy at 12:24:28 UTC and 12:33:43 UTC; HyperEVM's new replicas became healthy
+at 12:18:27 UTC and 12:20:17 UTC. Both volumes report `healthy`. Completion is
+verified from replica health, rather than the configured replica count.
 
 During the physical outage, GitHub's actual VPN client joined successfully,
 but the full gateway convergence check failed on `10.250.0.10`. Those failed
