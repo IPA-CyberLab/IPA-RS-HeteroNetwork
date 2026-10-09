@@ -3,3 +3,4 @@ kind: Kustomization
 resources:
   - node-prerequisites.yaml
   - syouyu-storage-class.yaml
+  - storage-policy.yaml
