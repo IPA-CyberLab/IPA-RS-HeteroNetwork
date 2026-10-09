@@ -57,8 +57,50 @@
         group: root
         mode: '0755'
 
-    - name: Capture existing container tasks before runtime configuration
-      ansible.builtin.command: ctr --namespace k8s.io tasks list --quiet
+    - name: Read current kubelet resource reservations
+      ansible.builtin.slurp:
+        src: /var/lib/kubelet/config.yaml
+      register: hnn_gvisor_kubelet_file
+      no_log: true
+
+    - name: Preserve explicit reservations and reserve memory for host services
+      ansible.builtin.set_fact:
+        hnn_gvisor_kubelet_config: "{{ hnn_gvisor_kubelet_file.content | b64decode | from_yaml }}"
+      no_log: true
+
+    - name: Configure default memory reservations for native and Kubernetes services
+      ansible.builtin.copy:
+        content: >-
+          {{ hnn_gvisor_kubelet_config | combine({
+            'systemReserved': (hnn_gvisor_kubelet_config.systemReserved | default({}, true)) | combine({
+              'memory': (hnn_gvisor_kubelet_config.systemReserved | default({}, true)).memory | default('3Gi')
+            }),
+            'kubeReserved': (hnn_gvisor_kubelet_config.kubeReserved | default({}, true)) | combine({
+              'memory': (hnn_gvisor_kubelet_config.kubeReserved | default({}, true)).memory | default('1Gi')
+            })
+          }) | to_nice_yaml }}
+        dest: /var/lib/kubelet/config.yaml
+        owner: root
+        group: root
+        mode: '0644'
+        backup: true
+      notify: Reload kubelet resource reservations
+      no_log: true
+
+    - name: Apply memory reservations before admitting workloads
+      ansible.builtin.meta: flush_handlers
+
+    - name: Capture ready application containers before runtime configuration
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - pods
+          - --all-namespaces
+          - "--field-selector=spec.nodeName={{ inventory_hostname }}"
+          - '-o=jsonpath={range .items[*]}{range .status.containerStatuses[?(@.ready==true)]}{.containerID}{"\n"}{end}{end}'
+      delegate_to: uc-k8sp5
       register: hnn_gvisor_existing_tasks
       changed_when: false
       check_mode: false
@@ -76,15 +118,24 @@
       changed_when: false
       when: not ansible_check_mode
 
-    - name: Capture container tasks after runtime configuration
-      ansible.builtin.command: ctr --namespace k8s.io tasks list --quiet
+    - name: Verify ready application tasks remain running after runtime configuration
+      ansible.builtin.shell: |
+        set -Eeuo pipefail
+        ctr --namespace k8s.io tasks list | awk 'NR > 1 && $3 == "RUNNING" {print $1}'
+      args:
+        executable: /bin/bash
       register: hnn_gvisor_current_tasks
       changed_when: false
+      until: >-
+        hnn_gvisor_existing_tasks.stdout_lines | map('regex_replace', '^containerd://', '') |
+        difference(hnn_gvisor_current_tasks.stdout_lines) | length == 0
+      retries: 5
+      delay: 2
       when: not ansible_check_mode
 
     - name: Require existing container tasks to survive the runtime configuration
       ansible.builtin.assert:
-        that: hnn_gvisor_existing_tasks.stdout_lines | difference(hnn_gvisor_current_tasks.stdout_lines) | length == 0
+        that: hnn_gvisor_existing_tasks.stdout_lines | map('regex_replace', '^containerd://', '') | difference(hnn_gvisor_current_tasks.stdout_lines) | length == 0
         fail_msg: An existing container task disappeared during runtime configuration
       when: not ansible_check_mode
 
@@ -108,3 +159,9 @@
       register: hnn_gvisor_acceptance
       changed_when: false
       when: not ansible_check_mode
+
+  handlers:
+    - name: Reload kubelet resource reservations
+      ansible.builtin.systemd_service:
+        name: kubelet.service
+        state: restarted

@@ -7,6 +7,9 @@ restart only the containerd process after confirming its unit preserves existing
 shims, and verify that existing container tasks remain. A bounded, nonroot,
 tokenless execution probe must demonstrate gVisor before the worker receives the
 runtime scheduling label. The dedicated Secret Manager masters are excluded.
+Workers default to 3 GiB of memory reserved for native host services and 1 GiB
+for Kubernetes processes; existing explicit reservations are preserved. This
+reduces advertised capacity before the new runtime scheduling label is added.
 
 This module manages the existing `uc-k8sp1`, `uc-k8sp2`, and `uc-k8s3p` hosts.
 The [deployment and verification record](../../../docs/master-only-iac-2026-09-15.md)
