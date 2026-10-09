@@ -291,7 +291,7 @@ resource "terraform_data" "gvisor_configuration" {
   input = {
     name    = each.key
     runtime = "runsc"
-    version = "20260907.0"
+    version = "20261005.0"
   }
   triggers_replace = [
     filesha256("${path.module}/ansible/gvisor.yaml"),

@@ -6,7 +6,7 @@
   vars:
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
-    hnn_gvisor_version: '20260907.0'
+    hnn_gvisor_version: '20261005.0'
     hnn_gvisor_source_commit: 23fccb36f18343bccad297d9a52455edd81999b3
     hnn_gvisor_install_sha256: 6ddb1921db7d152c40d964de2435b68d6dde3ddde8ff2dd2218b75665aa06737
     hnn_gvisor_check_sha256: 74069ea8a27ff355e542230c08678e0f995a0d44892a3ec836a8b9a31742c06e
