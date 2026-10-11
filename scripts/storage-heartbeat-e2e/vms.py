@@ -91,13 +91,11 @@ Requires=containerd.service
 ConditionPathExists=/var/lib/kubelet/config.yaml
 [Service]
 EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
-ExecStart=/usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml --resolv-conf=/run/systemd/resolve/resolv.conf $KUBELET_KUBEADM_ARGS
+# kind's shared configuration nests pods under /kubelet for Docker nodes.
+# Native VM workers use the host cgroup root, as ordinary kubeadm nodes do.
+ExecStart=/usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml --cgroup-root=/ --resolv-conf=/run/systemd/resolve/resolv.conf $KUBELET_KUBEADM_ARGS
 Restart=always
 RestartSec=5
-# Match the kubeletCgroups setting supplied by the pinned kind control plane.
-Slice=kubelet.slice
-CPUAccounting=true
-MemoryAccounting=true
 KillMode=process
 [Install]
 WantedBy=multi-user.target
