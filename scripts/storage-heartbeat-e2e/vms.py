@@ -20,7 +20,11 @@ CP = CLUSTER + '-control-plane'
 
 
 def run(command, timeout=30, data=None):
-    p = subprocess.run(command, input=data, capture_output=True, timeout=timeout)
+    try:
+        p = subprocess.run(command, input=data, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # TimeoutExpired normally embeds argv, including kubeadm's short-lived token.
+        raise RuntimeError('VM operation timed out: ' + command[0]) from None
     if p.returncode:
         # Never include a bootstrap token, SSH key or kubeconfig in error output.
         detail = re.sub(r'\b[a-z0-9]{6}\.[a-z0-9]{16}\b', '[bootstrap token]',
@@ -102,6 +106,8 @@ systemctl enable --now containerd kubelet iscsid
 '''
     ssh(node, ['bash', '-se'], timeout=60, data=setup.encode())
     join = run(['docker', 'exec', CP, 'kubeadm', 'token', 'create', '--ttl=30m', '--print-join-command']).decode().strip()
+    token = shlex.split(join)[shlex.split(join).index('--token') + 1]
+    print('::add-mask::' + token, flush=True)
     ssh(node, shlex.split(join) + ['--node-name', node, '--cri-socket', 'unix:///run/containerd/containerd.sock'], timeout=180)
     print(json.dumps({'vm': node, 'joined': True}), flush=True)
 
@@ -156,6 +162,8 @@ def create():
              '-netdev', 'tap,id=n0,ifname=' + info['tap'] + ',script=no,downscript=no',
              '-device', 'virtio-net-pci,netdev=n0,mac=' + mac, '-display', 'none', '-daemonize',
              '-serial', 'file:' + str(ROOT / 'results' / (node + '.serial.log')), '-pidfile', str(ROOT / (node + '.pid'))])
+        run(['sudo', 'chown', str(os.getuid()) + ':' + str(os.getgid()),
+             str(ROOT / 'results' / (node + '.serial.log')), str(ROOT / (node + '.pid'))])
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(bootstrap, nodes))
 
