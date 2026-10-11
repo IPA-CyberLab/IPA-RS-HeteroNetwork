@@ -47,8 +47,8 @@ spec:
           envoyGateway:
             resources:
               requests:
-                cpu: 5m
-                memory: 8Mi
+                cpu: 100m
+                memory: 128Mi
               limits:
                 cpu: 1
                 memory: 1Gi
@@ -61,6 +61,14 @@ spec:
             provider:
               type: Kubernetes
               kubernetes:
+                # Retain leadership through brief API/etcd stalls without
+                # restarting the controller and abandoning endpoint updates.
+                # Election remains enabled; contenders can claim leadership
+                # 45 seconds after the last acknowledged renewal.
+                leaderElection:
+                  leaseDuration: 45s
+                  renewDeadline: 30s
+                  retryPeriod: 2s
                 rateLimitDeployment:
                   replicas: 3
                   container:
