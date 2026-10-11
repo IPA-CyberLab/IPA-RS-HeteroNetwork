@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise real kubelet leases, Longhorn RWX and Envoy in a disposable kind cluster."""
+"""Exercise real kubelet leases, Longhorn RWX and Envoy in a disposable cluster with KVM storage workers."""
 import json
 import os
 from pathlib import Path
@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import vms
 
 CLUSTER = 'hnn-heartbeat-e2e'
 CONTEXT = 'kind-' + CLUSTER
@@ -135,7 +136,7 @@ def scenario(name, seconds, duration, expect_outage, url):
     monitor_thread.start()
     try:
         # Pause only heartbeats. Application, storage, network and containerd keep running.
-        run(['docker', 'exec', node, 'systemctl', 'stop', 'kubelet'], 30)
+        vms.ssh(node, ['systemctl', 'stop', 'kubelet'], timeout=30)
         started = time.monotonic()
         while time.monotonic() - started < duration:
             actual = get('node', node)
@@ -143,7 +144,7 @@ def scenario(name, seconds, duration, expect_outage, url):
             result['node_states'].append(state)
             time.sleep(2)
     finally:
-        run(['docker', 'exec', node, 'systemctl', 'start', 'kubelet'], 30)
+        vms.ssh(node, ['systemctl', 'start', 'kubelet'], timeout=30)
         stop.set()
         monitor_thread.join(timeout=5)
     if expect_outage:
@@ -174,14 +175,15 @@ def scenario(name, seconds, duration, expect_outage, url):
 def main():
     global MARKER
     assert os.environ.get('GITHUB_ACTIONS') == 'true'
-    assert os.environ.get('HNN_FAULT_E2E') == 'isolated-kind-only'
+    assert os.environ.get('HNN_FAULT_E2E') == 'isolated-vms-only'
     assert os.environ.get('KUBECONFIG') == str(ROOT / 'kubeconfig')
     assert run(['kubectl', 'config', 'current-context']).strip() == CONTEXT
     cluster_nodes = get('nodes')['items']
     assert {n['metadata']['name'] for n in cluster_nodes} == {CP, CLUSTER+'-worker', CLUSTER+'-worker2'}
-    for node in cluster_nodes:
-        inspected = json.loads(run(['docker', 'inspect', node['metadata']['name']]))[0]
-        assert inspected['Config']['Labels']['io.x-k8s.kind.cluster'] == CLUSTER
+    inspected = json.loads(run(['docker', 'inspect', CP]))[0]
+    assert inspected['Config']['Labels']['io.x-k8s.kind.cluster'] == CLUSTER
+    for node in (CLUSTER + '-worker', CLUSTER + '-worker2'):
+        vms.assert_owned(node)
     svc = wait_for('Envoy NodePort', lambda: next((s for s in get('svc', ns='envoy-gateway-system')['items']
                        if s['metadata'].get('labels', {}).get('gateway.envoyproxy.io/owning-gateway-name') == 'fixture'), None), 120)
     node_port = next(p['nodePort'] for p in svc['spec']['ports'] if p.get('port') == 8080)

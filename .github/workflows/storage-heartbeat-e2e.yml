@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      HNN_FAULT_E2E: isolated-kind-only
+      HNN_FAULT_E2E: isolated-vms-only
       KUBECONFIG: /tmp/hnn-heartbeat-e2e/kubeconfig
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -64,6 +64,18 @@ jobs:
           kubectl -n longhorn-system logs -l app=longhorn-manager --all-containers --tail=300 > /tmp/hnn-heartbeat-e2e/results/longhorn.txt 2>&1 || true
           kubectl -n longhorn-system logs -l longhorn.io/component=share-manager --all-containers --tail=150 > /tmp/hnn-heartbeat-e2e/results/share-manager.txt 2>&1 || true
           kubectl -n longhorn-system get volumes.longhorn.io -o yaml > /tmp/hnn-heartbeat-e2e/results/volumes.yaml 2>&1 || true
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts/storage-heartbeat-e2e')
+          import vms
+          if (vms.ROOT / 'vms.json').exists():
+              for node in [vms.CLUSTER + '-worker', vms.CLUSTER + '-worker2']:
+                  try:
+                      logs = vms.ssh(node, ['journalctl', '-u', 'iscsid', '-u', 'kubelet', '--no-pager', '-n', '150'])
+                      (vms.ROOT / 'results' / (node + '.journal.log')).write_bytes(logs)
+                  except Exception:
+                      pass
+          PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -72,4 +84,6 @@ jobs:
           retention-days: 14
       - name: Destroy only this job's cluster
         if: always()
-        run: kind delete cluster --name hnn-heartbeat-e2e
+        run: |
+          python3 scripts/storage-heartbeat-e2e/vms.py destroy
+          kind delete cluster --name hnn-heartbeat-e2e
