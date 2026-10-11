@@ -1,0 +1,103 @@
+- name: Reconcile API server client endpoints without changing etcd membership
+  hosts: master_only:bootstrap:enrollment_issuer
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    hnn_etcd_policy: "{{ lookup('file', hnn_repo_root ~ '/deploy/terraform/master-only/apiserver-etcd-policy.json') | from_json }}"
+  tasks:
+    - name: Require three distinct declared control plane client endpoints
+      ansible.builtin.assert:
+        that:
+          - hnn_etcd_policy.client_backends | length == 3
+          - hnn_etcd_policy.client_backends | unique | length == 3
+          - hnn_etcd_policy.client_backends | difference(hnn_control_planes) | length == 0
+
+    - name: Verify the existing node state retains its protected permissions
+      ansible.builtin.stat:
+        path: /etc/heteronetwork/kubernetes/node.env
+      register: hnn_node_state
+
+    - name: Require an existing secure node configuration
+      ansible.builtin.assert:
+        that:
+          - hnn_node_state.stat.isreg | default(false)
+          - not (hnn_node_state.stat.islnk | default(false))
+          - hnn_node_state.stat.uid == 0
+          - hnn_node_state.stat.mode == '0600'
+
+    - name: Install the verifier for the running API server manifest and readiness
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/verify-apiserver-etcd.py"
+        dest: /opt/heteronetwork/libexec/verify-apiserver-etcd.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Keep the original API manifest for recovery
+      ansible.builtin.copy:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml
+        dest: /etc/heteronetwork/kubernetes/apiserver-before-etcd-policy.yaml
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+        force: false
+
+    - name: Verify each selected member with the API server client certificate
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --connect-timeout
+          - '2'
+          - --max-time
+          - '5'
+          - --cacert
+          - /etc/kubernetes/pki/etcd/ca.crt
+          - --cert
+          - /etc/kubernetes/pki/apiserver-etcd-client.crt
+          - --key
+          - /etc/kubernetes/pki/apiserver-etcd-client.key
+          - "https://{{ item }}:2379/readyz"
+      loop: "{{ hnn_etcd_policy.client_backends }}"
+      register: hnn_etcd_preflight
+      until: hnn_etcd_preflight.rc == 0
+      retries: 3
+      delay: 2
+      changed_when: false
+
+    - name: Reconcile only the API server etcd client arguments
+      ansible.builtin.shell: |
+        set -euo pipefail
+        set -a
+        . /etc/heteronetwork/kubernetes/node.env
+        set +a
+        export HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS="$HNN_DESIRED_APISERVER_ETCD_BACKENDS"
+        flock -w 90 /run/heteronetwork-kubeadm-backend-autopilot.lock \
+          /opt/heteronetwork/libexec/kubeadm-ha-node.sh reconcile-apiserver-etcd
+      args:
+        executable: /bin/bash
+      environment:
+        HNN_DESIRED_APISERVER_ETCD_BACKENDS: "{{ hnn_etcd_policy.client_backends | join(',') }}"
+
+    - name: Wait for the new API server Pod to be ready before continuing
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /opt/heteronetwork/libexec/verify-apiserver-etcd.py
+          - --node
+          - "{{ inventory_hostname }}"
+          - --endpoint
+          - "https://{{ vpn_ip }}:6443"
+          - --backends
+          - "{{ hnn_etcd_policy.client_backends | join(',') }}"
+      register: hnn_api_verified
+      changed_when: false
+      until: hnn_api_verified.rc == 0
+      retries: 45
+      delay: 3
