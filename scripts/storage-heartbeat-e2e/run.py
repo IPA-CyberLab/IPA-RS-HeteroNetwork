@@ -14,7 +14,7 @@ CONTEXT = 'kind-' + CLUSTER
 CP = CLUSTER + '-control-plane'
 ROOT = Path('/tmp/hnn-heartbeat-e2e')
 REPORT = {'scenarios': [], 'result': 'failed'}
-MARKER = b'heartbeat-e2e-persistent-home-v1'
+MARKER = None
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -86,7 +86,8 @@ def probe(url):
     try:
         with OPENER.open(url, timeout=3) as response:
             status = response.status
-            matches = response.read(4096) == MARKER
+            body = response.read(4096)
+            matches = body == MARKER if MARKER is not None else body.startswith(b'heartbeat-e2e-')
     except urllib.error.HTTPError as error:
         status, matches = error.code, False
     except (OSError, urllib.error.URLError):
@@ -171,6 +172,7 @@ def scenario(name, seconds, duration, expect_outage, url):
 
 
 def main():
+    global MARKER
     assert os.environ.get('GITHUB_ACTIONS') == 'true'
     assert os.environ.get('HNN_FAULT_E2E') == 'isolated-kind-only'
     assert os.environ.get('KUBECONFIG') == str(ROOT / 'kubeconfig')
@@ -187,6 +189,10 @@ def main():
     address = inspected['NetworkSettings']['Networks']['kind']['IPAddress']
     url = f'http://{address}:{node_port}/'
     wait_for('initial Envoy HTTP response', lambda: probe(url)['data_preserved'], 180)
+    with OPENER.open(url, timeout=3) as response:
+        MARKER = response.read(4096)
+    # A recreated empty filesystem must not be mistaken for retained user data.
+    assert len(MARKER) == len(b'heartbeat-e2e-') + 32
     seconds = json.loads(Path('deploy/terraform/master-only/node-health-policy.json').read_text())['node_monitor_grace_seconds']
     assert seconds >= 50
     scenario('fixed_policy_brief_heartbeat_loss', seconds, 35, False, url)

@@ -53,6 +53,8 @@ jobs:
           kubectl get nodes,pods -A -o wide > /tmp/hnn-heartbeat-e2e/results/workloads.txt 2>&1 || true
           kubectl get events -A --sort-by=.lastTimestamp > /tmp/hnn-heartbeat-e2e/results/events.txt 2>&1 || true
           kubectl -n longhorn-system logs -l app=longhorn-manager --all-containers --tail=300 > /tmp/hnn-heartbeat-e2e/results/longhorn.txt 2>&1 || true
+          kubectl -n longhorn-system logs -l longhorn.io/component=share-manager --all-containers --tail=150 > /tmp/hnn-heartbeat-e2e/results/share-manager.txt 2>&1 || true
+          kubectl -n longhorn-system get volumes.longhorn.io -o yaml > /tmp/hnn-heartbeat-e2e/results/volumes.yaml 2>&1 || true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

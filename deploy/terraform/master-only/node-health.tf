@@ -3,7 +3,8 @@ resource "terraform_data" "node_health_policy" {
   triggers_replace = [
     filesha256("${path.module}/node-health-policy.json"),
     filesha256("${path.module}/ansible/node-health.yaml"),
-    filesha256("${local.repo_root}/scripts/reconcile-node-health.py")
+    filesha256("${local.repo_root}/scripts/reconcile-node-health.py"),
+    filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")
   ]
   provisioner "local-exec" {
     working_dir = abspath(path.module)

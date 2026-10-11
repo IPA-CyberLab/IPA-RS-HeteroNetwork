@@ -22,12 +22,12 @@ metadata:
   namespace: heartbeat-e2e
 data:
   server.py: |
-    import http.server, os
+    import http.server, os, uuid
     from pathlib import Path
     marker = Path('/data/marker')
     if not marker.exists():
         with marker.open('w') as f:
-            f.write('heartbeat-e2e-persistent-home-v1')
+            f.write('heartbeat-e2e-' + uuid.uuid4().hex)
             f.flush()
             os.fsync(f.fileno())
     class Handler(http.server.BaseHTTPRequestHandler):

@@ -15,6 +15,9 @@ def files():
     paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/postgres-ha-autopilot.sh','scripts/master-only-iac.py',
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/test_verify_standard_node.py',
            'scripts/publish-master-only.py',
+           'scripts/reconcile-node-health.py','scripts/test_reconcile_node_health.py',
+           'scripts/verify-apiserver-etcd.py','scripts/test_verify_apiserver_etcd.py',
+           '.github/workflows/storage-heartbeat-e2e.yml',
            'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',
            'scripts/heteronetwork-console-e2e.sh','scripts/heteronetwork-console-browser-e2e.mjs',
            'scripts/verify-overlay-client-console.py','scripts/test_verify_overlay_client_console.py',
@@ -39,10 +42,10 @@ def files():
               'deploy/gitops/cluster-dns/postgres-ha-connector.yaml','deploy/gitops/cluster-dns/service-route.yaml',
               'deploy/gitops/network-policy-engine/kube-router.yaml','deploy/gitops/longhorn-prerequisites/node-prerequisites.yaml',
               'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml']
-    for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns']:
+    for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns','scripts/storage-heartbeat-e2e']:
         for p in (ROOT/directory).rglob('*'):
             if not p.is_file() or '.terraform' in p.parts or '__pycache__' in p.parts: continue
-            if p.suffix in ['.tf','.py','.yaml','.j2','.json','.md','.cfg'] or p.name=='.terraform.lock.hcl':
+            if p.suffix in ['.tf','.py','.yaml','.j2','.json','.md','.cfg','.sh'] or p.name=='.terraform.lock.hcl':
                 paths.append(str(p.relative_to(ROOT)))
     return sorted(set(paths))
 

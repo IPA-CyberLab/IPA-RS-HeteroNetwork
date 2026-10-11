@@ -17,6 +17,14 @@
     - name: Apply the policy only to existing control planes
       when: hnn_controller_manifest.stat.exists
       block:
+        - name: Keep future node initialization and verification on the same policy
+          ansible.builtin.copy:
+            src: "{{ hnn_repo_root }}/scripts/kubeadm-ha-node.sh"
+            dest: /opt/heteronetwork/libexec/kubeadm-ha-node.sh
+            owner: root
+            group: root
+            mode: '0755'
+
         - name: Install the narrowly scoped policy reconciler
           ansible.builtin.copy:
             src: "{{ hnn_repo_root }}/scripts/reconcile-node-health.py"

@@ -8,8 +8,8 @@ sudo apt-get update -qq
 sudo apt-get install -y open-iscsi nfs-common
 sudo modprobe iscsi_tcp
 sudo modprobe nfs
-curl --fail --location --silent --show-error https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64 -o /tmp/hnn-heartbeat-e2e/kind
-curl --fail --location --silent --show-error https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum -o /tmp/hnn-heartbeat-e2e/kind.sha256sum
+curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 --retry 2 https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64 -o /tmp/hnn-heartbeat-e2e/kind
+curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 --retry 2 https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum -o /tmp/hnn-heartbeat-e2e/kind.sha256sum
 python3 - <<'PY'
 from pathlib import Path
 import hashlib
@@ -47,6 +47,11 @@ for app in ['longhorn', 'envoy-gateway']:
     else:
         values['deployment']['replicas'] = 1
         values['podDisruptionBudget'] = {'minAvailable':0}
+        gateway = values['config']['envoyGateway']
+        # This fixture has no rate-limit policy or Redis dependency.
+        gateway.pop('rateLimit', None)
+        gateway['provider']['kubernetes'].pop('rateLimitDeployment', None)
+        gateway['provider']['kubernetes'].pop('rateLimitPDB', None)
     Path(f'/tmp/hnn-heartbeat-e2e/{app}.yaml').write_text(yaml.safe_dump(values))
     Path(f'/tmp/hnn-heartbeat-e2e/{app}.version').write_text(manifest['spec']['source']['targetRevision'])
 PY
@@ -54,7 +59,7 @@ kind create cluster --name hnn-heartbeat-e2e --wait 180s \
   --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed \
   --config /tmp/hnn-heartbeat-e2e/kind.yaml
 for node in hnn-heartbeat-e2e-worker hnn-heartbeat-e2e-worker2; do
-  docker exec "$node" bash -ec 'apt-get update -qq; apt-get install -y open-iscsi nfs-common; systemctl enable --now iscsid'
+  docker exec "$node" bash -ec 'apt-get update -qq; apt-get install -y open-iscsi nfs-common; mkdir -p /run/lock/iscsi; systemctl enable --now iscsid'
 done
 helm repo add longhorn https://charts.longhorn.io
 helm upgrade --install longhorn longhorn/longhorn --version "$(cat /tmp/hnn-heartbeat-e2e/longhorn.version)" \
@@ -64,5 +69,5 @@ helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
   --namespace envoy-gateway-system --create-namespace --values /tmp/hnn-heartbeat-e2e/envoy-gateway.yaml --wait --timeout 5m
 kubectl wait --for=condition=Ready node --all --timeout=120s
 kubectl apply -f scripts/storage-heartbeat-e2e/fixture.yaml
-kubectl -n heartbeat-e2e rollout status deployment/persistent-web --timeout=600s
+kubectl -n heartbeat-e2e rollout status deployment/persistent-web --timeout=300s
 kubectl -n heartbeat-e2e wait --for=condition=Programmed gateway/fixture --timeout=180s
