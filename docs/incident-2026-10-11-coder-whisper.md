@@ -1,6 +1,6 @@
 # 2026-10-11 Coder / Whisper 障害
 
-時刻はすべて UTC。状態: サービス復旧を確認、障害再現 E2E を検証中。
+時刻はすべて UTC。状態: サービス復旧、基盤修正の適用、障害再現 E2E の合格を確認。
 
 ## 影響
 
@@ -59,6 +59,8 @@ etcd には slow fdatasync と heartbeat 遅延の記録がある。さらに、
 | 16:54 | etcd の既存 6 メンバーすべてで HA 設定と正常応答を確認 |
 | 16:56 | 全 9 アプリ Pod の UID を維持。Chromium で HyperEVM の IDE 表示を再確認（200、4.23 秒） |
 | 17:42–17:43 | 復旧後の 9 Pod は同じ UID / 再起動 0 / Ready。Coder・Whisper は 200。HyperEVM の最終切断時刻は 16:26 のまま、接続更新を継続 |
+| 17:51 | HyperEVM の code-server / filebrowser の両方が healthy。障害注入の 3 シナリオが成功 |
+| 17:52 | 証跡回収とテスト用クラスタ削除を含む E2E ジョブの成功を確認 |
 
 ## 再発防止 E2E
 
@@ -72,7 +74,15 @@ etcd には slow fdatasync と heartbeat 遅延の記録がある。さらに、
 
 初期の Docker ワーカー構成では、テスト環境の iSCSI netlink 通信が失敗し、共有ディスクの準備に失敗した。3 回の試行は合格としていない。iSCSI に独立したカーネルを与えるため、ワーカーを KVM VM に変更した。続く VM 準備では名前解決、CRI の起動待ち、Docker 専用 cgroup 設定の引き継ぎを修正した。これらの失敗・中止も合格数に含めず、各実行の結論を JSON に残す。
 
-17:44 時点では [再実行 38160730945](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/38160730945) が環境構築中であり、障害再現テストの合格は未確認。通常の VPN＋Chromium E2E は [38157484921](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/38157484921) で成功した。
+[障害再現 E2E 38160730945](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/38160730945) は成功した。通常の VPN＋Chromium E2E も [38157484921](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/38157484921) で成功した。
+
+| 試験 | 注入 | 実測 | 復旧 / データ |
+| --- | --- | --- | --- |
+| 修正後 60 秒 | ハートビート 35 秒停止 | 74/74 が HTTP 200、Node Ready 維持 | Pod / share-manager の UID・再起動回数を維持、データ一致 |
+| 旧設定 20 秒 | ハートビート 35 秒停止 | 503 が 13 件、通信失敗が 3 件、Node Unknown | share-manager を再作成し自動復旧、同じ PVC / データ |
+| 修正後 60 秒の継続故障 | ハートビート 95 秒停止 | 503 が 14 件、通信失敗が 2 件、Node Unknown | share-manager を再作成し自動復旧、同じ PVC / データ |
+
+この CI 実行ではアプリケーション Pod は UID を維持して回復した。したがって、共有ディスク切替と 503 の経路を再現した結果であり、本番で発生したアプリ Pod 削除までを再現したとは扱わない。テスト用 VM とクラスタの削除も成功した。
 
 VM 参加のタイムアウト例外に、この CI だけの一時 bootstrap token が出た試行のログは GitHub から削除した。以後はタイムアウト例外から引数を除外し、失敗ログのマスクと回帰テストを追加した。本番の認証情報を使うジョブではない。
 
