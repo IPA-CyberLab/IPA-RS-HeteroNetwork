@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shlex
 import subprocess
@@ -22,7 +23,9 @@ def run(command, timeout=30, data=None):
     p = subprocess.run(command, input=data, capture_output=True, timeout=timeout)
     if p.returncode:
         # Never include a bootstrap token, SSH key or kubeconfig in error output.
-        raise RuntimeError('VM operation failed: ' + command[0] + ' (exit ' + str(p.returncode) + ')')
+        detail = re.sub(r'\b[a-z0-9]{6}\.[a-z0-9]{16}\b', '[bootstrap token]',
+                        p.stderr.decode(errors='replace')[-1800:])
+        raise RuntimeError('VM operation failed: ' + command[0] + ' (exit ' + str(p.returncode) + '): ' + detail)
     return p.stdout
 
 
@@ -54,6 +57,11 @@ def wait_for_ssh(node):
 def bootstrap(node):
     wait_for_ssh(node)
     ssh(node, ['cloud-init', 'status', '--wait'], timeout=360)
+    control_plane = json.loads(run(['docker', 'inspect', CP]))[0]
+    address = str(ipaddress.ip_address(control_plane['NetworkSettings']['Networks']['kind']['IPAddress']))
+    # kubeadm's cluster-info uses the Docker node hostname. Native VMs do not use
+    # Docker's embedded DNS, so keep that same endpoint resolvable inside each VM.
+    ssh(node, ['sh', '-c', 'cat >> /etc/hosts'], data=(address + ' ' + CP + '\n').encode())
     payload = (ROOT / 'worker-binaries.tar.gz').read_bytes()
     ssh(node, ['tar', '-xzf', '-', '-C', '/'], timeout=90, data=payload)
     setup = r'''set -eu
