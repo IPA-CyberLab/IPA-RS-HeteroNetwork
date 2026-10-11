@@ -1706,8 +1706,9 @@ reconcile_etcd_resources() {
   [[ -f "$manifest" && ! -L "$manifest" ]] \
     || die "etcd static Pod manifest is missing or is a symlink"
 
-  local temporary mode
-  temporary="$(mktemp)"
+  local temporary mode changed=false
+  # Stage beside, never inside, the watched manifests directory and atomically replace.
+  temporary="$(mktemp /etc/kubernetes/etcd-policy.XXXXXX)"
   if ! awk \
     -v heartbeat="$ETCD_HEARTBEAT_INTERVAL_MILLISECONDS" \
     -v election="$ETCD_ELECTION_TIMEOUT_MILLISECONDS" \
@@ -1764,10 +1765,17 @@ reconcile_etcd_resources() {
   fi
   if ! cmp -s "$temporary" "$manifest"; then
     mode="$(stat -c '%a' "$manifest")"
-    install -o root -g root -m "$mode" "$temporary" "$manifest"
+    install -d -o root -g root -m 0700 /etc/heteronetwork/kubernetes
+    if [[ ! -e /etc/heteronetwork/kubernetes/etcd-before-ha-policy.yaml ]]; then
+      install -o root -g root -m 0600 "$manifest" /etc/heteronetwork/kubernetes/etcd-before-ha-policy.yaml
+    fi
+    chmod "$mode" "$temporary"
+    chown root:root "$temporary"
+    mv -f -- "$temporary" "$manifest"
+    changed=true
   fi
   rm -f "$temporary"
-  printf 'etcd resource reservations reconciled on %s\n' "$node_name"
+  printf 'etcd resource reservations reconciled on %s changed=%s\n' "$node_name" "$changed"
 }
 
 configure_local_state() {

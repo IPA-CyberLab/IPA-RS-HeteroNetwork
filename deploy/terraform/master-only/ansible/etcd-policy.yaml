@@ -1,0 +1,80 @@
+- name: Align existing etcd voters without restarting application runtimes
+  hosts: master_only:bootstrap:enrollment_issuer:standard
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Detect an existing etcd member without adding members
+      ansible.builtin.stat:
+        path: /etc/kubernetes/manifests/etcd.yaml
+      register: hnn_etcd_manifest
+
+    - name: Reconcile only existing etcd members
+      when: hnn_etcd_manifest.stat.exists
+      block:
+        - name: Install the scoped helpers
+          ansible.builtin.copy:
+            src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+            dest: "/opt/heteronetwork/libexec/{{ item }}"
+            owner: root
+            group: root
+            mode: '0755'
+          loop: [kubeadm-ha-node.sh, verify-etcd-policy.py]
+
+        - name: Require every voter healthy and move local leadership before changing it
+          ansible.builtin.command:
+            argv: [python3, /opt/heteronetwork/libexec/verify-etcd-policy.py, prepare, --node, "{{ inventory_hostname }}"]
+          register: hnn_etcd_preflight
+          changed_when: false
+          until: hnn_etcd_preflight.rc == 0
+          retries: 5
+          delay: 3
+
+        - name: Read persisted kubeadm configuration
+          ansible.builtin.command:
+            argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, --request-timeout=10s, -n, kube-system, get, cm, kubeadm-config, -o, json]
+          register: hnn_kubeadm_cm
+          changed_when: false
+
+        - name: Preserve unrelated kubeadm and etcd settings
+          ansible.builtin.set_fact:
+            hnn_kubeadm_old: "{{ (hnn_kubeadm_cm.stdout | from_json).data.ClusterConfiguration | from_yaml }}"
+
+        - name: Calculate the timing policy for future joins and upgrades
+          ansible.builtin.set_fact:
+            hnn_etcd_extra_args: "{{ hnn_kubeadm_old.etcd.local.extraArgs | default([]) | rejectattr('name', 'in', ['heartbeat-interval', 'election-timeout']) | list + [{'name': 'heartbeat-interval', 'value': '500'}, {'name': 'election-timeout', 'value': '5000'}] }}"
+
+        - name: Persist timings without overwriting a concurrent configuration change
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - --request-timeout=10s
+              - -n
+              - kube-system
+              - patch
+              - cm
+              - kubeadm-config
+              - --type=merge
+              - -p
+              - "{{ {'metadata': {'resourceVersion': (hnn_kubeadm_cm.stdout | from_json).metadata.resourceVersion}, 'data': {'ClusterConfiguration': (hnn_kubeadm_old | combine({'etcd': {'local': {'extraArgs': hnn_etcd_extra_args}}}, recursive=true) | to_nice_yaml)}} | to_json }}"
+          when: hnn_kubeadm_old.etcd.local.extraArgs | default([]) != hnn_etcd_extra_args
+
+        - name: Apply only the local etcd manifest policy
+          ansible.builtin.command:
+            argv: [bash, /opt/heteronetwork/libexec/kubeadm-ha-node.sh, reconcile-etcd-resources]
+          register: hnn_etcd_reconcile
+          changed_when: "'changed=true' in hnn_etcd_reconcile.stdout"
+
+        - name: Require new arguments and every voter healthy before proceeding
+          ansible.builtin.command:
+            argv: [python3, /opt/heteronetwork/libexec/verify-etcd-policy.py, verify, --node, "{{ inventory_hostname }}"]
+          register: hnn_etcd_ready
+          changed_when: false
+          until: hnn_etcd_ready.rc == 0
+          retries: 40
+          delay: 3

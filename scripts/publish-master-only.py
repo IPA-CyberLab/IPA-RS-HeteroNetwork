@@ -16,6 +16,7 @@ def files():
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/test_verify_standard_node.py',
            'scripts/publish-master-only.py',
            'scripts/reconcile-node-health.py','scripts/test_reconcile_node_health.py',
+           'scripts/verify-etcd-policy.py','scripts/test_verify_etcd_policy.py',
            'scripts/verify-apiserver-etcd.py','scripts/test_verify_apiserver_etcd.py',
            '.github/workflows/storage-heartbeat-e2e.yml',
            'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',

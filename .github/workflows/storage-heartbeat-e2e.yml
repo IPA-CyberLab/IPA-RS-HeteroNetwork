@@ -5,6 +5,10 @@ on:
   push:
     paths:
       - 'scripts/kubeadm-ha-node.sh'
+      - 'scripts/verify-etcd-policy.py'
+      - 'scripts/test_verify_etcd_policy.py'
+      - 'deploy/terraform/master-only/etcd-policy.tf'
+      - 'deploy/terraform/master-only/ansible/etcd-policy.yaml'
       - 'scripts/reconcile-node-health.py'
       - 'scripts/test_reconcile_node_health.py'
       - 'scripts/storage-heartbeat-e2e/**'
@@ -16,6 +20,10 @@ on:
   pull_request:
     paths:
       - 'scripts/kubeadm-ha-node.sh'
+      - 'scripts/verify-etcd-policy.py'
+      - 'scripts/test_verify_etcd_policy.py'
+      - 'deploy/terraform/master-only/etcd-policy.tf'
+      - 'deploy/terraform/master-only/ansible/etcd-policy.yaml'
       - 'scripts/reconcile-node-health.py'
       - 'scripts/test_reconcile_node_health.py'
       - 'scripts/storage-heartbeat-e2e/**'
@@ -43,6 +51,7 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
           python3 -B -m unittest discover -s scripts -p test_reconcile_node_health.py -v
+          python3 -B -m unittest discover -s scripts -p test_verify_etcd_policy.py -v
           bash scripts/storage-heartbeat-e2e/setup.sh
       - name: Reproduce the outage and verify the repaired policy
         run: python3 scripts/storage-heartbeat-e2e/run.py

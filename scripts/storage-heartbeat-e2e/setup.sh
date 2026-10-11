@@ -59,7 +59,21 @@ kind create cluster --name hnn-heartbeat-e2e --wait 180s \
   --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed \
   --config /tmp/hnn-heartbeat-e2e/kind.yaml
 for node in hnn-heartbeat-e2e-worker hnn-heartbeat-e2e-worker2; do
-  docker exec "$node" bash -ec 'apt-get update -qq; apt-get install -y open-iscsi nfs-common; mkdir -p /run/lock/iscsi; systemctl enable --now iscsid'
+  docker exec "$node" bash -ec '
+    apt-get update -qq
+    apt-get install -y open-iscsi nfs-common
+    mkdir -p /run/lock/iscsi
+    printf "InitiatorName=%s\n" "$(iscsi-iname)" > /etc/iscsi/initiatorname.iscsi
+    systemctl enable iscsid
+    systemctl restart iscsid
+    systemctl is-active --quiet iscsid
+    pgrep -a iscsid
+    ss -xlpn
+    journalctl -u iscsid --no-pager -n 30
+  ' > "/tmp/hnn-heartbeat-e2e/results/$node-iscsi.txt" 2>&1 || {
+    cat "/tmp/hnn-heartbeat-e2e/results/$node-iscsi.txt"
+    exit 1
+  }
 done
 helm repo add longhorn https://charts.longhorn.io
 helm upgrade --install longhorn longhorn/longhorn --version "$(cat /tmp/hnn-heartbeat-e2e/longhorn.version)" \
@@ -69,5 +83,17 @@ helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
   --namespace envoy-gateway-system --create-namespace --values /tmp/hnn-heartbeat-e2e/envoy-gateway.yaml --wait --timeout 5m
 kubectl wait --for=condition=Ready node --all --timeout=120s
 kubectl apply -f scripts/storage-heartbeat-e2e/fixture.yaml
+# Keep diagnostics while a failed share manager is still present.
+(
+  for attempt in $(seq 1 30); do
+    kubectl -n longhorn-system logs -l longhorn.io/component=share-manager --all-containers --tail=60 >> /tmp/hnn-heartbeat-e2e/results/share-manager-history.txt 2>&1 || true
+    for node in hnn-heartbeat-e2e-worker hnn-heartbeat-e2e-worker2; do
+      docker exec "$node" journalctl -u iscsid --no-pager -n 20 >> "/tmp/hnn-heartbeat-e2e/results/$node-iscsi.txt" 2>&1 || true
+    done
+    sleep 10
+  done
+) &
+diagnostics_pid=$!
+trap 'kill "$diagnostics_pid" 2>/dev/null || true' EXIT
 kubectl -n heartbeat-e2e rollout status deployment/persistent-web --timeout=300s
 kubectl -n heartbeat-e2e wait --for=condition=Programmed gateway/fixture --timeout=180s
