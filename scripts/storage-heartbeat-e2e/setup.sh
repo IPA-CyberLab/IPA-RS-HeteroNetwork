@@ -53,6 +53,9 @@ PY
 kind create cluster --name hnn-heartbeat-e2e --wait 180s \
   --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed \
   --config /tmp/hnn-heartbeat-e2e/kind.yaml
+# kind initially sees a single-node cluster and makes its control plane schedulable.
+# Storage must run only in the native VM kernels; Envoy explicitly tolerates this taint.
+kubectl taint node hnn-heartbeat-e2e-control-plane node-role.kubernetes.io/control-plane=:NoSchedule --overwrite
 python3 scripts/storage-heartbeat-e2e/vms.py create
 helm repo add longhorn https://charts.longhorn.io
 helm upgrade --install longhorn longhorn/longhorn --version "$(cat /tmp/hnn-heartbeat-e2e/longhorn.version)" \
