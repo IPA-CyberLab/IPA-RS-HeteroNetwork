@@ -14,6 +14,9 @@ on:
       - 'scripts/test_verify_gvisor_worker.py'
       - 'deploy/gitops/applications/custom-domains.yaml'
       - 'deploy/gitops/applications/cert-manager.yaml'
+      - 'deploy/gitops/applications/envoy-gateway.yaml'
+      - 'scripts/configure_gateway_rollout.py'
+      - 'scripts/normalize_application_helm_values.py'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'scripts/verify-public-dns-quorum.py'
@@ -53,6 +56,9 @@ on:
       - 'scripts/test_verify_gvisor_worker.py'
       - 'deploy/gitops/applications/custom-domains.yaml'
       - 'deploy/gitops/applications/cert-manager.yaml'
+      - 'deploy/gitops/applications/envoy-gateway.yaml'
+      - 'scripts/configure_gateway_rollout.py'
+      - 'scripts/normalize_application_helm_values.py'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'scripts/verify-public-dns-quorum.py'
@@ -113,6 +119,7 @@ jobs:
           node --check scripts/verify-console-gateways.mjs
           node --check scripts/heteronetwork-console-browser-e2e.mjs
           python3 -m py_compile scripts/verify-gvisor-worker.py
+          python3 -m py_compile scripts/configure_gateway_rollout.py scripts/normalize_application_helm_values.py
           python3 -m py_compile scripts/accept-registered-nodes.py scripts/verify-overlay-client-console.py scripts/reconcile-console-e2e-user.py scripts/verify-master-only.py scripts/verify-standard-node.py scripts/verify-gpu-runtime.py scripts/gpu_inventory.py scripts/verify_gpu_inventory.py scripts/verify_flash_crds.py deploy/gitops/cluster-dns/overlay-dns-service-discovery.py
 
   live-overlay-browser-e2e:
