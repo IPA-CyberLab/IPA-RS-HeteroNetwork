@@ -52,6 +52,7 @@ jobs:
           python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
           python3 -B -m unittest discover -s scripts -p test_reconcile_node_health.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_etcd_policy.py -v
+          python3 -B -m unittest discover -s scripts/storage-heartbeat-e2e -p 'test_*.py' -v
           bash scripts/storage-heartbeat-e2e/setup.sh
       - name: Reproduce the outage and verify the repaired policy
         run: python3 scripts/storage-heartbeat-e2e/run.py
@@ -71,7 +72,7 @@ jobs:
           if (vms.ROOT / 'vms.json').exists():
               for node in [vms.CLUSTER + '-worker', vms.CLUSTER + '-worker2']:
                   try:
-                      logs = vms.ssh(node, ['journalctl', '-u', 'iscsid', '-u', 'kubelet', '--no-pager', '-n', '150'])
+                      logs = vms.ssh(node, ['journalctl', '-u', 'iscsid', '-u', 'kubelet', '-u', 'containerd', '--no-pager', '-n', '150'])
                       (vms.ROOT / 'results' / (node + '.journal.log')).write_bytes(logs)
                   except Exception:
                       pass

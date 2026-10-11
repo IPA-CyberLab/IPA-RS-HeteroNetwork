@@ -103,8 +103,16 @@ sysctl -w net.ipv4.ip_forward=1 net.bridge.bridge-nf-call-iptables=1
 swapoff -a
 systemctl daemon-reload
 systemctl enable --now containerd kubelet iscsid
+for attempt in $(seq 1 40); do
+  if /usr/local/bin/crictl --runtime-endpoint unix:///run/containerd/containerd.sock info >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 1
+done
+journalctl -u containerd --no-pager -n 60 >&2
+exit 1
 '''
-    ssh(node, ['bash', '-se'], timeout=60, data=setup.encode())
+    ssh(node, ['bash', '-se'], timeout=90, data=setup.encode())
     join = run(['docker', 'exec', CP, 'kubeadm', 'token', 'create', '--ttl=30m', '--print-join-command']).decode().strip()
     token = shlex.split(join)[shlex.split(join).index('--token') + 1]
     print('::add-mask::' + token, flush=True)
@@ -132,7 +140,7 @@ def create():
     assert hashlib.sha256(image.read_bytes()).hexdigest() == digest
     (ROOT / 'results' / 'vm-image.json').write_text(json.dumps({'image': base, 'sha256': digest}))
     # Reuse the exact Kubernetes, containerd, runc and CNI binaries from the pinned kind image.
-    binaries = ['usr/local/bin/containerd', 'usr/local/bin/containerd-shim-runc-v2', 'usr/local/bin/ctr',
+    binaries = ['usr/local/bin/containerd', 'usr/local/bin/containerd-shim-runc-v2', 'usr/local/bin/ctr', 'usr/local/bin/crictl',
                 'usr/local/sbin/runc', 'usr/bin/kubelet', 'usr/bin/kubeadm', 'opt/cni/bin']
     (ROOT / 'worker-binaries.tar.gz').write_bytes(run(['docker', 'exec', CP, 'tar', '-czf', '-', '-C', '/', *binaries], timeout=60))
     nodes = {CLUSTER + '-' + suffix: {'ip': str(subnet.network_address + 200 + i), 'nonce': secrets.token_hex(16),
