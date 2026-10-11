@@ -71,10 +71,19 @@ def documents():
             "rootfs_storage_gib": {
                 "type": "integer", "minimum": 1, "maximum": 1_000_000, "nullable": True,
             },
+            "persistent_storage_gib": {
+                "type": "integer", "minimum": 1, "maximum": 1_000_000, "nullable": True,
+            },
         }}},
     })
     service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"] = {
-        "properties": {"stopped": {"type": "boolean", "default": False}},
+        "properties": {
+            "stopped": {"type": "boolean", "default": False},
+            "rootfs_storage_bytes": {"type": "integer"},
+            "persistent_storage_bytes": {"type": "integer"},
+            "persistent_storage_capacity_bytes": {"type": "integer"},
+            "storage_resize_pending": {"type": "boolean"},
+        },
     }
     return application, device, job, service
 
@@ -105,6 +114,15 @@ class VerifyFlashCrdsTests(unittest.TestCase):
         del workload["properties"]["rootfs_storage_gib"]
         with self.assertRaisesRegex(RuntimeError, "writable disk"):
             verify.validate(application, device, job, service)
+
+    def test_rejects_schema_that_would_prune_persistent_size_or_resize_status(self):
+        for field in ("persistent_storage_gib", "persistent_storage_bytes", "storage_resize_pending"):
+            application, device, job, service = documents()
+            properties = service["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            target = properties["spec"]["properties"]["workload"]["properties"] if field == "persistent_storage_gib" else properties["status"]["properties"]
+            del target[field]
+            with self.assertRaises(RuntimeError):
+                verify.validate(application, device, job, service)
 
     def test_rejects_unbounded_or_non_uuid_assignments(self):
         application, device, job, service = documents()

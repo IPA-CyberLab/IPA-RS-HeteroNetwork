@@ -134,11 +134,22 @@ def validate(application: dict, device: dict, job: dict, service: dict) -> dict[
             or rootfs.get("maximum") != 1_000_000 or rootfs.get("nullable") is not True
             or "rootfs_storage_gib" in workload_schema.get("required", [])):
         raise RuntimeError(f"{SERVICE_CRD} does not support optional bounded writable disk allocation")
+    persistent = workload.get("persistent_storage_gib", {})
+    if (persistent.get("type") != "integer" or persistent.get("minimum") != 1
+            or persistent.get("maximum") != 1_000_000 or persistent.get("nullable") is not True
+            or "persistent_storage_gib" in workload_schema.get("required", [])):
+        raise RuntimeError(f"{SERVICE_CRD} does not preserve optional bounded persistent disk allocation")
 
     stopped = workload.get("stopped", {})
     versions = service["spec"]["versions"]
     schema = next(version["schema"]["openAPIV3Schema"] for version in versions if version["name"] == VERSION)
     observed_stop = schema.get("properties", {}).get("status", {}).get("properties", {}).get("stopped", {})
+    observed_storage = schema.get("properties", {}).get("status", {}).get("properties", {})
+    for name in ("rootfs_storage_bytes", "persistent_storage_bytes", "persistent_storage_capacity_bytes"):
+        if observed_storage.get(name, {}).get("type") != "integer":
+            raise RuntimeError(f"{SERVICE_CRD} does not preserve {name}")
+    if observed_storage.get("storage_resize_pending", {}).get("type") != "boolean":
+        raise RuntimeError(f"{SERVICE_CRD} does not preserve disk resize progress")
     for field in (stopped, observed_stop):
         if field.get("type") != "boolean" or field.get("default") is not False or field.get("nullable") is True:
             raise RuntimeError(f"{SERVICE_CRD} does not preserve the explicit stop contract with a running default")
@@ -150,7 +161,8 @@ def validate(application: dict, device: dict, job: dict, service: dict) -> dict[
         DEVICE_CRD: {"established": True, "assignment_contract": True},
         JOB_CRD: {"established": True, "gpu_type_contract": True, "max_gpus": 1},
         SERVICE_CRD: {"established": True, "secret_env_contract": True, "legacy_secret_contract": True,
-                      "rootfs_storage_contract": True, "explicit_stop_contract": True},
+                      "rootfs_storage_contract": True, "persistent_storage_contract": True,
+                      "storage_resize_status_contract": True, "explicit_stop_contract": True},
     }
 
 
