@@ -88,11 +88,17 @@ cat > /etc/systemd/system/kubelet.service <<'UNIT'
 [Unit]
 After=containerd.service
 Requires=containerd.service
+ConditionPathExists=/var/lib/kubelet/config.yaml
 [Service]
 EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
 ExecStart=/usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml --resolv-conf=/run/systemd/resolve/resolv.conf $KUBELET_KUBEADM_ARGS
 Restart=always
 RestartSec=5
+# Match the kubeletCgroups setting supplied by the pinned kind control plane.
+Slice=kubelet.slice
+CPUAccounting=true
+MemoryAccounting=true
+KillMode=process
 [Install]
 WantedBy=multi-user.target
 UNIT
