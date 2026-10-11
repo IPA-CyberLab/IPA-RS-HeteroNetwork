@@ -1,0 +1,64 @@
+name: Storage heartbeat fault E2E
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/kubeadm-ha-node.sh'
+      - 'scripts/reconcile-node-health.py'
+      - 'scripts/test_reconcile_node_health.py'
+      - 'scripts/storage-heartbeat-e2e/**'
+      - 'deploy/terraform/master-only/node-health*'
+      - 'deploy/terraform/master-only/ansible/node-health.yaml'
+      - 'deploy/gitops/applications/longhorn.yaml'
+      - 'deploy/gitops/applications/envoy-gateway.yaml'
+      - '.github/workflows/storage-heartbeat-e2e.yml'
+  pull_request:
+    paths:
+      - 'scripts/kubeadm-ha-node.sh'
+      - 'scripts/reconcile-node-health.py'
+      - 'scripts/test_reconcile_node_health.py'
+      - 'scripts/storage-heartbeat-e2e/**'
+      - 'deploy/terraform/master-only/node-health*'
+      - 'deploy/terraform/master-only/ansible/node-health.yaml'
+      - 'deploy/gitops/applications/longhorn.yaml'
+      - 'deploy/gitops/applications/envoy-gateway.yaml'
+      - '.github/workflows/storage-heartbeat-e2e.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  heartbeat-storage-gateway:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      HNN_FAULT_E2E: isolated-kind-only
+      KUBECONFIG: /tmp/hnn-heartbeat-e2e/kubeconfig
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Check policy reconciliation and create isolated cluster
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+          python3 -B -m unittest discover -s scripts -p test_reconcile_node_health.py -v
+          bash scripts/storage-heartbeat-e2e/setup.sh
+      - name: Reproduce the outage and verify the repaired policy
+        run: python3 scripts/storage-heartbeat-e2e/run.py
+      - name: Collect non-secret diagnostics
+        if: always()
+        run: |
+          mkdir -p /tmp/hnn-heartbeat-e2e/results
+          kubectl get nodes,pods -A -o wide > /tmp/hnn-heartbeat-e2e/results/workloads.txt 2>&1 || true
+          kubectl get events -A --sort-by=.lastTimestamp > /tmp/hnn-heartbeat-e2e/results/events.txt 2>&1 || true
+          kubectl -n longhorn-system logs -l app=longhorn-manager --all-containers --tail=300 > /tmp/hnn-heartbeat-e2e/results/longhorn.txt 2>&1 || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: storage-heartbeat-e2e
+          path: /tmp/hnn-heartbeat-e2e/results
+          retention-days: 14
+      - name: Destroy only this job's cluster
+        if: always()
+        run: kind delete cluster --name hnn-heartbeat-e2e

@@ -23,7 +23,9 @@ readonly MIN_STABLE_APISERVER_ETCD_BACKENDS="2"
 readonly KUBERNETES_CONTROL_PLANE_TAG="kubernetes-control-plane"
 readonly KUBERNETES_HA_TAG_PREFIX="kubernetes-ha-"
 readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
-readonly NODE_MONITOR_GRACE_PERIOD="20s"
+# A 20s threshold falsely fenced live RWX storage hosts during API stalls.
+# Allow multiple 10s lease renewals and the HTTP/2 connection recovery window.
+readonly NODE_MONITOR_GRACE_PERIOD="60s"
 readonly ETCD_HEARTBEAT_INTERVAL_MILLISECONDS="500"
 readonly ETCD_ELECTION_TIMEOUT_MILLISECONDS="5000"
 readonly ETCD_LIVENESS_FAILURE_THRESHOLD="30"
