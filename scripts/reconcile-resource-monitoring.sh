@@ -8,8 +8,8 @@ DB_ROLE=heterocloud_resource_monitoring
 DB_NAME="${HETEROCLOUD_DB_NAME:-heterocloud}"
 DB_HOST="${FLOW_GRAFANA_DB_HOST:-127.0.0.1}"
 DB_PORT="${FLOW_GRAFANA_DB_PORT:-25432}"
-EXPORTER_DB_HOST="${RESOURCE_MONITORING_DB_HOST:-heterocloud-flow-postgres-proxy.heterocloud-flow.svc.cluster.local}"
-EXPORTER_DB_PORT="${RESOURCE_MONITORING_DB_PORT:-55432}"
+EXPORTER_DB_HOST="${RESOURCE_MONITORING_DB_HOST:-postgres-ha-connector.kube-system.svc.cluster.local}"
+EXPORTER_DB_PORT="${RESOURCE_MONITORING_DB_PORT:-25432}"
 PASSWORD_FILE="${POSTGRES_SUPERUSER_PASSWORD_FILE:-/etc/heteronetwork/postgres-autopilot/bundle/secrets/superuser.password}"
 for command in kubectl openssl psql base64; do command -v "$command" >/dev/null; done
 [[ "$DB_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
