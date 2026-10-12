@@ -1,0 +1,38 @@
+- name: Provision the read-only cluster resource inventory
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_monitoring_root: /opt/heteronetwork/resource-monitoring
+  tasks:
+    - name: Create the reconciler directories
+      ansible.builtin.file:
+        path: "{{ hnn_monitoring_root }}/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - scripts
+        - deploy/monitoring
+    - name: Install versioned monitoring reconciler and metadata projection
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/{{ item }}"
+        dest: "{{ hnn_monitoring_root }}/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - scripts/reconcile-resource-monitoring.sh
+        - deploy/monitoring/resource-services.sql
+    - name: Reconcile SQL read permissions and credentials without rotation
+      ansible.builtin.command:
+        argv:
+          - bash
+          - "{{ hnn_monitoring_root }}/scripts/reconcile-resource-monitoring.sh"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      no_log: true

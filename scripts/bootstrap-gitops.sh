@@ -33,6 +33,7 @@ helm upgrade --install heteronetwork "${ROOT_DIR}/charts/ipars" \
   --history-max 10
 
 "${ROOT_DIR}/scripts/reconcile-flow-monitoring.sh"
+"${ROOT_DIR}/scripts/reconcile-resource-monitoring.sh"
 "${ROOT_DIR}/scripts/reconcile-harbor-runtime.sh"
 "${ROOT_DIR}/scripts/reconcile-syouyu-runtime.sh"
 
