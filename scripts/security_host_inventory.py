@@ -46,6 +46,28 @@ def digest(path):
     return h.hexdigest()
 
 
+def go_module_records(text, source):
+    records = []
+    previous = None
+    for line in text.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3 or fields[0] not in ('mod', 'dep', '=>'):
+            continue
+        if fields[0] == '=>':
+            # Replaced modules are not linked into the executable under the
+            # originally requested version. Report the actual replacement.
+            if previous is not None:
+                records.pop(previous)
+            previous = None
+        else:
+            previous = None
+        if fields[2].startswith('v'):
+            records.append({'name': fields[1], 'version': fields[2].removeprefix('v'), 'ecosystem': 'gobinary', 'source': source, 'purl': '', 'licenses': []})
+            if fields[0] != '=>':
+                previous = len(records) - 1
+    return records
+
+
 def go_packages(path, source):
     """Read only Go's version/module table, never embedded build settings."""
     try:
@@ -88,10 +110,7 @@ def go_packages(path, source):
         modules, _ = text_at(position)
         version = version.decode().removeprefix('go')
         records = [{'name': 'stdlib', 'version': version, 'ecosystem': 'gobinary', 'source': source, 'purl': '', 'licenses': []}]
-        for line in modules[16:-16].decode(errors='replace').splitlines():
-            fields = line.split('\t')
-            if len(fields) >= 3 and fields[0] in ('mod', 'dep', '=>') and fields[2].startswith('v'):
-                records.append({'name': fields[1], 'version': fields[2].removeprefix('v'), 'ecosystem': 'gobinary', 'source': source, 'purl': '', 'licenses': []})
+        records.extend(go_module_records(modules[16:-16].decode(errors='replace'), source))
         return records
     except (OSError, ValueError, IndexError, struct.error):
         return []

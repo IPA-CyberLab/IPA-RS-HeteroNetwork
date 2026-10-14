@@ -12,11 +12,18 @@ from security_cargo_patch import fixes
 from security_containerd_update import preserved
 from security_candidate import candidate
 from security_gvisor_e2e import continuity
-from security_promote import canonical_image, tenant_identity, validate_identity, verified_fixes
+from security_promote import canonical_image, deployment_ready, image_repository, tenant_identity, validate_identity, verified_fixes
 from security_runtime_snapshot import tcp_connections
+from security_host_inventory import go_module_records
 
 
 class InventoryTests(unittest.TestCase):
+    def test_go_replacement_does_not_report_unlinked_requested_version(self):
+        modules = 'dep\texample.com/old\tv1.0.0\th1:old\n=>\texample.com/fixed\tv1.2.0\th1:new\n\nbuild\tsecret-setting=not-exported\n'
+        records = go_module_records(modules, 'runtime')
+        self.assertEqual([(p['name'], p['version']) for p in records], [('example.com/fixed', '1.2.0')])
+        self.assertNotIn('secret-setting', str(records))
+
     def test_running_digest_is_used_and_finished_pods_are_removed(self):
         pod = {'metadata': {'namespace': 'platform'}, 'spec': {'containers': [{'name': 'app', 'image': 'image:latest'}]}, 'status': {'phase': 'Running', 'containerStatuses': [{'name': 'app', 'imageID': 'docker-pullable://image@sha256:' + 'a' * 64}]}}
         completed = {**pod, 'status': {'phase': 'Succeeded'}}
@@ -144,6 +151,19 @@ class RunningTaskPreservationTests(unittest.TestCase):
 
 
 class CandidateTests(unittest.TestCase):
+    def test_related_repositories_are_separate(self):
+        self.assertEqual(image_repository('registry.example:5443/team/app:v1@sha256:abc'), 'registry.example:5443/team/app')
+        self.assertNotEqual(image_repository('ghcr.io/org/flow-livekit:1'), image_repository('ghcr.io/org/flow:1'))
+
+    def test_old_rollout_status_cannot_accept_a_new_template(self):
+        deployment = {'metadata': {'generation': 2}, 'spec': {'replicas': 2},
+                      'status': {'observedGeneration': 1, 'replicas': 2, 'updatedReplicas': 2, 'readyReplicas': 2, 'availableReplicas': 2}}
+        self.assertFalse(deployment_ready(deployment))
+        deployment['status']['observedGeneration'] = 2
+        self.assertTrue(deployment_ready(deployment))
+        deployment['status']['replicas'] = 3
+        self.assertFalse(deployment_ready(deployment))
+
     def setUp(self):
         self.repository = 'IPA-CyberLab/IPA-RS-HeteroCloud-Flash'
         self.report = {'Results': [{'Type': 'cargo', 'Packages': [{'Name': 'rustls', 'Version': '0.23.45'}]}]}

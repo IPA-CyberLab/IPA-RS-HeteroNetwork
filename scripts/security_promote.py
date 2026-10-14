@@ -39,6 +39,21 @@ def canonical_image(image):
     return repository + '@' + digest
 
 
+def image_repository(image):
+    prefix, _, tail = image.split('@', 1)[0].rpartition('/')
+    return (prefix + '/' if prefix else '') + tail.split(':', 1)[0]
+
+
+def deployment_ready(deployment):
+    status = deployment.get('status', {})
+    desired = deployment['spec'].get('replicas', 1)
+    return (status.get('observedGeneration', 0) >= deployment['metadata'].get('generation', 1)
+            and status.get('replicas', 0) == desired
+            and status.get('updatedReplicas', 0) == desired
+            and status.get('readyReplicas', 0) >= desired
+            and status.get('availableReplicas', 0) >= desired)
+
+
 def trusted(path):
     path = Path(path)
     for parent in [path, *path.parents]:
@@ -183,19 +198,19 @@ class Reconciler:
         pods = self.kube('-n', component['namespace'], 'get', 'pods', '-o', 'json')['items']
         deployments = self.kube('-n', component['namespace'], 'get', 'deployments', '-o', 'json')['items']
         repository = 'ghcr.io/' + component['repository'].lower()
-        targets = [d for d in deployments if any(c['image'].split(':')[0].split('@')[0] == repository for c in d['spec']['template']['spec']['containers'])]
+        targets = [d for d in deployments if any(image_repository(c['image']) == repository for c in d['spec']['template']['spec']['containers'])]
         require(targets, 'no declared platform Deployments use this component')
         for deployment in targets:
             desired = deployment['spec'].get('replicas', 1)
             require(desired >= 2 and deployment.get('status', {}).get('availableReplicas', 0) >= desired, 'platform availability or replica reserve is insufficient')
-        if all(canonical_image(c['image']) == value['image'] for d in targets for c in d['spec']['template']['spec']['containers'] if c['image'].startswith(repository)):
+        if all(deployment_ready(d) for d in targets) and all(canonical_image(c['image']) == value['image'] for d in targets for c in d['spec']['template']['spec']['containers'] if image_repository(c['image']) == repository):
             return {'component': component['application'], 'status': 'current', 'image': value['image']}
         # Observe connections immediately before mutation, not from the periodic
         # inventory. The forced SSH observer cannot execute mutating commands.
         snapshots = self.snapshots()
         for pod in pods:
             for container in pod['status'].get('containerStatuses', []):
-                if not container.get('image', '').startswith(repository) or 'running' not in container.get('state', {}):
+                if image_repository(container.get('image', '')) != repository or 'running' not in container.get('state', {}):
                     continue
                 cid = container['containerID'].split('://', 1)[-1]
                 tcp = snapshots[pod['spec']['nodeName']]['tasks'].get(cid, {}).get('tcp', {})
@@ -204,21 +219,21 @@ class Reconciler:
         self.health()
         inventory = json.loads(Path(self.args.inventory).read_text())
         require(inventory['status'] == 'complete' and time.time() - datetime.datetime.fromisoformat(inventory['observed_at']).timestamp() < self.policy['inventory_max_age_seconds'], 'fleet security inventory is incomplete or stale')
-        references = {canonical_image(c['image']) for p in pods for c in p['spec']['containers'] if c['image'].startswith(repository)}
+        references = {canonical_image(c['image']) for p in pods for c in p['spec']['containers'] if image_repository(c['image']) == repository}
         credentials = registry_credentials(self.kubectl, pods)
         old_findings = []
         # Pod status names the architecture-specific manifest; a declared
         # multi-platform index is not the same scan reference. Refresh both
         # sides against the same DB so new advisories are not false regressions.
         for source in deployed_images(pods):
-            if not source['reference'].startswith(repository):
+            if image_repository(source['reference']) != repository:
                 continue
             old_scan = scan_source(self.args.trivy, Path(self.args.inventory).parent / 'cache', source,
                                    Path(self.args.inventory).parent / 'scan-reports', timeout=300,
                                    registry_auth=credentials.get(source['reference']))
             require(old_scan['status'] == 'complete', 'current deployed image baseline could not be re-scanned')
             old_findings.extend(old_scan['findings'])
-        auth = next((auth for ref, auth in credentials.items() if ref.startswith(repository)), None)
+        auth = next((auth for ref, auth in credentials.items() if image_repository(ref) == repository), None)
         scan = scan_source(self.args.trivy, Path(self.args.inventory).parent / 'cache',
                            {'kind': 'image', 'reference': value['image'], 'digest_verified': True},
                            Path(self.args.inventory).parent / 'scan-reports', timeout=300, registry_auth=auth)
@@ -238,15 +253,21 @@ class Reconciler:
             return record
         source = app['spec']['source']
         parameters = source.get('helm', {}).get('parameters', [])
+        image_parameter = component.get('image_parameter', 'image.tag')
+        require(image_parameter in ('image', 'image.tag'), 'unsupported image parameter')
         require(not any(p['name'] == 'image.repository' for p in parameters), 'an external image repository override is present')
-        new_parameters = [p for p in parameters if p['name'] != 'image.tag'] + [
-            {'name': 'image.tag', 'value': 'security-' + value['source_commit'] + '@' + value['image'].split('@', 1)[1]}]
+        new_parameters = [p for p in parameters if p['name'] != image_parameter] + [
+            {'name': image_parameter, 'value': (value['image'] if image_parameter == 'image' else
+             'security-' + value['source_commit'] + '@' + value['image'].split('@', 1)[1])}]
         atomic_json(self.root / (component['application'] + '-before.json'), {'source_sha256': hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest(), 'tenants': before, 'candidate': record})
-        def change(parameters):
+        def change(parameters, expected_parameters):
             current = self.kube('-n', 'argocd', 'get', 'application', component['application'], '-o', 'json')
             current_parameters = current['spec']['source'].get('helm', {}).get('parameters', [])
-            tag = next((p for p in parameters if p['name'] == 'image.tag'), None)
-            index = next((i for i, p in enumerate(current_parameters) if p['name'] == 'image.tag'), None)
+            tag = next((p for p in parameters if p['name'] == image_parameter), None)
+            expected = next((p for p in expected_parameters if p['name'] == image_parameter), None)
+            index = next((i for i, p in enumerate(current_parameters) if p['name'] == image_parameter), None)
+            require((current_parameters[index] if index is not None else None) == expected,
+                    'image parameter changed outside security reconciliation')
             patch = [{'op': 'test', 'path': '/metadata/resourceVersion', 'value': current['metadata']['resourceVersion']},
                      {'op': 'test', 'path': '/spec/source/repoURL', 'value': source['repoURL']},
                      {'op': 'test', 'path': '/spec/source/targetRevision', 'value': source['targetRevision']}]
@@ -263,11 +284,11 @@ class Reconciler:
         snapshots = self.snapshots()
         for pod in pods:
             for container in pod['status'].get('containerStatuses', []):
-                if container.get('image', '').startswith(repository) and 'running' in container.get('state', {}):
+                if image_repository(container.get('image', '')) == repository and 'running' in container.get('state', {}):
                     cid = container['containerID'].split('://', 1)[-1]
                     tcp = snapshots[pod['spec']['nodeName']]['tasks'].get(cid, {}).get('tcp', {})
                     require(tcp.get('status') == 'complete' and tcp.get('inbound_connections') == 0, 'platform connections became active while preparing the update')
-        change(new_parameters)
+        change(new_parameters, parameters)
         try:
             deadline = time.monotonic() + self.policy.get('rollout_timeout_seconds', 600)
             while time.monotonic() < deadline:
@@ -275,17 +296,27 @@ class Reconciler:
                 current = self.kube('-n', component['namespace'], 'get', 'deployments', '-o', 'json')['items']
                 names = {d['metadata']['name'] for d in targets}
                 observed = [d for d in current if d['metadata']['name'] in names]
-                if all(d.get('status', {}).get('updatedReplicas', 0) == d['spec']['replicas']
-                       and d.get('status', {}).get('availableReplicas', 0) >= d['spec']['replicas']
-                       and all(canonical_image(c['image']) == value['image'] for c in d['spec']['template']['spec']['containers'] if c['image'].startswith(repository))
+                if all(deployment_ready(d)
+                       and all(canonical_image(c['image']) == value['image'] for c in d['spec']['template']['spec']['containers'] if image_repository(c['image']) == repository)
                        for d in observed) and len(observed) == len(targets):
                     require(before == self.tenants(), 'tenant state or runtime identities changed during the platform update')
                     return {**record, 'status': 'promoted', 'tenant_tasks_preserved': True, 'completed_at': utc_now()}
                 time.sleep(3)
             raise RuntimeError('platform rollout did not pass acceptance before its deadline')
         except BaseException:
-            change(parameters)
-            atomic_json(self.root / (component['application'] + '-rollback.json'), {'status': 'rollback-requested', 'observed_at': utc_now()})
+            change(parameters, new_parameters)
+            deadline = time.monotonic() + self.policy.get('rollout_timeout_seconds', 600)
+            old_images = {d['metadata']['name']: [c['image'] for c in d['spec']['template']['spec']['containers']] for d in targets}
+            while time.monotonic() < deadline:
+                current = self.kube('-n', component['namespace'], 'get', 'deployments', '-o', 'json')['items']
+                observed = [d for d in current if d['metadata']['name'] in old_images]
+                if len(observed) == len(targets) and all(deployment_ready(d) and [c['image'] for c in d['spec']['template']['spec']['containers']] == old_images[d['metadata']['name']] for d in observed):
+                    atomic_json(self.root / (component['application'] + '-rollback.json'), {'status': 'rollback-verified', 'observed_at': utc_now(), 'tenant_tasks_preserved': before == self.tenants()})
+                    break
+                time.sleep(3)
+            else:
+                atomic_json(self.root / (component['application'] + '-rollback.json'), {'status': 'rollback-unverified', 'observed_at': utc_now()})
+                raise RuntimeError('rollback did not recover the previous platform image before its deadline')
             raise
 
 
@@ -303,7 +334,8 @@ def main():
     policy = json.loads(trusted(args.policy).read_text())
     observer = Reconciler(args, policy)
     results = []
-    lock = os.open('/run/lock/heteronetwork-security-promotion.lock', os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    # The hardened service permits writes only below its private output root.
+    lock = os.open(Path(args.output) / 'reconciliation.lock', os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for component in policy['components']:
