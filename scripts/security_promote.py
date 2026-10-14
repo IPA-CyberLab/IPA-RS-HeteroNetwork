@@ -151,9 +151,14 @@ class Reconciler:
     def health(self):
         nodes = self.kube('get', 'nodes', '-o', 'json')['items']
         require(all(any(c['type'] == 'Ready' and c['status'] == 'True' for c in n['status']['conditions']) for n in nodes), 'fleet is not healthy')
+        # VPN health must traverse the actual fleet path, not an inherited
+        # HTTP proxy. Identify the monitor so public bot rules need not treat
+        # it as an anonymous Python client.
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for probe in self.policy.get('health_probes', []):
             started = time.monotonic()
-            with urllib.request.urlopen(probe['url'], timeout=probe.get('deadline_seconds', 3)) as response:
+            request = urllib.request.Request(probe['url'], headers={'User-Agent': 'HeteroCloud-Security-Health/1.0'})
+            with direct.open(request, timeout=probe.get('deadline_seconds', 3)) as response:
                 require(response.status in probe.get('statuses', [200]), 'service health failed')
                 response.read(1024 * 1024)
             require(time.monotonic() - started <= probe.get('deadline_seconds', 3), 'service health exceeded its deadline')
