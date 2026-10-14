@@ -44,6 +44,28 @@ def bundle_identity(runtime):
     return {str(path.relative_to(parent)): digest(path) for path in files if path.is_file()}
 
 
+def running_sentry(runtime, common, container, expected):
+    state = json.loads(command([runtime, *common, 'state', container]).stdout)
+    pending, seen = [int(state['pid'])], set()
+    while pending and len(seen) < 128:
+        pid = pending.pop()
+        if pid in seen or pid <= 0:
+            continue
+        seen.add(pid)
+        executable = Path('/proc') / str(pid) / 'exe'
+        try:
+            if Path(os.readlink(executable).removesuffix(' (deleted)')).name == 'gvisor_sentry':
+                observed = digest(executable)
+                if observed != expected.get('gvisor-bin/gvisor_sentry'):
+                    raise RuntimeError('running Sentry differs from the staged runtime bundle')
+                return {'pid': pid, 'sha256': observed}
+            children = Path('/proc') / str(pid) / 'task' / str(pid) / 'children'
+            pending.extend(int(v) for v in children.read_text().split())
+        except OSError:
+            continue
+    raise RuntimeError('running Sentry identity could not be verified')
+
+
 def continuity(before, after):
     return (all(before[key] == after[key] for key in ['nonce', 'memory_hash', 'started_ns', 'guest_pid'])
             and after['connections'] == before['connections'] == 1
@@ -118,6 +140,7 @@ def run(args):
         command(['ip', '-n', namespace, 'link', 'set', peer_link, 'up'])
         command(['ip', '-n', namespace, 'link', 'set', 'lo', 'up'])
         command([args.source_runsc, *common, 'run', '--detach', '--bundle=' + str(bundle), source_id])
+        evidence['source_sentry'] = running_sentry(args.source_runsc, common, source_id, evidence['source_bundle'])
         deadline = time.monotonic() + 30
         while True:
             try:
@@ -148,10 +171,12 @@ def run(args):
         command(['ip', '-n', namespace, 'addr', 'replace', '192.0.2.2/30', 'dev', peer_link])
         result = command([args.target_runsc, *common, 'restore', '--detach', '--bundle=' + str(bundle), '--image-path=' + str(checkpoint), target_id], timeout=120, checked=False)
         if result.returncode == 0:
+            evidence['target_sentry'] = running_sentry(args.target_runsc, common, target_id, evidence['target_bundle'])
             after = observe()
             if not continuity(before, after):
                 raise RuntimeError('restore lost in-memory state or reconnected the client')
-            evidence.update(status='verified', after=after, cross_version_restore_passed=True,
+            evidence.update(status='verified', after=after,
+                            cross_version_restore_passed=evidence['source_sha256'] != evidence['target_sha256'],
                             state_preserved=True, network_connections_preserved=True,
                             target_runtime_verified=True, capacity_reserved=True)
         else:
@@ -159,6 +184,7 @@ def run(args):
             command([args.target_runsc, *common, 'delete', '--force', target_id], checked=False)
             command(['ip', '-n', namespace, 'addr', 'replace', '192.0.2.2/30', 'dev', peer_link])
             command([args.source_runsc, *common, 'restore', '--detach', '--bundle=' + str(bundle), '--image-path=' + str(checkpoint), rollback_id], timeout=120)
+            evidence['rollback_sentry'] = running_sentry(args.source_runsc, common, rollback_id, evidence['source_bundle'])
             after = observe()
             if not continuity(before, after):
                 raise RuntimeError('rollback failed to recover memory and the existing connection')

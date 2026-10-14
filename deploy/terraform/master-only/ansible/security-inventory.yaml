@@ -86,6 +86,7 @@
         group: root
         mode: '0755'
     - name: Install root-owned read-only inventory code
+      tags: [security_code]
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/scripts/{{ item }}"
         dest: "{{ hnn_security_root }}/{{ item }}"
@@ -183,6 +184,7 @@
         mode: '0644'
       loop: [heteronetwork-security-scan.service, heteronetwork-security-scan.timer, heteronetwork-security-metrics.service]
     - name: Install signed candidate reconciliation code
+      tags: [security_code]
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/scripts/security_promote.py"
         dest: /opt/heteronetwork/security/security_promote.py
@@ -212,6 +214,7 @@
         group: root
         mode: '0755'
     - name: Declare production security reconciliation targets and health checks
+      tags: [security_code]
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/security/promotion-heteronet.json"
         dest: /opt/heteronetwork/security/promotion.json
