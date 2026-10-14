@@ -67,9 +67,9 @@ jobs:
       - name: Install WireGuard-compatible Go toolchain
         env:
           EXPECTED_MACHINE_ARCH: ${{ matrix.machine_arch }}
-          GO_VERSION: 1.20.14
-          GO_AMD64_SHA256: 754363489e2244e72cb49b4ec6ddfd6a2c60b0700f8c4876e11befb1913b11c5
-          GO_ARM64_SHA256: 6da3f76164b215053daf730a9b8f1d673dbbaa4c61031374a6744b75cb728641
+          GO_VERSION: 1.27.2
+          GO_AMD64_SHA256: 587b59182488b23aa6e5fc25110405a3e0e5b38ed2f5b2f46ed13c32aee356fe
+          GO_ARM64_SHA256: 76812b213b1b2302c978d28fa52fa92d541704b9e7d9d5db8002c50e4018c4c5
         run: |
           set -euo pipefail
           machine_arch="$(uname -m)"
