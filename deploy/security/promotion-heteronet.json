@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "trusted_builder_commit": "3ccd26d515d895ecbcb325afa503fe9b43c3943b",
+  "trusted_builder_commit": "591ff29e57a7fb7acdcf2a0553ca64fe54e657bf",
   "inventory_max_age_seconds": 3600,
   "rollout_timeout_seconds": 600,
   "tenant_namespace": "heterocloud-flash-workloads",
