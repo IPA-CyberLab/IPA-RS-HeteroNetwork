@@ -1,0 +1,33 @@
+name: Continuous OSS security
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+  push:
+    paths: ['scripts/security_*.py', 'scripts/test_security_inventory.py', 'deploy/security/**', '.github/workflows/oss-security*.yml']
+  pull_request:
+    paths: ['scripts/security_*.py', 'scripts/test_security_inventory.py', 'deploy/security/**', '.github/workflows/oss-security*.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  policy-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts -p test_security_inventory.py -v
+  inventory:
+    needs: policy-tests
+    uses: ./.github/workflows/oss-security-reusable.yml
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      tooling_ref: ${{ github.sha }}
+      auto_patch: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}

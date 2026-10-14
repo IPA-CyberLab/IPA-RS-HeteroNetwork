@@ -1,0 +1,23 @@
+[Unit]
+Description=HeteroNetwork host OSS and vulnerability inventory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/heteronetwork/security/security_host_inventory.py
+User=root
+Group=root
+UMask=0027
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=40%
+MemoryMax=1G
+TimeoutStartSec=15min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/heteronetwork-security /var/cache/heteronetwork-security
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME TRIVY_TOKEN TRIVY_USERNAME TRIVY_PASSWORD TRIVY_REGISTRY_TOKEN

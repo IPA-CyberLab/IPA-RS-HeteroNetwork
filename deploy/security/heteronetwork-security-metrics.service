@@ -1,0 +1,22 @@
+[Unit]
+Description=Private HeteroNetwork security scan metrics
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/heteronetwork/security/security_inventory.py serve --output /var/lib/heteronetwork-security/cluster --listen 10.250.0.2 --port 19765
+Restart=on-failure
+RestartSec=5
+MemoryMax=128M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME
+
+[Install]
+WantedBy=multi-user.target

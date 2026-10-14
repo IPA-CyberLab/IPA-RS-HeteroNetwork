@@ -1,0 +1,24 @@
+[Unit]
+Description=HeteroNetwork deployed OSS, CVE and release inventory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStartPre=/usr/bin/python3 /opt/heteronetwork/security/security_refresh_repositories.py --policy /opt/heteronetwork/security/policy.json --destination /var/lib/heteronetwork-security/repos
+ExecStart=/usr/bin/python3 /opt/heteronetwork/security/security_inventory.py refresh --policy /opt/heteronetwork/security/policy.json --repos-dir /var/lib/heteronetwork-security/repos --output /var/lib/heteronetwork-security/cluster --trivy /opt/heteronetwork/security/trivy --kubeconfig /etc/kubernetes/admin.conf --hosts /etc/heteronetwork/security/hosts.json --ssh-key /etc/heteronetwork/security/inventory.key --known-hosts /etc/heteronetwork/security/known_hosts --parallel 2 --timeout 300
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=150%
+MemoryMax=2G
+TimeoutStartSec=60min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/heteronetwork-security
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME GH_TOKEN GITHUB_TOKEN

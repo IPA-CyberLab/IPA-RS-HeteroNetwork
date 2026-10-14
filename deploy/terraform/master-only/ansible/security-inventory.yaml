@@ -1,0 +1,166 @@
+- name: Prepare an SSH identity limited to reading host inventory
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Create a protected inventory identity directory
+      ansible.builtin.file:
+        path: /etc/heteronetwork/security
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+    - name: Generate an inventory-only key without exporting it
+      ansible.builtin.command:
+        argv: [ssh-keygen, -t, ed25519, -N, '', -C, heteronetwork-security-inventory, -f, /etc/heteronetwork/security/inventory.key]
+        creates: /etc/heteronetwork/security/inventory.key
+      no_log: true
+    - name: Read only the public inventory identity
+      ansible.builtin.command: cat /etc/heteronetwork/security/inventory.key.pub
+      register: hnn_inventory_public_key
+      changed_when: false
+
+- name: Install host OSS/CVE collection without changing workloads
+  hosts: all
+  gather_facts: false
+  become: true
+  serial: 2
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_security_root: /opt/heteronetwork/security
+    hnn_security_policy: "{{ lookup('file', hnn_repo_root + '/deploy/security/policy.json') | from_json }}"
+  tasks:
+    - name: Find the inventory account home
+      ansible.builtin.getent:
+        database: passwd
+        key: mizuame
+    - name: Authorize only the forced inventory read command
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_facts.getent_passwd.mizuame[4] }}/.ssh/authorized_keys"
+        regexp: '.* heteronetwork-security-inventory$'
+        line: 'restrict,command="/bin/cat /var/lib/heteronetwork-security/host-report.json" {{ hostvars[groups["bootstrap"][0]].hnn_inventory_public_key.stdout }}'
+        create: false
+    - name: Create protected scanner directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - "{{ hnn_security_root }}"
+        - /var/cache/heteronetwork-security
+    - name: Create inventory directory readable by the inventory SSH account
+      ansible.builtin.file:
+        path: /var/lib/heteronetwork-security
+        state: directory
+        owner: root
+        group: mizuame
+        mode: '0750'
+    - name: Fetch checksum-pinned scanner archive
+      ansible.builtin.get_url:
+        url: "https://github.com/aquasecurity/trivy/releases/download/v{{ hnn_security_policy.trivy.version }}/trivy_{{ hnn_security_policy.trivy.version }}_Linux-64bit.tar.gz"
+        checksum: "sha256:{{ hnn_security_policy.trivy.linux_amd64_archive_sha256 }}"
+        dest: "{{ hnn_security_root }}/trivy.tar.gz"
+        mode: '0644'
+    - name: Extract only the scanner executable
+      ansible.builtin.unarchive:
+        src: "{{ hnn_security_root }}/trivy.tar.gz"
+        dest: "{{ hnn_security_root }}"
+        remote_src: true
+        include: [trivy]
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Install root-owned read-only inventory code
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "{{ hnn_security_root }}/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop: [security_inventory.py, security_host_inventory.py, security_refresh_repositories.py, security_update_gate.py]
+    - name: Install the declared update policy
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/policy.json"
+        dest: "{{ hnn_security_root }}/policy.json"
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Install host collection service and timer
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [heteronetwork-security-host.service, heteronetwork-security-host.timer]
+    - name: Enable recurring host inventory
+      ansible.builtin.systemd_service:
+        name: heteronetwork-security-host.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+    - name: Start the first host collection asynchronously
+      ansible.builtin.command: systemctl restart --no-block heteronetwork-security-host.service
+      changed_when: false
+
+- name: Provision the continuous fleet security inventory
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Create the private operator directory
+      ansible.builtin.file:
+        path: /etc/heteronetwork/security
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+    - name: Remove the superseded general operator key copy
+      ansible.builtin.file:
+        path: /etc/heteronetwork/security/operator.key
+        state: absent
+    - name: Install trusted host identities
+      ansible.builtin.copy:
+        src: "{{ hnn_work_dir }}/known_hosts"
+        dest: /etc/heteronetwork/security/known_hosts
+        owner: root
+        group: root
+        mode: '0600'
+    - name: Declare the complete fleet inventory
+      ansible.builtin.copy:
+        content: "{{ groups['all'] | map('extract', hostvars) | map(attribute='inventory_hostname') | list | to_json }}"
+        dest: /etc/heteronetwork/security/node-names.json
+        mode: '0600'
+    - name: Render SSH inventory endpoints
+      ansible.builtin.copy:
+        content: >-
+          [{% for name in groups['all'] %}{"name":{{ name | to_json }},"ssh_host":{{ hostvars[name].ansible_host | to_json }}}{% if not loop.last %},{% endif %}{% endfor %}]
+        dest: /etc/heteronetwork/security/hosts.json
+        owner: root
+        group: root
+        mode: '0600'
+    - name: Install recurring scan and VPN-only aggregate metrics
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: '0644'
+      loop: [heteronetwork-security-scan.service, heteronetwork-security-scan.timer, heteronetwork-security-metrics.service]
+    - name: Enable inventory and aggregate metrics
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: "{{ 'restarted' if item == 'heteronetwork-security-metrics.service' else 'started' }}"
+        daemon_reload: true
+      loop: [heteronetwork-security-scan.timer, heteronetwork-security-metrics.service]
+    - name: Start the first deployed image/source inventory
+      ansible.builtin.command: systemctl restart --no-block heteronetwork-security-scan.service
+      changed_when: false

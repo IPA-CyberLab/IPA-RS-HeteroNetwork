@@ -1,0 +1,32 @@
+- name: Patch the containerd daemon serially while retaining every running task
+  hosts: all
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the independently versioned transparent runtime updater
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/security_containerd_update.py"
+        dest: /opt/heteronetwork/security/security_containerd_update.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Install the verified runtime artifact lock
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/containerd-lock.json"
+        dest: /opt/heteronetwork/security/containerd-lock.json
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Patch the daemon and assert existing task IDs and PIDs remain
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/security/security_containerd_update.py]
+      register: runtime_security_acceptance
+      changed_when: "'running_tasks_preserved' in runtime_security_acceptance.stdout"
+    - name: Refresh the active binary security inventory
+      ansible.builtin.command: systemctl start --no-block heteronetwork-security-host.service
+      changed_when: false

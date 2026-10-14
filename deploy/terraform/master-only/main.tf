@@ -39,7 +39,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -284,6 +284,38 @@ resource "terraform_data" "host_configuration" {
     }
   }
   depends_on = [local_file.known_hosts, local_file.inventory]
+}
+
+resource "terraform_data" "security_inventory" {
+  input = { scan_interval_seconds = 900, allow_restart_fallback = false }
+  triggers_replace = concat(
+    [filesha256("${path.module}/ansible/security-inventory.yaml")],
+    [for f in sort(tolist(fileset(local.repo_root, "scripts/security_*.py"))) : filesha256("${local.repo_root}/${f}")],
+    [for f in sort(tolist(fileset(local.repo_root, "deploy/security/*"))) : filesha256("${local.repo_root}/${f}")]
+  )
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/security-inventory.yaml"
+    environment = {
+      HNN_IAC_INVENTORY = local_file.inventory.filename
+    }
+  }
+  depends_on = [local_file.inventory, local_file.known_hosts]
+}
+
+resource "terraform_data" "containerd_security" {
+  input = jsondecode(file("${local.repo_root}/deploy/security/containerd-lock.json"))
+  triggers_replace = [
+    filesha256("${local.repo_root}/deploy/security/containerd-lock.json"),
+    filesha256("${local.repo_root}/scripts/security_containerd_update.py"),
+    filesha256("${path.module}/ansible/containerd-security.yaml")
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/containerd-security.yaml"
+    environment = { HNN_IAC_INVENTORY = local_file.inventory.filename }
+  }
+  depends_on = [terraform_data.security_inventory]
 }
 
 resource "terraform_data" "gvisor_configuration" {

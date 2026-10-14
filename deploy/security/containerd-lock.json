@@ -1,0 +1,12 @@
+{
+  "version": "2.2.10",
+  "url": "https://github.com/containerd/containerd/releases/download/v2.2.10/containerd-2.2.10-linux-amd64.tar.gz",
+  "archive_sha256": "5adda535e65393c4c24f88771ccc4604906d0b0128d448bf74b5336153753b1b",
+  "source_url": "https://github.com/containerd/containerd/releases/tag/v2.2.10",
+  "fixed_advisories": ["GHSA-p7v4-vr35-mj6f", "CVE-2026-95837"],
+  "binaries": {
+    "containerd": "dbc252c7f4e3534dcbe674552b87b20194967e7b6069e66de61632dcdd3acc83",
+    "containerd-shim-runc-v2": "c40cce1c4eb07bfbcf64d13ed269186d5902332df64e03a33fa6f0e9a3dc530c",
+    "ctr": "c82c5e1a85200dedf3ff5b7e4c7708e588afa4001add7f763714ed25007a0fde"
+  }
+}

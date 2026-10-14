@@ -1,0 +1,214 @@
+name: OSS security patch pipeline
+
+on:
+  workflow_call:
+    inputs:
+      tooling_ref:
+        required: true
+        type: string
+      auto_patch:
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      auto_patch:
+        description: Apply verified compatible Cargo fixes
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oss-security-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      fixes: ${{ steps.scan.outputs.fixes }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: IPA-CyberLab/IPA-RS-HeteroNetwork
+          ref: ${{ inputs.tooling_ref || github.sha }}
+          path: .security-tooling
+          persist-credentials: false
+      - name: Install checksum-pinned scanner
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, tarfile, urllib.request
+          p=json.loads(pathlib.Path('.security-tooling/deploy/security/policy.json').read_text())['trivy']
+          url='https://github.com/aquasecurity/trivy/releases/download/v'+p['version']+'/trivy_'+p['version']+'_Linux-64bit.tar.gz'
+          with urllib.request.urlopen(url, timeout=60) as r: data=r.read()
+          assert hashlib.sha256(data).hexdigest()==p['linux_amd64_archive_sha256']
+          archive=pathlib.Path(os.environ['RUNNER_TEMP'])/'trivy.tar.gz'; archive.write_bytes(data)
+          with tarfile.open(archive) as f:
+            binary=pathlib.Path(os.environ['RUNNER_TEMP'])/'trivy'; binary.write_bytes(f.extractfile('trivy').read()); binary.chmod(0o755)
+          PY
+      - name: Collect SBOM, advisories and compatible fixes
+        id: scan
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trivy" fs --scanners vuln --list-all-pkgs --format json --skip-dirs .security-tooling --skip-dirs node_modules --skip-dirs target . > "$RUNNER_TEMP/security-scan.json"
+          python3 .security-tooling/scripts/security_cargo_patch.py --report "$RUNNER_TEMP/security-scan.json" --output "$RUNNER_TEMP/security-fixes.json" --live-osv --advisory-cache "$RUNNER_TEMP/osv-cache"
+          python3 - <<'PY'
+          import json,os,pathlib
+          fixes=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'security-fixes.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('fixes='+str(len(fixes))+'\n')
+          PY
+      - name: Upload OSS scan and patch plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-security-inventory
+          path: |
+            ${{ runner.temp }}/security-scan.json
+            ${{ runner.temp }}/security-fixes.json
+          retention-days: 30
+
+  patch:
+    needs: scan
+    if: inputs.auto_patch && needs.scan.outputs.fixes != '0' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: IPA-CyberLab/IPA-RS-HeteroNetwork
+          ref: ${{ inputs.tooling_ref || github.sha }}
+          path: .security-tooling
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: oss-security-inventory
+          path: ${{ runner.temp }}/inventory
+      - name: Install Rust used by release verification
+        run: rustup toolchain install 1.96.1 --profile minimal --component clippy
+      - name: Apply compatible security fixes and run release tests
+        env:
+          RUSTUP_TOOLCHAIN: 1.96.1
+        run: |
+          set -euo pipefail
+          python3 .security-tooling/scripts/security_cargo_patch.py --report "$RUNNER_TEMP/inventory/security-scan.json" --output "$RUNNER_TEMP/applied-fixes.json" --live-osv --advisory-cache "$RUNNER_TEMP/osv-cache" --apply
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          # Only the dependency lockfile may be changed by this automation.
+          test "$(git diff --name-only)" = Cargo.lock
+      - name: Re-scan the patched lockfile
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,tarfile,urllib.request
+          p=json.loads(pathlib.Path('.security-tooling/deploy/security/policy.json').read_text())['trivy']
+          url='https://github.com/aquasecurity/trivy/releases/download/v'+p['version']+'/trivy_'+p['version']+'_Linux-64bit.tar.gz'
+          with urllib.request.urlopen(url,timeout=60) as r: data=r.read()
+          assert hashlib.sha256(data).hexdigest()==p['linux_amd64_archive_sha256']
+          archive=pathlib.Path(os.environ['RUNNER_TEMP'])/'trivy.tar.gz';archive.write_bytes(data)
+          with tarfile.open(archive) as f:
+            binary=pathlib.Path(os.environ['RUNNER_TEMP'])/'trivy';binary.write_bytes(f.extractfile('trivy').read());binary.chmod(0o755)
+          PY
+          "$RUNNER_TEMP/trivy" fs --scanners vuln --list-all-pkgs --format json --skip-dirs .security-tooling --skip-dirs target --skip-dirs node_modules . > "$RUNNER_TEMP/candidate-scan.json"
+          python3 - <<'PY'
+          import json,os,pathlib,sys
+          sys.path.insert(0,'.security-tooling/scripts')
+          from security_inventory import normalize_trivy,live_osv
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          fixes=json.loads((root/'applied-fixes.json').read_text())
+          report=json.loads((root/'candidate-scan.json').read_text())
+          packages,findings=normalize_trivy(report,'ci')
+          additions,errors=live_osv([p for p in packages if p['ecosystem']=='cargo'],findings,root/'osv-cache')
+          assert not errors, 'Live advisory re-scan did not complete'
+          bad={v['VulnerabilityID'] for r in report.get('Results',[]) for v in r.get('Vulnerabilities',[])} | {f['id'] for f in additions}
+          assert not any(identifier in bad for fix in fixes for identifier in fix['advisories']), 'The candidate still contains the targeted vulnerability'
+          PY
+      - name: Commit verified patch without persisting a GitHub credential
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git config core.hooksPath /dev/null
+          git config user.name heterocloud-security
+          git config user.email heterocloud-security@users.noreply.github.com
+          git add Cargo.lock
+          git commit -m 'security: apply tested compatible dependency fixes'
+          # Push uses the ephemeral job token over stdin through gh auth;
+          # neither token nor credential-bearing remote is recorded in files.
+          gh auth setup-git
+          git push origin "HEAD:$DEFAULT_BRANCH"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Save patch acceptance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-security-applied-fixes
+          path: ${{ runner.temp }}/applied-fixes.json
+          retention-days: 90
+
+  publish:
+    needs: patch
+    if: needs.patch.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ needs.patch.outputs.commit }}
+          persist-credentials: false
+      - name: Detect container build
+        id: image
+        run: |
+          if test -f Dockerfile; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.image.outputs.enabled == 'true'
+      - uses: docker/login-action@v3
+        if: steps.image.outputs.enabled == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build immutable security image
+        if: steps.image.outputs.enabled == 'true'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.image.outputs.name }}:security-${{ needs.patch.outputs.commit }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.patch.outputs.commit }}
+            io.heterocloud.security.ci-passed=true
+      - name: Attest candidate identity
+        if: steps.image.outputs.enabled == 'true'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      # Candidate publication is not active process remediation. A deployment
+      # must pass security_update_gate and its fleet/availability checks.

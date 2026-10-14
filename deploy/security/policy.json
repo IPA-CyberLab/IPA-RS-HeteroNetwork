@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "scan_interval_seconds": 900,
+  "inventory_max_age_seconds": 3600,
+  "proof_max_age_seconds": 86400,
+  "auto_patch_severities": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+  "require_fixed_version": true,
+  "require_candidate_rescan": true,
+  "require_ci": true,
+  "require_live_migration": true,
+  "allow_restart_fallback": false,
+  "max_parallel_nodes": 1,
+  "trivy": {
+    "version": "0.75.0",
+    "linux_amd64_archive_sha256": "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f",
+    "release_repository": "aquasecurity/trivy"
+  },
+  "repositories": [
+    "IPA-CyberLab/IPA-RS-HeteroNetwork",
+    "IPA-CyberLab/IPA-RS-HeteroCloud",
+    "IPA-CyberLab/IPA-RS-HeteroCloud-Flash",
+    "IPA-CyberLab/IPA-RS-HeteroCloud-Flow",
+    "IPA-CyberLab/IPA-RS-HeteroCloud-SecretManager",
+    "IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu",
+    "IPA-CyberLab/IPA-RS-HeteroCloud-VPC"
+  ],
+  "release_watches": [
+    {"component": "trivy", "repository": "aquasecurity/trivy"},
+    {"component": "gvisor", "repository": "google/gvisor"},
+    {"component": "containerd", "repository": "containerd/containerd"},
+    {"component": "runc", "repository": "opencontainers/runc"},
+    {"component": "kubernetes", "repository": "kubernetes/kubernetes"},
+    {"component": "etcd", "repository": "etcd-io/etcd"},
+    {"component": "openbao", "repository": "openbao/openbao"},
+    {"component": "keycloak", "repository": "keycloak/keycloak"},
+    {"component": "argocd", "repository": "argoproj/argo-cd"},
+    {"component": "longhorn", "repository": "longhorn/longhorn"},
+    {"component": "envoy-gateway", "repository": "envoyproxy/gateway"},
+    {"component": "envoy", "repository": "envoyproxy/envoy"},
+    {"component": "coredns", "repository": "coredns/coredns"},
+    {"component": "flannel", "repository": "flannel-io/flannel"},
+    {"component": "kube-router", "repository": "cloudnativelabs/kube-router"},
+    {"component": "harbor", "repository": "goharbor/harbor"},
+    {"component": "grafana", "repository": "grafana/grafana"},
+    {"component": "prometheus", "repository": "prometheus/prometheus"},
+    {"component": "livekit", "repository": "livekit/livekit"},
+    {"component": "coturn", "repository": "coturn/coturn"},
+    {"component": "nvidia-container-toolkit", "repository": "NVIDIA/nvidia-container-toolkit"},
+    {"component": "nvidia-device-plugin", "repository": "NVIDIA/k8s-device-plugin"},
+    {"component": "patroni", "repository": "patroni/patroni"},
+    {"component": "redis", "repository": "redis/redis"}
+  ]
+}
