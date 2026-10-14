@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, validate_host_os
+from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, scoped_registry_auth, validate_host_os
 from security_update_gate import assess, fingerprint
 from security_cargo_patch import fixes
 from security_containerd_update import preserved
@@ -36,6 +36,12 @@ class InventoryTests(unittest.TestCase):
     def test_digest_without_a_repository_uses_the_requested_repository(self):
         pod = {'metadata': {'namespace': 'platform'}, 'spec': {'containers': [{'name': 'app', 'image': 'registry.example:5443/team/app:v1'}]}, 'status': {'phase': 'Running', 'containerStatuses': [{'name': 'app', 'imageID': 'containerd://sha256:' + 'b' * 64}]}}
         self.assertEqual(deployed_images([pod])[0]['reference'], 'registry.example:5443/team/app@sha256:' + 'b' * 64)
+
+    def test_credentials_are_never_sent_to_another_registry(self):
+        auths = {'registry.example': {'auth': 'private'}, 'other.example': {'auth': 'other'}}
+        self.assertEqual(scoped_registry_auth('registry.example', auths), {'registry.example': {'auth': 'private'}})
+        self.assertEqual(scoped_registry_auth('unknown.example', auths), {})
+        self.assertEqual(scoped_registry_auth('registry.example:5443', auths), {})
 
     def test_error_inventory_does_not_publish_success(self):
         value = metrics({'observed_at': '2026-10-14T00:00:00+00:00', 'status': 'incomplete', 'errors': [{'source': 'node1'}], 'packages': [], 'findings': []}, now=datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc).timestamp())

@@ -6,6 +6,7 @@ use running image digests; source scans cover lockfiles, including transitive
 dependencies. Only vulnerabilities are enabled (never secret/config scanning).
 """
 import argparse
+import base64
 import collections
 import concurrent.futures
 import csv
@@ -43,8 +44,8 @@ def atomic_json(path, value):
             os.unlink(temporary)
 
 
-def command_json(command, timeout=600):
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+def command_json(command, timeout=600, env=None):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=env)
     if result.returncode:
         # Registry errors may contain URLs with credentials. Do not propagate
         # raw command stderr to inventory, metrics, CI artifacts, or logs.
@@ -102,7 +103,15 @@ def validate_host_os(report, packages):
         raise RuntimeError('installed OS packages were not detected')
 
 
-def scan_source(trivy, cache, source, reports, timeout=600):
+def scan_source(trivy, cache, source, reports, timeout=600, registry_auth=None):
+    if registry_auth:
+        with tempfile.TemporaryDirectory(prefix='registry-auth-', dir=reports) as directory:
+            atomic_json(Path(directory) / 'config.json', {'auths': registry_auth})
+            return _scan_source(trivy, cache, source, reports, timeout, dict(os.environ, DOCKER_CONFIG=directory))
+    return _scan_source(trivy, cache, source, reports, timeout)
+
+
+def _scan_source(trivy, cache, source, reports, timeout, env=None):
     reference = source['reference']
     key = hashlib.sha256((source['kind'] + ':' + reference).encode()).hexdigest()
     path = reports / (key + '.json')
@@ -114,7 +123,7 @@ def scan_source(trivy, cache, source, reports, timeout=600):
     attempts = 3 if source['kind'] == 'image' else 1
     for attempt in range(attempts):
         try:
-            report = command_json(base + flags + [reference], timeout=timeout + 30)
+            report = command_json(base + flags + [reference], timeout=timeout + 30, env=env)
             atomic_json(path, report)
             packages, findings = normalize_trivy(report, reference)
             return {'source': source, 'scanned_at': utc_now(), 'status': 'complete', 'packages': packages, 'findings': findings}
@@ -123,6 +132,47 @@ def scan_source(trivy, cache, source, reports, timeout=600):
             if attempt + 1 < attempts:
                 time.sleep(2 ** attempt)
     return {'source': source, 'scanned_at': utc_now(), 'status': 'error', 'error': category, 'packages': [], 'findings': []}
+
+
+def scoped_registry_auth(registry, auths):
+    result = {}
+    for name, value in auths.items():
+        parsed = urllib.parse.urlsplit(name if '://' in name else 'https://' + name)
+        host = parsed.netloc.lower()
+        if parsed.username is not None:
+            continue
+        if host == registry.lower() or registry == 'docker.io' and host in ('index.docker.io', 'registry-1.docker.io'):
+            result[name] = value
+    return result
+
+
+def registry_credentials(kubectl, pods):
+    """Use only pull credentials explicitly referenced by the observed Pods.
+
+    Values remain in memory and private transient Docker config files. They
+    are never included in source records, reports, subprocess arguments or logs.
+    """
+    credentials, cached = {}, {}
+    for pod in pods:
+        if pod.get('status', {}).get('phase') in ('Succeeded', 'Failed'):
+            continue
+        images = deployed_images([pod])
+        for entry in images:
+            registry = entry['reference'].split('/')[0]
+            if '.' not in registry and ':' not in registry:
+                registry = 'docker.io'
+            for ref in pod['spec'].get('imagePullSecrets', []):
+                key = (pod['metadata']['namespace'], ref['name'])
+                if key not in cached:
+                    try:
+                        secret = command_json(kubectl + ['-n', key[0], 'get', 'secret', key[1], '-o', 'json'], timeout=30)
+                        cached[key] = json.loads(base64.b64decode(secret['data']['.dockerconfigjson']))['auths']
+                    except (OSError, KeyError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+                        cached[key] = {}
+                scoped = scoped_registry_auth(registry, cached[key])
+                if scoped:
+                    credentials.setdefault(entry['reference'], {}).update(scoped)
+    return credentials
 
 
 def fetch_releases(policy, previous):
@@ -196,6 +246,28 @@ def fetch_hosts(inventory, ssh_key, known_hosts):
             return {'node': node, 'status': 'error', 'error': 'host report unavailable', 'packages': [], 'findings': []}
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         return list(executor.map(fetch, inventory))
+
+
+def match_host_packages(host, trivy, cache, directory):
+    if host.get('status') != 'complete' or host.get('vulnerability_matching') != 'central':
+        return host
+    try:
+        with tempfile.TemporaryDirectory(prefix='host-metadata-', dir=directory) as temporary:
+            stage = Path(temporary)
+            for name in ['etc/os-release', 'etc/lsb-release', 'etc/debian_version', 'var/lib/dpkg/status']:
+                if name not in host['package_metadata']:
+                    continue
+                target = stage / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(host['package_metadata'][name])
+            report = command_json([trivy, '--cache-dir', str(cache), '--timeout', '10m', 'rootfs', '--skip-db-update', '--scanners', 'vuln', '--format', 'json', '--list-all-pkgs', '--no-progress', str(stage)], timeout=660)
+        packages, findings = normalize_trivy(report, 'node:' + host['node'])
+        validate_host_os(report, packages)
+        native = [p for p in host['packages'] if p['ecosystem'] == 'native']
+        return {**host, 'packages': packages + native, 'findings': findings, 'matched_at': utc_now()}
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        # Keep enumerated versions but do not mark unscanned hosts as clean.
+        return {**host, 'status': 'error', 'error': 'host vulnerability matching failed'}
 
 
 def live_osv(packages, existing, cache):
@@ -284,6 +356,7 @@ def refresh(args):
     nodes = command_json(kubectl + ['get', 'nodes', '-o', 'json'])['items']
     pods = command_json(kubectl + ['get', 'pods', '-A', '-o', 'json'])['items']
     sources = deployed_images(pods)
+    credentials = registry_credentials(kubectl, pods)
     for repository in policy['repositories']:
         path = Path(args.repos_dir) / repository.split('/')[1]
         sources.append({'kind': 'fs', 'reference': str(path), 'repository': repository})
@@ -297,7 +370,7 @@ def refresh(args):
     reports.mkdir(mode=0o700, exist_ok=True)
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        futures = {executor.submit(scan_source, args.trivy, root / 'cache', source, reports, args.timeout): source for source in sources}
+        futures = {executor.submit(scan_source, args.trivy, root / 'cache', source, reports, args.timeout, credentials.get(source['reference'])): source for source in sources}
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             results.append(result)
@@ -306,6 +379,8 @@ def refresh(args):
     hosts = []
     if args.hosts:
         hosts = fetch_hosts(json.loads(Path(args.hosts).read_text()), args.ssh_key, args.known_hosts)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            hosts = list(executor.map(lambda h: match_host_packages(h, args.trivy, root / 'cache', root), hosts))
     packages = [p for r in [*results, *hosts] for p in r.get('packages', [])]
     findings = [v for r in [*results, *hosts] for v in r.get('findings', [])]
     errors = [{'source': r.get('source', r.get('node')), 'error': r.get('error', 'scan incomplete')} for r in [*results, *hosts] if r.get('status') != 'complete']

@@ -30,6 +30,7 @@ BINARIES = {
     'nvidia-container-runtime': ['/usr/bin/nvidia-container-runtime'],
     'heteronetwork': ['/opt/heteronetwork/bin/ipars'],
     'heteronetwork-daemon': ['/opt/heteronetwork/bin/iparsd'],
+    'trivy': ['/opt/heteronetwork/security/trivy'],
 }
 
 
@@ -84,6 +85,30 @@ def collect(args):
         r = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'], capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             gpu = r.stdout.strip().splitlines()
+    if args.metadata_only:
+        metadata = {p.lstrip('/'): Path(p).read_text() for p in ['/etc/os-release', '/etc/lsb-release', '/etc/debian_version', '/var/lib/dpkg/status'] if Path(p).is_file()}
+        package_rows = subprocess.run(['dpkg-query', '--show', '--showformat=${binary:Package}\t${Version}\t${db:Status-Abbrev}\n'], capture_output=True, text=True, timeout=15)
+        if package_rows.returncode:
+            raise RuntimeError('installed package enumeration failed')
+        family = 'ubuntu' if 'ID=ubuntu' in metadata.get('etc/os-release', '') else 'debian'
+        packages = []
+        for line in package_rows.stdout.splitlines():
+            fields = line.split('\t')
+            if len(fields) == 3 and fields[2].startswith('ii'):
+                packages.append({'name': fields[0], 'version': fields[1], 'ecosystem': family, 'source': source, 'purl': '', 'licenses': []})
+        if not packages:
+            raise RuntimeError('installed package enumeration was empty')
+        binaries_packages = [{'name': b['component'], 'version': b.get('version') or 'unknown (' + b.get('sha256', '')[:12] + ')', 'ecosystem': 'native', 'source': source, 'purl': '', 'licenses': []} for b in binaries]
+        binaries_packages.append({'name': 'linux-running-kernel', 'version': platform.release(), 'ecosystem': 'native', 'source': source, 'purl': '', 'licenses': []})
+        patch_path = Path(args.output).parent / 'containerd-update.json'
+        patch = json.loads(patch_path.read_text()) if patch_path.exists() else {}
+        result = {'schema_version': 2, 'node': node, 'observed_at': utc_now(), 'status': 'complete', 'vulnerability_matching': 'central', 'package_metadata': metadata, 'kernel': platform.release(), 'binaries': binaries, 'active_runtimes': active_runtimes({b['sha256'] for b in binaries if 'sha256' in b}), 'gpu_driver': gpu, 'packages': packages + binaries_packages, 'findings': [], 'containerd_patch': {key: patch[key] for key in ['status', 'target_version', 'running_tasks_preserved', 'verified_at', 'fixed_advisories'] if key in patch}}
+        atomic_json(args.output, result)
+        account = pwd.getpwnam(args.inventory_user)
+        os.chown(args.output, 0, account.pw_gid)
+        os.chmod(args.output, 0o640)
+        print(json.dumps({'node': node, 'metadata_collected': True, 'packages': len(packages), 'matching': 'central'}))
+        return
     cmd = [args.trivy, '--cache-dir', args.cache, '--timeout', '10m', 'rootfs', '--scanners', 'vuln', '--format', 'json', '--list-all-pkgs', '--no-progress']
     try:
         # Scan package metadata and explicitly installed runtimes, not VM disks,
@@ -138,6 +163,7 @@ def main():
     p.add_argument('--cache', default='/var/cache/heteronetwork-security')
     p.add_argument('--output', default='/var/lib/heteronetwork-security/host-report.json')
     p.add_argument('--inventory-user', default='mizuame')
+    p.add_argument('--metadata-only', action='store_true')
     collect(p.parse_args())
 
 

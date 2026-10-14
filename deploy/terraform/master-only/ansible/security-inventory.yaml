@@ -108,6 +108,10 @@
     - name: Start the first host collection asynchronously
       ansible.builtin.command: systemctl restart --no-block heteronetwork-security-host.service
       changed_when: false
+    - name: Remove the superseded per-host vulnerability database
+      ansible.builtin.file:
+        path: /var/cache/heteronetwork-security/db
+        state: absent
 
 - name: Provision the continuous fleet security inventory
   hosts: bootstrap

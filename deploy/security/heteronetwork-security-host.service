@@ -5,15 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /opt/heteronetwork/security/security_host_inventory.py
+ExecStart=/usr/bin/python3 /opt/heteronetwork/security/security_host_inventory.py --metadata-only
 User=root
 Group=root
 UMask=0027
 Nice=19
 IOSchedulingClass=idle
-CPUQuota=40%
-MemoryMax=1G
-TimeoutStartSec=15min
+CPUQuota=20%
+MemoryMax=256M
+TimeoutStartSec=3min
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
