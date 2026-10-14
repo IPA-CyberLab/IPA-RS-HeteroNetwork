@@ -20,6 +20,7 @@ BINARIES = {
     'gvisor': ['/usr/bin/runsc', '/usr/local/bin/runsc'],
     'gvisor-shim': ['/usr/bin/containerd-shim-runsc-v1', '/usr/local/bin/containerd-shim-runsc-v1'],
     'containerd': ['/usr/bin/containerd', '/usr/local/bin/containerd'],
+    'containerd-shim': ['/usr/bin/containerd-shim-runc-v2', '/usr/local/bin/containerd-shim-runc-v2'],
     'runc': ['/usr/bin/runc', '/usr/local/sbin/runc'],
     'kubelet': ['/usr/bin/kubelet'],
     'kubeadm': ['/usr/bin/kubeadm'],
