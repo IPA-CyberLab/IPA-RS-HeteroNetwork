@@ -20,4 +20,5 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/heteronetwork-security /var/cache/heteronetwork-security
 Environment=PYTHONNOUSERSITE=1
+Environment=HETERONETWORK_NODE_NAME={{ inventory_hostname }}
 UnsetEnvironment=PYTHONPATH PYTHONHOME TRIVY_TOKEN TRIVY_USERNAME TRIVY_PASSWORD TRIVY_REGISTRY_TOKEN

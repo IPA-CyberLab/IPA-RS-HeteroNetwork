@@ -92,7 +92,7 @@
         group: root
         mode: '0644'
     - name: Install host collection service and timer
-      ansible.builtin.copy:
+      ansible.builtin.template:
         src: "{{ hnn_repo_root }}/deploy/security/{{ item }}"
         dest: "/etc/systemd/system/{{ item }}"
         owner: root

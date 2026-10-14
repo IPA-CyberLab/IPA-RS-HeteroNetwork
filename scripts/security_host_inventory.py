@@ -66,7 +66,7 @@ def active_runtimes(installed):
 
 
 def collect(args):
-    node = Path('/etc/hostname').read_text().strip()
+    node = args.node_name or os.environ.get('HETERONETWORK_NODE_NAME') or Path('/etc/hostname').read_text().strip()
     source = 'node:' + node
     binaries = []
     for component, paths in BINARIES.items():
@@ -164,6 +164,7 @@ def main():
     p.add_argument('--output', default='/var/lib/heteronetwork-security/host-report.json')
     p.add_argument('--inventory-user', default='mizuame')
     p.add_argument('--metadata-only', action='store_true')
+    p.add_argument('--node-name')
     collect(p.parse_args())
 
 
