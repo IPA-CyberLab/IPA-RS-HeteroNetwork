@@ -22,6 +22,15 @@
       ansible.builtin.command: cat /etc/heteronetwork/security/inventory.key.pub
       register: hnn_inventory_public_key
       changed_when: false
+    - name: Generate a separate read-only runtime acceptance identity
+      ansible.builtin.command:
+        argv: [ssh-keygen, -t, ed25519, -N, '', -C, heteronetwork-security-snapshot, -f, /etc/heteronetwork/security/snapshot.key]
+        creates: /etc/heteronetwork/security/snapshot.key
+      no_log: true
+    - name: Read only the public acceptance identity
+      ansible.builtin.command: cat /etc/heteronetwork/security/snapshot.key.pub
+      register: hnn_snapshot_public_key
+      changed_when: false
 
 - name: Install host OSS/CVE collection without changing workloads
   hosts: all
@@ -83,7 +92,22 @@
         owner: root
         group: root
         mode: '0755'
-      loop: [security_inventory.py, security_host_inventory.py, security_refresh_repositories.py, security_update_gate.py]
+      loop: [security_inventory.py, security_host_inventory.py, security_refresh_repositories.py, security_update_gate.py, security_runtime_snapshot.py]
+    - name: Authorize only the forced runtime snapshot command
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_facts.getent_passwd.mizuame[4] }}/.ssh/authorized_keys"
+        regexp: '.* heteronetwork-security-snapshot$'
+        line: 'restrict,command="/usr/bin/sudo -n /opt/heteronetwork/security/security_runtime_snapshot.py" {{ hostvars[groups["bootstrap"][0]].hnn_snapshot_public_key.stdout }}'
+        create: false
+    - name: Permit only the argument-free read-only observer
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/heteronetwork-security-observer
+        content: |
+          mizuame ALL=(root) NOPASSWD: /opt/heteronetwork/security/security_runtime_snapshot.py ""
+        owner: root
+        group: root
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'
     - name: Install the declared update policy
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/security/policy.json"
@@ -158,6 +182,56 @@
         dest: "/etc/systemd/system/{{ item }}"
         mode: '0644'
       loop: [heteronetwork-security-scan.service, heteronetwork-security-scan.timer, heteronetwork-security-metrics.service]
+    - name: Install signed candidate reconciliation code
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/security_promote.py"
+        dest: /opt/heteronetwork/security/security_promote.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Fetch the checksum-pinned attestation verifier
+      ansible.builtin.get_url:
+        url: https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz
+        checksum: sha256:bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+        dest: /opt/heteronetwork/security/gh.tar.gz
+        mode: '0644'
+    - name: Extract only the verification CLI
+      ansible.builtin.unarchive:
+        src: /opt/heteronetwork/security/gh.tar.gz
+        dest: /opt/heteronetwork/security
+        remote_src: true
+        include: [gh_2.102.0_linux_amd64/bin/gh]
+        owner: root
+        group: root
+    - name: Install the protected verifier executable
+      ansible.builtin.copy:
+        src: /opt/heteronetwork/security/gh_2.102.0_linux_amd64/bin/gh
+        dest: /opt/heteronetwork/security/gh
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Declare production security reconciliation targets and health checks
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/promotion-heteronet.json"
+        dest: /opt/heteronetwork/security/promotion.json
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Install serial production security reconciliation
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [heteronetwork-security-promote.service, heteronetwork-security-promote.timer]
+    - name: Enable periodic signed candidate reconciliation
+      ansible.builtin.systemd_service:
+        name: heteronetwork-security-promote.timer
+        enabled: true
+        state: started
+        daemon_reload: true
     - name: Enable inventory and aggregate metrics
       ansible.builtin.systemd_service:
         name: "{{ item }}"

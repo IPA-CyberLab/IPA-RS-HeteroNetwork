@@ -10,6 +10,10 @@
   "require_live_migration": true,
   "allow_restart_fallback": false,
   "max_parallel_nodes": 1,
+  "attestation_verifier": {
+    "version": "2.102.0",
+    "linux_amd64_archive_sha256": "bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386"
+  },
   "trivy": {
     "version": "0.75.0",
     "linux_amd64_archive_sha256": "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f",

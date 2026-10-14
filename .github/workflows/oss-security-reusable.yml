@@ -9,10 +9,17 @@ on:
       auto_patch:
         default: false
         type: boolean
+      build_candidate:
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       auto_patch:
         description: Apply verified compatible Cargo fixes
+        default: false
+        type: boolean
+      build_candidate:
+        description: Build, test and publish an immutable security candidate
         default: false
         type: boolean
 
@@ -29,6 +36,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       fixes: ${{ steps.scan.outputs.fixes }}
+      candidate_required: ${{ steps.candidate.outputs.candidate_required }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -63,6 +71,25 @@ jobs:
           fixes=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'security-fixes.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('fixes='+str(len(fixes))+'\n')
           PY
+      - name: Discover whether this source still needs a candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_CANDIDATE: ${{ inputs.build_candidate }}
+        run: |
+          python3 - <<'PYTHON'
+          import os,pathlib,urllib.request,urllib.error
+          required=False
+          if os.environ['BUILD_CANDIDATE']=='true' and pathlib.Path('Dockerfile').is_file():
+            url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/releases/tags/security-'+os.environ['GITHUB_SHA']
+            request=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'User-Agent':'HeteroCloud-security'})
+            try:
+              with urllib.request.urlopen(request,timeout=30) as response: response.read()
+            except urllib.error.HTTPError as error:
+              if error.code!=404: raise
+              required=True
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out: out.write('candidate_required='+str(required).lower()+'\n')
+          PYTHON
       - name: Upload OSS scan and patch plan
         uses: actions/upload-artifact@v4
         with:
@@ -160,26 +187,58 @@ jobs:
           retention-days: 90
 
   publish:
-    needs: patch
-    if: needs.patch.outputs.commit != ''
+    needs: [scan, patch]
+    if: >-
+      always() && !cancelled() && needs.scan.result == 'success'
+      && (needs.patch.result == 'success' || needs.patch.result == 'skipped')
+      && (needs.patch.outputs.commit != '' || needs.scan.outputs.candidate_required == 'true')
+      && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
-      contents: read
+      contents: write
       packages: write
       id-token: write
       attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ needs.patch.outputs.commit }}
+          ref: ${{ needs.patch.outputs.commit || github.sha }}
           persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: IPA-CyberLab/IPA-RS-HeteroNetwork
+          ref: ${{ inputs.tooling_ref || github.sha }}
+          path: .security-tooling
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: oss-security-inventory
+          path: ${{ runner.temp }}/inventory
+      - name: Verify the candidate source before building
+        env:
+          RUSTUP_TOOLCHAIN: 1.96.1
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.96.1 --profile minimal --component clippy
+          if test -f Cargo.toml; then
+            cargo test --all-targets --locked
+            cargo clippy --all-targets --locked -- -D warnings
+          fi
+          python3 - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          # A manually requested candidate may contain already merged fixes.
+          # Current source and built-image scans still have to pass below.
+          (root/'candidate-fixes.json').write_text(json.dumps(json.loads((root/'inventory/security-fixes.json').read_text())))
+          PY
       - name: Detect container build
         id: image
         run: |
           if test -f Dockerfile; then
             echo 'enabled=true' >> "$GITHUB_OUTPUT"
             echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+            echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           fi
       - uses: docker/setup-buildx-action@v3
         if: steps.image.outputs.enabled == 'true'
@@ -195,13 +254,14 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
           pull: true
           push: true
           provenance: mode=max
           sbom: true
-          tags: ${{ steps.image.outputs.name }}:security-${{ needs.patch.outputs.commit }}
+          tags: ${{ steps.image.outputs.name }}:security-${{ steps.image.outputs.commit }}
           labels: |
-            org.opencontainers.image.revision=${{ needs.patch.outputs.commit }}
+            org.opencontainers.image.revision=${{ steps.image.outputs.commit }}
             io.heterocloud.security.ci-passed=true
       - name: Attest candidate identity
         if: steps.image.outputs.enabled == 'true'
@@ -210,5 +270,56 @@ jobs:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
-      # Candidate publication is not active process remediation. A deployment
-      # must pass security_update_gate and its fleet/availability checks.
+      - name: Re-scan the exact published digest and bind its acceptance evidence
+        if: steps.image.outputs.enabled == 'true'
+        env:
+          CANDIDATE_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          CANDIDATE_COMMIT: ${{ steps.image.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,tarfile,urllib.request
+          p=json.loads(pathlib.Path('.security-tooling/deploy/security/policy.json').read_text())['trivy']
+          with urllib.request.urlopen('https://github.com/aquasecurity/trivy/releases/download/v'+p['version']+'/trivy_'+p['version']+'_Linux-64bit.tar.gz',timeout=60) as r: data=r.read()
+          assert hashlib.sha256(data).hexdigest()==p['linux_amd64_archive_sha256']
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); archive=root/'trivy.tar.gz'; archive.write_bytes(data)
+          with tarfile.open(archive) as f:
+            binary=root/'trivy'; binary.write_bytes(f.extractfile('trivy').read()); binary.chmod(0o755)
+          PY
+          "$RUNNER_TEMP/trivy" fs --scanners vuln --list-all-pkgs --format json --skip-dirs .security-tooling --skip-dirs node_modules --skip-dirs target . > "$RUNNER_TEMP/candidate-source.json"
+          "$RUNNER_TEMP/trivy" image --scanners vuln --list-all-pkgs --format json "$CANDIDATE_IMAGE" > "$RUNNER_TEMP/candidate-image.json"
+          python3 .security-tooling/scripts/security_candidate_baseline.py \
+            --repository "$GITHUB_REPOSITORY" --source-report "$RUNNER_TEMP/candidate-source.json" \
+            --trivy "$RUNNER_TEMP/trivy" --output "$RUNNER_TEMP/candidate-baseline.json"
+          python3 .security-tooling/scripts/security_candidate.py \
+            --repository "$GITHUB_REPOSITORY" --commit "$CANDIDATE_COMMIT" \
+            --image "$CANDIDATE_IMAGE" --run-id "$GITHUB_RUN_ID" --ci-commit "$GITHUB_SHA" \
+            --source-report "$RUNNER_TEMP/candidate-source.json" \
+            --image-report "$RUNNER_TEMP/candidate-image.json" \
+            --fixes "$RUNNER_TEMP/candidate-fixes.json" --baseline "$RUNNER_TEMP/candidate-baseline.json" --output "$RUNNER_TEMP/security-candidate.json"
+      - name: Sign the candidate descriptor with GitHub build provenance
+        if: steps.image.outputs.enabled == 'true'
+        id: descriptor_attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ runner.temp }}/security-candidate.json
+      - name: Publish the immutable candidate descriptor for fleet reconciliation
+        if: steps.image.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_COMMIT: ${{ steps.image.outputs.commit }}
+        run: |
+          set -euo pipefail
+          tag="security-$CANDIDATE_COMMIT"
+          # Release assets provide read-only public discovery without placing a
+          # permanent GitHub credential on the fleet. Existing assets never change.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Candidate identity already published; refusing replacement.' >&2
+            exit 1
+          fi
+          cp '${{ steps.descriptor_attestation.outputs.bundle-path }}' "$RUNNER_TEMP/security-candidate.sigstore.json"
+          gh release create "$tag" "$RUNNER_TEMP/security-candidate.json" "$RUNNER_TEMP/security-candidate.sigstore.json" \
+            --target "$CANDIDATE_COMMIT" --prerelease \
+            --title "Verified security candidate $CANDIDATE_COMMIT" \
+            --notes 'Digest, source and successful CI must be verified before promotion.' \
+            --repo "$GITHUB_REPOSITORY"

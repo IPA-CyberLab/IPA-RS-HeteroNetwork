@@ -3,11 +3,17 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import socket
+import os
 
 from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, safe_trivy_report, scoped_registry_auth, validate_host_os
 from security_update_gate import assess, fingerprint
 from security_cargo_patch import fixes
 from security_containerd_update import preserved
+from security_candidate import candidate
+from security_gvisor_e2e import continuity
+from security_promote import canonical_image, tenant_identity, validate_identity, verified_fixes
+from security_runtime_snapshot import tcp_connections
 
 
 class InventoryTests(unittest.TestCase):
@@ -135,6 +141,79 @@ class RunningTaskPreservationTests(unittest.TestCase):
 
     def test_missing_running_task_is_rejected(self):
         self.assertFalse(preserved({'workspace': 123}, {}))
+
+
+class CandidateTests(unittest.TestCase):
+    def setUp(self):
+        self.repository = 'IPA-CyberLab/IPA-RS-HeteroCloud-Flash'
+        self.report = {'Results': [{'Type': 'cargo', 'Packages': [{'Name': 'rustls', 'Version': '0.23.45'}]}]}
+        self.value = candidate(self.repository, 'a' * 40, 'ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash@sha256:' + 'b' * 64, 12, self.report, self.report, [])
+        self.component = {'repository': self.repository}
+        self.run = {'head_sha': 'a' * 40, 'head_branch': 'master', 'status': 'completed', 'conclusion': 'success',
+                    'event': 'workflow_dispatch', 'path': '.github/workflows/oss-security.yml'}
+
+    def test_exact_ci_binding_is_accepted(self):
+        validate_identity(self.value, self.component, self.run)
+
+    def test_failed_and_untrusted_ci_cannot_promote(self):
+        for changed in [{'conclusion': 'failure'}, {'head_sha': 'c' * 40}, {'event': 'pull_request'},
+                        {'head_branch': 'untrusted'}, {'path': '.github/workflows/other.yml'}]:
+            with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                validate_identity(self.value, self.component, {**self.run, **changed})
+
+    def test_mutable_or_foreign_images_are_rejected(self):
+        for image in ['ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:latest',
+                      'ghcr.io/attacker/flash@sha256:' + 'b' * 64]:
+            with self.subTest(image=image), self.assertRaises(ValueError):
+                candidate(self.repository, 'a' * 40, image, 12, self.report, self.report, [])
+
+    def test_built_image_with_no_packages_is_not_a_pass(self):
+        with self.assertRaises(ValueError):
+            candidate(self.repository, 'a' * 40, self.value['image'], 12, self.report, {}, [])
+
+    def test_a_targeted_advisory_must_disappear(self):
+        bad = {'Results': [{'Type': 'cargo', 'Vulnerabilities': [{'VulnerabilityID': 'GHSA-target', 'PkgName': 'rustls', 'InstalledVersion': '0.23.43'}]}]}
+        with self.assertRaises(ValueError):
+            candidate(self.repository, 'a' * 40, self.value['image'], 12, bad, self.report, [{'advisories': ['GHSA-target']}])
+
+    def test_tag_plus_digest_and_bare_digest_refer_to_the_same_artifact(self):
+        digest = 'sha256:' + 'b' * 64
+        self.assertEqual(canonical_image('registry.example:5443/team/api:v1@' + digest), 'registry.example:5443/team/api@' + digest)
+
+    def test_unfixed_advisories_do_not_count_as_automatic_fixes(self):
+        old = [{'id': 'CVE-unfixed', 'package': 'p', 'fixed_version': ''},
+               {'id': 'GHSA-fixed', 'package': 'q', 'fixed_version': '2'}]
+        self.assertEqual(verified_fixes(old, []), ['GHSA-fixed'])
+
+
+class LiveAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        self.before = {'nonce': 'in-memory-only', 'memory_hash': 'hash', 'started_ns': 1, 'guest_pid': 1, 'connections': 1, 'sequence': 1}
+
+    def test_restarts_and_reconnections_cannot_pass_the_migration_probe(self):
+        self.assertTrue(continuity(self.before, {**self.before, 'sequence': 2}))
+        for change in [{'nonce': 'restarted'}, {'started_ns': 2}, {'connections': 2}, {'sequence': 0}, {'memory_hash': 'lost'}]:
+            with self.subTest(change=change):
+                self.assertFalse(continuity(self.before, {**self.before, 'sequence': 2, **change}))
+
+    def test_fresh_runtime_observation_detects_a_live_server_connection(self):
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(1)
+            with socket.create_connection(listener.getsockname()) as client:
+                connection, _ = listener.accept()
+                with connection:
+                    self.assertEqual(tcp_connections(os.getpid())['inbound_connections'], 1)
+
+    def test_kubernetes_container_identity_without_a_runtime_pid_is_rejected(self):
+        pods = [{'metadata': {'uid': 'user-pod'}, 'spec': {'nodeName': 'node'},
+                 'status': {'phase': 'Running', 'containerStatuses': [
+                     {'name': 'workload', 'containerID': 'containerd://cid', 'state': {'running': {}}}]}}]
+        with self.assertRaises(RuntimeError):
+            tenant_identity(pods, {'node': {'tasks': {}}})
+        old = tenant_identity(pods, {'node': {'tasks': {'cid': {'pid': 123, 'exe_sha256': 'a' * 64}}}})
+        restarted = tenant_identity(pods, {'node': {'tasks': {'cid': {'pid': 456, 'exe_sha256': 'a' * 64}}}})
+        self.assertNotEqual(old, restarted)
 
 
 if __name__ == '__main__':

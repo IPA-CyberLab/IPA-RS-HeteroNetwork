@@ -286,7 +286,7 @@ def match_host_packages(host, trivy, cache, directory):
             report = command_json([trivy, '--cache-dir', str(cache), '--timeout', '10m', 'rootfs', '--skip-db-update', '--scanners', 'vuln', '--format', 'json', '--list-all-pkgs', '--no-progress', str(stage)], timeout=660)
         packages, findings = normalize_trivy(report, 'node:' + host['node'])
         validate_host_os(report, packages)
-        native = [p for p in host['packages'] if p['ecosystem'] == 'native']
+        native = [p for p in host['packages'] if p['ecosystem'] not in ('ubuntu', 'debian')]
         return {**host, 'packages': packages + native, 'findings': findings, 'matched_at': utc_now()}
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         # Keep enumerated versions but do not mark unscanned hosts as clean.

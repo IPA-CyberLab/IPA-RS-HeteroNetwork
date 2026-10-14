@@ -1,0 +1,91 @@
+name: gVisor migration acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/security_gvisor_e2e.py
+      - scripts/security-probe/**
+      - deploy/security/gvisor-probe-lock.json
+      - .github/workflows/gvisor-migration-e2e.yml
+  pull_request:
+    paths:
+      - scripts/security_gvisor_e2e.py
+      - scripts/security-probe/**
+      - deploy/security/gvisor-probe-lock.json
+      - .github/workflows/gvisor-migration-e2e.yml
+
+permissions:
+  contents: read
+
+jobs:
+  real-checkpoint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: 1.27.2
+          cache: false
+      - name: Build the state and connection acceptance probe
+        run: CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/security-probe" scripts/security-probe/main.go
+      - name: Stage complete checksum-pinned runtime bundles
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /var/lib/heteronetwork-security
+          sudo python3 - <<'PY'
+          import hashlib,io,json,pathlib,tarfile,urllib.request
+          root=pathlib.Path('/opt/hetero-security-e2e');root.mkdir(mode=0o755)
+          for lock in json.loads(pathlib.Path('deploy/security/gvisor-probe-lock.json').read_text()):
+            with urllib.request.urlopen(lock['url'],timeout=90) as r:data=r.read()
+            assert hashlib.sha256(data).hexdigest()==lock['archive_sha256']
+            destination=root/lock['version'];destination.mkdir(mode=0o755)
+            with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+              for member in tar.getmembers():
+                name=pathlib.PurePosixPath(member.name)
+                assert not name.is_absolute() and '..' not in name.parts
+                path=destination/name
+                if member.isdir():path.mkdir(mode=0o755,parents=True,exist_ok=True)
+                else:
+                  assert member.isfile()
+                  path.parent.mkdir(mode=0o755,parents=True,exist_ok=True)
+                  path.write_bytes(tar.extractfile(member).read());path.chmod(0o755)
+          PY
+          sudo install -m 0755 "$RUNNER_TEMP/security-probe" /opt/hetero-security-e2e/security-probe
+      - name: Preserve memory and the established TCP socket on real restore
+        run: |
+          sudo python3 scripts/security_gvisor_e2e.py \
+            --source-runsc /opt/hetero-security-e2e/release-20261005.0/runsc \
+            --target-runsc /opt/hetero-security-e2e/release-20261005.0/runsc \
+            --probe-binary /opt/hetero-security-e2e/security-probe \
+            --output "$RUNNER_TEMP/same-version.json"
+      - name: Recover original memory and socket when the new version rejects restore
+        run: |
+          set +e
+          sudo python3 scripts/security_gvisor_e2e.py \
+            --source-runsc /opt/hetero-security-e2e/release-20260928.0/runsc \
+            --target-runsc /opt/hetero-security-e2e/release-20261005.0/runsc \
+            --probe-binary /opt/hetero-security-e2e/security-probe \
+            --output "$RUNNER_TEMP/incompatible-version.json"
+          status=$?
+          test "$status" = 2 || exit 1
+          sudo python3 - "$RUNNER_TEMP/incompatible-version.json" <<'PY'
+          import json,sys
+          value=json.load(open(sys.argv[1]))
+          assert value['status']=='blocked-incompatible'
+          assert value['rollback_verified'] and value['rollback_state_preserved'] and value['rollback_network_connections_preserved']
+          assert not value['cross_version_restore_passed']
+          PY
+      - name: Make only the canary's nonsecret acceptance evidence readable
+        if: always()
+        run: sudo chmod 0644 "$RUNNER_TEMP/same-version.json" "$RUNNER_TEMP/incompatible-version.json" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-gvisor-migration-acceptance
+          path: |
+            ${{ runner.temp }}/same-version.json
+            ${{ runner.temp }}/incompatible-version.json

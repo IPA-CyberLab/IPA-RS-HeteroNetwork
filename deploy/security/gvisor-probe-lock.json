@@ -1,0 +1,12 @@
+[
+  {
+    "version": "release-20260928.0",
+    "url": "https://github.com/google/gvisor/releases/download/release-20260928.0/gvisor-x86_64.tar.bz2",
+    "archive_sha256": "f3ed9131bc252259df150e270154180188f9df56b73a2312940325e1f522a2d6"
+  },
+  {
+    "version": "release-20261005.0",
+    "url": "https://github.com/google/gvisor/releases/download/release-20261005.0/gvisor-x86_64.tar.bz2",
+    "archive_sha256": "bd4eb2ca0ee74f0fbbb5f5273ba011e79c56a29fbb047393b88b981cd3230ede"
+  }
+]

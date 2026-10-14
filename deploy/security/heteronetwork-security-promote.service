@@ -1,0 +1,26 @@
+[Unit]
+Description=Reconcile verified security candidates through Argo CD
+After=network-online.target heteronetwork-security-scan.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/heteronetwork/security/security_promote.py --apply --policy /opt/heteronetwork/security/promotion.json --inventory /var/lib/heteronetwork-security/cluster/inventory.json --hosts /etc/heteronetwork/security/hosts.json --snapshot-key /etc/heteronetwork/security/snapshot.key --known-hosts /etc/heteronetwork/security/known_hosts --kubeconfig /etc/kubernetes/admin.conf --output /var/lib/heteronetwork-security/promotion
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=100%
+MemoryMax=2G
+TimeoutStartSec=60min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/heteronetwork-security
+Environment=PYTHONNOUSERSITE=1 XDG_CACHE_HOME=/var/lib/heteronetwork-security/verifier-cache
+UnsetEnvironment=PYTHONPATH PYTHONHOME GH_TOKEN GITHUB_TOKEN
+
+[Install]
+WantedBy=multi-user.target

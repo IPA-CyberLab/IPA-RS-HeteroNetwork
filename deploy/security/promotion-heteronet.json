@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "trusted_builder_commit": "0000000000000000000000000000000000000000",
+  "inventory_max_age_seconds": 3600,
+  "rollout_timeout_seconds": 600,
+  "tenant_namespace": "heterocloud-flash-workloads",
+  "health_probes": [
+    {"url": "http://console.heteronetwork.internal/ui/", "deadline_seconds": 3},
+    {"url": "https://heterocloud.mizuame.app/login", "deadline_seconds": 3},
+    {"url": "https://coder.mizuame.app/", "deadline_seconds": 3}
+  ],
+  "components": [
+    {"application": "heterocloud", "namespace": "heterocloud", "repository": "IPA-CyberLab/IPA-RS-HeteroCloud"},
+    {"application": "heterocloud-flash", "namespace": "heterocloud-flash", "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-Flash"},
+    {"application": "heterocloud-flow", "namespace": "heterocloud-flow", "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-Flow"},
+    {"application": "heterocloud-syouyu", "namespace": "heterocloud-syouyu", "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu"},
+    {"application": "heterocloud-vpc", "namespace": "heterocloud-vpc", "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-VPC"}
+  ]
+}
