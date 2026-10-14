@@ -40,7 +40,7 @@ def baseline(repository, current, trivy):
     remaining = {f['id'] for f in new}
     removed = [f for f in old if f.get('fixed_version') and f['id'] not in remaining]
     return {'source_commit': source, 'image': image, 'lock_sha256': hashlib.sha256(raw).hexdigest(),
-            'release_tag': release['tag_name'], 'fixed_advisories': removed}
+            'release_tag': release['tag_name'], 'fixed_advisories': removed, 'findings': old}
 
 
 def main():

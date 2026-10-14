@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-from security_inventory import atomic_json, command_json, normalize_trivy, registry_credentials, scan_source, utc_now
+from security_inventory import atomic_json, command_json, deployed_images, registry_credentials, scan_source, utc_now
 
 
 def require(value, message):
@@ -205,8 +205,19 @@ class Reconciler:
         inventory = json.loads(Path(self.args.inventory).read_text())
         require(inventory['status'] == 'complete' and time.time() - datetime.datetime.fromisoformat(inventory['observed_at']).timestamp() < self.policy['inventory_max_age_seconds'], 'fleet security inventory is incomplete or stale')
         references = {canonical_image(c['image']) for p in pods for c in p['spec']['containers'] if c['image'].startswith(repository)}
-        old_findings = [v for v in inventory['findings'] if canonical_image(v['source']) in references]
         credentials = registry_credentials(self.kubectl, pods)
+        old_findings = []
+        # Pod status names the architecture-specific manifest; a declared
+        # multi-platform index is not the same scan reference. Refresh both
+        # sides against the same DB so new advisories are not false regressions.
+        for source in deployed_images(pods):
+            if not source['reference'].startswith(repository):
+                continue
+            old_scan = scan_source(self.args.trivy, Path(self.args.inventory).parent / 'cache', source,
+                                   Path(self.args.inventory).parent / 'scan-reports', timeout=300,
+                                   registry_auth=credentials.get(source['reference']))
+            require(old_scan['status'] == 'complete', 'current deployed image baseline could not be re-scanned')
+            old_findings.extend(old_scan['findings'])
         auth = next((auth for ref, auth in credentials.items() if ref.startswith(repository)), None)
         scan = scan_source(self.args.trivy, Path(self.args.inventory).parent / 'cache',
                            {'kind': 'image', 'reference': value['image'], 'digest_verified': True},
@@ -216,6 +227,7 @@ class Reconciler:
         baseline = value.get('baseline') or {}
         if baseline.get('image') in references:
             fixed = sorted(set(fixed) | {f['id'] for f in baseline.get('fixed_advisories', [])})
+            old_findings.extend(baseline.get('findings', []))
         require(fixed or value['fixed_advisories'], 'candidate has no observed, verified remediation')
         old_critical = {(v['id'], v['package']) for v in old_findings if v['severity'] in ('CRITICAL', 'HIGH')}
         new_critical = {(v['id'], v['package']) for v in scan['findings'] if v['severity'] in ('CRITICAL', 'HIGH')}
@@ -246,6 +258,15 @@ class Reconciler:
                 else:
                     patch.append({'op': 'add', 'path': '/spec/source/helm/parameters', 'value': [tag]})
             self.kube('-n', 'argocd', 'patch', 'application', component['application'], '--type=json', '-p', json.dumps(patch), '-o', 'json')
+        # Building/scanning can take minutes. Recheck live socket activity at
+        # the mutation boundary rather than reuse an earlier idle observation.
+        snapshots = self.snapshots()
+        for pod in pods:
+            for container in pod['status'].get('containerStatuses', []):
+                if container.get('image', '').startswith(repository) and 'running' in container.get('state', {}):
+                    cid = container['containerID'].split('://', 1)[-1]
+                    tcp = snapshots[pod['spec']['nodeName']]['tasks'].get(cid, {}).get('tcp', {})
+                    require(tcp.get('status') == 'complete' and tcp.get('inbound_connections') == 0, 'platform connections became active while preparing the update')
         change(new_parameters)
         try:
             deadline = time.monotonic() + self.policy.get('rollout_timeout_seconds', 600)
