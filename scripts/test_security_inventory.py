@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, scoped_registry_auth, validate_host_os
+from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, safe_trivy_report, scoped_registry_auth, validate_host_os
 from security_update_gate import assess, fingerprint
 from security_cargo_patch import fixes
 from security_containerd_update import preserved
@@ -42,6 +42,12 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(scoped_registry_auth('registry.example', auths), {'registry.example': {'auth': 'private'}})
         self.assertEqual(scoped_registry_auth('unknown.example', auths), {})
         self.assertEqual(scoped_registry_auth('registry.example:5443', auths), {})
+
+    def test_image_environment_and_build_history_are_not_saved(self):
+        report = {'Results': [], 'Metadata': {'OS': {'Family': 'ubuntu'}, 'ImageConfig': {'config': {'Env': ['TEST_SECRET=must-not-be-saved']}, 'history': ['private-build-argument']}}}
+        safe = safe_trivy_report(report)
+        self.assertEqual(safe['Metadata'], {'OS': {'Family': 'ubuntu'}})
+        self.assertNotIn('must-not-be-saved', str(safe))
 
     def test_error_inventory_does_not_publish_success(self):
         value = metrics({'observed_at': '2026-10-14T00:00:00+00:00', 'status': 'incomplete', 'errors': [{'source': 'node1'}], 'packages': [], 'findings': []}, now=datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc).timestamp())

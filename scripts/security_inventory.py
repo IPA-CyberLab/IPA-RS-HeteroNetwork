@@ -49,7 +49,9 @@ def command_json(command, timeout=600, env=None):
     if result.returncode:
         # Registry errors may contain URLs with credentials. Do not propagate
         # raw command stderr to inventory, metrics, CI artifacts, or logs.
-        raise RuntimeError('command failed with exit status ' + str(result.returncode))
+        error = result.stderr.lower()
+        category = 'registry_authentication' if any(v in error for v in ['unauthorized', 'authentication required', 'denied']) else 'registry_rate_limit' if any(v in error for v in ['toomanyrequests', 'too many requests', '429']) else 'fetch_timeout' if any(v in error for v in ['deadline exceeded', 'timed out', 'timeout']) else 'process_failed'
+        raise RuntimeError(category + ' (exit ' + str(result.returncode) + ')')
     return json.loads(result.stdout)
 
 
@@ -103,6 +105,13 @@ def validate_host_os(report, packages):
         raise RuntimeError('installed OS packages were not detected')
 
 
+def safe_trivy_report(report):
+    # OCI image config can contain baked ENV values and build history. Package
+    # inventory needs none of it; never persist those fields even privately.
+    metadata = report.get('Metadata') or {}
+    return {**{key: report[key] for key in ['SchemaVersion', 'ArtifactName', 'ArtifactType', 'Results'] if key in report}, 'Metadata': {key: metadata[key] for key in ['OS', 'ImageID', 'DiffIDs', 'RepoTags', 'RepoDigests'] if key in metadata}}
+
+
 def scan_source(trivy, cache, source, reports, timeout=600, registry_auth=None):
     if registry_auth:
         with tempfile.TemporaryDirectory(prefix='registry-auth-', dir=reports) as directory:
@@ -115,20 +124,31 @@ def _scan_source(trivy, cache, source, reports, timeout, env=None):
     reference = source['reference']
     key = hashlib.sha256((source['kind'] + ':' + reference).encode()).hexdigest()
     path = reports / (key + '.json')
+    marker_path = reports / (key + '.metadata.json')
+    db_path = Path(cache) / 'db' / 'metadata.json'
+    db_version = json.loads(db_path.read_text()).get('UpdatedAt') if db_path.exists() else None
+    marker = {'db_updated_at': db_version, 'collector_schema': 3}
+    if source['kind'] == 'image' and source.get('digest_verified') and db_version and path.exists() and marker_path.exists() and json.loads(marker_path.read_text()) == marker:
+        report = safe_trivy_report(json.loads(path.read_text()))
+        packages, findings = normalize_trivy(report, reference)
+        return {'source': source, 'scanned_at': utc_now(), 'status': 'complete', 'packages': packages, 'findings': findings, 'cached_digest_and_db': True}
     base = [trivy, '--cache-dir', str(cache), '--timeout', str(timeout) + 's', source['kind']]
     flags = ['--scanners', 'vuln', '--format', 'json', '--list-all-pkgs', '--no-progress']
+    if db_version:
+        flags.append('--skip-db-update')
     if source['kind'] == 'fs':
         for directory in ['target', 'node_modules', '.git', 'artifacts', 'test-results']:
             flags += ['--skip-dirs', str(Path(reference) / directory)]
     attempts = 3 if source['kind'] == 'image' else 1
     for attempt in range(attempts):
         try:
-            report = command_json(base + flags + [reference], timeout=timeout + 30, env=env)
+            report = safe_trivy_report(command_json(base + flags + [reference], timeout=timeout + 30, env=env))
             atomic_json(path, report)
+            atomic_json(marker_path, marker)
             packages, findings = normalize_trivy(report, reference)
             return {'source': source, 'scanned_at': utc_now(), 'status': 'complete', 'packages': packages, 'findings': findings}
         except (RuntimeError, ValueError, subprocess.TimeoutExpired, OSError) as error:
-            category = type(error).__name__
+            category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
             if attempt + 1 < attempts:
                 time.sleep(2 ** attempt)
     return {'source': source, 'scanned_at': utc_now(), 'status': 'error', 'error': category, 'packages': [], 'findings': []}
@@ -237,13 +257,16 @@ def fetch_hosts(inventory, ssh_key, known_hosts):
     def fetch(host):
         node, address = host['name'], host['ssh_host']
         args = ['ssh', '-i', ssh_key, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + known_hosts, '-o', 'ConnectTimeout=7', 'mizuame@' + address, 'cat /var/lib/heteronetwork-security/host-report.json']
-        try:
-            report = command_json(args, timeout=30)
-            if report.get('node') != node:
-                raise ValueError('host identity mismatch')
-            return report
-        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
-            return {'node': node, 'status': 'error', 'error': 'host report unavailable', 'packages': [], 'findings': []}
+        for attempt in range(3):
+            try:
+                report = command_json(args, timeout=30)
+                if report.get('node') != node:
+                    raise ValueError('host identity mismatch')
+                return report
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        return {'node': node, 'status': 'error', 'error': 'host report unavailable', 'packages': [], 'findings': []}
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         return list(executor.map(fetch, inventory))
 
