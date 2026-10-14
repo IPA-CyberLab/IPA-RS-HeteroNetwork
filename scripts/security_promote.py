@@ -80,7 +80,7 @@ def candidate_tag(repository):
             expected = '/' + repository + '/releases/tag/'
             if parsed.scheme == 'https' and parsed.netloc == 'github.com' and parsed.path.startswith(expected):
                 tag = urllib.parse.unquote(parsed.path[len(expected):])
-                if re.fullmatch(r'security-[0-9a-f]{40}', tag):
+                if re.fullmatch(r'security-[0-9a-f]{40}(?:-[0-9]+)?', tag):
                     return tag
     return None
 
@@ -189,6 +189,7 @@ class Reconciler:
         value = json_request('https://github.com/' + component['repository'] + '/releases/download/' + tag + '/security-candidate.json')
         run = json_request('https://api.github.com/repos/' + component['repository'] + '/actions/runs/' + str(value['ci']['run_id']))
         validate_identity(value, component, run)
+        require(tag in ('security-' + value['source_commit'], 'security-' + value['source_commit'] + '-' + str(value['ci']['run_id'])), 'release tag does not match the signed candidate identity')
         self.attestation(component, tag, value)
         if value['source_commit'] != run['head_sha']:
             compare = json_request('https://api.github.com/repos/' + component['repository'] + '/compare/' + run['head_sha'] + '...' + value['source_commit'])
@@ -258,7 +259,7 @@ class Reconciler:
         require(not any(p['name'] == 'image.repository' for p in parameters), 'an external image repository override is present')
         new_parameters = [p for p in parameters if p['name'] != image_parameter] + [
             {'name': image_parameter, 'value': (value['image'] if image_parameter == 'image' else
-             'security-' + value['source_commit'] + '@' + value['image'].split('@', 1)[1])}]
+             tag + '@' + value['image'].split('@', 1)[1])}]
         atomic_json(self.root / (component['application'] + '-before.json'), {'source_sha256': hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest(), 'tenants': before, 'candidate': record})
         def change(parameters, expected_parameters):
             current = self.kube('-n', 'argocd', 'get', 'application', component['application'], '-o', 'json')

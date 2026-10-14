@@ -76,20 +76,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD_CANDIDATE: ${{ inputs.build_candidate }}
-        run: |
-          python3 - <<'PYTHON'
-          import os,pathlib,urllib.request,urllib.error
-          required=False
-          if os.environ['BUILD_CANDIDATE']=='true' and pathlib.Path('Dockerfile').is_file():
-            url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/releases/tags/security-'+os.environ['GITHUB_SHA']
-            request=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'User-Agent':'HeteroCloud-security'})
-            try:
-              with urllib.request.urlopen(request,timeout=30) as response: response.read()
-            except urllib.error.HTTPError as error:
-              if error.code!=404: raise
-              required=True
-          with open(os.environ['GITHUB_OUTPUT'],'a') as out: out.write('candidate_required='+str(required).lower()+'\n')
-          PYTHON
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: python3 .security-tooling/scripts/security_candidate_needed.py --trivy "$RUNNER_TEMP/trivy"
       - name: Upload OSS scan and patch plan
         uses: actions/upload-artifact@v4
         with:
@@ -259,7 +248,7 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
-          tags: ${{ steps.image.outputs.name }}:security-${{ steps.image.outputs.commit }}
+          tags: ${{ steps.image.outputs.name }}:security-${{ steps.image.outputs.commit }}-${{ github.run_id }}
           labels: |
             org.opencontainers.image.revision=${{ steps.image.outputs.commit }}
             io.heterocloud.security.ci-passed=true
@@ -310,7 +299,7 @@ jobs:
           CANDIDATE_COMMIT: ${{ steps.image.outputs.commit }}
         run: |
           set -euo pipefail
-          tag="security-$CANDIDATE_COMMIT"
+          tag="security-$CANDIDATE_COMMIT-$GITHUB_RUN_ID"
           # Release assets provide read-only public discovery without placing a
           # permanent GitHub credential on the fleet. Existing assets never change.
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

@@ -15,6 +15,7 @@ from security_gvisor_e2e import continuity
 from security_promote import canonical_image, deployment_ready, image_repository, tenant_identity, validate_identity, verified_fixes
 from security_runtime_snapshot import tcp_connections
 from security_host_inventory import go_module_records
+from security_candidate_needed import new_os_fixes
 
 
 class InventoryTests(unittest.TestCase):
@@ -151,6 +152,13 @@ class RunningTaskPreservationTests(unittest.TestCase):
 
 
 class CandidateTests(unittest.TestCase):
+    def test_new_os_fixes_rebuild_unchanged_source_without_looping(self):
+        finding = {'id': 'CVE-new', 'package': 'libc6', 'installed_version': '1', 'fixed_version': '2', 'ecosystem': 'debian'}
+        self.assertTrue(new_os_fixes([], [finding]))
+        self.assertFalse(new_os_fixes([finding], [finding]))
+        self.assertFalse(new_os_fixes([], [{**finding, 'fixed_version': ''}]))
+        self.assertFalse(new_os_fixes([], [{**finding, 'ecosystem': 'cargo'}]))
+
     def test_related_repositories_are_separate(self):
         self.assertEqual(image_repository('registry.example:5443/team/app:v1@sha256:abc'), 'registry.example:5443/team/app')
         self.assertNotEqual(image_repository('ghcr.io/org/flow-livekit:1'), image_repository('ghcr.io/org/flow:1'))
