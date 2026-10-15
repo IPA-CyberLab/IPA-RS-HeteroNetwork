@@ -398,7 +398,11 @@ class Reconciler:
                         require(all(d['spec'].get('replicas', 1) >= 2 for d in observed), 'controller bootstrap did not create standby capacity')
                         change(normal_parameters, new_parameters, chart, chart)
                         active_parameters = normal_parameters
-                    return {**record, 'status': 'promoted', 'tenant_tasks_preserved': True, 'completed_at': utc_now()}
+                    accepted = {**record, 'status': 'promoted', 'tenant_tasks_preserved': True,
+                                'tenant_identity_sha256': hashlib.sha256(json.dumps(before, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+                                'ci_run_id': value['ci']['run_id'], 'chart_revision': chart, 'completed_at': utc_now()}
+                    atomic_json(self.root / (component['application'] + '-last-accepted.json'), accepted)
+                    return accepted
                 time.sleep(3)
             raise RuntimeError('platform rollout did not pass acceptance before its deadline')
         except BaseException:
