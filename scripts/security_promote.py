@@ -248,6 +248,7 @@ class Reconciler:
         chart = component.get('chart_revision', old_chart)
         if chart != old_chart:
             require(old_chart in component.get('chart_previous_revisions', []), 'chart revision changed outside the reviewed transition')
+        if component.get('chart_revision'):
             comparison = self.history(component['repository'], chart, value['source_commit'])
             require(comparison['status'] in ('ahead', 'identical') and comparison['behind_by'] == 0, 'candidate does not include the reviewed chart revision')
         pods = self.kube('-n', component['namespace'], 'get', 'pods', '-o', 'json')['items']
