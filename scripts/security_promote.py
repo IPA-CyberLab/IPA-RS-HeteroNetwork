@@ -72,10 +72,17 @@ def json_request(url, maximum=8 * 1024 * 1024):
     return json.loads(raw)
 
 
-def candidate_tag(repository):
+def newest_candidate(tags, source=None):
+    matching = [tag for tag in tags if re.fullmatch(r'security-[0-9a-f]{40}(?:-[0-9]+)?', tag)
+                and (source is None or tag.split('-')[1] == source)]
+    return max(matching, key=lambda tag: int(tag.split('-')[2]) if len(tag.split('-')) == 3 else 0, default=None)
+
+
+def candidate_tag(repository, source=None):
     url = 'https://github.com/' + repository + '/releases.atom'
     with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'HeteroCloud-Security-Reconciliation'}), timeout=20) as response:
         raw = response.read(2 * 1024 * 1024)
+    tags = []
     for entry in ET.fromstring(raw).findall('{http://www.w3.org/2005/Atom}entry'):
         for link in entry.findall('{http://www.w3.org/2005/Atom}link'):
             parsed = urllib.parse.urlsplit(link.get('href', ''))
@@ -83,8 +90,8 @@ def candidate_tag(repository):
             if parsed.scheme == 'https' and parsed.netloc == 'github.com' and parsed.path.startswith(expected):
                 tag = urllib.parse.unquote(parsed.path[len(expected):])
                 if re.fullmatch(r'security-[0-9a-f]{40}(?:-[0-9]+)?', tag):
-                    return tag
-    return None
+                    tags.append(tag)
+    return newest_candidate(tags, source)
 
 
 def validate_identity(value, component, run):
@@ -223,7 +230,7 @@ class Reconciler:
         atomic_json(directory / 'verified-attestation.json', json.loads(result.stdout))
 
     def reconcile(self, component):
-        tag = candidate_tag(component['repository'])
+        tag = candidate_tag(component['repository'], current_source(component['repository']))
         if not tag:
             return {'component': component['application'], 'status': 'awaiting-candidate'}
         value = json_request('https://github.com/' + component['repository'] + '/releases/download/' + tag + '/security-candidate.json')

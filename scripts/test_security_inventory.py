@@ -12,7 +12,7 @@ from security_cargo_patch import fixes
 from security_containerd_update import preserved
 from security_candidate import candidate
 from security_gvisor_e2e import continuity
-from security_promote import canonical_image, deployment_ready, image_repository, tenant_identity, validate_identity, verified_fixes
+from security_promote import canonical_image, deployment_ready, image_repository, newest_candidate, tenant_identity, validate_identity, verified_fixes
 from security_runtime_snapshot import tcp_connections
 from security_host_inventory import go_module_records
 from security_candidate_needed import new_os_fixes
@@ -163,6 +163,12 @@ class RunningTaskPreservationTests(unittest.TestCase):
 
 
 class CandidateTests(unittest.TestCase):
+    def test_release_feed_order_cannot_select_a_superseded_candidate(self):
+        old, new = 'a' * 40, 'b' * 40
+        tags = ['security-' + old + '-100', 'security-' + new + '-102', 'security-' + new + '-101']
+        self.assertEqual(newest_candidate(tags, new), 'security-' + new + '-102')
+        self.assertIsNone(newest_candidate(tags, 'c' * 40))
+
     def test_new_os_fixes_rebuild_unchanged_source_without_looping(self):
         finding = {'id': 'CVE-new', 'package': 'libc6', 'installed_version': '1', 'fixed_version': '2', 'ecosystem': 'debian'}
         self.assertTrue(new_os_fixes([], [finding]))
