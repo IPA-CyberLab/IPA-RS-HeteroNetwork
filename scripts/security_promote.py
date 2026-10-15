@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -151,9 +152,11 @@ class Reconciler:
             command = ['ssh', '-i', self.args.snapshot_key, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
                        '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + self.args.known_hosts,
                        '-o', 'ConnectTimeout=7', 'mizuame@' + host['ssh_host'], 'runtime-snapshot']
-            report = command_json(command, timeout=40)
-            age = time.time() - datetime.datetime.fromisoformat(report['observed_at']).timestamp()
-            require(0 <= age < 45, 'runtime acceptance snapshot is stale')
+            challenge = secrets.token_hex(32)
+            result = subprocess.run(command, input=challenge + '\n', capture_output=True, text=True, timeout=40)
+            require(result.returncode == 0, 'runtime acceptance observation failed')
+            report = json.loads(result.stdout)
+            require(report.get('challenge') == challenge, 'runtime acceptance snapshot did not bind the fresh challenge')
             return host['name'], report
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             return dict(pool.map(fetch, self.hosts))

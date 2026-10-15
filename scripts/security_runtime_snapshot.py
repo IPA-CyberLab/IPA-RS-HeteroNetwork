@@ -84,7 +84,7 @@ def tcp_connections(pid, namespaces=None):
         return {'status': 'unverified'}
 
 
-def collect():
+def collect(challenge=None):
     ctr = next((p for p in ['/usr/bin/ctr', '/usr/local/bin/ctr'] if Path(p).is_file()), None)
     if not ctr:
         raise RuntimeError('containerd task observer unavailable')
@@ -114,7 +114,7 @@ def collect():
         except OSError:
             tasks[identifier] = {'pid': pid, 'status': 'unverified'}
     save_hashes(hashes)
-    return {'schema_version': 1, 'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    return {'schema_version': 1, 'challenge': challenge, 'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'host': os.uname().nodename, 'tasks': tasks}
 
 
@@ -122,6 +122,9 @@ if __name__ == '__main__':
     if os.geteuid() != 0 or len(sys.argv) != 1:
         raise SystemExit('root with no arguments required')
     try:
-        print(json.dumps(collect(), separators=(',', ':')))
+        challenge = sys.stdin.readline(100).strip()
+        if challenge and not re.fullmatch(r'[0-9a-f]{64}', challenge):
+            raise RuntimeError('invalid observation challenge')
+        print(json.dumps(collect(challenge or None), separators=(',', ':')))
     except (RuntimeError, OSError, subprocess.SubprocessError):
         raise SystemExit('runtime snapshot failed')
