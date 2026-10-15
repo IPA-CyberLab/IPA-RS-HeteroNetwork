@@ -16,9 +16,20 @@ from security_promote import canonical_image, deployment_ready, image_repository
 from security_runtime_snapshot import tcp_connections
 from security_host_inventory import go_module_records
 from security_candidate_needed import new_os_fixes
+from security_candidate_baseline import select_release
 
 
 class InventoryTests(unittest.TestCase):
+    def test_image_source_revision_is_retained_without_other_labels(self):
+        report = {'Metadata': {'ImageConfig': {'config': {'Labels': {'org.opencontainers.image.revision': 'a' * 40, 'secret-label': 'must-not-persist'}, 'Env': ['PRIVATE=value']}}}}
+        safe = safe_trivy_report(report)
+        self.assertEqual(safe['Metadata'], {'SourceRevision': 'a' * 40})
+        self.assertNotIn('PRIVATE', str(safe))
+
+    def test_incomplete_latest_release_is_not_a_deployment_baseline(self):
+        complete = {'tag_name': 'v1', 'assets': [{'name': 'service-release-artifact.json'}]}
+        self.assertEqual(select_release([{'tag_name': 'v2', 'assets': []}, complete]), complete)
+
     def test_go_replacement_does_not_report_unlinked_requested_version(self):
         modules = 'dep\texample.com/old\tv1.0.0\th1:old\n=>\texample.com/fixed\tv1.2.0\th1:new\n\nbuild\tsecret-setting=not-exported\n'
         records = go_module_records(modules, 'runtime')

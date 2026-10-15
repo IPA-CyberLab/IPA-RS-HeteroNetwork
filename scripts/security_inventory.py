@@ -109,7 +109,11 @@ def safe_trivy_report(report):
     # OCI image config can contain baked ENV values and build history. Package
     # inventory needs none of it; never persist those fields even privately.
     metadata = report.get('Metadata') or {}
-    return {**{key: report[key] for key in ['SchemaVersion', 'ArtifactName', 'ArtifactType', 'Results'] if key in report}, 'Metadata': {key: metadata[key] for key in ['OS', 'ImageID', 'DiffIDs', 'RepoTags', 'RepoDigests'] if key in metadata}}
+    safe = {key: metadata[key] for key in ['OS', 'ImageID', 'DiffIDs', 'RepoTags', 'RepoDigests'] if key in metadata}
+    revision = metadata.get('SourceRevision') or ((metadata.get('ImageConfig') or {}).get('config') or {}).get('Labels', {}).get('org.opencontainers.image.revision')
+    if isinstance(revision, str) and re.fullmatch(r'[0-9a-f]{40}', revision):
+        safe['SourceRevision'] = revision
+    return {**{key: report[key] for key in ['SchemaVersion', 'ArtifactName', 'ArtifactType', 'Results'] if key in report}, 'Metadata': safe}
 
 
 def scan_source(trivy, cache, source, reports, timeout=600, registry_auth=None):
@@ -127,11 +131,11 @@ def _scan_source(trivy, cache, source, reports, timeout, env=None):
     marker_path = reports / (key + '.metadata.json')
     db_path = Path(cache) / 'db' / 'metadata.json'
     db_version = json.loads(db_path.read_text()).get('UpdatedAt') if db_path.exists() else None
-    marker = {'db_updated_at': db_version, 'collector_schema': 3}
+    marker = {'db_updated_at': db_version, 'collector_schema': 4}
     if source['kind'] == 'image' and source.get('digest_verified') and db_version and path.exists() and marker_path.exists() and json.loads(marker_path.read_text()) == marker:
         report = safe_trivy_report(json.loads(path.read_text()))
         packages, findings = normalize_trivy(report, reference)
-        return {'source': source, 'scanned_at': utc_now(), 'status': 'complete', 'packages': packages, 'findings': findings, 'cached_digest_and_db': True}
+        return {'source': source, 'scanned_at': utc_now(), 'status': 'complete', 'packages': packages, 'findings': findings, 'source_revision': report.get('Metadata', {}).get('SourceRevision'), 'cached_digest_and_db': True}
     base = [trivy, '--cache-dir', str(cache), '--timeout', str(timeout) + 's', source['kind']]
     flags = ['--scanners', 'vuln', '--format', 'json', '--list-all-pkgs', '--no-progress']
     if db_version:
@@ -146,7 +150,7 @@ def _scan_source(trivy, cache, source, reports, timeout, env=None):
             atomic_json(path, report)
             atomic_json(marker_path, marker)
             packages, findings = normalize_trivy(report, reference)
-            return {'source': source, 'scanned_at': utc_now(), 'status': 'complete', 'packages': packages, 'findings': findings}
+            return {'source': source, 'scanned_at': utc_now(), 'status': 'complete', 'packages': packages, 'findings': findings, 'source_revision': report.get('Metadata', {}).get('SourceRevision')}
         except (RuntimeError, ValueError, subprocess.TimeoutExpired, OSError) as error:
             category = str(error) if isinstance(error, RuntimeError) else type(error).__name__
             if attempt + 1 < attempts:

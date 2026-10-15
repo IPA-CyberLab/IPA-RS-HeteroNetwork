@@ -93,7 +93,7 @@
         owner: root
         group: root
         mode: '0755'
-      loop: [security_inventory.py, security_host_inventory.py, security_refresh_repositories.py, security_update_gate.py, security_runtime_snapshot.py]
+      loop: [security_inventory.py, security_host_inventory.py, security_refresh_repositories.py, security_update_gate.py, security_runtime_snapshot.py, security_candidate_baseline.py]
     - name: Authorize only the forced runtime snapshot command
       ansible.builtin.lineinfile:
         path: "{{ ansible_facts.getent_passwd.mizuame[4] }}/.ssh/authorized_keys"

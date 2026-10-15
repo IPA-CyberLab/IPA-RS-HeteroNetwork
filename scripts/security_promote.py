@@ -23,6 +23,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 from security_inventory import atomic_json, command_json, deployed_images, registry_credentials, scan_source, utc_now
+from security_candidate_baseline import source_baseline
 
 
 def require(value, message):
@@ -242,6 +243,7 @@ class Reconciler:
         references = {canonical_image(c['image']) for p in pods for c in p['spec']['containers'] if image_repository(c['image']) == repository}
         credentials = registry_credentials(self.kubectl, pods)
         old_findings = []
+        source_baselines = []
         # Pod status names the architecture-specific manifest; a declared
         # multi-platform index is not the same scan reference. Refresh both
         # sides against the same DB so new advisories are not false regressions.
@@ -253,6 +255,16 @@ class Reconciler:
                                    registry_auth=credentials.get(source['reference']))
             require(old_scan['status'] == 'complete', 'current deployed image baseline could not be re-scanned')
             old_findings.extend(old_scan['findings'])
+            revision = old_scan.get('source_revision')
+            if revision:
+                compare = json_request('https://api.github.com/repos/' + component['repository'] + '/compare/' + revision + '...' + value['source_commit'])
+                require(compare.get('status') in ('ahead', 'identical') and compare.get('behind_by') == 0,
+                        'candidate does not contain the deployed source history')
+                source_proof = source_baseline(component['repository'], revision, source['reference'],
+                                               value['inventory']['source_findings'], self.args.trivy,
+                                               Path(self.args.inventory).parent / 'cache')
+                old_findings.extend(source_proof['findings'])
+                source_baselines.append({'image': source['reference'], 'source_commit': revision})
         auth = next((auth for ref, auth in credentials.items() if image_repository(ref) == repository), None)
         scan = scan_source(self.args.trivy, Path(self.args.inventory).parent / 'cache',
                            {'kind': 'image', 'reference': value['image'], 'digest_verified': True},
@@ -268,7 +280,8 @@ class Reconciler:
         new_critical = {(v['id'], v['package']) for v in scan['findings'] if v['severity'] in ('CRITICAL', 'HIGH')}
         require(not new_critical - old_critical, 'candidate introduces a new high or critical finding')
         record = {'component': component['application'], 'status': 'eligible', 'image': value['image'],
-                  'fixed_advisories': fixed, 'candidate_source': value['source_commit'], 'verified_at': utc_now()}
+                  'fixed_advisories': fixed, 'candidate_source': value['source_commit'], 'verified_at': utc_now(),
+                  'deployed_source_baselines': source_baselines}
         if not self.args.apply:
             return record
         source = app['spec']['source']
