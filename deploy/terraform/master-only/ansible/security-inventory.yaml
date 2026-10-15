@@ -222,6 +222,7 @@
         group: root
         mode: '0644'
     - name: Install serial production security reconciliation
+      tags: [security_code]
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/security/{{ item }}"
         dest: "/etc/systemd/system/{{ item }}"
@@ -230,6 +231,7 @@
         mode: '0644'
       loop: [heteronetwork-security-promote.service, heteronetwork-security-promote.timer]
     - name: Enable periodic signed candidate reconciliation
+      tags: [security_code]
       ansible.builtin.systemd_service:
         name: heteronetwork-security-promote.timer
         enabled: true

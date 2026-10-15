@@ -274,6 +274,8 @@ class Reconciler:
         require(inventory['status'] == 'complete' and time.time() - datetime.datetime.fromisoformat(inventory['observed_at']).timestamp() < self.policy['inventory_max_age_seconds'], 'fleet security inventory is incomplete or stale')
         references = {canonical_image(c['image']) for p in pods for c in p['spec']['containers'] if image_repository(c['image']) == repository}
         credentials = registry_credentials(self.kubectl, pods)
+        database = Path(self.args.inventory).parent / 'cache' / 'db' / 'metadata.json'
+        database_version = json.loads(database.read_text()).get('UpdatedAt')
         old_findings = []
         source_baselines = []
         # Pod status names the architecture-specific manifest; a declared
@@ -302,6 +304,8 @@ class Reconciler:
                            {'kind': 'image', 'reference': value['image'], 'digest_verified': True},
                            Path(self.args.inventory).parent / 'scan-reports', timeout=300, registry_auth=auth)
         require(scan['status'] == 'complete', 'built candidate re-scan failed')
+        require(database_version and json.loads(database.read_text()).get('UpdatedAt') == database_version,
+                'advisory database changed during the candidate comparison')
         fixed = verified_fixes(old_findings, scan['findings'])
         baseline = value.get('baseline') or {}
         if baseline.get('image') in references:

@@ -1,6 +1,6 @@
 [Unit]
 Description=Reconcile verified security candidates through Argo CD
-After=network-online.target heteronetwork-security-scan.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
