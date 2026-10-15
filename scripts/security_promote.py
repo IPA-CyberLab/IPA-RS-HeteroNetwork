@@ -147,6 +147,19 @@ class Reconciler:
     def kube(self, *args):
         return command_json(self.kubectl + list(args), timeout=30)
 
+    def history(self, repository, before, after):
+        identity = {'repository': repository, 'before': before, 'after': after}
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        path = self.root / ('source-history-' + key + '.json')
+        if path.exists():
+            saved = json.loads(path.read_text())
+            require(saved['identity'] == identity, 'source history cache identity mismatch')
+            return saved['comparison']
+        result = json_request('https://api.github.com/repos/' + repository + '/compare/' + before + '...' + after)
+        comparison = {k: result.get(k) for k in ('status', 'ahead_by', 'behind_by')}
+        atomic_json(path, {'identity': identity, 'comparison': comparison})
+        return comparison
+
     def snapshots(self):
         def fetch(host):
             command = ['ssh', '-i', self.args.snapshot_key, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
@@ -197,10 +210,15 @@ class Reconciler:
                    '--repo', component['repository'], '--source-ref', 'refs/heads/master',
                    '--source-digest', value['ci']['source_commit'], '--deny-self-hosted-runners',
                    '--signer-workflow', 'IPA-CyberLab/IPA-RS-HeteroNetwork/.github/workflows/oss-security-reusable.yml',
-                   '--signer-digest', self.policy['trusted_builder_commit'], '--format', 'json']
+                   '--format', 'json']
         env = {k: v for k, v in os.environ.items() if k not in ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN')}
         env['GH_CONFIG_DIR'] = str(directory / 'gh-verification-config')
-        result = subprocess.run(command, capture_output=True, text=True, timeout=90, env=env)
+        builders = [self.policy['trusted_builder_commit']] + self.policy.get('previous_builder_commits', [])
+        require(1 <= len(builders) <= 3 and all(re.fullmatch(r'[0-9a-f]{40}', b) for b in builders), 'builder allowlist is invalid')
+        for builder in builders:
+            result = subprocess.run(command + ['--signer-digest', builder], capture_output=True, text=True, timeout=90, env=env)
+            if result.returncode == 0:
+                break
         require(result.returncode == 0, 'candidate signature, builder or source binding was not verified')
         atomic_json(directory / 'verified-attestation.json', json.loads(result.stdout))
 
@@ -219,14 +237,25 @@ class Reconciler:
             require(compare.get('ahead_by') == 1 and {f['filename'] for f in compare.get('files', [])} == {'Cargo.lock'}, 'automatic source patch changed more than the tested lockfile')
         app = self.kube('-n', 'argocd', 'get', 'application', component['application'], '-o', 'json')
         require(app['spec']['source']['repoURL'] == 'https://github.com/' + component['repository'] + '.git', 'Application source is outside the component repository')
+        old_chart = app['spec']['source']['targetRevision']
+        chart = component.get('chart_revision', old_chart)
+        if chart != old_chart:
+            require(old_chart in component.get('chart_previous_revisions', []), 'chart revision changed outside the reviewed transition')
+            comparison = self.history(component['repository'], chart, value['source_commit'])
+            require(comparison['status'] in ('ahead', 'identical') and comparison['behind_by'] == 0, 'candidate does not include the reviewed chart revision')
         pods = self.kube('-n', component['namespace'], 'get', 'pods', '-o', 'json')['items']
         deployments = self.kube('-n', component['namespace'], 'get', 'deployments', '-o', 'json')['items']
         repository = 'ghcr.io/' + component['repository'].lower()
         targets = [d for d in deployments if any(image_repository(c['image']) == repository for c in d['spec']['template']['spec']['containers'])]
         require(targets, 'no declared platform Deployments use this component')
+        bootstrap = False
         for deployment in targets:
             desired = deployment['spec'].get('replicas', 1)
-            require(desired >= 2 and deployment.get('status', {}).get('availableReplicas', 0) >= desired, 'platform availability or replica reserve is insufficient')
+            initial_controller = (desired == 1 and chart != old_chart
+                                  and deployment['metadata']['name'] in component.get('bootstrap_controllers', [])
+                                  and deployment['spec'].get('strategy', {}).get('type') == 'Recreate')
+            require((desired >= 2 or initial_controller) and deployment.get('status', {}).get('availableReplicas', 0) >= desired, 'platform availability or replica reserve is insufficient')
+            bootstrap = bootstrap or initial_controller
         if all(deployment_ready(d) for d in targets) and all(canonical_image(c['image']) == value['image'] for d in targets for c in d['spec']['template']['spec']['containers'] if image_repository(c['image']) == repository):
             return {'component': component['application'], 'status': 'current', 'image': value['image']}
         # Observe connections immediately before mutation, not from the periodic
@@ -260,7 +289,7 @@ class Reconciler:
             old_findings.extend(old_scan['findings'])
             revision = old_scan.get('source_revision')
             if revision:
-                compare = json_request('https://api.github.com/repos/' + component['repository'] + '/compare/' + revision + '...' + value['source_commit'])
+                compare = self.history(component['repository'], revision, value['source_commit'])
                 require(compare.get('status') in ('ahead', 'identical') and compare.get('behind_by') == 0,
                         'candidate does not contain the deployed source history')
                 source_proof = source_baseline(component['repository'], revision, source['reference'],
@@ -295,25 +324,41 @@ class Reconciler:
         new_parameters = [p for p in parameters if p['name'] != image_parameter] + [
             {'name': image_parameter, 'value': (value['image'] if image_parameter == 'image' else
              tag + '@' + value['image'].split('@', 1)[1])}]
+        normal_parameters = new_parameters
+        if bootstrap:
+            require(not any(p['name'] == 'controllerUpdateStrategy' for p in parameters), 'bootstrap strategy already has an external override')
+            new_parameters = new_parameters + [{'name': 'controllerUpdateStrategy', 'value': 'Recreate'}]
+        active_parameters = new_parameters
         atomic_json(self.root / (component['application'] + '-before.json'), {'source_sha256': hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest(), 'tenants': before, 'candidate': record})
-        def change(parameters, expected_parameters):
+        def change(parameters, expected_parameters, target_chart, expected_chart):
             current = self.kube('-n', 'argocd', 'get', 'application', component['application'], '-o', 'json')
             current_parameters = current['spec']['source'].get('helm', {}).get('parameters', [])
-            tag = next((p for p in parameters if p['name'] == image_parameter), None)
-            expected = next((p for p in expected_parameters if p['name'] == image_parameter), None)
-            index = next((i for i, p in enumerate(current_parameters) if p['name'] == image_parameter), None)
-            require((current_parameters[index] if index is not None else None) == expected,
-                    'image parameter changed outside security reconciliation')
             patch = [{'op': 'test', 'path': '/metadata/resourceVersion', 'value': current['metadata']['resourceVersion']},
                      {'op': 'test', 'path': '/spec/source/repoURL', 'value': source['repoURL']},
-                     {'op': 'test', 'path': '/spec/source/targetRevision', 'value': source['targetRevision']}]
-            if index is not None:
-                patch.append({'op': 'replace' if tag else 'remove', 'path': '/spec/source/helm/parameters/' + str(index), **({'value': tag} if tag else {})})
-            elif tag:
+                     {'op': 'test', 'path': '/spec/source/targetRevision', 'value': expected_chart}]
+            managed = [image_parameter] + (['controllerUpdateStrategy'] if bootstrap else [])
+            removals, additions = [], []
+            for name in managed:
+                tag = next((p for p in parameters if p['name'] == name), None)
+                expected = next((p for p in expected_parameters if p['name'] == name), None)
+                index = next((i for i, p in enumerate(current_parameters) if p['name'] == name), None)
+                require((current_parameters[index] if index is not None else None) == expected,
+                        'deployment parameter changed outside security reconciliation')
+                if index is not None:
+                    if tag:
+                        patch.append({'op': 'replace', 'path': '/spec/source/helm/parameters/' + str(index), 'value': tag})
+                    else:
+                        removals.append(index)
+                elif tag:
+                    additions.append(tag)
+            patch.extend({'op': 'remove', 'path': '/spec/source/helm/parameters/' + str(i)} for i in sorted(removals, reverse=True))
+            if additions:
                 if 'parameters' in current['spec']['source'].get('helm', {}):
-                    patch.append({'op': 'add', 'path': '/spec/source/helm/parameters/-', 'value': tag})
+                    patch.extend({'op': 'add', 'path': '/spec/source/helm/parameters/-', 'value': p} for p in additions)
                 else:
-                    patch.append({'op': 'add', 'path': '/spec/source/helm/parameters', 'value': [tag]})
+                    patch.append({'op': 'add', 'path': '/spec/source/helm/parameters', 'value': additions})
+            if target_chart != expected_chart:
+                patch.append({'op': 'replace', 'path': '/spec/source/targetRevision', 'value': target_chart})
             self.kube('-n', 'argocd', 'patch', 'application', component['application'], '--type=json', '-p', json.dumps(patch), '-o', 'json')
         # Building/scanning can take minutes. Recheck live socket activity at
         # the mutation boundary rather than reuse an earlier idle observation.
@@ -325,7 +370,7 @@ class Reconciler:
                     tcp = snapshots[pod['spec']['nodeName']]['tasks'].get(cid, {}).get('tcp', {})
                     require(tcp.get('status') == 'complete' and tcp.get('inbound_connections') == 0, 'platform connections became active while preparing the update')
         require(value['source_commit'] == current_source(component['repository']), 'candidate source changed while preparing the update')
-        change(new_parameters, parameters)
+        change(new_parameters, parameters, chart, old_chart)
         try:
             deadline = time.monotonic() + self.policy.get('rollout_timeout_seconds', 600)
             while time.monotonic() < deadline:
@@ -337,11 +382,15 @@ class Reconciler:
                        and all(canonical_image(c['image']) == value['image'] for c in d['spec']['template']['spec']['containers'] if image_repository(c['image']) == repository)
                        for d in observed) and len(observed) == len(targets):
                     require(before == self.tenants(), 'tenant state or runtime identities changed during the platform update')
+                    if bootstrap:
+                        require(all(d['spec'].get('replicas', 1) >= 2 for d in observed), 'controller bootstrap did not create standby capacity')
+                        change(normal_parameters, new_parameters, chart, chart)
+                        active_parameters = normal_parameters
                     return {**record, 'status': 'promoted', 'tenant_tasks_preserved': True, 'completed_at': utc_now()}
                 time.sleep(3)
             raise RuntimeError('platform rollout did not pass acceptance before its deadline')
         except BaseException:
-            change(parameters, new_parameters)
+            change(parameters, active_parameters, old_chart, chart)
             deadline = time.monotonic() + self.policy.get('rollout_timeout_seconds', 600)
             old_images = {d['metadata']['name']: [c['image'] for c in d['spec']['template']['spec']['containers']] for d in targets}
             while time.monotonic() < deadline:

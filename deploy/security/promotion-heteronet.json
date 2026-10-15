@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "trusted_builder_commit": "591ff29e57a7fb7acdcf2a0553ca64fe54e657bf",
+  "trusted_builder_commit": "55a3636a4bca2e3c0fb9f1281c62436ff722c10c",
   "inventory_max_age_seconds": 3600,
   "rollout_timeout_seconds": 600,
   "tenant_namespace": "heterocloud-flash-workloads",
@@ -27,7 +27,11 @@
     {
       "application": "heterocloud-flash",
       "namespace": "heterocloud-flash",
-      "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-Flash"
+      "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-Flash",
+      "chart_revision": "3f6644c22e81d7fd32f746ebe5a5686979d33586",
+      "chart_previous_revisions": [
+        "v0.1.48"
+      ]
     },
     {
       "application": "heterocloud-flow",
@@ -43,7 +47,17 @@
       "application": "heterocloud-vpc",
       "namespace": "heterocloud-vpc",
       "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-VPC",
-      "image_parameter": "image"
+      "image_parameter": "image",
+      "chart_revision": "a41b2634c7a7b49c3c99027053ecbf596b78dcc5",
+      "bootstrap_controllers": [
+        "heterocloud-vpc-controller"
+      ],
+      "chart_previous_revisions": [
+        "0c3ecaa7446470b3e74045056513cbdce32a6dde"
+      ]
     }
+  ],
+  "previous_builder_commits": [
+    "591ff29e57a7fb7acdcf2a0553ca64fe54e657bf"
   ]
 }
