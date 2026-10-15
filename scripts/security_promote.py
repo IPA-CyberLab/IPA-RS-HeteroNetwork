@@ -97,6 +97,19 @@ def validate_identity(value, component, run):
     require(value.get('ci', {}).get('source_commit') == run.get('head_sha'), 'attested source does not match CI')
 
 
+def current_source(repository):
+    # Public Git discovery avoids exhausting the anonymous REST API allowance
+    # and cannot pick up an operator credential or interactive prompt.
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
+               GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/bin/false', SSH_ASKPASS='/bin/false')
+    result = subprocess.check_output(['git', '-c', 'credential.helper=', '-c', 'http.extraHeader=',
+                                      'ls-remote', '--exit-code', 'https://github.com/' + repository + '.git',
+                                      'refs/heads/master'], text=True, timeout=30, env=env)
+    match = re.fullmatch(r'([0-9a-f]{40})\s+refs/heads/master\n?', result)
+    require(match is not None, 'the current production source could not be verified')
+    return match.group(1)
+
+
 def verified_fixes(old, new):
     remaining = {(v['id'], v['package']) for v in new}
     return sorted({v['id'] for v in old if v.get('fixed_version') and (v['id'], v['package']) not in remaining})
@@ -194,6 +207,7 @@ class Reconciler:
         value = json_request('https://github.com/' + component['repository'] + '/releases/download/' + tag + '/security-candidate.json')
         run = json_request('https://api.github.com/repos/' + component['repository'] + '/actions/runs/' + str(value['ci']['run_id']))
         validate_identity(value, component, run)
+        require(value['source_commit'] == current_source(component['repository']), 'candidate source has been superseded on master')
         require(tag in ('security-' + value['source_commit'], 'security-' + value['source_commit'] + '-' + str(value['ci']['run_id'])), 'release tag does not match the signed candidate identity')
         self.attestation(component, tag, value)
         if value['source_commit'] != run['head_sha']:
@@ -294,6 +308,7 @@ class Reconciler:
                     cid = container['containerID'].split('://', 1)[-1]
                     tcp = snapshots[pod['spec']['nodeName']]['tasks'].get(cid, {}).get('tcp', {})
                     require(tcp.get('status') == 'complete' and tcp.get('inbound_connections') == 0, 'platform connections became active while preparing the update')
+        require(value['source_commit'] == current_source(component['repository']), 'candidate source changed while preparing the update')
         change(new_parameters, parameters)
         try:
             deadline = time.monotonic() + self.policy.get('rollout_timeout_seconds', 600)
