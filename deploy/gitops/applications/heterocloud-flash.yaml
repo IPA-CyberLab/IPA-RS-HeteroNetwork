@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
-    targetRevision: v0.1.48
+    targetRevision: 3f6644c22e81d7fd32f746ebe5a5686979d33586
     path: deploy/helm/heterocloud-flash
     helm:
       releaseName: heterocloud-flash
