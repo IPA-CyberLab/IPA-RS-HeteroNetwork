@@ -52,7 +52,7 @@ for source in files:
  relative=source.relative_to(stage)
  assert '..' not in relative.parts
  target=Path('/usr/bin')/relative
- target.parent.mkdir(parents=True,exist_ok=True)
+ target.parent.mkdir(mode=0o755,parents=True,exist_ok=True)
  temporary=target.with_name('.'+target.name+'.test-new')
  shutil.copy2(source,temporary);os.chown(temporary,0,0);temporary.chmod(0o755)
  os.replace(temporary,target)

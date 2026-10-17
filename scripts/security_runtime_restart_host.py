@@ -39,7 +39,7 @@ def trusted(path):
     for item in [path, *path.parents]:
         info = item.lstat()
         require(info.st_uid == 0 and not stat.S_ISLNK(info.st_mode)
-                and info.st_mode & 0o022 == 0, 'untrusted runtime restart path')
+                and info.st_mode & 0o022 == 0, 'untrusted runtime restart path: ' + str(item))
     return path
 
 

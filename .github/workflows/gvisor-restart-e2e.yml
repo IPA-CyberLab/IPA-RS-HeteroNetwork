@@ -84,11 +84,13 @@ jobs:
           fi
           kubectl label node runtime-restart-e2e-control-plane flash.heterocloud.io/gvisor-ready=true
           docker exec runtime-restart-e2e-control-plane sh -ec 'command -v python3 || (apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates)'
-          docker exec runtime-restart-e2e-control-plane mkdir -p /opt/heteronetwork/security
+          docker exec runtime-restart-e2e-control-plane install -d -m 0755 /opt/heteronetwork /opt/heteronetwork/security /var/lib/heteronetwork-security
           for file in security_inventory.py security_update_gate.py security_runtime_restart_host.py; do
             docker cp "scripts/$file" "runtime-restart-e2e-control-plane:/opt/heteronetwork/security/$file"
           done
           docker cp deploy/security/policy.json runtime-restart-e2e-control-plane:/opt/heteronetwork/security/policy.json
+          docker exec runtime-restart-e2e-control-plane chown -R 0:0 /opt/heteronetwork/security
+          docker exec runtime-restart-e2e-control-plane chmod 0644 /opt/heteronetwork/security/policy.json
       - name: Preserve persistent data through a real version change and recover from injected HTTP 503
         run: |
           sudo python3 scripts/security_runtime_restart_e2e.py \
