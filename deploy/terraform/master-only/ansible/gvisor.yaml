@@ -111,13 +111,28 @@
           - --kubeconfig=/etc/kubernetes/admin.conf
           - get
           - pods
-          - --all-namespaces
-          - "--field-selector=spec.nodeName={{ inventory_hostname }}"
+          - "--namespace={{ item }}"
+          - --ignore-not-found
+          - "--field-selector=spec.nodeName={{ inventory_hostname }},status.phase=Running"
           - '-o=jsonpath={range .items[*]}{range .status.containerStatuses[?(@.ready==true)]}{.containerID}{"\n"}{end}{end}'
       delegate_to: uc-k8sp5
-      register: hnn_gvisor_existing_tasks
+      loop: [heterocloud-flash-workloads, heteronetwork-security]
+      register: hnn_gvisor_task_snapshots
       changed_when: false
       check_mode: false
+
+    - name: Retain user and acceptance container identities without unrelated platform rollout churn
+      ansible.builtin.set_fact:
+        hnn_gvisor_existing_tasks:
+          stdout_lines: "{{ hnn_gvisor_task_snapshots.results | map(attribute='stdout_lines') | flatten }}"
+
+    - name: Create the protected runtime installation lock directory
+      ansible.builtin.file:
+        path: /var/lib/heteronetwork-security/runtime-restart-host
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
 
     - name: Install the runtime backup program before changing the package
       ansible.builtin.copy:
@@ -143,8 +158,42 @@
         - hnn_gvisor_previous_package.rc == 0
         - hnn_gvisor_previous_package.stdout != hnn_gvisor_version
 
+    - name: Read the actual installed runtime version independently of package accounting
+      ansible.builtin.command:
+        argv: [/usr/bin/runsc, --version]
+      register: hnn_gvisor_previous_binary
+      changed_when: false
+      when: hnn_gvisor_previous_package.rc == 0
+
+    - name: Suspend new CPU sandbox placement while the runtime package changes
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - label
+          - node
+          - "{{ inventory_hostname }}"
+          - flash.heterocloud.io/gvisor-ready=false
+          - --overwrite
+      delegate_to: uc-k8sp5
+      when:
+        - not ansible_check_mode
+        - hnn_gvisor_version not in (hnn_gvisor_previous_binary.stdout | default(''))
+
+    - name: Restore the pinned package after a verified binary rollback
+      ansible.builtin.command:
+        argv: [flock, --exclusive, --timeout=600, /var/lib/heteronetwork-security/runtime-restart-host/operation.lock, apt-get, install, --reinstall, -y, --no-install-recommends, "runsc={{ hnn_gvisor_version }}"]
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when:
+        - not ansible_check_mode
+        - hnn_gvisor_previous_package.rc == 0
+        - hnn_gvisor_previous_package.stdout == hnn_gvisor_version
+        - "('runsc version release-' + hnn_gvisor_version) not in hnn_gvisor_previous_binary.stdout_lines"
+
     - name: Install the pinned sandbox package and configure its containerd handler
-      ansible.builtin.command: /bin/bash /opt/heteronetwork/libexec/flash/install-gvisor.sh
+      ansible.builtin.command:
+        argv: [flock, --exclusive, --timeout=600, /var/lib/heteronetwork-security/runtime-restart-host/operation.lock, /bin/bash, /opt/heteronetwork/libexec/flash/install-gvisor.sh]
       environment:
         GVISOR_VERSION: "{{ hnn_gvisor_version }}"
       register: hnn_gvisor_install
@@ -154,6 +203,18 @@
     - name: Verify the installed runtime and effective containerd configuration
       ansible.builtin.command: /bin/bash /opt/heteronetwork/libexec/flash/check-gvisor.sh
       changed_when: false
+      when: not ansible_check_mode
+
+    - name: Read the actual version after the pinned installation
+      ansible.builtin.command:
+        argv: [/usr/bin/runsc, --version]
+      register: hnn_gvisor_installed_binary
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Require the running file version to match the declared package
+      ansible.builtin.assert:
+        that: "('runsc version release-' + hnn_gvisor_version) in hnn_gvisor_installed_binary.stdout_lines"
       when: not ansible_check_mode
 
     - name: Verify ready application tasks remain running after runtime configuration

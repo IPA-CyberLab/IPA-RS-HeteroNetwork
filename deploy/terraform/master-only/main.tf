@@ -342,7 +342,7 @@ resource "terraform_data" "gvisor_configuration" {
       ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
     }
   }
-  depends_on = [local_file.inventory, local_file.known_hosts]
+  depends_on = [terraform_data.security_inventory, local_file.inventory, local_file.known_hosts]
 }
 
 resource "terraform_data" "runtime_restart" {

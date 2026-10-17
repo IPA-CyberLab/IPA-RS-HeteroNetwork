@@ -39,25 +39,36 @@ def assess(plan, proof, policy, now=None):
         if proof.get(field) is not True:
             reasons.append(field + '_required')
     if plan.get('running_workloads'):
-        for field in ('target_runtime_verified', 'source_fenced', 'capacity_reserved'):
+        for field in ('target_runtime_verified', 'source_fenced'):
             if proof.get(field) is not True:
                 reasons.append(field + '_required')
         strategy = proof.get('strategy')
-        if strategy == 'bounded_restart':
+        if strategy in ('bounded_restart', 'bounded_pod_replacement'):
             if policy.get('require_live_migration') or policy.get('allow_restart_fallback') is not True:
                 reasons.append('restart_fallback_forbidden')
             if proof.get('restart_fallback') is not True:
                 reasons.append('restart_must_be_explicit')
-            for field in ('persistent_volumes_retained', 'persistent_data_canary_passed', 'resource_limits_verified', 'same_pod_uid', 'restart_budget_respected'):
+            for field in ('persistent_volumes_retained', 'persistent_data_canary_passed', 'resource_limits_verified', 'restart_budget_respected'):
                 if proof.get(field) is not True:
                     reasons.append(field + '_required')
+            fields = ('same_pod_uid', 'capacity_reserved') if strategy == 'bounded_restart' else (
+                'workload_identity_preserved', 'template_preserved', 'replacement_resources_ready')
+            for field in fields:
+                if proof.get(field) is not True:
+                    reasons.append(field + '_required')
+            if strategy == 'bounded_pod_replacement' and proof.get('same_pod_uid') is not False:
+                reasons.append('replacement_must_report_new_pod_uid')
             elapsed = proof.get('recovery_seconds')
             limit = policy.get('restart', {}).get('recovery_timeout_seconds', 0)
             if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not 0 <= elapsed <= limit:
                 reasons.append('restart_recovery_deadline_exceeded')
             if plan.get('gpu'):
-                reasons.append('gpu_restart_requires_separate_acceptance')
+                for field in ('gpu_restart_canary_passed', 'gpu_binding_verified'):
+                    if proof.get(field) is not True:
+                        reasons.append(field + '_required')
         elif strategy in ('gvisor_checkpoint_restore', 'vm_live_migration'):
+            if proof.get('capacity_reserved') is not True:
+                reasons.append('capacity_reserved_required')
             for field in ('state_preserved', 'network_connections_preserved'):
                 if proof.get(field) is not True:
                     reasons.append(field + '_required')

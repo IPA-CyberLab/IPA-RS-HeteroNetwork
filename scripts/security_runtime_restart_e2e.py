@@ -18,7 +18,7 @@ import time
 from types import SimpleNamespace
 
 from security_inventory import atomic_json, utc_now
-from security_runtime_restart import Controller, IMAGE, ready
+from security_runtime_restart import Controller, IMAGE, ready, probe_command
 from security_runtime_restart_host import require
 
 
@@ -75,9 +75,7 @@ def fixture(controller, node):
                  'securityContext': {'runAsUser': 65532, 'runAsNonRoot': True, 'fsGroup': 65532, 'seccompProfile': {'type': 'RuntimeDefault'}},
                  'volumes': [{'name': 'data', 'persistentVolumeClaim': {'claimName': name}}, {'name': 'temp', 'emptyDir': {}}],
                  'containers': [{'name': 'app', 'image': IMAGE,
-                                 'command': ['/bin/sh', '-ec', 'test -f /persistent/marker || printf %s ' + token + ' > /persistent/marker; '
-                                             'dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 > /temporary/boot; '
-                                             'exec httpd -f -p 8080 -h /persistent'],
+                                 'command': probe_command(token),
                                  'resources': {'requests': {'cpu': '10m', 'memory': '32Mi'}, 'limits': {'cpu': '100m', 'memory': '64Mi'}},
                                  'securityContext': {'allowPrivilegeEscalation': False, 'readOnlyRootFilesystem': True, 'capabilities': {'drop': ['ALL']}},
                                  'readinessProbe': {'httpGet': {'path': '/marker', 'port': 8080}, 'periodSeconds': 1},

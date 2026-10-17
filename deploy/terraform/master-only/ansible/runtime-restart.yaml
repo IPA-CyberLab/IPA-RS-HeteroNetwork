@@ -5,7 +5,26 @@
   vars:
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_restart_policy: "{{ (lookup('file', hnn_repo_root + '/deploy/security/policy.json') | from_json).restart }}"
   tasks:
+    - name: Detect an existing Flash workload namespace
+      tags: [restart_policy]
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, get, namespace, "{{ hnn_restart_policy.namespace }}", --ignore-not-found, -o, name]
+      register: hnn_restart_namespace
+      changed_when: false
+    - name: Default bounded resources for newly admitted Flash initialization containers
+      tags: [restart_policy]
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, apply, --server-side, --field-manager=heteronetwork-iac, -f, '-']
+        stdin: >-
+          {{ {'apiVersion': 'v1', 'kind': 'LimitRange',
+              'metadata': {'name': 'flash-initializer-defaults', 'namespace': hnn_restart_policy.namespace},
+              'spec': {'limits': [{'type': 'Container',
+                  'default': {'cpu': '100m', 'memory': '64Mi'},
+                  'defaultRequest': {'cpu': '10m', 'memory': '16Mi'}}]}} | to_json }}
+      changed_when: false
+      when: hnn_restart_namespace.stdout | length > 0
     - name: Generate the private activation identity only on the operator
       ansible.builtin.command:
         argv: [ssh-keygen, -t, ed25519, -N, '', -C, heteronetwork-security-restart, -f, /etc/heteronetwork/security/restart.key]
@@ -33,6 +52,7 @@
         database: passwd
         key: mizuame
     - name: Install root-owned activation code and its policy dependencies
+      tags: [restart_code]
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/scripts/{{ item }}"
         dest: "/opt/heteronetwork/security/{{ item }}"
@@ -41,6 +61,7 @@
         mode: '0755'
       loop: [security_inventory.py, security_update_gate.py, security_runtime_restart_host.py]
     - name: Declare the approved restart policy
+      tags: [restart_code]
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/security/policy.json"
         dest: /opt/heteronetwork/security/policy.json
@@ -73,12 +94,14 @@
     hnn_security_restart_enable: true
   tasks:
     - name: Install the activation controller
+      tags: [restart_code]
       ansible.builtin.copy:
-        src: "{{ hnn_repo_root }}/scripts/security_runtime_restart.py"
-        dest: /opt/heteronetwork/security/security_runtime_restart.py
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/security/{{ item }}"
         owner: root
         group: root
         mode: '0755'
+      loop: [security_runtime_restart.py, security_runtime_restart_e2e.py, security_runtime_restart_native_e2e.py, security_initializer_memory_e2e.py]
     - name: Install the activation service and timer
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/security/{{ item }}"

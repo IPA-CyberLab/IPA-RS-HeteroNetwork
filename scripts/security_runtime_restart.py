@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Activate an installed gVisor patch by restarting one sandbox at a time.
 
-The Pod and its PVCs are retained. Each node first passes a real restart canary.
+PVCs are retained; legacy unlimited Pods are replaced after source fencing.
+Each node first passes a real restart canary.
 Intent is persisted on the host before stopping a sandbox; a failed artifact is
 held rather than retried by the timer. This is deliberately not live migration.
 """
@@ -10,6 +11,7 @@ import contextlib
 import datetime
 import decimal
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +28,16 @@ from security_update_gate import fingerprint
 
 IMAGE = 'alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8'
 OWNER = 'security.heteronetwork.io/restart-canary'
+
+
+def probe_command(token):
+    require(re.fullmatch(r'[0-9a-f]{32}', token), 'invalid canary marker')
+    # Alpine's base BusyBox has nc but deliberately omits the httpd applet.
+    # This small HTTP responder uses only commands present in the pinned image.
+    return ['/bin/sh', '-ec', 'test -f /persistent/marker || printf %s ' + token + ' > /persistent/marker; '
+            'dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 > /temporary/boot; '
+            "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 32\\r\\nConnection: close\\r\\n\\r\\n%s' "
+            + token + ' | nc -l -p 8080; done']
 
 
 def ready(pod):
@@ -76,6 +88,28 @@ def pod_memory_limit(pod):
     declared = pod['spec'].get('resources', {}).get('limits', {}).get('memory')
     maximum = memory_bytes(declared) if declared else max(regular + sidecars, init)
     return maximum + memory_bytes(pod['spec'].get('overhead', {}).get('memory', 0))
+
+
+HELPER_RESOURCES = {'requests': {'cpu': '10m', 'memory': '16Mi'}, 'limits': {'cpu': '100m', 'memory': '64Mi'}}
+
+
+def legacy_helper(spec):
+    for index, container in enumerate(spec.get('initContainers', [])):
+        if (container['name'] == 'flash-secret-launcher'
+                and not container.get('resources', {}).get('limits', {}).get('memory')):
+            require(container.get('command') == ['/bin/cp', '/usr/local/bin/flash-secret-env-launcher', '/run/flash-helper/launcher'],
+                    'unrecognized secret initializer cannot be automatically resized')
+            return index
+    return None
+
+
+def template_identity(template):
+    value = json.loads(json.dumps(template))
+    value.get('metadata', {}).get('labels', {}).pop('pod-template-hash', None)
+    for container in value['spec'].get('initContainers', []):
+        if container['name'] == 'flash-secret-launcher':
+            container.pop('resources', None)
+    return fingerprint(value)
 
 
 class Controller:
@@ -143,10 +177,119 @@ class Controller:
         require(len(records) == 1, 'exactly one ready sandbox is required')
         return records[0]
 
+    def repair_initializer(self, pod, observation):
+        if legacy_helper(pod['spec']) is None:
+            return pod
+        source = self.sandbox(observation, pod['metadata']['uid'])
+        usage = source.get('pod_memory')
+        require(usage and usage['nonreclaimable'] < pod_memory_limit(pod) * 0.9,
+                'initializer resize needs a graceful maintenance window: current resident memory exceeds the declared budget')
+        namespace, name, uid = (pod['metadata'][k] for k in ('namespace', 'name', 'uid'))
+        owners = [o for o in pod['metadata'].get('ownerReferences', []) if o.get('controller') and o['kind'] == 'ReplicaSet']
+        require(len(owners) == 1, 'legacy initializer repair requires a managed workload')
+        replica = self.get('replicaset', owners[0]['name'], namespace)
+        require(replica and replica['metadata']['uid'] == owners[0]['uid'], 'ReplicaSet identity changed')
+        parents = [o for o in replica['metadata'].get('ownerReferences', []) if o.get('controller') and o['kind'] == 'Deployment']
+        require(len(parents) == 1, 'legacy initializer repair requires a Deployment')
+        deployment = self.get('deployment', parents[0]['name'], namespace)
+        require(deployment and deployment['metadata']['uid'] == parents[0]['uid'], 'Deployment identity changed')
+        identity = template_identity(deployment['spec']['template'])
+        require(template_identity(replica['spec']['template']) == identity, 'wait for the existing workload rollout to finish')
+        token = secrets.token_hex(16)
+        marker = 'security.heteronetwork.io/initializer-repair'
+        paused = deployment['spec'].get('paused', False)
+
+        def patch(kind, resource, operation, subresource=None):
+            command = ['patch', kind, resource['metadata']['name'], '-n', namespace, '--type=json',
+                       '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json']
+            if subresource:
+                command += ['--subresource=' + subresource]
+            return self.kube(*command, body=[{'op': 'test', 'path': '/metadata/resourceVersion',
+                                             'value': resource['metadata']['resourceVersion']}, *operation])
+
+        def set_limit(kind, resource, subresource=None):
+            spec = resource['spec'] if kind == 'pod' else resource['spec']['template']['spec']
+            index = legacy_helper(spec)
+            if index is None:
+                return resource
+            path = '/spec/initContainers/' if kind == 'pod' else '/spec/template/spec/initContainers/'
+            return patch(kind, resource, [{'op': 'add', 'path': path + str(index) + '/resources', 'value': HELPER_RESOURCES}], subresource)
+
+        # Pausing does not stop Pods. Update the existing ReplicaSet before the
+        # Deployment so it remains the matching revision (hash label ignored by
+        # Kubernetes), then unpause. The /resize subresource preserves Pod UID.
+        annotations = dict(deployment['metadata'].get('annotations', {}))
+        owned_marker = str(int(paused)) + ':' + token
+        annotations[marker] = owned_marker
+        deployment = patch('deployment', deployment, [
+            {'op': 'add', 'path': '/metadata/annotations', 'value': annotations},
+            {'op': 'add', 'path': '/spec/paused', 'value': True}])
+        try:
+            current = self.get('pod', name, namespace)
+            require(current and current['metadata']['uid'] == uid and current['spec'] == pod['spec'], 'Pod changed before initializer repair')
+            updated = set_limit('pod', current, 'resize')
+            require(legacy_helper(updated['spec']) is None, 'API did not retain the initializer resource limit')
+            replica = self.get('replicaset', owners[0]['name'], namespace)
+            require(replica and replica['metadata']['uid'] == owners[0]['uid']
+                    and template_identity(replica['spec']['template']) == identity, 'ReplicaSet changed during initializer repair')
+            set_limit('replicaset', replica)
+            deployment = self.get('deployment', parents[0]['name'], namespace)
+            require(deployment and template_identity(deployment['spec']['template']) == identity,
+                    'workload configuration changed during initializer repair')
+            set_limit('deployment', deployment)
+        finally:
+            current = self.get('deployment', parents[0]['name'], namespace)
+            if current and current['metadata']['uid'] == parents[0]['uid'] and current['metadata'].get('annotations', {}).get(marker) == owned_marker:
+                values = dict(current['metadata']['annotations'])
+                values.pop(marker)
+                patch('deployment', current, [{'op': 'add', 'path': '/spec/paused', 'value': paused},
+                                              {'op': 'add', 'path': '/metadata/annotations', 'value': values}])
+        current = self.get('pod', name, namespace)
+        require(current and current['metadata']['uid'] == uid and ready(current), 'initializer repair must retain the running Pod')
+        require(self.volumes(current) == self.volumes(pod), 'initializer repair changed persistent storage')
+        return current
+
+    def resume_repairs(self):
+        """Complete template alignment after an interrupted initializer repair."""
+        namespace = self.policy['namespace']
+        marker = 'security.heteronetwork.io/initializer-repair'
+        deployments = self.kube('get', 'deployments', '-n', namespace, '-o', 'json')['items']
+        for deployment in deployments:
+            owned = deployment['metadata'].get('annotations', {}).get(marker, '')
+            if not re.fullmatch(r'[01]:[0-9a-f]{32}', owned):
+                continue
+            identity = template_identity(deployment['spec']['template'])
+            replicas = self.kube('get', 'replicasets', '-n', namespace, '-o', 'json')['items']
+            matched = [r for r in replicas if any(o.get('uid') == deployment['metadata']['uid'] and o.get('controller')
+                                                for o in r['metadata'].get('ownerReferences', []))
+                       and template_identity(r['spec']['template']) == identity]
+            for kind, resource in [('replicaset', r) for r in matched] + [('deployment', deployment)]:
+                index = legacy_helper(resource['spec']['template']['spec'])
+                if index is not None:
+                    self.kube('patch', kind, resource['metadata']['name'], '-n', namespace, '--type=json',
+                              '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json', body=[
+                                  {'op': 'test', 'path': '/metadata/resourceVersion', 'value': resource['metadata']['resourceVersion']},
+                                  {'op': 'add', 'path': '/spec/template/spec/initContainers/' + str(index) + '/resources', 'value': HELPER_RESOURCES}])
+            current = self.get('deployment', deployment['metadata']['name'], namespace)
+            require(current and current['metadata']['uid'] == deployment['metadata']['uid']
+                    and current['metadata'].get('annotations', {}).get(marker) == owned, 'initializer repair ownership changed')
+            annotations = dict(current['metadata']['annotations'])
+            annotations.pop(marker)
+            self.kube('patch', 'deployment', current['metadata']['name'], '-n', namespace, '--type=json',
+                      '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json', body=[
+                          {'op': 'test', 'path': '/metadata/resourceVersion', 'value': current['metadata']['resourceVersion']},
+                          {'op': 'add', 'path': '/spec/paused', 'value': owned.startswith('1:')},
+                          {'op': 'add', 'path': '/metadata/annotations', 'value': annotations}])
+
     def restart(self, pod, observation, probe=False, recovering=False):
+        source = self.sandbox(observation, pod['metadata']['uid'])
+        if (not recovering and (source.get('memory_max') is None or source['memory_max'] > pod_memory_limit(pod))):
+            return self.replace_pod(pod, observation, probe=probe)
         namespace, name, uid = (pod['metadata'][k] for k in ('namespace', 'name', 'uid'))
         node = pod['spec']['nodeName']
         require((ready(pod) or recovering) and pod['spec'].get('restartPolicy', 'Always') == 'Always', 'only ready, restartable Pods are eligible')
+        require(not any(c.get('lifecycle', {}).get('preStop') for c in pod['spec']['containers']),
+                'preStop hooks require kubelet-managed maintenance; refusing to bypass the declared hook')
         before = self.get('pod', name, namespace)
         require(before and before['metadata']['uid'] == uid and before['spec'] == pod['spec']
                 and (ready(before) or recovering), 'Pod changed before restart')
@@ -186,13 +329,200 @@ class Controller:
             time.sleep(2)
         raise RuntimeError('restart recovery deadline exceeded; further automatic restarts are held')
 
+    def release_replacement(self, record):
+        """Idempotently release an owned scheduling gate, only after fencing.
+
+        This also runs after interruptions. An eviction still in progress keeps
+        the gate and Deployment pause in place; a later timer resumes cleanup.
+        No second eviction or sandbox stop is issued by this recovery path.
+        """
+        namespace = record['namespace']
+        marker = 'security.heteronetwork.io/runtime-replacement'
+        gate = 'security.heteronetwork.io/runtime-maintenance'
+        deployment = self.get('deployment', record['deployment'], namespace)
+        require(deployment and deployment['metadata']['uid'] == record['deployment_uid'], 'replacement parent identity changed')
+        owned = deployment['metadata'].get('annotations', {}).get(marker) == record['token']
+        if not owned:
+            require(record.get('status') in ('admitted', 'completed', 'aborted'), 'replacement ownership marker changed')
+            return self.replacement_candidate(record)
+        fence = self.remote(record['source_node'], pod_uid=record['source_pod_uid'], artifact_sha256=record['target_artifact'])
+        fenced = fence.get('source_fenced') and not any(s['metadata']['uid'] == record['source_pod_uid'] for s in fence['sandboxes'])
+        old = self.get('pod', record['source_pod'], namespace)
+        unchanged = old and old['metadata']['uid'] == record['source_pod_uid'] and ready(old)
+        require(fenced or unchanged, 'replacement eviction is still draining; maintenance gate retained')
+        replica = self.get('replicaset', record['replicaset'], namespace)
+        require(replica and replica['metadata']['uid'] == record['replicaset_uid'], 'replacement ReplicaSet identity changed')
+        if replica['spec']['template']['spec'].get('schedulingGates') == [{'name': gate}]:
+            self.kube('patch', 'replicaset', replica['metadata']['name'], '-n', namespace, '--type=json',
+                      '--patch-file=/dev/stdin', '-o', 'json', body=[
+                          {'op': 'test', 'path': '/metadata/resourceVersion', 'value': replica['metadata']['resourceVersion']},
+                          {'op': 'remove', 'path': '/spec/template/spec/schedulingGates'}])
+        candidate = self.replacement_candidate(record)
+        if fenced and candidate and candidate['spec'].get('schedulingGates') == [{'name': gate}]:
+            candidate = self.kube('patch', 'pod', candidate['metadata']['name'], '-n', namespace, '--type=json',
+                                  '--patch-file=/dev/stdin', '-o', 'json', body=[
+                                      {'op': 'test', 'path': '/metadata/resourceVersion', 'value': candidate['metadata']['resourceVersion']},
+                                      {'op': 'remove', 'path': '/spec/schedulingGates'}])
+        require(fenced or candidate is None, 'an unfenced source cannot release a replacement')
+        annotations = dict(deployment['metadata']['annotations'])
+        annotations.pop(marker)
+        record['status'] = 'admitted' if fenced else 'aborted'
+        atomic_json(self.root / ('replacement-' + record['source_pod_uid'] + '.json'), record)
+        self.kube('patch', 'deployment', deployment['metadata']['name'], '-n', namespace, '--type=json',
+                  '--patch-file=/dev/stdin', '-o', 'json', body=[
+                      {'op': 'test', 'path': '/metadata/resourceVersion', 'value': deployment['metadata']['resourceVersion']},
+                      {'op': 'add', 'path': '/spec/paused', 'value': record['token'].startswith('1:')},
+                      {'op': 'add', 'path': '/metadata/annotations', 'value': annotations}])
+        return candidate
+
+    def replacement_candidate(self, record):
+        pods = self.kube('get', 'pods', '-n', record['namespace'], '-o', 'json')['items']
+        candidates = [p for p in pods if p['metadata']['uid'] != record['source_pod_uid']
+                      and not p['metadata'].get('deletionTimestamp')
+                      and any(o.get('uid') == record['replicaset_uid'] and o.get('controller')
+                              for o in p['metadata'].get('ownerReferences', []))]
+        require(len(candidates) <= 1, 'replacement has more than one candidate')
+        return candidates[0] if candidates else None
+
+    def resume_replacements(self):
+        for path in self.root.glob('replacement-*.json'):
+            record = json.loads(trusted(path).read_text())
+            if record.get('status') == 'completed':
+                deployment = self.get('deployment', record['deployment'], record['namespace'])
+                if deployment and deployment['metadata'].get('annotations', {}).get('security.heteronetwork.io/runtime-replacement') == record['token']:
+                    self.release_replacement(record)
+                    record['status'] = 'completed'
+                    atomic_json(path, record)
+                continue
+            self.release_replacement(record)
+            atomic_json(self.root / ('held-' + record['source_node'] + '-' + record['target_artifact'] + '.json'),
+                        {'status': 'held', 'reason': 'an interrupted Pod replacement requires review; cleanup resumed without repeating its stop',
+                         'observed_at': utc_now()})
+
+    def replace_pod(self, pod, observation, probe=False):
+        """Recreate a legacy Pod whose kubelet allocation cached an unlimited init.
+
+        A temporary scheduling gate prevents the replacement from starting
+        before the old sandbox is fenced. The Deployment stays paused while its
+        ReplicaSet template is temporarily gated; no extra revision is created.
+        """
+        namespace, name, uid = (pod['metadata'][k] for k in ('namespace', 'name', 'uid'))
+        source_node = pod['spec']['nodeName']
+        target = observation['artifact']
+        require(ready(pod), 'replacement requires a ready source Pod')
+        require(pod['spec'].get('terminationGracePeriodSeconds', 30) <= self.policy['recovery_timeout_seconds'] - 30,
+                'declared termination grace exceeds the bounded maintenance window')
+        owners = [o for o in pod['metadata'].get('ownerReferences', []) if o.get('controller') and o['kind'] == 'ReplicaSet']
+        require(len(owners) == 1, 'bounded replacement requires a managed ReplicaSet')
+        replica = self.get('replicaset', owners[0]['name'], namespace)
+        require(replica and replica['metadata']['uid'] == owners[0]['uid'], 'replacement ReplicaSet changed')
+        require(replica['spec'].get('replicas', 1) == 1, 'bounded legacy replacement currently requires one replica')
+        parents = [o for o in replica['metadata'].get('ownerReferences', []) if o.get('controller') and o['kind'] == 'Deployment']
+        require(len(parents) == 1, 'replacement requires a Deployment')
+        deployment = self.get('deployment', parents[0]['name'], namespace)
+        require(deployment and deployment['metadata']['uid'] == parents[0]['uid'], 'replacement Deployment changed')
+        require(template_identity(deployment['spec']['template']) == template_identity(replica['spec']['template']),
+                'an existing rollout must finish before replacement')
+        volumes = self.volumes(pod)
+        before_template = fingerprint(deployment['spec']['template'])
+        marker = 'security.heteronetwork.io/runtime-replacement'
+        gate = 'security.heteronetwork.io/runtime-maintenance'
+        require(not replica['spec']['template']['spec'].get('schedulingGates'), 'another scheduling gate is already present')
+        paused = deployment['spec'].get('paused', False)
+        token = str(int(paused)) + ':' + secrets.token_hex(16)
+        annotations = dict(deployment['metadata'].get('annotations', {}))
+        annotations[marker] = token
+
+        def patch(kind, resource, operations):
+            return self.kube('patch', kind, resource['metadata']['name'], '-n', namespace, '--type=json',
+                             '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json', body=[
+                                 {'op': 'test', 'path': '/metadata/resourceVersion', 'value': resource['metadata']['resourceVersion']}, *operations])
+
+        # The reservation is durable before API deletion. Its source PID and
+        # start time provide fencing evidence even after the Pod object is gone.
+        self.remote(source_node, 'reserve', pod_uid=uid,
+                    sandbox_id=self.sandbox(observation, uid)['id'],
+                    source_sha256=self.sandbox(observation, uid)['exe_sha256'], artifact_sha256=target['sha256'], probe=probe)
+        journal = {'namespace': namespace, 'source_node': source_node, 'source_pod': name, 'source_pod_uid': uid,
+                   'target_artifact': target['sha256'], 'deployment': deployment['metadata']['name'],
+                   'deployment_uid': deployment['metadata']['uid'], 'replicaset': replica['metadata']['name'],
+                   'replicaset_uid': replica['metadata']['uid'], 'token': token, 'status': 'prepared', 'started_at': utc_now()}
+        journal_path = self.root / ('replacement-' + uid + '.json')
+        atomic_json(journal_path, journal)
+        deployment = patch('deployment', deployment, [
+            {'op': 'add', 'path': '/metadata/annotations', 'value': annotations}, {'op': 'add', 'path': '/spec/paused', 'value': True}])
+        started = time.monotonic()
+        candidate = None
+        try:
+            replica = self.get('replicaset', replica['metadata']['name'], namespace)
+            patch('replicaset', replica, [{'op': 'add', 'path': '/spec/template/spec/schedulingGates', 'value': [{'name': gate}]}])
+            eviction = {'apiVersion': 'policy/v1', 'kind': 'Eviction', 'metadata': {'namespace': namespace, 'name': name},
+                        'deleteOptions': {'preconditions': {'uid': uid}}}
+            self.kube('create', '--raw=/api/v1/namespaces/' + namespace + '/pods/' + name + '/eviction', '-f', '-', body=eviction)
+            deadline = started + self.policy['recovery_timeout_seconds']
+            while time.monotonic() < deadline:
+                fence = self.remote(source_node, pod_uid=uid, artifact_sha256=target['sha256'])
+                if fence.get('source_fenced') and not any(s['metadata']['uid'] == uid for s in fence['sandboxes']):
+                    break
+                time.sleep(2)
+            else:
+                raise RuntimeError('old sandbox could not be fenced before replacement')
+            while time.monotonic() < deadline:
+                pods = self.kube('get', 'pods', '-n', namespace, '-o', 'json')['items']
+                candidates = [p for p in pods if p['metadata']['uid'] != uid and not p['metadata'].get('deletionTimestamp')
+                              and any(o.get('uid') == replica['metadata']['uid'] and o.get('controller')
+                                      for o in p['metadata'].get('ownerReferences', []))]
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    break
+                time.sleep(2)
+            require(candidate, 'replacement Pod was not created')
+            require(candidate['spec'].get('schedulingGates') == [{'name': gate}], 'replacement did not inherit the maintenance gate')
+            replica = self.get('replicaset', replica['metadata']['name'], namespace)
+            patch('replicaset', replica, [{'op': 'remove', 'path': '/spec/template/spec/schedulingGates'}])
+            candidate = patch('pod', candidate, [{'op': 'remove', 'path': '/spec/schedulingGates'}])
+            while time.monotonic() < deadline:
+                current = self.get('pod', candidate['metadata']['name'], namespace)
+                if ready(current):
+                    active_node = current['spec']['nodeName']
+                    observed = self.remote(active_node)
+                    active = self.sandbox(observed, current['metadata']['uid'])
+                    require(observed['artifact']['sha256'] == target['sha256'] and active['exe_sha256'] == target['sentry_sha256'],
+                            'replacement started on an unverified runtime artifact')
+                    require(isinstance(active.get('memory_max'), int) and 0 < active['memory_max'] <= pod_memory_limit(current),
+                            'replacement did not enforce the workload memory limit')
+                    require(self.volumes(current) == volumes, 'replacement changed persistent storage')
+                    latest = self.get('deployment', deployment['metadata']['name'], namespace)
+                    require(fingerprint(latest['spec']['template']) == before_template, 'replacement changed the user workload template')
+                    journal['status'] = 'completed'
+                    atomic_json(journal_path, journal)
+                    return {'status': 'restarted', 'strategy': 'bounded_pod_replacement', 'restart_fallback': True,
+                            'source_pod_uid': uid, 'pod_uid': current['metadata']['uid'], 'pod': current['metadata']['name'], 'node': active_node,
+                            'source_node': source_node, 'target_artifact': target['sha256'], 'target_sentry_sha256': active['exe_sha256'],
+                            'persistent_volumes_retained': True, 'source_fenced': True, 'resource_limits_verified': True,
+                            'same_pod_uid': False, 'workload_identity_preserved': True, 'template_preserved': True,
+                            'replacement_resources_ready': True, 'restart_budget_respected': True,
+                            'recovery_seconds': round(time.monotonic() - started, 3), 'completed_at': utc_now()}
+                time.sleep(2)
+            raise RuntimeError('replacement did not become ready before the recovery deadline')
+        finally:
+            completed = journal['status'] == 'completed'
+            self.release_replacement(journal)
+            if completed:
+                journal['status'] = 'completed'
+                atomic_json(journal_path, journal)
+
     def canary(self, node, observation):
         identity = observation['artifact']['sha256']
+        code = fingerprint({'controller': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                            'host_endpoint': hashlib.sha256(Path(__file__).with_name('security_runtime_restart_host.py').read_bytes()).hexdigest(),
+                            'policy': self.policy, 'image': IMAGE})
         path = self.root / ('canary-' + node + '-' + identity + '.json')
         if path.exists() and not self.args.probe_only:
             proof = json.loads(path.read_text())
             age = (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(proof['completed_at'])).total_seconds()
-            if proof.get('persistent_data_canary_passed') and 0 <= age <= self.policy['canary_max_age_seconds']:
+            if (proof.get('persistent_data_canary_passed') and proof.get('acceptance_code_sha256') == code
+                    and 0 <= age <= self.policy['canary_max_age_seconds']):
                 return proof
         namespace = self.policy['probe_namespace']
         if not self.get('namespace', namespace, namespace):
@@ -212,9 +542,7 @@ class Controller:
                                           'seccompProfile': {'type': 'RuntimeDefault'}},
                       'volumes': [{'name': 'persistent', 'persistentVolumeClaim': {'claimName': name}}, {'name': 'temporary', 'emptyDir': {}}],
                       'containers': [{'name': 'probe', 'image': IMAGE,
-                                      'command': ['/bin/sh', '-ec', 'test -f /persistent/marker || printf %s ' + token + ' > /persistent/marker; '
-                                                  'dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 > /temporary/boot; '
-                                                  'exec httpd -f -p 8080 -h /persistent'],
+                                      'command': probe_command(token),
                                       'securityContext': {'allowPrivilegeEscalation': False, 'readOnlyRootFilesystem': True, 'capabilities': {'drop': ['ALL']}},
                                       'resources': {'requests': {'cpu': '10m', 'memory': '32Mi'}, 'limits': {'cpu': '100m', 'memory': '64Mi'}},
                                       'readinessProbe': {'httpGet': {'path': '/marker', 'port': 8080}, 'periodSeconds': 2},
@@ -239,9 +567,7 @@ class Controller:
             boot_after = self.kube('exec', name, '-n', namespace, '--', 'cat', '/temporary/boot', text=True).strip()
             require(marker == token and boot_before and boot_after and boot_before != boot_after,
                     'restart canary did not preserve disk data across a real process restart')
-            result.update(persistent_data_canary_passed=True)
-            atomic_json(path, result)
-            return result
+            result.update(persistent_data_canary_passed=True, acceptance_code_sha256=code)
         finally:
             for kind, uid in reversed(created):
                 current = self.get(kind, name, namespace)
@@ -252,6 +578,8 @@ class Controller:
                         while self.get(kind, name, namespace) and time.monotonic() < deadline:
                             time.sleep(2)
                         require(not self.get(kind, name, namespace), 'canary cleanup did not finish; its disk was retained')
+        atomic_json(path, result)
+        return result
 
     def recover(self, pod, rollback):
         namespace, name, uid = (pod['metadata'][k] for k in ('namespace', 'name', 'uid'))
@@ -276,9 +604,11 @@ class Controller:
 
     def reconcile(self, node):
         observed = self.remote(node)
+        require(self.args.probe_only or observed['artifact']['version'] == 'runsc version ' + self.policy['target_runtime_version'],
+                'the approved target must be reinstalled after rollback; healthy workloads are never downgraded by the timer')
         artifact = observed['artifact']['sha256']
         hold = self.root / ('held-' + node + '-' + artifact + '.json')
-        require(not hold.exists(), 'artifact is held after an earlier failure; inspect its recovery record')
+        require(self.args.probe_only or not hold.exists(), 'artifact is held after an earlier failure; inspect its recovery record')
         pods = self.kube('get', 'pods', '-n', self.policy['namespace'],
                          '--field-selector=spec.nodeName=' + node, '-o', 'json')['items']
         workloads = []
@@ -299,9 +629,13 @@ class Controller:
                         'a verified previous runtime bundle is required before restarting users')
                 for pod in workloads:
                     self.health()
+                    pod = self.repair_initializer(pod, self.remote(node))
                     pending = pod
                     # A single sandbox holds its existing node resource allocation.
-                    results.append(self.restart(pod, self.remote(node)))
+                    restarted = self.restart(pod, self.remote(node))
+                    results.append(restarted)
+                    if not restarted['same_pod_uid']:
+                        pending = self.get('pod', restarted['pod'], pod['metadata']['namespace'])
                     self.health()
                     pending = None
             result = {'node': node, 'status': 'canary-verified' if self.args.probe_only else 'verified',
@@ -311,16 +645,35 @@ class Controller:
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             record = {'node': node, 'status': 'held', 'artifact': artifact,
                       'reason': str(error)[:200], 'observed_at': utc_now()}
-            if observed.get('rollback_sha256') and observed['rollback_sha256'] != artifact:
+            if not self.args.probe_only and observed.get('rollback_sha256') and observed['rollback_sha256'] != artifact:
                 try:
                     rollback = self.remote(node, 'rollback', artifact_sha256=artifact)
                     record['rollback'] = {'status': rollback['status'], 'artifact': rollback['artifact']['sha256']}
                     if pending:
+                        replacement_path = self.root / ('replacement-' + pending['metadata']['uid'] + '.json')
+                        if replacement_path.exists():
+                            journal = json.loads(trusted(replacement_path).read_text())
+                            candidate = self.release_replacement(journal)
+                            if candidate:
+                                pending = candidate
+                        active_node = pending['spec'].get('nodeName')
+                        deadline = time.monotonic() + self.policy['recovery_timeout_seconds']
+                        while not active_node and time.monotonic() < deadline:
+                            pending = self.get('pod', pending['metadata']['name'], pending['metadata']['namespace'])
+                            active_node = pending['spec'].get('nodeName')
+                            time.sleep(2)
+                        require(active_node, 'replacement recovery has not been scheduled')
+                        if active_node != node:
+                            current = self.remote(active_node)
+                            if current['artifact']['sha256'] == artifact:
+                                rollback = self.remote(active_node, 'rollback', artifact_sha256=artifact)
+                            else:
+                                require(current['artifact']['sha256'] == rollback['artifact']['sha256'], 'recovery runtime differs on the destination node')
                         record['recovery'] = self.recover(pending, rollback['artifact'])
                     self.health()
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                     record['rollback'] = {'status': 'unverified'}
-            atomic_json(hold, record)
+            atomic_json(self.root / (node + '-probe-failed.json') if self.args.probe_only else hold, record)
             raise
 
 
@@ -346,6 +699,8 @@ def main():
         for path in [controller.root / 'reconciliation.lock', Path(args.promotion_output) / 'reconciliation.lock']:
             handle = stack.enter_context(open(path, 'a'))
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        controller.resume_replacements()
+        controller.resume_repairs()
         inventory = json.loads(trusted(args.inventory).read_text())
         age = (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(inventory['observed_at'])).total_seconds()
         require(inventory['status'] == 'complete' and 0 <= age <= controller.config['inventory_max_age_seconds'], 'complete, recent inventory required')

@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - scripts/security_runtime_restart*.py
+      - scripts/security_initializer_memory_e2e.py
+      - scripts/security-initializer-probe/**
       - scripts/security_update_gate.py
       - scripts/test_security_inventory.py
       - deploy/security/policy.json
@@ -13,6 +15,8 @@ on:
   pull_request:
     paths:
       - scripts/security_runtime_restart*.py
+      - scripts/security_initializer_memory_e2e.py
+      - scripts/security-initializer-probe/**
       - scripts/security_update_gate.py
       - scripts/test_security_inventory.py
       - deploy/security/policy.json
@@ -88,14 +92,24 @@ jobs:
           sudo python3 scripts/security_runtime_restart_e2e.py \
             --node runtime-restart-e2e-control-plane --kubeconfig "$KUBECONFIG" \
             --bundles /opt/hetero-security-restart-e2e --output "$RUNNER_TEMP/restart-acceptance.json"
+      - name: Verify that an unlimited initializer cannot remove the workload memory boundary
+        run: |
+          docker build -t hetero-initializer-probe:e2e scripts/security-initializer-probe
+          "$RUNNER_TEMP/kind" load docker-image hetero-initializer-probe:e2e --name runtime-restart-e2e
+          sudo python3 scripts/security_initializer_memory_e2e.py --kind \
+            --node runtime-restart-e2e-control-plane --kubeconfig "$KUBECONFIG" \
+            --helper-image hetero-initializer-probe:e2e
+          sudo cp /var/lib/heteronetwork-security/initializer-memory-e2e/acceptance.json "$RUNNER_TEMP/initializer-memory-acceptance.json"
       - name: Export only isolated nonsecret acceptance evidence
         if: always()
-        run: sudo chmod 0644 "$RUNNER_TEMP/restart-acceptance.json" 2>/dev/null || true
+        run: sudo chmod 0644 "$RUNNER_TEMP/restart-acceptance.json" "$RUNNER_TEMP/initializer-memory-acceptance.json" 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: real-gvisor-restart-acceptance
-          path: ${{ runner.temp }}/restart-acceptance.json
+          path: |
+            ${{ runner.temp }}/restart-acceptance.json
+            ${{ runner.temp }}/initializer-memory-acceptance.json
       - name: Remove the disposable cluster
         if: always()
         run: if test -x "$RUNNER_TEMP/kind"; then "$RUNNER_TEMP/kind" delete cluster --name runtime-restart-e2e; fi

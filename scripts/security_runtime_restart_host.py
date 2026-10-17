@@ -58,11 +58,12 @@ def run(args, timeout=20):
 
 
 def cri(*args, timeout=20):
-    return run(['crictl', '--runtime-endpoint=' + ENDPOINT, *args], timeout)
+    return run(['crictl', '--runtime-endpoint=' + ENDPOINT, '--timeout=60s', *args], timeout)
 
 
 def artifact():
-    paths = BINARIES + sorted(p for p in BUNDLE.rglob('*') if p.is_file())
+    paths = BINARIES + sorted(p for p in BUNDLE.rglob('*')
+                              if p.is_file() and not p.name.startswith('.') and '.dpkg-' not in p.name)
     require(2 < len(paths) <= 100 and BUNDLE.joinpath('gvisor_sentry') in paths,
             'complete gVisor bundle is required')
     files = {}
@@ -103,6 +104,21 @@ def memory_limit(pid):
     return min(limits) if limits else None
 
 
+def pod_memory(pid, uid):
+    rows = (Path('/proc') / str(pid) / 'cgroup').read_text().splitlines()
+    unified = next((r[3:] for r in rows if r.startswith('0::')), None)
+    require(unified is not None and '..' not in Path(unified).parts, 'invalid memory accounting path')
+    current = Path('/sys/fs/cgroup') / unified.lstrip('/')
+    normalized = uid.replace('-', '_')
+    while current != Path('/sys/fs/cgroup'):
+        if uid in current.name or normalized in current.name:
+            values = dict(line.split() for line in (current / 'memory.stat').read_text().splitlines())
+            nonreclaimable = sum(int(values.get(k, 0)) for k in ('anon', 'shmem', 'kernel_stack', 'pagetables', 'slab_unreclaimable'))
+            return {'current': int((current / 'memory.current').read_text()), 'nonreclaimable': nonreclaimable}
+        current = current.parent
+    return None
+
+
 def snapshot(policy):
     result = []
     namespaces = (policy['namespace'], policy['probe_namespace'])
@@ -119,7 +135,8 @@ def snapshot(policy):
             identity = process(pid)
         except FileNotFoundError:
             continue  # The kubelet may already be replacing a terminated sandbox.
-        result.append({'id': item['id'], 'metadata': meta, 'memory_max': memory_limit(pid), **identity})
+        result.append({'id': item['id'], 'metadata': meta, 'memory_max': memory_limit(pid),
+                       'pod_memory': pod_memory(pid, meta['uid']), **identity})
     return result
 
 
@@ -188,7 +205,7 @@ def validate_request(request, current, pods, policy):
 
 def operate(request, policy):
     action = request.get('action')
-    require(action in ('inspect', 'restart', 'rollback'), 'unsupported runtime action')
+    require(action in ('inspect', 'reserve', 'restart', 'rollback'), 'unsupported runtime action')
     current = artifact()
     require(current['version'].removeprefix('runsc version ') in policy['approved_runtime_versions'],
             'installed runtime version is not approved')
@@ -223,8 +240,20 @@ def operate(request, policy):
               'sandbox_id': pod['id'], 'source': {k: pod[k] for k in ('pid', 'start_ticks', 'exe_sha256')},
               'target_artifact': current['sha256'], 'target_sentry_sha256': current['sentry_sha256']}
     atomic_json(record_path, record)
+    if action == 'reserve':
+        record.update(status='reserved-for-pod-replacement')
+        atomic_json(record_path, record)
+        return record
     started = time.monotonic()
-    cri('stopp', '--timeout=' + str(policy['grace_seconds']), pod['id'], timeout=policy['grace_seconds'] + 30)
+    # StopPodSandbox has no grace-period parameter. Gracefully stop application
+    # containers first, sharing one grace budget, then stop the empty sandbox.
+    containers = json.loads(cri('ps', '--pod', pod['id'], '-o', 'json')).get('containers', []) or []
+    deadline = started + policy['grace_seconds']
+    for container in containers:
+        require(re.fullmatch(r'[0-9a-f]{64}', container['id']), 'invalid application container ID')
+        remaining = max(0, int(deadline - time.monotonic()))
+        cri('stop', '--timeout=' + str(remaining), container['id'], timeout=remaining + 15)
+    cri('stopp', pod['id'], timeout=30)
     record.update(status='stopped', stop_seconds=round(time.monotonic() - started, 3), stopped_at=utc_now())
     atomic_json(record_path, record)
     return record

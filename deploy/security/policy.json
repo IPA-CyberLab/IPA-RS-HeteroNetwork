@@ -13,6 +13,7 @@
     "namespace": "heterocloud-flash-workloads",
     "runtime_class": "gvisor",
     "runtime_handler": "runsc",
+    "target_runtime_version": "release-20261012.0",
     "approved_runtime_versions": ["release-20261005.0", "release-20261012.0"],
     "probe_namespace": "heteronetwork-security",
     "max_parallel_workloads": 1,

@@ -168,6 +168,21 @@ class UpdateGateTests(unittest.TestCase):
         self.proof['recovery_seconds'] = 181
         self.assertIn('restart_recovery_deadline_exceeded', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
 
+    def test_replacement_requires_actual_resources_and_preserved_workload_instead_of_same_uid(self):
+        self.restart_proof()
+        self.proof.update(strategy='bounded_pod_replacement', same_pod_uid=False,
+                          workload_identity_preserved=True, template_preserved=True, replacement_resources_ready=True)
+        self.proof.pop('capacity_reserved')
+        self.assertTrue(assess(self.plan, self.proof, self.policy, self.now)['allowed'])
+        self.proof['replacement_resources_ready'] = False
+        self.assertIn('replacement_resources_ready_required', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+    def test_replacement_cannot_claim_same_pod_identity(self):
+        self.restart_proof()
+        self.proof.update(strategy='bounded_pod_replacement', workload_identity_preserved=True,
+                          template_preserved=True, replacement_resources_ready=True)
+        self.assertIn('replacement_must_report_new_pod_uid', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
     def test_restart_is_not_enabled_merely_by_relaxing_live_migration(self):
         self.restart_proof()
         self.policy['allow_restart_fallback'] = False
@@ -182,6 +197,14 @@ class UpdateGateTests(unittest.TestCase):
         self.restart_proof()
         self.proof['strategy'] = 'just_replace_binary'
         self.assertIn('verified_strategy_required', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+    def test_gpu_cold_restart_needs_actual_startup_and_assignment_evidence(self):
+        self.restart_proof()
+        self.plan['gpu'] = True
+        self.proof['plan_sha256'] = fingerprint(self.plan)
+        self.assertIn('gpu_restart_canary_passed_required', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+        self.proof.update(gpu_restart_canary_passed=True, gpu_binding_verified=True)
+        self.assertTrue(assess(self.plan, self.proof, self.policy, self.now)['allowed'])
 
 
 class RestartSafetyTests(unittest.TestCase):
