@@ -1,0 +1,101 @@
+name: gVisor bounded restart acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/security_runtime_restart*.py
+      - scripts/security_update_gate.py
+      - scripts/test_security_inventory.py
+      - deploy/security/policy.json
+      - deploy/security/gvisor-restart-lock.json
+      - .github/workflows/gvisor-restart-e2e.yml
+  pull_request:
+    paths:
+      - scripts/security_runtime_restart*.py
+      - scripts/security_update_gate.py
+      - scripts/test_security_inventory.py
+      - deploy/security/policy.json
+      - deploy/security/gvisor-restart-lock.json
+      - .github/workflows/gvisor-restart-e2e.yml
+
+permissions:
+  contents: read
+
+jobs:
+  real-kubernetes-restart:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      KUBECONFIG: ${{ runner.temp }}/restart-e2e.kubeconfig
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Verify restart authorization and safety boundaries
+        run: python3 -m unittest discover -s scripts -p test_security_inventory.py -q
+      - name: Stage complete checksum-pinned old and new runtime bundles
+        run: |
+          sudo python3 - <<'PY'
+          import hashlib,io,json,pathlib,tarfile,urllib.request
+          root=pathlib.Path('/opt/hetero-security-restart-e2e');root.mkdir(mode=0o755)
+          for lock in json.loads(pathlib.Path('deploy/security/gvisor-restart-lock.json').read_text()):
+            with urllib.request.urlopen(lock['url'],timeout=120) as r:data=r.read(200*1024*1024)
+            assert hashlib.sha256(data).hexdigest()==lock['archive_sha256']
+            destination=root/lock['version'];destination.mkdir(mode=0o755)
+            with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+              for member in archive.getmembers():
+                name=pathlib.PurePosixPath(member.name)
+                assert not name.is_absolute() and '..' not in name.parts
+                path=destination/name
+                if member.isdir():path.mkdir(mode=0o755,parents=True,exist_ok=True)
+                else:
+                  assert member.isfile()
+                  path.parent.mkdir(mode=0o755,parents=True,exist_ok=True)
+                  path.write_bytes(archive.extractfile(member).read());path.chmod(0o755)
+          PY
+      - name: Start a disposable real Kubernetes node
+        run: |
+          python3 - <<'PY'
+          import hashlib,os,pathlib,urllib.request
+          with urllib.request.urlopen('https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64',timeout=90) as r:data=r.read()
+          assert hashlib.sha256(data).hexdigest()=='aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d'
+          binary=pathlib.Path(os.environ['RUNNER_TEMP'])/'kind';binary.write_bytes(data);binary.chmod(0o755)
+          pathlib.Path(os.environ['RUNNER_TEMP'],'kind-restart.yaml').write_text('''kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          containerdConfigPatches:
+            - |-
+              [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]
+                runtime_type = "io.containerd.runsc.v1"
+          nodes:
+            - role: control-plane
+          ''')
+          PY
+          "$RUNNER_TEMP/kind" create cluster --name runtime-restart-e2e --wait 120s \
+            --config "$RUNNER_TEMP/kind-restart.yaml" \
+            --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+          chmod 0600 "$KUBECONFIG"
+          kubectl taint node runtime-restart-e2e-control-plane node-role.kubernetes.io/control-plane-
+          kubectl label node runtime-restart-e2e-control-plane node-role.kubernetes.io/control-plane- flash.heterocloud.io/gvisor-ready=true
+          docker exec runtime-restart-e2e-control-plane sh -ec 'command -v python3 || (apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates)'
+          docker exec runtime-restart-e2e-control-plane mkdir -p /opt/heteronetwork/security
+          for file in security_inventory.py security_update_gate.py security_runtime_restart_host.py; do
+            docker cp "scripts/$file" "runtime-restart-e2e-control-plane:/opt/heteronetwork/security/$file"
+          done
+          docker cp deploy/security/policy.json runtime-restart-e2e-control-plane:/opt/heteronetwork/security/policy.json
+      - name: Preserve persistent data through a real version change and recover from injected HTTP 503
+        run: |
+          sudo python3 scripts/security_runtime_restart_e2e.py \
+            --node runtime-restart-e2e-control-plane --kubeconfig "$KUBECONFIG" \
+            --bundles /opt/hetero-security-restart-e2e --output "$RUNNER_TEMP/restart-acceptance.json"
+      - name: Export only isolated nonsecret acceptance evidence
+        if: always()
+        run: sudo chmod 0644 "$RUNNER_TEMP/restart-acceptance.json" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-gvisor-restart-acceptance
+          path: ${{ runner.temp }}/restart-acceptance.json
+      - name: Remove the disposable cluster
+        if: always()
+        run: if test -x "$RUNNER_TEMP/kind"; then "$RUNNER_TEMP/kind" delete cluster --name runtime-restart-e2e; fi

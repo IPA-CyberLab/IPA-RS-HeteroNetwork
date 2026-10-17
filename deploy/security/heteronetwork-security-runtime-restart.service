@@ -1,0 +1,24 @@
+[Unit]
+Description=Activate verified gVisor patches with bounded serial sandbox restarts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/heteronetwork/security/security_runtime_restart.py
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=100%
+MemoryMax=512M
+TimeoutStartSec=60min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/heteronetwork-security
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME GH_TOKEN GITHUB_TOKEN
+

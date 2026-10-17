@@ -7,8 +7,21 @@
   "require_fixed_version": true,
   "require_candidate_rescan": true,
   "require_ci": true,
-  "require_live_migration": true,
-  "allow_restart_fallback": false,
+  "require_live_migration": false,
+  "allow_restart_fallback": true,
+  "restart": {
+    "namespace": "heterocloud-flash-workloads",
+    "runtime_class": "gvisor",
+    "runtime_handler": "runsc",
+    "approved_runtime_versions": ["release-20261005.0", "release-20261012.0"],
+    "probe_namespace": "heteronetwork-security",
+    "max_parallel_workloads": 1,
+    "max_attempts_per_artifact": 1,
+    "grace_seconds": 30,
+    "recovery_timeout_seconds": 180,
+    "canary_max_age_seconds": 86400,
+    "require_persistent_volume": true
+  },
   "max_parallel_nodes": 1,
   "attestation_verifier": {
     "version": "2.102.0",

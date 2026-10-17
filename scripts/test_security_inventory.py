@@ -17,6 +17,8 @@ from security_runtime_snapshot import tcp_connections
 from security_host_inventory import go_module_records
 from security_candidate_needed import new_os_fixes
 from security_candidate_baseline import select_release
+from security_runtime_restart_host import validate_request
+from security_runtime_restart import eligible as restart_eligible, memory_bytes, pod_memory_limit
 
 
 class InventoryTests(unittest.TestCase):
@@ -98,6 +100,8 @@ class InventoryTests(unittest.TestCase):
 class UpdateGateTests(unittest.TestCase):
     def setUp(self):
         self.policy = json.loads((Path(__file__).resolve().parents[1] / 'deploy/security/policy.json').read_text())
+        self.policy['require_live_migration'] = True
+        self.policy['allow_restart_fallback'] = False
         self.now = datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc)
         self.plan = {'severity': 'HIGH', 'cves': ['CVE-2026-12345'], 'fixed_version': '20261005.0', 'source_sha256': 'a' * 64, 'running_workloads': ['test'], 'from_runtime': 'old', 'to_runtime': 'new', 'inventory_complete': True, 'fleet_healthy': True, 'generation': 5}
         self.proof = {'verified_at': self.now.isoformat(), 'plan_sha256': fingerprint(self.plan), 'generation': 5, 'ci_passed': True, 'candidate_rescan_passed': True, 'service_health_passed': True, 'rollback_verified': True, 'state_preserved': True, 'network_connections_preserved': True, 'target_runtime_verified': True, 'source_fenced': True, 'capacity_reserved': True, 'strategy': 'gvisor_checkpoint_restore', 'cross_version_restore_passed': True}
@@ -139,6 +143,101 @@ class UpdateGateTests(unittest.TestCase):
     def test_silent_restart_fallback_is_rejected(self):
         self.proof['restart_fallback'] = True
         self.assertIn('restart_fallback_forbidden', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+    def restart_proof(self):
+        self.policy['require_live_migration'] = False
+        self.policy['allow_restart_fallback'] = True
+        self.proof.update(strategy='bounded_restart', restart_fallback=True,
+                          persistent_volumes_retained=True, persistent_data_canary_passed=True,
+                          resource_limits_verified=True, same_pod_uid=True,
+                          restart_budget_respected=True, recovery_seconds=12.5)
+        for field in ('state_preserved', 'network_connections_preserved', 'cross_version_restore_passed'):
+            self.proof.pop(field)
+
+    def test_authorized_bounded_restart_does_not_claim_memory_or_socket_continuity(self):
+        self.restart_proof()
+        self.assertTrue(assess(self.plan, self.proof, self.policy, self.now)['allowed'])
+
+    def test_restart_preserves_persistent_volumes(self):
+        self.restart_proof()
+        self.proof['persistent_volumes_retained'] = False
+        self.assertIn('persistent_volumes_retained_required', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+    def test_restart_timeout_is_enforced(self):
+        self.restart_proof()
+        self.proof['recovery_seconds'] = 181
+        self.assertIn('restart_recovery_deadline_exceeded', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+    def test_restart_is_not_enabled_merely_by_relaxing_live_migration(self):
+        self.restart_proof()
+        self.policy['allow_restart_fallback'] = False
+        self.assertIn('restart_fallback_forbidden', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+    def test_restart_cannot_bypass_target_runtime_acceptance(self):
+        self.restart_proof()
+        self.proof['target_runtime_verified'] = False
+        self.assertIn('target_runtime_verified_required', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+    def test_unknown_strategy_is_not_allowed_after_relaxing_live_migration(self):
+        self.restart_proof()
+        self.proof['strategy'] = 'just_replace_binary'
+        self.assertIn('verified_strategy_required', assess(self.plan, self.proof, self.policy, self.now)['reasons'])
+
+
+class RestartSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.artifact = {'sha256': 'b' * 64, 'sentry_sha256': 'c' * 64}
+        self.pod = {'id': 'a' * 64, 'metadata': {'uid': 'uid', 'namespace': 'tenants'}, 'exe_sha256': 'd' * 64}
+        self.request = {'artifact_sha256': 'b' * 64, 'sandbox_id': 'a' * 64, 'pod_uid': 'uid', 'source_sha256': 'd' * 64}
+        self.policy = {'namespace': 'tenants', 'probe_namespace': 'canaries'}
+
+    def test_exact_sandbox_and_artifact_are_required(self):
+        self.assertEqual(validate_request(self.request, self.artifact, [self.pod], self.policy), self.pod)
+        self.request['pod_uid'] = 'replacement'
+        with self.assertRaisesRegex(RuntimeError, 'Pod UID changed'):
+            validate_request(self.request, self.artifact, [self.pod], self.policy)
+
+    def test_source_runtime_cannot_change_between_observation_and_stop(self):
+        self.request['source_sha256'] = 'e' * 64
+        with self.assertRaisesRegex(RuntimeError, 'source runtime changed'):
+            validate_request(self.request, self.artifact, [self.pod], self.policy)
+
+    def test_already_active_users_are_not_restarted(self):
+        self.pod['exe_sha256'] = self.request['source_sha256'] = 'c' * 64
+        with self.assertRaisesRegex(RuntimeError, 'already active'):
+            validate_request(self.request, self.artifact, [self.pod], self.policy)
+
+    def test_probe_flag_cannot_force_restart_of_a_tenant(self):
+        self.request['probe'] = True
+        with self.assertRaisesRegex(RuntimeError, 'only a canary'):
+            validate_request(self.request, self.artifact, [self.pod], self.policy)
+
+    def test_probe_can_verify_an_already_current_runtime(self):
+        self.request['probe'] = True
+        self.pod['metadata']['namespace'] = 'canaries'
+        self.pod['exe_sha256'] = self.request['source_sha256'] = 'c' * 64
+        self.assertEqual(validate_request(self.request, self.artifact, [self.pod], self.policy), self.pod)
+
+    def test_resource_limit_accounts_for_sidecars_init_and_overhead(self):
+        pod = {'spec': {'containers': [{'resources': {'limits': {'memory': '64Mi'}}}, {'resources': {'limits': {'memory': '16Mi'}}}],
+                        'initContainers': [{'resources': {'limits': {'memory': '96Mi'}}}], 'overhead': {'memory': '8Mi'}}}
+        self.assertEqual(pod_memory_limit(pod), 104 * 1024 * 1024)
+        self.assertEqual(memory_bytes('0.5Gi'), 512 * 1024 * 1024)
+        pod['spec']['containers'][0]['resources']['limits'] = {}
+        with self.assertRaisesRegex(RuntimeError, 'needs a memory limit'):
+            pod_memory_limit(pod)
+
+    def test_master_only_nodes_are_never_runtime_restart_targets(self):
+        node = {'metadata': {'labels': {'flash.heterocloud.io/gvisor-ready': 'true'}},
+                'spec': {}, 'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]}}
+        self.assertTrue(restart_eligible(node))
+        node['metadata']['labels']['heteronetwork.io/control-plane-only'] = 'true'
+        self.assertFalse(restart_eligible(node))
+        node['metadata']['labels'].pop('heteronetwork.io/control-plane-only')
+        node['metadata']['labels']['node-role.kubernetes.io/control-plane'] = ''
+        self.assertTrue(restart_eligible(node))  # Shared control planes host Flash by explicit fleet policy.
+        node['spec']['taints'] = [{'key': 'node-role.kubernetes.io/control-plane', 'effect': 'NoSchedule'}]
+        self.assertFalse(restart_eligible(node))
 
 
 class CargoFixTests(unittest.TestCase):

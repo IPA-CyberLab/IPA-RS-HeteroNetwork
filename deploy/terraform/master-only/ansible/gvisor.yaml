@@ -1,12 +1,12 @@
 - name: Configure and verify Flash CPU runtimes on workload workers
-  hosts: standard:bootstrap
+  hosts: standard:bootstrap:enrollment_issuer:!master_only
   gather_facts: true
   become: true
   serial: 1
   vars:
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
-    hnn_gvisor_version: '20261005.0'
+    hnn_gvisor_version: '20261012.0'
     hnn_gvisor_source_commit: 23fccb36f18343bccad297d9a52455edd81999b3
     hnn_gvisor_install_sha256: 6ddb1921db7d152c40d964de2435b68d6dde3ddde8ff2dd2218b75665aa06737
     hnn_gvisor_check_sha256: 74069ea8a27ff355e542230c08678e0f995a0d44892a3ec836a8b9a31742c06e
@@ -118,6 +118,30 @@
       register: hnn_gvisor_existing_tasks
       changed_when: false
       check_mode: false
+
+    - name: Install the runtime backup program before changing the package
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/security/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop: [security_inventory.py, security_update_gate.py, security_runtime_restart_host.py]
+
+    - name: Read the installed runtime package version
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, '-f=${Version}', runsc]
+      register: hnn_gvisor_previous_package
+      changed_when: false
+      failed_when: hnn_gvisor_previous_package.rc not in [0, 1]
+
+    - name: Retain the complete previous runtime bundle for verified rollback
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/security/security_runtime_restart_host.py, --prepare-install]
+      when:
+        - not ansible_check_mode
+        - hnn_gvisor_previous_package.rc == 0
+        - hnn_gvisor_previous_package.stdout != hnn_gvisor_version
 
     - name: Install the pinned sandbox package and configure its containerd handler
       ansible.builtin.command: /bin/bash /opt/heteronetwork/libexec/flash/install-gvisor.sh

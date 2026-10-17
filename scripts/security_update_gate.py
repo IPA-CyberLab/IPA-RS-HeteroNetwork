@@ -10,6 +10,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import re
 from pathlib import Path
 
 
@@ -24,7 +25,7 @@ def assess(plan, proof, policy, now=None):
         reasons.append('severity_not_in_policy')
     if not plan.get('cves') or not plan.get('fixed_version'):
         reasons.append('no_verified_fix')
-    if not plan.get('source_sha256') or len(plan['source_sha256']) != 64:
+    if not isinstance(plan.get('source_sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', plan['source_sha256']):
         reasons.append('artifact_not_pinned')
     try:
         age = (now - datetime.datetime.fromisoformat(proof['verified_at'])).total_seconds()
@@ -37,16 +38,37 @@ def assess(plan, proof, policy, now=None):
     for field in ('ci_passed', 'candidate_rescan_passed', 'service_health_passed', 'rollback_verified'):
         if proof.get(field) is not True:
             reasons.append(field + '_required')
-    if policy['require_live_migration'] and plan.get('running_workloads'):
-        for field in ('state_preserved', 'network_connections_preserved', 'target_runtime_verified', 'source_fenced', 'capacity_reserved'):
+    if plan.get('running_workloads'):
+        for field in ('target_runtime_verified', 'source_fenced', 'capacity_reserved'):
             if proof.get(field) is not True:
                 reasons.append(field + '_required')
-        if proof.get('strategy') not in ('gvisor_checkpoint_restore', 'vm_live_migration'):
-            reasons.append('live_migration_required')
-        if plan.get('gpu') and proof.get('gpu_state_preserved') is not True:
-            reasons.append('gpu_state_preservation_required')
-        if plan.get('from_runtime') != plan.get('to_runtime') and proof.get('cross_version_restore_passed') is not True:
-            reasons.append('cross_version_restore_unverified')
+        strategy = proof.get('strategy')
+        if strategy == 'bounded_restart':
+            if policy.get('require_live_migration') or policy.get('allow_restart_fallback') is not True:
+                reasons.append('restart_fallback_forbidden')
+            if proof.get('restart_fallback') is not True:
+                reasons.append('restart_must_be_explicit')
+            for field in ('persistent_volumes_retained', 'persistent_data_canary_passed', 'resource_limits_verified', 'same_pod_uid', 'restart_budget_respected'):
+                if proof.get(field) is not True:
+                    reasons.append(field + '_required')
+            elapsed = proof.get('recovery_seconds')
+            limit = policy.get('restart', {}).get('recovery_timeout_seconds', 0)
+            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not 0 <= elapsed <= limit:
+                reasons.append('restart_recovery_deadline_exceeded')
+            if plan.get('gpu'):
+                reasons.append('gpu_restart_requires_separate_acceptance')
+        elif strategy in ('gvisor_checkpoint_restore', 'vm_live_migration'):
+            for field in ('state_preserved', 'network_connections_preserved'):
+                if proof.get(field) is not True:
+                    reasons.append(field + '_required')
+            if plan.get('gpu') and proof.get('gpu_state_preserved') is not True:
+                reasons.append('gpu_state_preservation_required')
+            if plan.get('from_runtime') != plan.get('to_runtime') and proof.get('cross_version_restore_passed') is not True:
+                reasons.append('cross_version_restore_unverified')
+            if proof.get('restart_fallback'):
+                reasons.append('live_migration_cannot_claim_restart')
+        else:
+            reasons.append('verified_strategy_required')
     if plan.get('inventory_complete') is not True:
         reasons.append('inventory_incomplete')
     if plan.get('fleet_healthy') is not True:

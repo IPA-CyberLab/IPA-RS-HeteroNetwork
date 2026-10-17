@@ -1,0 +1,95 @@
+- name: Prepare a separate, restricted runtime activation identity
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Generate the private activation identity only on the operator
+      ansible.builtin.command:
+        argv: [ssh-keygen, -t, ed25519, -N, '', -C, heteronetwork-security-restart, -f, /etc/heteronetwork/security/restart.key]
+        creates: /etc/heteronetwork/security/restart.key
+      no_log: true
+    - name: Read only the public activation identity
+      ansible.builtin.command: cat /etc/heteronetwork/security/restart.key.pub
+      register: hnn_restart_public_key
+      changed_when: false
+
+- name: Install the bounded activation endpoint on workload workers
+  hosts: standard:bootstrap:enrollment_issuer:!master_only
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Reject dedicated masters
+      ansible.builtin.assert:
+        that: inventory_hostname not in groups['master_only']
+    - name: Find the activation account home
+      ansible.builtin.getent:
+        database: passwd
+        key: mizuame
+    - name: Install root-owned activation code and its policy dependencies
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/security/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop: [security_inventory.py, security_update_gate.py, security_runtime_restart_host.py]
+    - name: Declare the approved restart policy
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/policy.json"
+        dest: /opt/heteronetwork/security/policy.json
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Restrict the activation key to the argument-free endpoint
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_facts.getent_passwd.mizuame[4] }}/.ssh/authorized_keys"
+        regexp: '.* heteronetwork-security-restart$'
+        line: 'restrict,command="/usr/bin/sudo -n /opt/heteronetwork/security/security_runtime_restart_host.py" {{ hostvars[groups["bootstrap"][0]].hnn_restart_public_key.stdout }}'
+        create: false
+    - name: Permit only the argument-free activation endpoint
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/heteronetwork-security-restart
+        content: |
+          mizuame ALL=(root) NOPASSWD: /opt/heteronetwork/security/security_runtime_restart_host.py ""
+        owner: root
+        group: root
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'
+
+- name: Install serial runtime activation on the operator
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_security_restart_enable: true
+  tasks:
+    - name: Install the activation controller
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/security_runtime_restart.py"
+        dest: /opt/heteronetwork/security/security_runtime_restart.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Install the activation service and timer
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/security/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [heteronetwork-security-runtime-restart.service, heteronetwork-security-runtime-restart.timer]
+    - name: Enable periodic activation after verified installation
+      ansible.builtin.systemd_service:
+        name: heteronetwork-security-runtime-restart.timer
+        enabled: "{{ hnn_security_restart_enable | bool }}"
+        state: "{{ 'started' if hnn_security_restart_enable | bool else 'stopped' }}"
+        daemon_reload: true

@@ -34,12 +34,13 @@ locals {
   }
   bootstrap = local.edge_nodes.bootstrap
   gvisor_workers = merge(local.standard_nodes, {
-    (local.bootstrap.name) = local.bootstrap
+    (local.bootstrap.name)         = local.bootstrap
+    (local.enrollment_issuer.name) = local.enrollment_issuer
   })
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/runtime-restart.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -287,7 +288,7 @@ resource "terraform_data" "host_configuration" {
 }
 
 resource "terraform_data" "security_inventory" {
-  input = { scan_interval_seconds = 900, allow_restart_fallback = false }
+  input = { scan_interval_seconds = 900, allow_restart_fallback = true }
   triggers_replace = concat(
     [filesha256("${path.module}/ansible/security-inventory.yaml")],
     [for f in sort(tolist(fileset(local.repo_root, "scripts/security_*.py"))) : filesha256("${local.repo_root}/${f}")],
@@ -323,11 +324,12 @@ resource "terraform_data" "gvisor_configuration" {
   input = {
     name    = each.key
     runtime = "runsc"
-    version = "20261005.0"
+    version = "20261012.0"
   }
   triggers_replace = [
     filesha256("${path.module}/ansible/gvisor.yaml"),
     filesha256("${local.repo_root}/scripts/verify-gvisor-worker.py"),
+    filesha256("${local.repo_root}/scripts/security_runtime_restart_host.py"),
     sha256(jsonencode(each.value)),
   ]
   provisioner "local-exec" {
@@ -341,6 +343,24 @@ resource "terraform_data" "gvisor_configuration" {
     }
   }
   depends_on = [local_file.inventory, local_file.known_hosts]
+}
+
+resource "terraform_data" "runtime_restart" {
+  input = jsondecode(file("${local.repo_root}/deploy/security/policy.json")).restart
+  triggers_replace = [
+    filesha256("${path.module}/ansible/runtime-restart.yaml"),
+    filesha256("${local.repo_root}/scripts/security_runtime_restart.py"),
+    filesha256("${local.repo_root}/scripts/security_runtime_restart_host.py"),
+    filesha256("${local.repo_root}/deploy/security/policy.json"),
+    filesha256("${local.repo_root}/deploy/security/heteronetwork-security-runtime-restart.service"),
+    filesha256("${local.repo_root}/deploy/security/heteronetwork-security-runtime-restart.timer")
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/runtime-restart.yaml"
+    environment = { HNN_IAC_INVENTORY = local_file.inventory.filename }
+  }
+  depends_on = [terraform_data.security_inventory, terraform_data.gvisor_configuration]
 }
 
 resource "terraform_data" "openbao_storage" {

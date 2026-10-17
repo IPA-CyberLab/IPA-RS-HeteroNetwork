@@ -110,6 +110,7 @@
         mode: '0440'
         validate: '/usr/sbin/visudo -cf %s'
     - name: Install the declared update policy
+      tags: [security_code]
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/security/policy.json"
         dest: "{{ hnn_security_root }}/policy.json"

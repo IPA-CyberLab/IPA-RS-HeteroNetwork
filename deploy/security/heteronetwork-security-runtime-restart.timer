@@ -1,0 +1,12 @@
+[Unit]
+Description=Check installed gVisor patch activation every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=30
+Persistent=true
+Unit=heteronetwork-security-runtime-restart.service
+
+[Install]
+WantedBy=timers.target
