@@ -18,3 +18,11 @@ The operator authorized a bounded stop and restart for security patches. CPU san
 `gvisor-restart-e2e.yml` uses a real disposable Kubernetes/containerd node. Native verification also uses the actual restricted SSH endpoint and Longhorn volumes. The initializer test creates its own real Failed Pod sharing the test disk, verifies that preflight refuses the stop, cleans up the test record, and then checks repair, fencing, memory enforcement and persistent data.
 
 Private evidence is kept under `/workspace/.heteronetwork-iac/security-20261017` and `/var/lib/heteronetwork-security` on the operator. It contains runtime hashes, Pod/PVC identities, acceptance results and the reviewed prior attempt; application environments, secret values and user files are not collected. Successful canary evidence is written only after cleanup. Automatic timers cannot clear a held candidate or its restart budget.
+
+## Production result
+
+At 10:09 UTC all three workload workers had the same verified 20261012.0 bundle, and all nine running CPU sandboxes used its Sentry executable. Effective memory boundaries matched their configured budgets, including the three formerly unlimited secret-enabled workloads. All 12 existing PVC identities and all 10 application configurations were retained; the three replaced Pods have new UIDs. The 8 GiB workspace remained at 8 GiB. No user Pod was placed on a dedicated master, and isolated test Pods/PVCs were cleaned up.
+
+The NVIDIA workload retained its Pod and running application container IDs with zero application restarts. Its completed initializer's metadata and matching templates were aligned with the 64 MiB limit without restarting the application, avoiding an unnecessary template rollout when the corrected platform controller is published.
+
+Final operator probes returned HTTP 200 in 0.009 seconds for the internal console, 0.374 seconds for the HeteroCloud login page, and 0.024 seconds for Coder. Both active workspace code-server listeners were reachable. The 15-minute activation timer was enabled through IaC; its immediate reconciliation reported all three nodes current and performed no further restarts. Native restart, persistent-data, injected-503 recovery, initialization-memory and terminal-volume-reference tests passed; the safety suite passed 59 tests and the Flash Rust suite passed 106 tests with Clippy.
