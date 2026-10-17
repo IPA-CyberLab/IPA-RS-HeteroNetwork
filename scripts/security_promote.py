@@ -124,6 +124,25 @@ def verified_fixes(old, new):
     return sorted({v['id'] for v in old if v.get('fixed_version') and (v['id'], v['package']) not in remaining})
 
 
+def verify_remediation(component, value, fixed):
+    # Only the protected operator policy can approve a source fix without an
+    # advisory identifier. Candidate metadata cannot authorize its own rollout.
+    reviews = component.get('reviewed_source_fixes', [])
+    require(isinstance(reviews, list) and len(reviews) <= 16, 'invalid source fix reviews')
+    approved = None
+    for review in reviews:
+        require(isinstance(review, dict)
+                and isinstance(review.get('source_commit'), str)
+                and re.fullmatch(r'[0-9a-f]{40}', review.get('source_commit', '')) is not None
+                and isinstance(review.get('reason'), str) and 1 <= len(review['reason'].strip()) <= 500,
+                'source fix review needs an exact commit and reason')
+        if review['source_commit'] == value['source_commit']:
+            require(approved is None, 'duplicate source fix review')
+            approved = {k: review[k] for k in ('source_commit', 'reason')}
+    require(fixed or value['fixed_advisories'] or approved, 'candidate has no observed, verified remediation')
+    return approved
+
+
 def tenant_identity(pods, snapshots):
     result = {}
     for pod in pods:
@@ -319,13 +338,15 @@ class Reconciler:
         if baseline.get('image') in references:
             fixed = sorted(set(fixed) | {f['id'] for f in baseline.get('fixed_advisories', [])})
             old_findings.extend(baseline.get('findings', []))
-        require(fixed or value['fixed_advisories'], 'candidate has no observed, verified remediation')
+        reviewed_fix = verify_remediation(component, value, fixed)
         old_critical = {(v['id'], v['package']) for v in old_findings if v['severity'] in ('CRITICAL', 'HIGH')}
         new_critical = {(v['id'], v['package']) for v in scan['findings'] if v['severity'] in ('CRITICAL', 'HIGH')}
         require(not new_critical - old_critical, 'candidate introduces a new high or critical finding')
         record = {'component': component['application'], 'status': 'eligible', 'image': value['image'],
                   'fixed_advisories': fixed, 'candidate_source': value['source_commit'], 'verified_at': utc_now(),
                   'deployed_source_baselines': source_baselines}
+        if reviewed_fix:
+            record['reviewed_source_fix'] = reviewed_fix
         if not self.args.apply:
             return record
         source = app['spec']['source']

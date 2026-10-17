@@ -14,7 +14,7 @@ from security_cargo_patch import fixes
 from security_containerd_update import preserved
 from security_candidate import candidate
 from security_gvisor_e2e import continuity
-from security_promote import canonical_image, deployment_ready, image_repository, newest_candidate, tenant_identity, validate_identity, verified_fixes
+from security_promote import canonical_image, deployment_ready, image_repository, newest_candidate, tenant_identity, validate_identity, verified_fixes, verify_remediation
 from security_runtime_snapshot import tcp_connections
 from security_host_inventory import go_module_records
 from security_candidate_needed import new_os_fixes
@@ -364,6 +364,24 @@ class CandidateTests(unittest.TestCase):
 
     def test_exact_ci_binding_is_accepted(self):
         validate_identity(self.value, self.component, self.run)
+
+    def test_non_advisory_source_fix_needs_exact_operator_review(self):
+        review = {'source_commit': 'a' * 40, 'reason': 'Bound completed initializer memory.'}
+        approved = {**self.component, 'reviewed_source_fixes': [review]}
+        self.assertEqual(verify_remediation(approved, self.value, []), review)
+        for component, value in [
+                (self.component, self.value),
+                (approved, {**self.value, 'source_commit': 'c' * 40}),
+                (self.component, {**self.value, 'reviewed_source_fixes': [review]})]:
+            with self.subTest(component=component, source=value['source_commit']), self.assertRaises(RuntimeError):
+                verify_remediation(component, value, [])
+        self.assertIsNone(verify_remediation(self.component, self.value, ['CVE-fixed']))
+
+    def test_source_review_cannot_use_a_branch_or_omit_its_reason(self):
+        for review in [{'source_commit': 'master', 'reason': 'Approved'},
+                       {'source_commit': 'a' * 40, 'reason': '  '}]:
+            with self.subTest(review=review), self.assertRaises(RuntimeError):
+                verify_remediation({**self.component, 'reviewed_source_fixes': [review]}, self.value, [])
 
     def test_failed_and_untrusted_ci_cannot_promote(self):
         for changed in [{'conclusion': 'failure'}, {'head_sha': 'c' * 40}, {'event': 'pull_request'},
