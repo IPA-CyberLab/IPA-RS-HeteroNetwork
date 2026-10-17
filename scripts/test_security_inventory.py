@@ -267,6 +267,23 @@ class RestartSafetyTests(unittest.TestCase):
                 restart_host.operate(self.request, self.policy)
         self.assertEqual(sum(c[0] == 'stopp' for c in calls), 1)
 
+    def test_stale_ready_list_cannot_claim_a_removed_sandbox_as_active(self):
+        item = {**self.pod, 'state': 'SANDBOX_READY'}
+        self.policy['runtime_handler'] = 'runsc'
+        for state in ('SANDBOX_NOTREADY', 'SANDBOX_READY'):
+            detail = {'status': {'runtimeHandler': 'runsc', 'state': state}, 'info': {'pid': 0}}
+            with mock.patch.object(restart_host, 'cri', side_effect=[json.dumps({'items': [item]}), json.dumps(detail)]):
+                self.assertEqual(restart_host.snapshot(self.policy), [])
+
+    def test_disappearing_cgroup_during_inspection_does_not_fail_the_entire_fleet_snapshot(self):
+        item = {**self.pod, 'state': 'SANDBOX_READY'}
+        self.policy['runtime_handler'] = 'runsc'
+        detail = {'status': {'runtimeHandler': 'runsc', 'state': 'SANDBOX_READY'}, 'info': {'pid': 123}}
+        with mock.patch.object(restart_host, 'cri', side_effect=[json.dumps({'items': [item]}), json.dumps(detail)]), \
+                mock.patch.object(restart_host, 'process', return_value={'pid': 123}), \
+                mock.patch.object(restart_host, 'memory_limit', side_effect=FileNotFoundError):
+            self.assertEqual(restart_host.snapshot(self.policy), [])
+
     def test_resource_limit_accounts_for_sidecars_init_and_overhead(self):
         pod = {'spec': {'containers': [{'resources': {'limits': {'memory': '64Mi'}}}, {'resources': {'limits': {'memory': '16Mi'}}}],
                         'initContainers': [{'resources': {'limits': {'memory': '96Mi'}}}], 'overhead': {'memory': '8Mi'}}}

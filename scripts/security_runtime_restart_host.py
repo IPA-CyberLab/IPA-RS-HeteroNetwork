@@ -127,16 +127,19 @@ def snapshot(policy):
         if meta['namespace'] not in namespaces or item['state'] != 'SANDBOX_READY':
             continue
         detail = json.loads(cri('inspectp', item['id']))
-        if detail.get('status', {}).get('runtimeHandler') != policy['runtime_handler']:
+        status = detail.get('status', {})
+        if status.get('runtimeHandler') != policy['runtime_handler'] or status.get('state') != 'SANDBOX_READY':
             continue
         pid = detail.get('info', {}).get('pid', 0)
-        require(isinstance(pid, int) and pid > 0, 'sandbox runtime identity is unavailable')
+        if not isinstance(pid, int) or pid <= 0:
+            continue  # List/Inspect can race kubelet's removal of a stopped sandbox.
         try:
             identity = process(pid)
+            record = {'id': item['id'], 'metadata': meta, 'memory_max': memory_limit(pid),
+                      'pod_memory': pod_memory(pid, meta['uid']), **identity}
         except FileNotFoundError:
             continue  # The kubelet may already be replacing a terminated sandbox.
-        result.append({'id': item['id'], 'metadata': meta, 'memory_max': memory_limit(pid),
-                       'pod_memory': pod_memory(pid, meta['uid']), **identity})
+        result.append(record)
     return result
 
 
