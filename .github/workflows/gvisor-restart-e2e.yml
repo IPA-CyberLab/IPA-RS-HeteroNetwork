@@ -79,8 +79,10 @@ jobs:
             --config "$RUNNER_TEMP/kind-restart.yaml" \
             --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
           chmod 0600 "$KUBECONFIG"
-          kubectl taint node runtime-restart-e2e-control-plane node-role.kubernetes.io/control-plane-
-          kubectl label node runtime-restart-e2e-control-plane node-role.kubernetes.io/control-plane- flash.heterocloud.io/gvisor-ready=true
+          if test -n "$(kubectl get node runtime-restart-e2e-control-plane -o 'jsonpath={.spec.taints[?(@.key=="node-role.kubernetes.io/control-plane")].key}')"; then
+            kubectl taint node runtime-restart-e2e-control-plane node-role.kubernetes.io/control-plane-
+          fi
+          kubectl label node runtime-restart-e2e-control-plane flash.heterocloud.io/gvisor-ready=true
           docker exec runtime-restart-e2e-control-plane sh -ec 'command -v python3 || (apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates)'
           docker exec runtime-restart-e2e-control-plane mkdir -p /opt/heteronetwork/security
           for file in security_inventory.py security_update_gate.py security_runtime_restart_host.py; do
