@@ -172,6 +172,16 @@ class Controller:
             result[name] = {'uid': claim['metadata']['uid'], 'volume': claim['spec']['volumeName']}
         return result
 
+    def recovery_health(self):
+        # A restarted process may be Running before its HTTP listener is ready.
+        # Wait within the existing recovery budget; each individual request
+        # must still satisfy its configured (three-second) health deadline.
+        try:
+            self.health()
+            return True
+        except (OSError, ValueError, RuntimeError):
+            return False
+
     def sandbox(self, observation, uid):
         records = [s for s in observation['sandboxes'] if s['metadata']['uid'] == uid]
         require(len(records) == 1, 'exactly one ready sandbox is required')
@@ -318,6 +328,9 @@ class Controller:
                     require(isinstance(active.get('memory_max'), int) and 0 < active['memory_max'] <= memory,
                             'new sandbox does not enforce the Pod memory limit')
                     require(self.volumes(current) == volumes, 'persistent volume identity changed')
+                    if not self.recovery_health():
+                        time.sleep(2)
+                        continue
                     seconds = time.monotonic() - started
                     require(seconds <= self.policy['recovery_timeout_seconds'], 'restart recovery deadline exceeded')
                     return {'status': 'restarted', 'strategy': 'bounded_restart', 'restart_fallback': True,
@@ -494,6 +507,10 @@ class Controller:
                     require(self.volumes(current) == volumes, 'replacement changed persistent storage')
                     latest = self.get('deployment', deployment['metadata']['name'], namespace)
                     require(fingerprint(latest['spec']['template']) == before_template, 'replacement changed the user workload template')
+                    if not self.recovery_health():
+                        time.sleep(2)
+                        continue
+                    require(time.monotonic() <= deadline, 'replacement recovery deadline exceeded')
                     journal['status'] = 'completed'
                     atomic_json(journal_path, journal)
                     return {'status': 'restarted', 'strategy': 'bounded_pod_replacement', 'restart_fallback': True,
@@ -593,6 +610,9 @@ class Controller:
             sources = [s for s in observation['sandboxes'] if s['metadata']['uid'] == uid]
             if len(sources) == 1 and sources[0]['exe_sha256'] == rollback['sentry_sha256'] and ready(current):
                 require(self.volumes(current) == volumes, 'persistent volume changed during recovery')
+                if not self.recovery_health():
+                    time.sleep(2)
+                    continue
                 return {'status': 'rollback-verified', 'pod_uid': uid, 'artifact': rollback['sha256'], 'persistent_volumes_retained': True}
             if len(sources) == 1 and sources[0]['exe_sha256'] != rollback['sentry_sha256'] and not stopped:
                 # One recovery stop is separate from the failed target's single
