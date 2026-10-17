@@ -30,12 +30,12 @@ jobs:
   real-kubernetes-restart:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    env:
-      KUBECONFIG: ${{ runner.temp }}/restart-e2e.kubeconfig
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
+      - name: Configure the isolated kubeconfig path
+        run: printf 'KUBECONFIG=%s/restart-e2e.kubeconfig\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Verify restart authorization and safety boundaries
         run: python3 -m unittest discover -s scripts -p test_security_inventory.py -q
       - name: Stage complete checksum-pinned old and new runtime bundles
