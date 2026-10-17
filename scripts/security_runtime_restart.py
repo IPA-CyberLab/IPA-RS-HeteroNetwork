@@ -112,6 +112,20 @@ def template_identity(template):
     return fingerprint(value)
 
 
+def configuration_tests(resource):
+    # Status updates continuously advance resourceVersion. Bind writes to the
+    # identity and configuration instead, while still rejecting concurrent
+    # user edits, controller ownership changes and annotation changes.
+    result = [{'op': 'test', 'path': '/metadata/uid', 'value': resource['metadata']['uid']},
+              {'op': 'test', 'path': '/spec', 'value': resource['spec']}]
+    for field in ('annotations', 'labels', 'ownerReferences'):
+        if field in resource['metadata']:
+            result.append({'op': 'test', 'path': '/metadata/' + field, 'value': resource['metadata'][field]})
+    if 'annotations' not in resource['metadata']:
+        result.append({'op': 'test', 'path': '/metadata/resourceVersion', 'value': resource['metadata']['resourceVersion']})
+    return result
+
+
 class Controller:
     def __init__(self, args, config):
         self.args, self.config, self.policy = args, config, config['restart']
@@ -240,8 +254,7 @@ class Controller:
                        '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json']
             if subresource:
                 command += ['--subresource=' + subresource]
-            return self.kube(*command, body=[{'op': 'test', 'path': '/metadata/resourceVersion',
-                                             'value': resource['metadata']['resourceVersion']}, *operation])
+            return self.kube(*command, body=[*configuration_tests(resource), *operation])
 
         def set_limit(kind, resource, subresource=None):
             spec = resource['spec'] if kind == 'pod' else resource['spec']['template']['spec']
@@ -304,7 +317,7 @@ class Controller:
                 if index is not None:
                     self.kube('patch', kind, resource['metadata']['name'], '-n', namespace, '--type=json',
                               '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json', body=[
-                                  {'op': 'test', 'path': '/metadata/resourceVersion', 'value': resource['metadata']['resourceVersion']},
+                                  *configuration_tests(resource),
                                   {'op': 'add', 'path': '/spec/template/spec/initContainers/' + str(index) + '/resources', 'value': HELPER_RESOURCES}])
             current = self.get('deployment', deployment['metadata']['name'], namespace)
             require(current and current['metadata']['uid'] == deployment['metadata']['uid']
@@ -313,7 +326,7 @@ class Controller:
             annotations.pop(marker)
             self.kube('patch', 'deployment', current['metadata']['name'], '-n', namespace, '--type=json',
                       '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json', body=[
-                          {'op': 'test', 'path': '/metadata/resourceVersion', 'value': current['metadata']['resourceVersion']},
+                          *configuration_tests(current),
                           {'op': 'add', 'path': '/spec/paused', 'value': owned.startswith('1:')},
                           {'op': 'add', 'path': '/metadata/annotations', 'value': annotations}])
 
@@ -396,13 +409,13 @@ class Controller:
         if replica['spec']['template']['spec'].get('schedulingGates') == [{'name': gate}]:
             self.kube('patch', 'replicaset', replica['metadata']['name'], '-n', namespace, '--type=json',
                       '--patch-file=/dev/stdin', '-o', 'json', body=[
-                          {'op': 'test', 'path': '/metadata/resourceVersion', 'value': replica['metadata']['resourceVersion']},
+                          *configuration_tests(replica),
                           {'op': 'remove', 'path': '/spec/template/spec/schedulingGates'}])
         candidate = self.replacement_candidate(record)
         if fenced and candidate and candidate['spec'].get('schedulingGates') == [{'name': gate}]:
             candidate = self.kube('patch', 'pod', candidate['metadata']['name'], '-n', namespace, '--type=json',
                                   '--patch-file=/dev/stdin', '-o', 'json', body=[
-                                      {'op': 'test', 'path': '/metadata/resourceVersion', 'value': candidate['metadata']['resourceVersion']},
+                                      *configuration_tests(candidate),
                                       {'op': 'remove', 'path': '/spec/schedulingGates'}])
         require(fenced or candidate is None, 'an unfenced source cannot release a replacement')
         annotations = dict(deployment['metadata']['annotations'])
@@ -411,7 +424,7 @@ class Controller:
         atomic_json(self.root / ('replacement-' + record['source_pod_uid'] + '.json'), record)
         self.kube('patch', 'deployment', deployment['metadata']['name'], '-n', namespace, '--type=json',
                   '--patch-file=/dev/stdin', '-o', 'json', body=[
-                      {'op': 'test', 'path': '/metadata/resourceVersion', 'value': deployment['metadata']['resourceVersion']},
+                      *configuration_tests(deployment),
                       {'op': 'add', 'path': '/spec/paused', 'value': record['token'].startswith('1:')},
                       {'op': 'add', 'path': '/metadata/annotations', 'value': annotations}])
         return candidate
@@ -477,7 +490,7 @@ class Controller:
         def patch(kind, resource, operations):
             return self.kube('patch', kind, resource['metadata']['name'], '-n', namespace, '--type=json',
                              '--field-manager=heteronetwork-security-runtime', '--patch-file=/dev/stdin', '-o', 'json', body=[
-                                 {'op': 'test', 'path': '/metadata/resourceVersion', 'value': resource['metadata']['resourceVersion']}, *operations])
+                                 *configuration_tests(resource), *operations])
 
         # The reservation is durable before API deletion. Its source PID and
         # start time provide fencing evidence even after the Pod object is gone.
