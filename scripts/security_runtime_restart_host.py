@@ -207,8 +207,6 @@ def operate(request, policy):
     action = request.get('action')
     require(action in ('inspect', 'reserve', 'restart', 'rollback'), 'unsupported runtime action')
     current = artifact()
-    require(current['version'].removeprefix('runsc version ') in policy['approved_runtime_versions'],
-            'installed runtime version is not approved')
     pods = snapshot(policy)
     previous = backup()
     if action == 'inspect':
@@ -228,6 +226,9 @@ def operate(request, policy):
     if action == 'rollback':
         restored = restore(request.get('artifact_sha256'))
         return {'status': 'rollback-restored', 'artifact': restored}
+    require(current['version'].removeprefix('runsc version ') in policy['approved_runtime_versions']
+            or (action == 'restart' and previous and current['sha256'] == previous['sha256']),
+            'installed runtime must be approved or the verified previous bundle used for recovery')
     pod = validate_request(request, current, pods, policy)
     directory = ROOT / 'attempts'
     directory.mkdir(mode=0o700, exist_ok=True)
@@ -253,8 +254,16 @@ def operate(request, policy):
         require(re.fullmatch(r'[0-9a-f]{64}', container['id']), 'invalid application container ID')
         remaining = max(0, int(deadline - time.monotonic()))
         cri('stop', '--timeout=' + str(remaining), container['id'], timeout=remaining + 15)
-    cri('stopp', pod['id'], timeout=30)
-    record.update(status='stopped', stop_seconds=round(time.monotonic() - started, 3), stopped_at=utc_now())
+    try:
+        cri('stopp', pod['id'], timeout=30)
+        status = 'stopped'
+    except (subprocess.TimeoutExpired, RuntimeError):
+        # CRI may still be draining mounts after the client's RPC deadline.
+        # Do not retry the stop or roll back a healthy new sandbox merely
+        # because its acknowledgment was late. The controller must still
+        # prove process fencing and recovery within the overall deadline.
+        status = 'stop-confirmation-pending'
+    record.update(status=status, stop_seconds=round(time.monotonic() - started, 3), stopped_at=utc_now())
     atomic_json(record_path, record)
     return record
 

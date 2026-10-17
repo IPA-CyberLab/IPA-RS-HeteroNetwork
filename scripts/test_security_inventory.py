@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+import subprocess
 import socket
 import os
 
@@ -18,6 +20,7 @@ from security_host_inventory import go_module_records
 from security_candidate_needed import new_os_fixes
 from security_candidate_baseline import select_release
 from security_runtime_restart_host import validate_request
+import security_runtime_restart_host as restart_host
 from security_runtime_restart import eligible as restart_eligible, memory_bytes, pod_memory_limit
 
 
@@ -240,6 +243,29 @@ class RestartSafetyTests(unittest.TestCase):
         self.pod['metadata']['namespace'] = 'canaries'
         self.pod['exe_sha256'] = self.request['source_sha256'] = 'c' * 64
         self.assertEqual(validate_request(self.request, self.artifact, [self.pod], self.policy), self.pod)
+
+    def test_late_stop_acknowledgment_does_not_repeat_or_claim_a_completed_stop(self):
+        self.artifact['version'] = 'runsc version release-20261012.0'
+        self.pod.update(pid=123, start_ticks='456')
+        self.request['action'] = 'restart'
+        self.policy.update(approved_runtime_versions=['release-20261012.0'], max_attempts_per_artifact=1, grace_seconds=5)
+        calls = []
+
+        def cri(*args, **kwargs):
+            calls.append(args)
+            if args[0] == 'ps':
+                return '{"containers":[]}'
+            raise subprocess.TimeoutExpired('crictl stopp', 30)
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(restart_host, 'ROOT', Path(root)), \
+                mock.patch.object(restart_host, 'artifact', return_value=self.artifact), \
+                mock.patch.object(restart_host, 'snapshot', return_value=[self.pod]), \
+                mock.patch.object(restart_host, 'backup', return_value=None), mock.patch.object(restart_host, 'cri', side_effect=cri):
+            result = restart_host.operate(self.request, self.policy)
+            self.assertEqual(result['status'], 'stop-confirmation-pending')
+            with self.assertRaisesRegex(RuntimeError, 'restart budget'):
+                restart_host.operate(self.request, self.policy)
+        self.assertEqual(sum(c[0] == 'stopp' for c in calls), 1)
 
     def test_resource_limit_accounts_for_sidecars_init_and_overhead(self):
         pod = {'spec': {'containers': [{'resources': {'limits': {'memory': '64Mi'}}}, {'resources': {'limits': {'memory': '16Mi'}}}],

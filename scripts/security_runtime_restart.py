@@ -182,6 +182,32 @@ class Controller:
         except (OSError, ValueError, RuntimeError):
             return False
 
+    def preflight_storage(self, pod):
+        """Refuse a stop while terminal PVC references can block remounting.
+
+        Longhorn versions affected by upstream #13723 reject an existing
+        Running Pod's remount when failed/succeeded historical Pods also refer
+        to its PVC. A fresh-volume canary alone cannot detect this condition.
+        """
+        namespace = pod['metadata']['namespace']
+        volumes = self.volumes(pod)
+        others = self.kube('get', 'pods', '-n', namespace, '-o', 'json')['items']
+        for other in others:
+            if other.get('status', {}).get('phase') not in ('Failed', 'Succeeded'):
+                continue
+            claims = {v['persistentVolumeClaim']['claimName'] for v in other['spec'].get('volumes', []) if 'persistentVolumeClaim' in v}
+            require(not claims.intersection(volumes), 'terminal Pod references must be cleaned up before stopping a workload with persistent storage')
+        for volume in volumes.values():
+            pv = self.get('pv', volume['volume'], namespace)
+            csi = pv.get('spec', {}).get('csi', {}) if pv else {}
+            if csi.get('driver') != 'driver.longhorn.io':
+                continue
+            record = self.get('volumes.longhorn.io', csi['volumeHandle'], 'longhorn-system')
+            require(record and record.get('status', {}).get('robustness') == 'healthy', 'persistent volume is not healthy before restart')
+            tracked = record.get('status', {}).get('kubernetesStatus', {}).get('workloadsStatus', [])
+            require(not any(p.get('podStatus') in ('Failed', 'Succeeded') for p in tracked),
+                    'Longhorn still tracks terminal Pods; wait for storage reconciliation before stopping the workload')
+
     def sandbox(self, observation, uid):
         records = [s for s in observation['sandboxes'] if s['metadata']['uid'] == uid]
         require(len(records) == 1, 'exactly one ready sandbox is required')
@@ -292,6 +318,8 @@ class Controller:
                           {'op': 'add', 'path': '/metadata/annotations', 'value': annotations}])
 
     def restart(self, pod, observation, probe=False, recovering=False):
+        if not recovering:
+            self.preflight_storage(pod)
         source = self.sandbox(observation, pod['metadata']['uid'])
         if (not recovering and (source.get('memory_max') is None or source['memory_max'] > pod_memory_limit(pod))):
             return self.replace_pod(pod, observation, probe=probe)
@@ -638,6 +666,8 @@ class Controller:
             source = self.sandbox(observed, pod['metadata']['uid'])
             if source['exe_sha256'] != observed['artifact']['sentry_sha256']:
                 workloads.append(pod)
+        for pod in workloads:
+            self.preflight_storage(pod)
         if not workloads and not self.args.probe_only:
             return {'node': node, 'status': 'current', 'artifact': artifact}
         pending = None
@@ -651,9 +681,13 @@ class Controller:
                     self.health()
                     pod = self.repair_initializer(pod, self.remote(node))
                     pending = pod
+                    print(json.dumps({'event': 'workload-restart-started', 'node': node, 'pod': pod['metadata']['name'],
+                                      'pod_uid': pod['metadata']['uid'], 'started_at': utc_now()}), flush=True)
                     # A single sandbox holds its existing node resource allocation.
                     restarted = self.restart(pod, self.remote(node))
                     results.append(restarted)
+                    atomic_json(self.root / ('workload-' + restarted['pod_uid'] + '-last-accepted.json'), restarted)
+                    print(json.dumps({'event': 'workload-restart-verified', **restarted}), flush=True)
                     if not restarted['same_pod_uid']:
                         pending = self.get('pod', restarted['pod'], pod['metadata']['namespace'])
                     self.health()

@@ -91,6 +91,41 @@ def main():
         current = control.get('pod', pod['metadata']['name'], namespace)
         require(current and current['metadata']['uid'] == pod['metadata']['uid'] and ready(current), 'resource repair recreated or stopped the Pod')
         require([s['containerID'] for s in current['status']['containerStatuses']] == ids, 'resource repair must not restart the application')
+        terminal_name = name + '-terminal'
+        terminal = {'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': terminal_name, 'namespace': namespace,
+                                                               'labels': {'security.heteronetwork.io/terminal-memory-probe': token}},
+                    'spec': {'nodeSelector': {'kubernetes.io/hostname': args.node}, 'restartPolicy': 'Never',
+                             'automountServiceAccountToken': False, 'securityContext': spec['securityContext'],
+                             'volumes': [spec['volumes'][0]], 'containers': [{**spec['containers'][0], 'command': ['/bin/sh', '-c', 'exit 1'],
+                                                                             'volumeMounts': [spec['containers'][0]['volumeMounts'][0]]}]}}
+        terminal['spec']['containers'][0].pop('readinessProbe')
+        control.kube('create', '-f', '-', '-o', 'json', body=terminal)
+        try:
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                failed = control.get('pod', terminal_name, namespace)
+                if failed and failed['status'].get('phase') == 'Failed':
+                    break
+                time.sleep(2)
+            require(failed and failed['status'].get('phase') == 'Failed', 'terminal-volume fixture did not reach Failed')
+            try:
+                control.restart(repaired, control.remote(args.node), probe=True)
+            except RuntimeError as error:
+                require('terminal Pod references' in str(error), 'storage preflight rejected for an unexpected reason')
+            else:
+                raise RuntimeError('unsafe restart with a terminal PVC reference was accepted')
+            retained = control.sandbox(control.remote(args.node), pod['metadata']['uid'])
+            require(retained['id'] == before['id'], 'storage preflight must not stop the running source')
+        finally:
+            control.kube('delete', 'pod', terminal_name, '-n', namespace, '--wait=true', '--timeout=30s', text=True)
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                control.preflight_storage(repaired)
+                break
+            except RuntimeError:
+                require(time.monotonic() < deadline, 'storage did not reconcile after terminal probe cleanup')
+                time.sleep(2)
         result = control.restart(repaired, control.remote(args.node), probe=True)
         after = control.sandbox(control.remote(result['node']), result['pod_uid'])
         require(after['memory_max'] == 128 * 1024 * 1024, 'sandbox memory did not match the workload budget after restart')
@@ -99,6 +134,7 @@ def main():
         accepted = {'status': 'verified', 'verified_at': utc_now(), 'before_memory_max': before['memory_max'],
                     'unbounded_runtime_reproduced': unbounded,
                     'after_memory_max': after['memory_max'], 'same_pod_uid': result['same_pod_uid'], 'no_extra_restart_during_repair': True,
+                    'terminal_volume_reference_held_before_stop': True,
                     'persistent_data_retained': True, 'restart': result}
         atomic_json(root / 'acceptance.json', accepted)
         print(json.dumps(accepted), flush=True)
