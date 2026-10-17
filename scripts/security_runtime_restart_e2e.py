@@ -24,7 +24,8 @@ from security_runtime_restart_host import require
 
 def command(args, body=None):
     result = subprocess.run(args, input=body, capture_output=True, text=True, timeout=60)
-    require(result.returncode == 0, 'isolated Kubernetes runtime test command failed: ' + args[0] + ': ' + result.stderr[-500:])
+    require(result.returncode == 0, 'isolated Kubernetes runtime test command failed: ' + args[0] + ': '
+            + (result.stderr[-500:] or result.stdout[-1500:]))
     return result.stdout
 
 

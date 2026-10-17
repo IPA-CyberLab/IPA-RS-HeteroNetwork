@@ -105,6 +105,12 @@ jobs:
       - name: Export only isolated nonsecret acceptance evidence
         if: always()
         run: sudo chmod 0644 "$RUNNER_TEMP/restart-acceptance.json" "$RUNNER_TEMP/initializer-memory-acceptance.json" 2>/dev/null || true
+      - name: Diagnose only the disposable node on failure
+        if: failure()
+        run: |
+          kubectl get pods --all-namespaces -o wide || true
+          kubectl get events --all-namespaces --sort-by=.metadata.creationTimestamp | tail -n 60 || true
+          docker exec runtime-restart-e2e-control-plane journalctl -u containerd -u kubelet --no-pager -n 80 || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
