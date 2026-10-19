@@ -16,6 +16,7 @@ locals {
     cluster-dns            = "deploy/gitops/cluster-dns"
     network-policy-engine  = "deploy/gitops/network-policy-engine"
     longhorn-prerequisites = "deploy/gitops/longhorn-prerequisites"
+    csi-snapshots          = "deploy/gitops/csi-snapshots"
     flash-web              = "deploy/gitops/flash-web"
     heterocloud-edge       = "deploy/gitops/envoy-gateway"
   }
@@ -40,7 +41,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/runtime-restart.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/flash-backups.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/runtime-restart.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -148,7 +149,7 @@ resource "local_file" "inventory" {
 }
 
 import {
-  for_each = local.managed_app_paths
+  for_each = { for key, path in local.managed_app_paths : key => path if key != "csi-snapshots" }
   to       = kubernetes_manifest.application_source[each.key]
   id       = "apiVersion=argoproj.io/v1alpha1,kind=Application,namespace=argocd,name=${each.key}"
 }
@@ -159,7 +160,7 @@ resource "kubernetes_manifest" "application_source" {
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata   = { name = each.key, namespace = "argocd" }
-    spec = merge({
+    spec = merge(jsondecode(each.key == "csi-snapshots" ? jsonencode(yamldecode(file("${local.repo_root}/deploy/gitops/applications/csi-snapshots.yaml")).spec) : "{}"), {
       source = {
         repoURL        = var.git_repository_url
         targetRevision = var.git_revision
@@ -844,4 +845,16 @@ resource "terraform_data" "custom_domains_cert_manager_values" {
     command     = "python3 scripts/normalize_application_helm_values.py --manifest deploy/gitops/applications/cert-manager.yaml"
   }
   depends_on = [kubernetes_manifest.custom_domains_cert_manager]
+}
+
+resource "terraform_data" "flash_backups" {
+  triggers_replace = [
+    filesha256("${local.repo_root}/scripts/provision-flash-backup-store.py"),
+    filesha256("${path.module}/ansible/flash-backups.yaml")
+  ]
+  provisioner "local-exec" {
+    working_dir = local.repo_root
+    command     = "ansible-playbook -i ${abspath(var.work_dir)}/inventory.json deploy/terraform/master-only/ansible/flash-backups.yaml"
+  }
+  depends_on = [local_file.inventory, kubernetes_manifest.application_source["csi-snapshots"]]
 }

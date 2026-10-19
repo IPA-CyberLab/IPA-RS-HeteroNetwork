@@ -1,0 +1,34 @@
+- name: Provision the private Flash persistent disk backup target
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_flash_backup_region: heteronet-global
+    hnn_flash_backup_endpoint: http://heterocloud-syouyu-s3.heterocloud-syouyu.svc.cluster.local:3900
+    hnn_flash_backup_capacity_gib: 40
+  tasks:
+    - name: Install the root-owned secret provisioning program
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/provision-flash-backup-store.py"
+        dest: /usr/local/sbin/heterocloud-flash-backup-store
+        owner: root
+        group: root
+        mode: '0700'
+    - name: Reconcile the bucket-scoped private backup target
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /usr/local/sbin/heterocloud-flash-backup-store
+          - --region
+          - "{{ hnn_flash_backup_region }}"
+          - --endpoint
+          - "{{ hnn_flash_backup_endpoint }}"
+          - --capacity-gib
+          - "{{ hnn_flash_backup_capacity_gib | string }}"
+      register: hnn_backup_target
+      changed_when: false
+    - name: Report only public provisioning status
+      ansible.builtin.debug:
+        msg: "{{ hnn_backup_target.stdout | from_json }}"
