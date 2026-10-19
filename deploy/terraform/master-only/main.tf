@@ -229,6 +229,7 @@ resource "terraform_data" "application_helm_value_cleanup" {
   provisioner "local-exec" {
     working_dir = local.repo_root
     command     = "python3 scripts/normalize_application_helm_values.py --manifest ${local.managed_external_application_files[each.key]} && python3 scripts/reconcile_platform_release.py --manifest ${local.managed_external_application_files[each.key]}"
+    environment = { KUBECONFIG = pathexpand(var.kubeconfig_path) }
   }
 }
 
