@@ -1,0 +1,40 @@
+- name: Expand declared existing root volumes without restarting workloads
+  hosts: master_only:bootstrap:enrollment_issuer:standard
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_root_storage: "{{ lookup('file', hnn_repo_root ~ '/deploy/terraform/master-only/node-root-storage-policy.json') | from_json }}"
+  tasks:
+    - name: Reconcile only explicitly declared hosts
+      when: inventory_hostname in hnn_root_storage.nodes
+      block:
+        - name: Install the guarded online volume reconciler
+          ansible.builtin.copy:
+            src: "{{ hnn_repo_root }}/scripts/reconcile-root-storage.py"
+            dest: /opt/heteronetwork/libexec/reconcile-root-storage.py
+            owner: root
+            group: root
+            mode: '0755'
+        - name: Store the declared root volume allocation
+          ansible.builtin.copy:
+            content: "{{ hnn_root_storage | to_nice_json }}\n"
+            dest: /etc/heteronetwork/node-root-storage-policy.json
+            owner: root
+            group: root
+            mode: '0644'
+        - name: Expand only existing free extents and the mounted ext4 filesystem
+          ansible.builtin.command:
+            argv:
+              - python3
+              - /opt/heteronetwork/libexec/reconcile-root-storage.py
+              - --node
+              - "{{ inventory_hostname }}"
+              - --policy
+              - /etc/heteronetwork/node-root-storage-policy.json
+              - --apply
+          register: hnn_root_storage_result
+          changed_when: (hnn_root_storage_result.stdout | from_json).changed

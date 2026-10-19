@@ -1,0 +1,9 @@
+{
+  "nodes": {
+    "uc-k8sp5": {
+      "logical_volume": "/dev/ubuntu-vg-1/ubuntu-lv",
+      "filesystem": "ext4",
+      "size_gib": 220
+    }
+  }
+}

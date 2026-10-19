@@ -1,0 +1,39 @@
+name: Node root storage policy checks
+
+on:
+  push:
+    paths:
+      - 'scripts/reconcile-root-storage.py'
+      - 'scripts/test_reconcile_root_storage.py'
+      - 'deploy/terraform/master-only/node-root-storage*'
+      - 'deploy/terraform/master-only/ansible/node-root-storage.yaml'
+      - '.github/workflows/node-root-storage.yml'
+  pull_request:
+    paths:
+      - 'scripts/reconcile-root-storage.py'
+      - 'scripts/test_reconcile_root_storage.py'
+      - 'deploy/terraform/master-only/node-root-storage*'
+      - 'deploy/terraform/master-only/ansible/node-root-storage.yaml'
+      - '.github/workflows/node-root-storage.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Verify no shrink, wrong device, or unavailable extents can be applied
+        run: |
+          python3 -B -m unittest discover -s scripts -p test_reconcile_root_storage.py -v
+          python3 -m py_compile scripts/reconcile-root-storage.py
+          python3 -m json.tool deploy/terraform/master-only/node-root-storage-policy.json >/dev/null
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+      - run: terraform fmt -check deploy/terraform/master-only/node-root-storage.tf
