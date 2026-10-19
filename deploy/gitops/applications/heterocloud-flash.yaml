@@ -9,13 +9,13 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
-    targetRevision: 3f6644c22e81d7fd32f746ebe5a5686979d33586
+    targetRevision: 55ea17285de43a495fd03e535c8fc3df0e3985c5
     path: deploy/helm/heterocloud-flash
     helm:
       releaseName: heterocloud-flash
       values: |
         image:
-          tag: "0.1.48@sha256:cc549e773d82fee1b5268636e4f98dbf20e381711cafb9a4d89b779d44809175"
+          tag: "0.1.49@sha256:7d9e4d9d77a1ccad4200c1d6c9441fba25859e26f9a2915786f2d1f1049bb697"
         workloadHelperImage: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.41@sha256:7a9f9d668bc4eaf9056a69d9f0b520862e84fcc0761733e74e199e5a7ec807ca"
         publicDomain: flash.heterocloud.mizuame.app
         workloadIdentity:
@@ -32,6 +32,9 @@ spec:
           secretManagerCidrs:
             - 10.250.0.10/32
             - 10.250.0.11/32
+        backups:
+          snapshotClass: flash-disk-backup
+          storageNamespace: longhorn-system
         persistence:
           enabled: true
           storageClass: longhorn-static

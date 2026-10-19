@@ -28,12 +28,15 @@
       "application": "heterocloud-flash",
       "namespace": "heterocloud-flash",
       "repository": "IPA-CyberLab/IPA-RS-HeteroCloud-Flash",
-      "chart_revision": "3f6644c22e81d7fd32f746ebe5a5686979d33586",
+      "chart_revision": "55ea17285de43a495fd03e535c8fc3df0e3985c5",
       "reviewed_source_fixes": [
         {
           "source_commit": "807700f62ee6c35c2956c84e641f1788cb2ada65",
           "reason": "Bound the secret initializer to 64 MiB so new Flash Pods retain their workload memory boundary; native reproduction and repair verified on 2026-10-17."
         }
+      ],
+      "chart_previous_revisions": [
+        "3f6644c22e81d7fd32f746ebe5a5686979d33586"
       ]
     },
     {
