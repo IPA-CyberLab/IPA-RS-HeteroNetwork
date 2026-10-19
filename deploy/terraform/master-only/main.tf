@@ -218,16 +218,17 @@ resource "kubernetes_manifest" "external_application" {
 resource "terraform_data" "application_helm_value_cleanup" {
   for_each = {
     for key, manifest in local.external_application_manifests : key => manifest
-    if contains(["envoy-gateway", "heterocloud"], key)
+    if contains(["envoy-gateway", "heterocloud", "heterocloud-flash"], key)
   }
   input = kubernetes_manifest.external_application[each.key].manifest.metadata.name
   triggers_replace = [
     filesha256("${local.repo_root}/${local.managed_external_application_files[each.key]}"),
-    filesha256("${local.repo_root}/scripts/normalize_application_helm_values.py")
+    filesha256("${local.repo_root}/scripts/normalize_application_helm_values.py"),
+    filesha256("${local.repo_root}/scripts/reconcile_platform_release.py")
   ]
   provisioner "local-exec" {
     working_dir = local.repo_root
-    command     = "python3 scripts/normalize_application_helm_values.py --manifest ${local.managed_external_application_files[each.key]}"
+    command     = "python3 scripts/normalize_application_helm_values.py --manifest ${local.managed_external_application_files[each.key]} && python3 scripts/reconcile_platform_release.py --manifest ${local.managed_external_application_files[each.key]}"
   }
 }
 
