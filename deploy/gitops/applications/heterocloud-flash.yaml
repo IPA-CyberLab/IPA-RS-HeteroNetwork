@@ -73,6 +73,11 @@ spec:
       jsonPointers:
         # Admission omits the empty optional aliases emitted by kube-rs.
         - /spec/names/shortNames
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      name: flashbackups.flash.heterocloud.io
+      jsonPointers:
+        - /spec/names/shortNames
   syncPolicy:
     automated:
       enabled: true
