@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-10-19T04:18:56.233445+00:00",
+  "releases": {
+    "heterocloud": {
+      "schema_version": 1,
+      "component": "heterocloud",
+      "version": "0.1.106",
+      "commit": "2c85147d650a00963069927dc0c976fca0e46713",
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:33a634f2d41d8707ab0a2f79d8c4e302eddc27e437fc59842bd55e586f157030"
+    },
+    "flash": {
+      "schema_version": 1,
+      "component": "flash",
+      "version": "0.1.49",
+      "commit": "55ea17285de43a495fd03e535c8fc3df0e3985c5",
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash@sha256:7d9e4d9d77a1ccad4200c1d6c9441fba25859e26f9a2915786f2d1f1049bb697"
+    }
+  },
+  "ci": {
+    "heterocloud_release": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud/actions/runs/39194834556",
+    "flash_release": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/39194999726",
+    "backup_checks": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud/actions/runs/39194734357",
+    "native_cli_platforms": [
+      "linux-x64",
+      "linux-arm64",
+      "macos-x64",
+      "macos-arm64",
+      "windows-x64",
+      "windows-arm64"
+    ],
+    "cli_command_audit": {
+      "passed": 337,
+      "failed": 0
+    }
+  },
+  "storage_probe": {
+    "schema_version": 1,
+    "namespace": "flash-backup-storage-e2e-e059d94a",
+    "test": "real-csi-s3-backup-restore",
+    "source_changed_after_backup": true,
+    "source_volume_deleted_before_restore": true,
+    "stopped_restore_copy_complete": true,
+    "backup_deleted_before_first_restore_mount": true,
+    "restored_original_marker_and_sha256": true,
+    "new_disk_identity": true,
+    "source_node": "ichikawap1",
+    "restored_node": "ichikawap1",
+    "restored_disk_survives_backup_deletion": true,
+    "cleanup_complete": true
+  },
+  "live_console_cli_probe": {
+    "run_id": "8be73ff6-47de-4fcd-89dd-2d72b994ee50",
+    "result": "passed",
+    "checks": {
+      "normal_public_oidc_login": true,
+      "cli_uses_device_code_authentication": true,
+      "backup_create_idempotent": true,
+      "backup_does_not_restart_source": true,
+      "backup_survives_source_service_and_volume_deletion": true,
+      "console_restore_and_cli_retry": true,
+      "restored_disk_copied_before_workload_start": true,
+      "hidden_files_modes_and_symlinks_preserved": true,
+      "restored_original_files_after_source_and_backup_deletion": true,
+      "new_disk_identity": true
+    },
+    "cleanup": {
+      "dedicated_fixture_project_retained_for_reuse": true,
+      "all_new_services_backups_and_volumes_removed": true,
+      "cli_token_revoked": true,
+      "browser_session_revoked": true
+    },
+    "errors": [],
+    "console_ready_ms": 1040,
+    "source_service_id": "01a15258-8dec-70e0-bfd3-163bff2844fa",
+    "restored_service_id": "01a1525a-5309-7372-a2ed-81d2bc35c78e"
+  },
+  "preservation": {
+    "verified_at": "2026-10-19T04:17:25.461269+00:00",
+    "existing_pods_preserved": 16,
+    "existing_container_ids_and_restart_counts_preserved": true,
+    "existing_pvcs_preserved": 12,
+    "all_nodes_ready": 6,
+    "control_plane_only_nodes_without_user_pods": [
+      "uc-k8s3p",
+      "uc-k8sp1",
+      "uc-k8sp2"
+    ],
+    "platform_images_and_all_replicas_verified": true
+  },
+  "anonymous_store_access": {
+    "anonymous_backup_bucket_access_http": 403,
+    "private": true
+  },
+  "scope": {
+    "contents": "persistent /root only",
+    "consistency": "crash-consistent; stop/quiesce transactional applications",
+    "restore": "new stopped private service and a different disk",
+    "store": "private bucket in the same cluster; not site disaster recovery"
+  }
+}

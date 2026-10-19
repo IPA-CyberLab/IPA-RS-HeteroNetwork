@@ -63,3 +63,13 @@ The GitHub Actions jobs in HeteroCloud run PostgreSQL authorization/retention
 tests, CLI command audits, and desktop/mobile Chromium UI tests without cluster
 operator credentials. Native storage acceptance uses these isolated scripts;
 no SSH administrator key or cluster-admin kubeconfig is uploaded to GitHub.
+
+## Declared releases and automatic security images
+
+The security promoter uses a Helm image parameter, which has precedence over
+Helm YAML and is intentionally preserved by Terraform. On a declared release
+change, `application_helm_value_cleanup` now verifies source history and removes
+only a superseded older security override. Same-source or newer security images
+are retained; unrelated histories fail without changing the image. The update
+uses resourceVersion and parameter tests to avoid overwriting a concurrent
+promotion. Subsequent Terraform runs do not periodically reset security fixes.
