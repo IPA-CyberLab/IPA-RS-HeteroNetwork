@@ -5,6 +5,13 @@ on:
   push:
     paths:
       - 'deploy/terraform/master-only/**'
+      - 'deploy/terraform/flash-offsite-r2/**'
+      - 'scripts/*flash*backup*.py'
+      - 'scripts/*flash*offsite*.py'
+      - 'scripts/*flash*operations*.py'
+      - 'scripts/flash_operations_live_e2e.mjs'
+      - 'scripts/flash_capacity_live_e2e.py'
+      - 'scripts/*flash*oom*.py'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
       - 'deploy/gitops/custom-domains/**'
@@ -13,6 +20,8 @@ on:
       - 'scripts/verify-gvisor-worker.py'
       - 'scripts/test_verify_gvisor_worker.py'
       - 'deploy/gitops/applications/custom-domains.yaml'
+      - 'deploy/gitops/applications/heterocloud.yaml'
+      - 'deploy/gitops/applications/heterocloud-flash.yaml'
       - 'deploy/gitops/applications/cert-manager.yaml'
       - 'deploy/gitops/applications/envoy-gateway.yaml'
       - 'scripts/configure_gateway_rollout.py'
@@ -49,6 +58,13 @@ on:
   pull_request:
     paths:
       - 'deploy/terraform/master-only/**'
+      - 'deploy/terraform/flash-offsite-r2/**'
+      - 'scripts/*flash*backup*.py'
+      - 'scripts/*flash*offsite*.py'
+      - 'scripts/*flash*operations*.py'
+      - 'scripts/flash_operations_live_e2e.mjs'
+      - 'scripts/flash_capacity_live_e2e.py'
+      - 'scripts/*flash*oom*.py'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
       - 'deploy/gitops/custom-domains/**'
@@ -57,6 +73,8 @@ on:
       - 'scripts/verify-gvisor-worker.py'
       - 'scripts/test_verify_gvisor_worker.py'
       - 'deploy/gitops/applications/custom-domains.yaml'
+      - 'deploy/gitops/applications/heterocloud.yaml'
+      - 'deploy/gitops/applications/heterocloud-flash.yaml'
       - 'deploy/gitops/applications/cert-manager.yaml'
       - 'deploy/gitops/applications/envoy-gateway.yaml'
       - 'scripts/configure_gateway_rollout.py'
@@ -119,8 +137,14 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_custom_domain_tls.py -v
           python3 -B -m unittest discover -s scripts -p test_gateway_health.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_apiserver_etcd.py -v
+          python3 -B -m unittest discover -s scripts -p test_flash_backup_store.py -v
+          python3 -B -m unittest discover -s scripts -p test_flash_offsite_config.py -v
+          python3 -B -m unittest discover -s scripts -p test_flash_oom_inject.py -v
       - name: Check verifier syntax
         run: |
+          node --check scripts/flash_operations_live_e2e.mjs
+          python3 -m py_compile scripts/flash_capacity_live_e2e.py scripts/flash_offsite_s3_e2e.py scripts/configure-flash-offsite.py scripts/provision-flash-operations.py
+          python3 -m py_compile scripts/flash_oom_inject.py scripts/flash_oom_inject_host.py scripts/run_flash_operations_live_e2e.py
           node --check scripts/verify-console-gateways.mjs
           node --check scripts/heteronetwork-console-browser-e2e.mjs
           python3 -m py_compile scripts/verify-gvisor-worker.py

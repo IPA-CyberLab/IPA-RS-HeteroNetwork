@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-20T15:25:06.751922+00:00",
+  "result": "passed",
+  "releases": {
+    "heterocloud": {
+      "version": "0.1.110",
+      "commit": "4e4d2a67e995de70aa9898ae195cde8d3174cb0e",
+      "run": 39445168140,
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:fc4f0ae213b222a921b7c32779afc5408cdd8c72e7c23e87079dcb2a52454369",
+      "ci": {
+        "conclusion": "success",
+        "headSha": "4e4d2a67e995de70aa9898ae195cde8d3174cb0e",
+        "status": "completed",
+        "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud/actions/runs/39445168140"
+      }
+    },
+    "flash": {
+      "version": "0.1.54",
+      "commit": "ebde56c153312b9313692f5d91ca1ff75e397337",
+      "run": 39445276808,
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash@sha256:7ed120f18b0868fa216db5e0cff5a6232c97dc2f2c356f8c029e9fc188d23250",
+      "ci": {
+        "conclusion": "success",
+        "headSha": "ebde56c153312b9313692f5d91ca1ff75e397337",
+        "status": "completed",
+        "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/39445276808"
+      }
+    }
+  },
+  "native_scopes": {
+    "admission": {
+      "schema_version": 1,
+      "mode": "live",
+      "run_id": "2dfc8ad9-df69-4acb-a468-6c7cc18ff9d3",
+      "result": "passed",
+      "checks": {
+        "normal_public_oidc_login": true,
+        "cli_uses_device_code_authentication": true,
+        "pod_denied_before_image_pull": true,
+        "replica_storage_capacity_denied": true
+      },
+      "cleanup": {
+        "dedicated_fixture_project_retained_for_reuse": true,
+        "all_new_services_backups_and_volumes_removed": true,
+        "cli_token_revoked": true,
+        "browser_session_revoked": true
+      },
+      "errors": [],
+      "organization_id": "01a1595e-a3c1-79a3-a051-6d43f24321db",
+      "project_id": "01a1595e-ac1a-75c0-8675-94eee86341db"
+    },
+    "runtime_recovery_and_rolling": {
+      "schema_version": 1,
+      "mode": "live",
+      "run_id": "ae52f956-6e75-4a6d-80e8-b05d66f5a24a",
+      "result": "passed",
+      "checks": {
+        "normal_public_oidc_login": true,
+        "cli_uses_device_code_authentication": true,
+        "real_oom_auto_rollback_and_persistent_data": true,
+        "manual_cli_rollback_retains_disk_data": true,
+        "real_console_revision_history": true,
+        "stateless_update_continuous_http": true
+      },
+      "cleanup": {
+        "dedicated_fixture_project_retained_for_reuse": true,
+        "all_new_services_backups_and_volumes_removed": true,
+        "cli_token_revoked": true,
+        "browser_session_revoked": true
+      },
+      "errors": [],
+      "organization_id": "01a1595e-a3c1-79a3-a051-6d43f24321db",
+      "project_id": "01a1595e-ac1a-75c0-8675-94eee86341db",
+      "memory_fault_injections": [
+        {
+          "pod_uid": "6a50763c-c06c-4285-af14-97dad46c506c",
+          "memory_max_bytes": 67108864,
+          "swap_limit_before": "max",
+          "swap_limit_now": "0",
+          "kernel_oom_kills": 0,
+          "only_disposable_cgroup_modified": true
+        }
+      ],
+      "memory_failures": {
+        "01a159d2-e409-72c1-8fee-a90edb5eadd6": {
+          "kind": "OOMKilled",
+          "exit_code": 137,
+          "configured_limit_mib": 64
+        }
+      },
+      "console_ready_ms": 1099,
+      "http_requests_during_update": 293,
+      "source_service_id": "01a159d2-e409-72c1-8fee-a90edb5eadd6"
+    },
+    "scheduled_backups": {
+      "schema_version": 1,
+      "mode": "live",
+      "run_id": "63d1a496-0d20-4d70-8de7-a0a4c0339aba",
+      "result": "passed",
+      "checks": {
+        "normal_public_oidc_login": true,
+        "cli_uses_device_code_authentication": true,
+        "real_console_scheduled_policy": true,
+        "scheduled_backups_verified_before_retention": true,
+        "manual_backups_not_pruned": true
+      },
+      "cleanup": {
+        "dedicated_fixture_project_retained_for_reuse": true,
+        "all_new_services_backups_and_volumes_removed": true,
+        "cli_token_revoked": true,
+        "browser_session_revoked": true
+      },
+      "errors": [],
+      "organization_id": "01a1595e-a3c1-79a3-a051-6d43f24321db",
+      "project_id": "01a1595e-ac1a-75c0-8675-94eee86341db",
+      "console_ready_ms": 1798,
+      "source_service_id": "01a159c9-4d9a-7563-a021-20767c0e64ca"
+    },
+    "cold_start": {
+      "schema_version": 1,
+      "mode": "live",
+      "run_id": "eb061dca-16ad-4243-800d-091c26438de3",
+      "result": "passed",
+      "checks": {
+        "normal_public_oidc_login": true,
+        "cli_uses_device_code_authentication": true,
+        "idle_time_not_counted_as_deployment_failure": true,
+        "cold_start_readiness_failure_observed": true,
+        "cold_start_failure_rollback_to_runtime_verified_revision": true
+      },
+      "cleanup": {
+        "dedicated_fixture_project_retained_for_reuse": true,
+        "all_new_services_backups_and_volumes_removed": true,
+        "cli_token_revoked": true,
+        "browser_session_revoked": true
+      },
+      "errors": [],
+      "organization_id": "01a1595e-a3c1-79a3-a051-6d43f24321db",
+      "project_id": "01a1595e-ac1a-75c0-8675-94eee86341db",
+      "cold_service_id": "01a159e5-b956-7253-adcf-593006c8e679"
+    },
+    "capacity_concurrency": {
+      "result": "passed",
+      "namespace": "flash-capacity-e2e-c49286fcdfc0",
+      "cleanup": {
+        "namespace_deletion_verified": true,
+        "fixture_deletion_submitted": true
+      },
+      "metrics": {
+        "passed": true,
+        "concurrent_requests": 128,
+        "workers": 32,
+        "snapshot_refreshes": 1,
+        "pod_count": 1395,
+        "peak_rss_bytes": 121372672,
+        "duration_seconds": 4.092
+      }
+    },
+    "s3_protocol_recovery": {
+      "run_id": "30a594721c3a436dac60f2d62cf2ad9b",
+      "result": "passed",
+      "scope": "real_s3_synthetic_objects_same_failure_domain",
+      "checks": {
+        "signed_catalog_committed_after_object_verification": true,
+        "recovered_original_bytes_after_source_deletion": true,
+        "nonempty_recovery_destination_refused": true,
+        "anonymous_bucket_listing_refused": true
+      },
+      "cleanup": {
+        "all_fixture_objects_buckets_and_key_removed": true
+      }
+    }
+  },
+  "preservation": {
+    "original_running_pods_unchanged_and_ready": 8,
+    "original_pvc_identities_and_volume_bindings_unchanged": 24,
+    "original_flash_pvcs_unchanged": 10,
+    "dedicated_masters_have_no_flash_pods": true,
+    "hyperevm_memory": "8Gi",
+    "fixture_pods_and_services_removed": true,
+    "public_http_status": {
+      "coder": 200,
+      "whisper": 200
+    }
+  },
+  "external_backup": {
+    "production_enabled": false,
+    "blocker": "Independent S3 destination credentials are not configured",
+    "same_cluster_s3_fixture_is_not_a_disaster_recovery_copy": true
+  },
+  "identity_cleanup": {
+    "dedicated_native_identity_disabled": true,
+    "shared_ci_identity_untouched": true
+  }
+}

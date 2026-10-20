@@ -1,0 +1,23 @@
+- name: Configure the isolated Flash restore-verification storage pool
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the root-owned operations provisioning program
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/provision-flash-operations.py"
+        dest: /usr/local/sbin/heterocloud-flash-operations
+        owner: root
+        group: root
+        mode: '0700'
+    - name: Reconcile the explicit verification worker tag
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /usr/local/sbin/heterocloud-flash-operations, --node, uc-k8sp4]
+      register: hnn_flash_operations
+      changed_when: (hnn_flash_operations.stdout | from_json).changed
+    - name: Report public operations status
+      ansible.builtin.debug:
+        msg: "{{ hnn_flash_operations.stdout | from_json }}"

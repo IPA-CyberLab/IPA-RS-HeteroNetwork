@@ -92,6 +92,7 @@ The current implementation and known gaps are tracked in
 - [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md)
 - [PostgreSQL HA](docs/POSTGRES_HA.md)
 - [Master-only and standard-node IaC](deploy/terraform/master-only/README.md)
+- [Flash capacity, deployment recovery and backups](docs/flash-operations.md)
 - [Release channels](docs/RELEASE_CHANNELS.md)
 - [GitHub Actions VPN and console E2E](docs/github-actions-vpn-console-e2e.md)
 

@@ -97,8 +97,23 @@ class Provisioner:
             require(len(matches) <= 1, 'ambiguous backup key')
             key = self.api('GetKeyInfo', id=matches[0]['id'], showSecretKey='true') if matches else self.api('CreateKey', {'name': args.key_name, 'expiration': None, 'neverExpires': True})
             validate_key(key, bucket['id'])
-            require(all(k['accessKeyId'] == key['accessKeyId'] for k in bucket.get('keys', [])),
+            export_matches = [k for k in self.api('ListKeys') if k['name'] == args.export_key_name]
+            require(len(export_matches) <= 1, 'ambiguous backup export key')
+            export_key = self.api('GetKeyInfo', id=export_matches[0]['id'], showSecretKey='true') if export_matches else self.api('CreateKey', {'name': args.export_key_name, 'expiration': None, 'neverExpires': True})
+            validate_key(export_key, bucket['id'])
+            allowed_keys = {key['accessKeyId'], export_key['accessKeyId']}
+            require(all(k['accessKeyId'] in allowed_keys for k in bucket.get('keys', [])),
                     'backup bucket has an unrelated access key')
+            self.api('AllowBucketKey', {'bucketId': bucket['id'], 'accessKeyId': export_key['accessKeyId'], 'permissions': {'read': True, 'write': False, 'owner': False}})
+            self.api('DenyBucketKey', {'bucketId': bucket['id'], 'accessKeyId': export_key['accessKeyId'], 'permissions': {'read': False, 'write': True, 'owner': True}})
+            export_key = self.api('GetKeyInfo', id=export_key['accessKeyId'], showSecretKey='true')
+            validate_key(export_key, bucket['id'])
+            require(len(export_key['buckets']) == 1 and export_key['buckets'][0]['permissions'] == {'read': True, 'write': False, 'owner': False}, 'export key must be read-only on one bucket')
+            export_config = {'endpoint': args.endpoint, 'bucket': args.bucket, 'region': args.region, 'access_key': export_key['accessKeyId'], 'secret_key': export_key['secretAccessKey'], 'private_source': True}
+            self.kube('apply', '--server-side', '--field-manager=heteronetwork-flash-backups', '-f', '-', '-o', 'json', body={'apiVersion': 'v1', 'kind': 'Secret',
+                'metadata': {'name': args.export_secret, 'namespace': args.export_namespace, 'labels': {'app.kubernetes.io/part-of': 'flash-backups'}},
+                'type': 'Opaque', 'data': {'config.json': base64.b64encode(json.dumps(export_config).encode()).decode()}})
+
             self.api('AllowBucketKey', {'bucketId': bucket['id'], 'accessKeyId': key['accessKeyId'],
                                       'permissions': {'read': True, 'write': True, 'owner': False}})
             self.api('DenyBucketKey', {'bucketId': bucket['id'], 'accessKeyId': key['accessKeyId'],
@@ -135,6 +150,9 @@ def main():
     parser.add_argument('--admin-secret', default='heterocloud-syouyu-secrets')
     parser.add_argument('--bucket', default='heterocloud-flash-backups')
     parser.add_argument('--key-name', default='heterocloud-flash-backup-store')
+    parser.add_argument('--export-key-name', default='heterocloud-flash-backup-export')
+    parser.add_argument('--export-secret', default='flash-backup-export-source')
+    parser.add_argument('--export-namespace', default='heterocloud-flash')
     parser.add_argument('--secret', default='flash-backup-store')
     parser.add_argument('--region', required=True)
     parser.add_argument('--endpoint', required=True)

@@ -9,13 +9,13 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
-    targetRevision: 55ea17285de43a495fd03e535c8fc3df0e3985c5
+    targetRevision: ebde56c153312b9313692f5d91ca1ff75e397337
     path: deploy/helm/heterocloud-flash
     helm:
       releaseName: heterocloud-flash
       values: |
         image:
-          tag: "0.1.49@sha256:7d9e4d9d77a1ccad4200c1d6c9441fba25859e26f9a2915786f2d1f1049bb697"
+          tag: "0.1.54@sha256:7ed120f18b0868fa216db5e0cff5a6232c97dc2f2c356f8c029e9fc188d23250"
         workloadHelperImage: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.41@sha256:7a9f9d668bc4eaf9056a69d9f0b520862e84fcc0761733e74e199e5a7ec807ca"
         publicDomain: flash.heterocloud.mizuame.app
         workloadIdentity:
@@ -32,7 +32,21 @@ spec:
           secretManagerCidrs:
             - 10.250.0.10/32
             - 10.250.0.11/32
+        capacity:
+          enabled: true
+          replicaCount: 2
+          minFreeGiB: 10
+          freePercent: 25
+          imageExpansionFactor: 6
         backups:
+          offsite:
+            # Enable only after independent destination credentials and recovery
+            # have been verified. The primary bucket shares the cluster's site.
+            enabled: false
+          verification:
+            enabled: true
+            replicaCount: 2
+            storageNodeTag: flash-backup-verification
           snapshotClass: flash-disk-backup
           storageNamespace: longhorn-system
         persistence:
@@ -62,6 +76,17 @@ spec:
     server: https://kubernetes.default.svc
     namespace: heterocloud-flash
   ignoreDifferences:
+    - group: ""
+      kind: ConfigMap
+      name: flash-capacity-reservations
+      namespace: heterocloud-flash
+      jsonPointers:
+        - /data
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      name: heterocloud-flash-capacity
+      jsonPointers:
+        - /webhooks/0/clientConfig/caBundle
     - group: apiextensions.k8s.io
       kind: CustomResourceDefinition
       jsonPointers:
