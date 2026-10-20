@@ -19,6 +19,9 @@ Flash's gate covers 93 library tests plus API/activator tests, strict Clippy,
 Python operations tests, generated CRDs, Helm and amd64/arm64 image artifacts.
 Infrastructure acceptance additionally covers backup credential boundaries,
 protected external configuration and rejection of foreign OOM fault targets.
+The [infrastructure workflow](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/39448502112)
+passed on feature commit `12d56d7a`, including an actual GitHub runner VPN join
+and authenticated Chromium access through HeteroNetwork.
 
 ## Native measurements
 

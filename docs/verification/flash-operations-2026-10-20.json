@@ -192,5 +192,21 @@
   "identity_cleanup": {
     "dedicated_native_identity_disabled": true,
     "shared_ci_identity_untouched": true
+  },
+  "infrastructure_ci": {
+    "status": "completed",
+    "conclusion": "success",
+    "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/39448502112",
+    "headSha": "12d56d7aec75f527d6a1b2cdbd2467c42b8f4529",
+    "checks": [
+      {
+        "name": "acceptance-failure-paths",
+        "conclusion": "success"
+      },
+      {
+        "name": "live-overlay-browser-e2e",
+        "conclusion": "success"
+      }
+    ]
   }
 }
