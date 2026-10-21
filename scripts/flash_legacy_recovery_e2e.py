@@ -38,7 +38,10 @@ def main():
         r = subprocess.run(command + list(parts), input=json.dumps(body) if body is not None else None,
                            capture_output=True, text=True, timeout=40)
         if r.returncode:
-            raise RuntimeError('fixture_kubernetes_operation_failed')
+            reason = next((v.lower() for v in ('Conflict', 'Forbidden', 'Invalid', 'BadRequest',
+                                               'NotFound', 'Timeout', 'InternalError')
+                           if '(' + v + ')' in r.stderr), 'operation_failed')
+            raise RuntimeError('fixture_kubernetes_' + reason)
         return r.stdout if raw else json.loads(r.stdout) if r.stdout.strip() else None
 
     def get(kind, resource, namespace=ns):
@@ -72,10 +75,16 @@ def main():
         return kube('-n', ns, 'exec', p['metadata']['name'], '-c', 'workload', '--', '/bin/sh', '-ec', text, raw=True).strip()
 
     def change(workload):
-        f = service()
-        return kube('-n', ns, 'patch', 'flashservice', name, '--type=merge', '--patch-file=/dev/stdin', '-o', 'json', body={
-            'metadata': {'resourceVersion': f['metadata']['resourceVersion']},
-            'spec': {'desired_generation': f['spec']['desired_generation'] + 1, 'workload': workload}})
+        for attempt in range(8):
+            f = service()
+            try:
+                return kube('-n', ns, 'patch', 'flashservice', name, '--type=merge', '--patch-file=/dev/stdin', '-o', 'json', body={
+                    'metadata': {'resourceVersion': f['metadata']['resourceVersion']},
+                    'spec': {'desired_generation': f['spec']['desired_generation'] + 1, 'workload': workload}})
+            except RuntimeError as error:
+                if str(error) != 'fixture_kubernetes_conflict' or attempt == 7:
+                    raise
+                time.sleep(0.5)
 
     try:
         node = get('node', args.node)
@@ -123,14 +132,17 @@ def main():
         # Keep the basic schema valid, but leave less space than the retained
         # automatic home requires. This must reach the post-inspection storage
         # allocator, not the earlier input validator.
+        stage = 'invalid_storage_update'
         change({'rootfs_storage_gib': 2})
         wait('invalid_storage_retains_image_metadata', lambda: service()['status'].get('phase') == 'error' and service()['status'].get('image_size_bytes', 0) > 0)
         report['checks']['invalid_storage_retains_verified_image_budget'] = True
+        stage = 'failed_inspection_update'
         change({'image': 'invalid image reference'})
         wait('failed_inspection_without_image_budget', lambda: service()['status'].get('phase') == 'error' and not service()['status'].get('image_size_bytes'))
         old = pod()
         deployment = get('deployment', name)
         assert deployment['metadata']['labels']['flash.heterocloud.io/instance'] == sid
+        stage = 'legacy_deployment_replacement'
         kube('-n', ns, 'patch', 'deployment', name, '--type=json', '--patch-file=/dev/stdin', '-o', 'json', body=[
             {'op': 'test', 'path': '/metadata/resourceVersion', 'value': deployment['metadata']['resourceVersion']},
             {'op': 'remove', 'path': '/spec/template/metadata/annotations/flash.heterocloud.io~1image-size-bytes'}])
