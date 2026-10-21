@@ -141,5 +141,16 @@ fixture validates the protocol, not independent-site durability. CI also runs
 PostgreSQL concurrency/IAM tests, CLI tests and desktop/mobile Chromium tests.
 Operator SSH keys and admin kubeconfigs are not uploaded for these native tests.
 
+`flash_legacy_recovery_e2e.py` covers automatic CSI allocation and replacement of
+an older ReplicaSet when the desired revision is invalid. Supply `--kubectl`,
+`--kubeconfig`, `--report` and an immutable official Flash `--image` already
+cached on every ready worker. It creates its own small Flash service and home,
+checks the combined image/rootfs/home budget over repeated reconciliations,
+then verifies that a cached legacy replacement retains a marker and the PVC
+identity. The replacement must use `imagePullPolicy: Never`; an unknown uncached
+digest is rejected in a server-side dry run. Cleanup fences its own claims and
+volumes by nonce, UID and claim reference before removing them. This test never
+evicts or rewrites an existing user workspace.
+
 The [2026-10-20 acceptance record](verification/flash-operations-2026-10-20.md)
 contains release references, measured results and remaining external setup.

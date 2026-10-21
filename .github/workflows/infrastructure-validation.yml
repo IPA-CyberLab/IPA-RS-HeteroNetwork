@@ -11,6 +11,7 @@ on:
       - 'scripts/*flash*operations*.py'
       - 'scripts/flash_operations_live_e2e.mjs'
       - 'scripts/flash_capacity_live_e2e.py'
+      - 'scripts/flash_legacy_recovery_e2e.py'
       - 'scripts/*flash*oom*.py'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
@@ -64,6 +65,7 @@ on:
       - 'scripts/*flash*operations*.py'
       - 'scripts/flash_operations_live_e2e.mjs'
       - 'scripts/flash_capacity_live_e2e.py'
+      - 'scripts/flash_legacy_recovery_e2e.py'
       - 'scripts/*flash*oom*.py'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
@@ -144,6 +146,7 @@ jobs:
         run: |
           node --check scripts/flash_operations_live_e2e.mjs
           python3 -m py_compile scripts/flash_capacity_live_e2e.py scripts/flash_offsite_s3_e2e.py scripts/configure-flash-offsite.py scripts/provision-flash-operations.py
+          python3 -m py_compile scripts/flash_legacy_recovery_e2e.py
           python3 -m py_compile scripts/flash_oom_inject.py scripts/flash_oom_inject_host.py scripts/run_flash_operations_live_e2e.py
           node --check scripts/verify-console-gateways.mjs
           node --check scripts/heteronetwork-console-browser-e2e.mjs
