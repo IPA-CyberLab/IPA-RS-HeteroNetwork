@@ -1,0 +1,103 @@
+{
+  "observed_at": "2026-10-22T13:44:32.156643+00:00",
+  "incident": "coder-hyperevm-transport-2026-10-22",
+  "before": {
+    "authenticated_app_http_status": 504,
+    "request_seconds": 15.162,
+    "local_code_server_health_http_status": 200,
+    "container_restarts": 0
+  },
+  "after": {
+    "authenticated_app_get_seconds": [
+      0.441,
+      0.265
+    ],
+    "direct_private_udp_peer": true,
+    "peer_round_trip_milliseconds": 2.3,
+    "workspace_memory_mib": 8192,
+    "container_restarts": 0,
+    "pod_uid": "8c93a734-7cbd-4858-9719-8ef5834cc077",
+    "pod_recreated": false,
+    "deployment_paused": false
+  },
+  "browser": {
+    "schema_version": 1,
+    "observed_at": "2026-10-22T13:41:52.561Z",
+    "passed": true,
+    "checks": [
+      {
+        "name": "folder_and_file",
+        "passed": true,
+        "status": 200,
+        "folder_loaded": true,
+        "file_opened": true,
+        "editor_rendered": true,
+        "websocket_bidirectional": true,
+        "stable_connection_ms": 5000,
+        "elapsed_ms": 12566
+      },
+      {
+        "name": "reload_existing_folder",
+        "passed": true,
+        "status": 200,
+        "folder_loaded": true,
+        "file_opened": true,
+        "editor_rendered": true,
+        "websocket_bidirectional": true,
+        "stable_connection_ms": 5000,
+        "elapsed_ms": 9419
+      }
+    ],
+    "server_errors": []
+  },
+  "native_network_policy_regression": {
+    "observed_at": "2026-10-22T13:36:55.549236+00:00",
+    "result": "passed",
+    "checks": [
+      {
+        "name": "default_denies_udp",
+        "passed": true
+      },
+      {
+        "name": "cross_node_udp_control_to_agent",
+        "passed": true
+      },
+      {
+        "name": "cross_node_udp_agent_to_control",
+        "passed": true
+      },
+      {
+        "name": "tcp_remains_denied",
+        "passed": true
+      },
+      {
+        "name": "other_organization_denied",
+        "passed": true
+      },
+      {
+        "name": "other_vpc_denied",
+        "passed": true
+      },
+      {
+        "name": "other_service_denied",
+        "passed": true
+      },
+      {
+        "name": "grant_restored",
+        "passed": true
+      },
+      {
+        "name": "revoked_grant_denies_new_flows",
+        "passed": true
+      }
+    ],
+    "cleanup": {
+      "namespace_deletion_verified": true
+    }
+  },
+  "terraform_target_plan": "No changes",
+  "limitations": [
+    "Initial cause of the DERP transport stall is not isolated.",
+    "Temporary in-process agent recovery requires a normal Pod replacement at the next planned workspace stop/start; container-only restart of the existing Pod retains its old environment."
+  ]
+}
