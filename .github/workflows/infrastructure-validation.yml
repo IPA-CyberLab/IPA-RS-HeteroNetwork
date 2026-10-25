@@ -162,7 +162,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_flash_oom_inject.py -v
       - name: Check verifier syntax
         run: |
-          python3 -m py_compile scripts/overlay_power_recovery_e2e.py
+          python3 -m py_compile scripts/overlay_power_recovery_e2e.py scripts/reconcile-dns-boot-recovery.py
           node --check scripts/flash_operations_live_e2e.mjs
           python3 -m py_compile scripts/flash_capacity_live_e2e.py scripts/flash_offsite_s3_e2e.py scripts/configure-flash-offsite.py scripts/provision-flash-operations.py
           python3 -m py_compile scripts/flash_legacy_recovery_e2e.py

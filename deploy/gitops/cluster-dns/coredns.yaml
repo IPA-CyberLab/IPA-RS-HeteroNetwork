@@ -111,6 +111,8 @@ spec:
         kubernetes.io/os: linux
       affinity:
         podAntiAffinity:
+          # Explicitly clear the old rule owned by the legacy DNS manager.
+          requiredDuringSchedulingIgnoredDuringExecution: []
           # Prefer independent hosts, but permit a rollout with one host absent.
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100

@@ -83,6 +83,10 @@ has failed. Physical or out-of-band access is required to distinguish them.
   on the Pod resolver file captured before host DNS was ready. CoreDNS prefers
   spreading across physical hosts while permitting a rollout when one host is
   unavailable; user applications remain excluded from the dedicated custodians.
+  A legacy `heteronetwork-dns` field manager retained its old hard anti-affinity
+  rule when Argo added the preferred rule. A guarded Terraform adoption removes
+  only that exact legacy rule, and spreading honors taints so dedicated masters
+  are not counted as eligible empty placement domains.
 - The Flow Application declares three Redis/Sentinel replicas and a two-vote
   majority, with the dedicated hosts still excluded. The running healthy Redis
   primary was preserved and the two reachable Sentinels aligned to it. The
