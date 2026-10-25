@@ -3,6 +3,7 @@ resource "terraform_data" "overlay_boot_recovery" {
   triggers_replace = [
     filesha256("${path.module}/ansible/overlay-boot-recovery.yaml"),
     filesha256("${local.repo_root}/scripts/reconcile-overlay-boot.py"),
+    filesha256("${local.repo_root}/scripts/overlay_power_recovery_e2e.py"),
     filesha256("${path.module}/overlay-boot-peers.json")
   ]
   provisioner "local-exec" {

@@ -50,3 +50,34 @@
       ansible.builtin.systemd_service:
         daemon_reload: true
       when: overlay_boot_unit.changed
+
+    - name: Install the isolated native Agent recovery E2E
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/overlay_power_recovery_e2e.py"
+        dest: /opt/heteronetwork/libexec/overlay_power_recovery_e2e.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create the protected infrastructure acceptance directory
+      ansible.builtin.file:
+        path: /var/lib/heteronetwork/acceptance
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: inventory_hostname == 'uc-k8sp5'
+
+    - name: Test loss of all volatile VPN state with the real Agent in isolated namespaces
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /opt/heteronetwork/libexec/overlay_power_recovery_e2e.py
+          - --agent
+          - /opt/heteronetwork/bin/iparsd
+          - --reconciler
+          - /opt/heteronetwork/libexec/reconcile-overlay-boot.py
+          - --report
+          - /var/lib/heteronetwork/acceptance/overlay-power-recovery.json
+      changed_when: false
+      when: inventory_hostname == 'uc-k8sp5'

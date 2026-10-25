@@ -1,0 +1,203 @@
+{
+  "observed_at_utc": "2026-10-25T13:14:30.993831+00:00",
+  "status": "partial_recovery_physical_host_access_required",
+  "ready_hosts": [
+    "uc-k8sp1",
+    "uc-k8sp2",
+    "uc-k8s3p",
+    "uc-k8sp5",
+    "ichikawap1"
+  ],
+  "unreachable_host": "uc-k8sp4",
+  "p4_last_kubernetes_heartbeat": "2026-10-23T11:11:56Z",
+  "vpn_browser": {
+    "passed": true,
+    "client_removed": true,
+    "canonical": {
+      "port": 9781,
+      "ui_http": 200,
+      "login_button_rendered": true,
+      "open_ms": 252
+    },
+    "gateways": [
+      {
+        "gateway": "10.250.0.2",
+        "port": 80,
+        "ui_http": 200,
+        "open_ms": 266
+      },
+      {
+        "gateway": "10.250.0.2",
+        "port": 9781,
+        "ui_http": 200,
+        "open_ms": 145
+      },
+      {
+        "gateway": "10.250.0.4",
+        "port": 80,
+        "ui_http": 200,
+        "open_ms": 200
+      },
+      {
+        "gateway": "10.250.0.4",
+        "port": 9781,
+        "ui_http": 200,
+        "open_ms": 152
+      },
+      {
+        "gateway": "10.250.0.5",
+        "port": 80,
+        "ui_http": 200,
+        "open_ms": 164
+      },
+      {
+        "gateway": "10.250.0.5",
+        "port": 9781,
+        "ui_http": 200,
+        "open_ms": 138
+      },
+      {
+        "gateway": "10.250.0.6",
+        "port": 80,
+        "ui_http": 200,
+        "open_ms": 197
+      },
+      {
+        "gateway": "10.250.0.6",
+        "port": 9781,
+        "ui_http": 200,
+        "open_ms": 146
+      },
+      {
+        "gateway": "10.250.0.10",
+        "port": 80,
+        "ui_http": 200,
+        "open_ms": 199
+      },
+      {
+        "gateway": "10.250.0.10",
+        "port": 9781,
+        "ui_http": 200,
+        "open_ms": 224
+      }
+    ],
+    "monitoring": {
+      "grafana.heteronetwork.internal": [
+        {
+          "address": "10.250.0.10",
+          "http": 200,
+          "open_ms": 183
+        },
+        {
+          "address": "10.250.0.2",
+          "http": 200,
+          "open_ms": 121
+        }
+      ],
+      "prometheus.heteronetwork.internal": [
+        {
+          "address": "10.250.0.10",
+          "http": 200,
+          "open_ms": 67
+        },
+        {
+          "address": "10.250.0.2",
+          "http": 200,
+          "open_ms": 66
+        }
+      ]
+    }
+  },
+  "public_browser": [
+    {
+      "url": "https://heterocloud.mizuame.app/",
+      "status": 200,
+      "elapsed_ms": 583,
+      "title": "HeteroCloud — 分散したリソースを、ひとつのクラウドへ",
+      "redirected": "/"
+    },
+    {
+      "url": "https://heterocloud.mizuame.app/login",
+      "status": 200,
+      "elapsed_ms": 349,
+      "title": "HeteroCloud Console",
+      "redirected": "/login"
+    },
+    {
+      "url": "https://coder.mizuame.app/",
+      "status": 200,
+      "elapsed_ms": 1622,
+      "title": "Coder",
+      "redirected": "/"
+    }
+  ],
+  "coder_ide": {
+    "schema_version": 1,
+    "observed_at": "2026-10-25T12:21:39.250Z",
+    "passed": true,
+    "checks": [
+      {
+        "name": "folder_and_file",
+        "passed": true,
+        "status": 200,
+        "folder_loaded": true,
+        "file_opened": true,
+        "editor_rendered": true,
+        "websocket_bidirectional": true,
+        "stable_connection_ms": 5000,
+        "elapsed_ms": 20374
+      },
+      {
+        "name": "reload_existing_folder",
+        "passed": true,
+        "status": 200,
+        "folder_loaded": true,
+        "file_opened": true,
+        "editor_rendered": true,
+        "websocket_bidirectional": true,
+        "stable_connection_ms": 5000,
+        "elapsed_ms": 10254
+      }
+    ],
+    "server_errors": []
+  },
+  "custodian_restart": {
+    "passed": true,
+    "manual_share_access": false,
+    "pod": "openbao-0",
+    "pod_recreated": true,
+    "sealed_observed": true,
+    "auto_unsealed": true,
+    "pvc_uid_preserved": true,
+    "recovery_seconds": 42.549
+  },
+  "database": {
+    "primary": "db-h",
+    "synchronous_streaming_standby": "db-b",
+    "strict_synchronous_mode_retained": true,
+    "commit_probe_passed": true,
+    "syncrep_waiters": 0
+  },
+  "registry_storage": {
+    "volume": "pvc-d5e6cff1-8fd6-4073-b27e-47ae17a339f9",
+    "configured_copies": 3,
+    "healthy_independent_hosts": [],
+    "available_copies": 0,
+    "severity": "critical",
+    "backup_record_present": false
+  },
+  "hyperEVM": {
+    "memory_mib": 8192,
+    "pvc_retained": true,
+    "ready_on": "uc-k8sp5",
+    "image_digest": "sha256:b9d558d8279f6da6a4deba566c5214a16947daf199a462f26a1b5abf968d27c5"
+  },
+  "native_vpn_cold_start": {
+    "passed": true,
+    "dead_only_cache_failed_as_expected": true,
+    "kernel_state_deleted_and_recreated": true,
+    "control_plane_available": false,
+    "production_agent_restarted": false,
+    "recovery_seconds": 2.061
+  }
+}

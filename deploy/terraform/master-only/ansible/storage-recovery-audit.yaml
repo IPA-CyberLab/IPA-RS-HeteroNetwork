@@ -1,0 +1,64 @@
+- name: Detect configured replication without actual independent data copies
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the read-only storage redundancy auditor
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/verify-storage-redundancy.py"
+        dest: /opt/heteronetwork/libexec/verify-storage-redundancy.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configure a visibly failing health check when copies are missing
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-storage-recovery-audit.service
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=Verify actual independent Longhorn copies for recovery
+          After=kubelet.service heteronetwork-agent.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 /opt/heteronetwork/libexec/verify-storage-redundancy.py --kubeconfig /etc/kubernetes/admin.conf --server https://127.0.0.1:6443 --tls-server-name {{ vpn_ip }}
+          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          RuntimeDirectory=heteronetwork-storage-audit
+          Environment=HOME=/run/heteronetwork-storage-audit
+          TimeoutStartSec=75
+          MemoryMax=128M
+          CPUQuota=30%
+          NoNewPrivileges=yes
+          CapabilityBoundingSet=
+          ProtectSystem=strict
+          ProtectHome=yes
+          PrivateTmp=yes
+
+    - name: Retry the storage health check after boot and every minute
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-storage-recovery-audit.timer
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          [Unit]
+          Description=Periodically detect missing independent storage copies
+          [Timer]
+          OnBootSec=60s
+          OnUnitInactiveSec=60s
+          RandomizedDelaySec=5s
+          Unit=heteronetwork-storage-recovery-audit.service
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable automatic detection without declaring the current storage healthy
+      ansible.builtin.systemd_service:
+        name: heteronetwork-storage-recovery-audit.timer
+        daemon_reload: true
+        enabled: true
+        state: started

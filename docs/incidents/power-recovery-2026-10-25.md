@@ -29,7 +29,10 @@ endpoint as a successful image pull.
    compounded the bootstrap problem.
 6. Harbor requested three Longhorn replicas, but the registry volume actually
    had only one data replica, on p4. Its Longhorn metadata contained no backup.
-   Configuration counts did not demonstrate actual redundancy. The remaining
+   Longhorn's `allow-volume-creation-with-degraded-availability` was enabled;
+   its Scheduled condition was reset to True under that setting even while the
+   data volume was faulted. Configuration counts and Scheduled=True therefore
+   did not demonstrate actual redundancy. The remaining
    healthy nodes cannot reconstruct data that was never copied to them.
 
 p4's last Kubernetes heartbeat was **2026-10-23 11:11:56 UTC**, before this
@@ -56,9 +59,17 @@ has failed. Physical or out-of-band access is required to distinguish them.
   A new replica cloned the current primary. HA elected db-h primary and db-b
   synchronous standby. Both surviving database proxies now know all three
   declared members. Strict synchronous commits were not disabled.
+- `storage-recovery-audit.tf` installs a one-minute check of actual healthy
+  replicas, Ready hosts, Ready disks and independent host counts. A configured
+  count of three does not pass with one actual copy, and inventory errors fail
+  closed. The check currently reports the registry as critical; installation
+  does not declare unavailable data recovered. Its systemd service fails visibly
+  while copies are missing. It does not delete, salvage or replace volumes.
 - CoreDNS and NodeLocal DNS read the persisted, provisioning-managed
   `/etc/kubernetes/resolv.conf` through a read-only mount, instead of depending
-  on the Pod resolver file captured before host DNS was ready.
+  on the Pod resolver file captured before host DNS was ready. CoreDNS prefers
+  spreading across physical hosts while permitting a rollout when one host is
+  unavailable; user applications remain excluded from the dedicated custodians.
 - The Flow Application declares three Redis/Sentinel replicas and a two-vote
   majority, with the dedicated hosts still excluded. The running healthy Redis
   primary was preserved and the two reachable Sentinels aligned to it. The
@@ -87,6 +98,21 @@ has failed. Physical or out-of-band access is required to distinguish them.
   README in the editor, exchanged WebSocket traffic, and passed a full reload.
   Its two checks returned HTTP 200 and held connections for five seconds each.
   The temporary incident credential was revoked after testing.
+- The actual deployed native Agent was started in two isolated Linux network
+  namespaces with newly generated fixture keys and no control plane. Its dead-only
+  bootstrap cache failed as expected. Both Agents were stopped, their kernel
+  WireGuard interfaces deleted, and the approved-roster hook applied. Cold start
+  then restored real bidirectional kernel handshakes and ping in **2.061 s**.
+  No production Agent or VM was restarted. Terraform runs this E2E on the
+  bootstrap host, and the Actions workflow requires the same test with checked
+  helper digests.
+- A newly registered temporary VPN client established a real WireGuard
+  handshake, exercised split DNS and Chromium, and opened the canonical internal
+  console in **252 ms**. All ten HTTP 80/9781 checks over the five reachable
+  gateways passed in 138–266 ms. Grafana and Prometheus returned HTTP 200 on
+  both reachable monitoring hosts. The temporary client was removed afterward.
+- Public Chromium checks returned HTTP 200: HeteroCloud home **583 ms**, login
+  **349 ms**, Coder **1622 ms**.
 - Anonymous command-line HTTP 403 responses from the HeteroCloud public site
   carried Cloudflare error 1010. They must not be reported as origin HTTP 503.
 
@@ -101,3 +127,20 @@ an independent registry backup. No empty replacement volume was substituted.
 After p4 returns, apply its pending host recovery hook and database proxy
 configuration, then repeat the storage and public endpoint checks. The system
 is not fully redundant while a required replica host remains unreachable.
+
+## Storage follow-up gates
+
+Do not disable degraded-volume attachment during this recovery: it is also used
+when reattaching an existing volume with a surviving partial replica set. The
+installed Longhorn controller and [upstream implementation](https://github.com/longhorn/longhorn-manager/blob/v1.12.1/controller/volume_controller.go)
+use it when no current attachment exists. Turning it off while p4 is absent
+could prevent existing workloads from recovering on the two surviving workers.
+
+After recovering the registry source, restore independent copies and verify
+capacity for the declared replica count before enforcing strict provisioning.
+The [Longhorn setting reference](https://longhorn.io/docs/1.13.0/references/settings/#allow-volume-creation-with-degraded-availability)
+recommends disabling degraded creation in production. That policy transition,
+registry backup/restore verification and a full storage-host loss drill remain
+open; a minute-by-minute block-copy audit is detection, not a replacement for
+those durability checks. Application-level replication (for example Garage) is
+separate from the block-copy audit and must be assessed at its own quorum layer.

@@ -39,6 +39,8 @@ on:
       - 'scripts/*database*.py'
       - 'scripts/reconcile-overlay-boot.py'
       - 'scripts/test_reconcile_overlay_boot.py'
+      - 'scripts/overlay_power_recovery_e2e.py'
+      - 'scripts/*storage*redundancy*.py'
       - 'scripts/accept-registered-nodes.py'
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/test_verify_standard_node.py'
@@ -97,6 +99,8 @@ on:
       - 'scripts/*database*.py'
       - 'scripts/reconcile-overlay-boot.py'
       - 'scripts/test_reconcile_overlay_boot.py'
+      - 'scripts/overlay_power_recovery_e2e.py'
+      - 'scripts/*storage*redundancy*.py'
       - 'scripts/accept-registered-nodes.py'
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/test_verify_standard_node.py'
@@ -134,6 +138,7 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
           python3 -B -m unittest discover -s scripts -p test_onboarding_acceptance.py -v
+          python3 -B -m unittest discover -s scripts -p test_verify_storage_redundancy.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_overlay_boot.py -v
           python3 -B -m unittest discover -s scripts -p test_promote_database_sync_replica.py -v
           python3 -B -m unittest discover -s scripts -p test_prepare_database_ha.py -v
@@ -157,6 +162,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_flash_oom_inject.py -v
       - name: Check verifier syntax
         run: |
+          python3 -m py_compile scripts/overlay_power_recovery_e2e.py
           node --check scripts/flash_operations_live_e2e.mjs
           python3 -m py_compile scripts/flash_capacity_live_e2e.py scripts/flash_offsite_s3_e2e.py scripts/configure-flash-offsite.py scripts/provision-flash-operations.py
           python3 -m py_compile scripts/flash_legacy_recovery_e2e.py
@@ -267,6 +273,38 @@ jobs:
               --credential-file "$E2E_ROOT/console-credentials.json" \
               --require-authenticated-console \
               --output "$E2E_ROOT/report.json"
+      - name: Verify a cold VPN start with the real Agent and no control plane
+        env:
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json, os, shlex, subprocess
+          from pathlib import Path
+          root = Path(os.environ["E2E_ROOT"])
+          files = ["overlay_power_recovery_e2e.py", "reconcile-overlay-boot.py"]
+          expected = {name: hashlib.sha256((Path("scripts") / name).read_bytes()).hexdigest() for name in files}
+          probe = """import hashlib,json,subprocess,sys
+          from pathlib import Path
+          expected=json.loads(sys.argv[1])
+          for name,digest in expected.items():
+              assert hashlib.sha256((Path('/opt/heteronetwork/libexec')/name).read_bytes()).hexdigest()==digest, 'deploy reviewed recovery helpers before E2E'
+          raise SystemExit(subprocess.run(['python3','/opt/heteronetwork/libexec/overlay_power_recovery_e2e.py','--agent','/opt/heteronetwork/bin/iparsd','--reconciler','/opt/heteronetwork/libexec/reconcile-overlay-boot.py','--report','/var/lib/heteronetwork/acceptance/overlay-power-recovery.json']).returncode)
+          """
+          command = ["ssh", "-i", str(root / "id_ed25519"), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                     "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + str(root / "known_hosts"),
+                     "mizuame@163.220.236.45", "sudo -S -p '' python3 -c " + shlex.quote(probe) + " " + shlex.quote(json.dumps(expected))]
+          result = subprocess.run(command, input=os.environ["HNN_IAC_BECOME_PASSWORD"] + "\n",
+                                  text=True, capture_output=True, timeout=150)
+          try:
+              report = json.loads(result.stdout)
+          except ValueError:
+              raise SystemExit("Native VPN recovery E2E failed; protected output withheld")
+          with os.fdopen(os.open(root / "native-boot.json", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "w") as output:
+              json.dump(report, output)
+          if result.returncode or report.get("passed") is not True:
+              raise SystemExit("Native VPN recovery E2E did not pass")
+          print("Real Agent recovered kernel WireGuard state with the control plane unavailable")
+          PYCODE
       - name: Publish sanitized E2E result
         if: always()
         run: |
@@ -277,6 +315,12 @@ jobs:
               sudo cat "$E2E_ROOT/report.json" | jq '{result, client_removed, console_identity_reconciled, gateway_vpn_ip, wireguard_handshake_at, route_convergence_ms, canonical: .console.canonical, authenticated: .console.authenticated, monitoring: .monitoring.services, gateways: [.console.gateways[]? | {gateway, port, open_ms, public_keycloak_credential_form}]}'
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Publish native recovery metadata
+        if: always()
+        run: |
+          if test -f "$E2E_ROOT/native-boot.json"; then
+            jq '{passed, dead_only_cache_failed_as_expected, kernel_state_recreated, bidirectional_handshake, recovery_seconds, production_agent_restarted, control_plane_available, failure_stage}' "$E2E_ROOT/native-boot.json" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Remove materialized private inputs
         if: always()
