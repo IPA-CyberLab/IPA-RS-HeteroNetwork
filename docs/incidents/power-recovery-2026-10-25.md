@@ -1,5 +1,18 @@
 # 2026-10-25 power-loss recovery
 
+## 要点
+
+- 原因は、VPNの起動先が停止中の1台だけになっていたこと、DBの同期相手不在、
+  シークレット基盤の封印、起動直後の空のDNS設定、Redisの末尾破損が連鎖したことです。
+- レジストリは「3コピー設定」に対し実際はp4の1コピーだけでした。
+  実コピーの検証と独立したバックアップの確認が不足しており、HAとして扱えない状態でした。
+- 到達できる5台のVPN・DB・シークレット基盤を復旧し、Coder／HyperEVMの実ブラウザ試験、
+  新規VPN接続、シークレット基盤の自動復旧、VPNの状態消失からの再起動試験が通りました。
+- 実コピー数・ホスト・ディスクの状態を毎分検査します。コピー不足を正常扱いしません。
+- **未復旧はp4に依存するレジストリです。p4の電源・LAN／管理コンソールでの確認が必要です。**
+  元のディスクを保全したまま復旧し、その後に独立したコピーとバックアップを検証します。
+- 以下の詳細記録と隣接するJSONに、実施した修正・検証結果・未完了の対策を記載しています。
+
 Status: core control plane and Coder recovered; registry storage still depends
 on the unreachable `uc-k8sp4`. Do not treat a responding registry authentication
 endpoint as a successful image pull.
