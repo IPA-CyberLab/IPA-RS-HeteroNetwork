@@ -1,0 +1,210 @@
+- name: Add a durable synchronous replica on the existing independent DCS host
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    sync_host: ichikawap1
+    sync_bundle: /etc/heteronetwork/postgres-autopilot/bundle
+    sync_archive: /etc/heteronetwork/postgres-autopilot/bundle.tar.gz
+  tasks:
+    - name: Require the declared third full database member
+      ansible.builtin.assert:
+        that:
+          - hostvars[sync_host].postgres_role == 'member'
+          - hostvars[sync_host].postgres_name == 'db-h'
+          - hostvars[sync_host].tailscale_ip == '100.65.54.75'
+
+    - name: Install reviewed authority and promotion helpers
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/libexec/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop: [recover-database-authority.py, promote-database-sync-replica.py, postgres-ha-node.sh]
+
+    - name: Install the approved public server identities
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/terraform/master-only/overlay-boot-peers.json"
+        dest: /etc/heteronetwork/overlay-boot-peers.json
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Validate the protected promotion before changing any process
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /opt/heteronetwork/libexec/promote-database-sync-replica.py
+          - --bundle
+          - "{{ sync_bundle }}"
+          - --archive
+          - "{{ sync_archive }}"
+          - --backups
+          - /var/backups/heteronetwork/sync-replica-promotion
+          - --helper
+          - /opt/heteronetwork/libexec/postgres-ha-node.sh
+          - --roster
+          - /etc/heteronetwork/overlay-boot-peers.json
+      changed_when: false
+
+    - name: Promote without restarting the primary or modifying existing data
+      block:
+        - name: Pause topology writers on the recovery authority
+          ansible.builtin.systemd_service:
+            name: heteronetwork-postgres-autopilot.service
+            state: stopped
+
+        - name: Pause topology writers on the existing DCS host
+          ansible.builtin.systemd_service:
+            name: heteronetwork-postgres-autopilot.service
+            state: stopped
+          delegate_to: "{{ sync_host }}"
+
+        - name: Extend only the reviewed protected member map
+          ansible.builtin.command:
+            argv:
+              - python3
+              - /opt/heteronetwork/libexec/promote-database-sync-replica.py
+              - --bundle
+              - "{{ sync_bundle }}"
+              - --archive
+              - "{{ sync_archive }}"
+              - --backups
+              - /var/backups/heteronetwork/sync-replica-promotion
+              - --helper
+              - /opt/heteronetwork/libexec/postgres-ha-node.sh
+              - --roster
+              - /etc/heteronetwork/overlay-boot-peers.json
+              - --apply
+              - --proxy-archive
+              - /etc/heteronetwork/postgres-autopilot/proxy-bundle.tar.gz
+          register: sync_promotion
+          changed_when: (sync_promotion.stdout | from_json).result == 'changed'
+
+        - name: Read the protected member archive without logging its contents
+          ansible.builtin.slurp:
+            src: "{{ sync_archive }}"
+          register: sync_credentials
+          no_log: true
+
+        - name: Create the protected directory on the existing DCS host
+          ansible.builtin.file:
+            path: /etc/heteronetwork/postgres-autopilot
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+          delegate_to: "{{ sync_host }}"
+
+        - name: Transfer the protected replica credentials
+          ansible.builtin.copy:
+            content: "{{ sync_credentials.content | b64decode }}"
+            dest: "{{ sync_archive }}"
+            owner: root
+            group: root
+            mode: '0600'
+          no_log: true
+          delegate_to: "{{ sync_host }}"
+
+        - name: Create the protected member bundle directory
+          ansible.builtin.file:
+            path: "{{ sync_bundle }}"
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+          delegate_to: "{{ sync_host }}"
+
+        - name: Unpack existing replica credentials on the existing DCS host
+          ansible.builtin.unarchive:
+            src: "{{ sync_archive }}"
+            dest: "{{ sync_bundle }}"
+            remote_src: true
+            owner: root
+            group: root
+          no_log: true
+          delegate_to: "{{ sync_host }}"
+
+        - name: Install the reviewed member helper on the replica
+          ansible.builtin.copy:
+            src: "{{ hnn_repo_root }}/scripts/postgres-ha-node.sh"
+            dest: /opt/heteronetwork/libexec/postgres-ha-node.sh
+            owner: root
+            group: root
+            mode: '0755'
+          delegate_to: "{{ sync_host }}"
+
+        - name: Admit only the new fixed replica address and reload Patroni
+          ansible.builtin.shell: |
+            /opt/heteronetwork/postgres-ha/patroni/bin/python - <<'PY'
+            import json,os,stat,tempfile,subprocess,yaml
+            path='/etc/heteronetwork/postgres-ha/patroni.yml'
+            metadata=os.stat(path,follow_symlinks=False)
+            assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid==0
+            with open(path) as source: data=yaml.safe_load(source)
+            rules=data['postgresql']['pg_hba']
+            additional=[f'hostssl {database} {user} 100.65.54.75/32 scram-sha-256' for database,user in [('replication','replicator'),('all','postgres'),('all','rewind'),('all','all')]]
+            changed=any(rule not in rules for rule in additional)
+            if changed:
+                rules.extend(rule for rule in additional if rule not in rules)
+                descriptor,temporary=tempfile.mkstemp(prefix='.sync-hba-',dir=os.path.dirname(path))
+                try:
+                    with os.fdopen(descriptor,'w') as output:
+                        os.fchmod(output.fileno(),stat.S_IMODE(metadata.st_mode));os.fchown(output.fileno(),metadata.st_uid,metadata.st_gid)
+                        yaml.safe_dump(data,output);output.flush();os.fsync(output.fileno())
+                    os.replace(temporary,path)
+                finally:
+                    if os.path.exists(temporary):os.unlink(temporary)
+                subprocess.run(['systemctl','kill','--kill-whom=main','--signal=HUP','heteronetwork-db.service'],check=True)
+            print(json.dumps({'changed':changed}))
+            PY
+          args:
+            executable: /bin/bash
+          register: sync_hba
+          changed_when: (sync_hba.stdout | from_json).changed
+          no_log: true
+
+        - name: Start the new replica using the existing DCS identity and data protection
+          ansible.builtin.script:
+            cmd: "{{ hnn_repo_root }}/scripts/start-declared-sync-replica.py"
+            executable: /opt/heteronetwork/postgres-ha/patroni/bin/python
+          no_log: true
+          delegate_to: "{{ sync_host }}"
+
+        - name: Require both surviving members to form a synchronous streaming pair
+          ansible.builtin.command:
+            argv:
+              - runuser
+              - -u
+              - postgres
+              - --
+              - psql
+              - -p
+              - '55432'
+              - -X
+              - -At
+              - -c
+              - SELECT CASE WHEN pg_is_in_recovery() THEN EXISTS (SELECT FROM pg_stat_wal_receiver WHERE status='streaming') ELSE EXISTS (SELECT FROM pg_stat_replication WHERE application_name IN ('db-b','db-h') AND state='streaming' AND sync_state IN ('sync','quorum')) END;
+          register: sync_acceptance
+          until: sync_acceptance.rc == 0 and sync_acceptance.stdout | trim == 't'
+          retries: 120
+          delay: 5
+          changed_when: false
+          delegate_to: "{{ item }}"
+          loop: [uc-k8sp5, ichikawap1]
+      always:
+        - name: Resume topology reconciliation on the authority
+          ansible.builtin.systemd_service:
+            name: heteronetwork-postgres-autopilot.service
+            state: started
+            enabled: true
+
+        - name: Resume topology reconciliation on the independent replica
+          ansible.builtin.systemd_service:
+            name: heteronetwork-postgres-autopilot.service
+            state: started
+            enabled: true
+          delegate_to: "{{ sync_host }}"

@@ -1,0 +1,317 @@
+{
+  "schema_version": 1,
+  "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
+  "hosts": {
+    "uc-k8sp1": "node-af375fc07e62d98e36d0ba0bfdcbea51",
+    "uc-k8sp4": "node-30c455638eba4281a25bb8ec2c8b742b",
+    "uc-k8sp5": "node-d295b84052d4a78d647b9b704c00c13e",
+    "ichikawap1": "node-010adc8f711b1982b3f0d0870d54431e",
+    "uc-k8sp2": "node-9befa279a7f75a740e5fb4e3b58ca9ee",
+    "uc-k8s3p": "node-d01718fd82a2f81b25c95fe9bab7d1d6"
+  },
+  "peers": [
+    {
+      "node_id": "node-010adc8f711b1982b3f0d0870d54431e",
+      "hostname": "ichikawa_p1",
+      "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
+      "vpn_ip": "10.250.0.10",
+      "identity_public_key": "6S8KoP/2D/CF9hw23woNQXckiD6ttfOfLQ688D1k0w4=",
+      "wireguard_public_key": "bGwpfQWEB0+JWKgN4GSlp4l7lu2aKJjsgiPzKoo8xg8=",
+      "role": "worker",
+      "tags": [
+        "kubernetes-control-plane",
+        "kubernetes-ha-545a7a1911f9580a"
+      ],
+      "endpoint_candidates": [
+        {
+          "node_id": "node-010adc8f711b1982b3f0d0870d54431e",
+          "kind": "public_udp",
+          "addr": "163.220.236.61:51820",
+          "observed_at": "2026-10-23T11:12:12.716659929Z",
+          "priority": 80,
+          "cost": 20,
+          "source": "stun_probe"
+        },
+        {
+          "node_id": "node-010adc8f711b1982b3f0d0870d54431e",
+          "kind": "local_udp",
+          "addr": "163.220.236.61:51820",
+          "observed_at": "2026-10-23T11:12:12.716659929Z",
+          "priority": 70,
+          "cost": 30,
+          "source": "stun_probe"
+        }
+      ],
+      "relay_capability": {
+        "enabled_by_policy": true,
+        "public_endpoint": "163.220.236.61:18445",
+        "admission_url": "http://10.250.0.10:18447",
+        "max_sessions": 10000,
+        "active_sessions": 0,
+        "max_mbps": 1000,
+        "e2e_only": true
+      },
+      "token_policy": {
+        "allow_join": true,
+        "allow_relay": true,
+        "allowed_routes": [],
+        "allowed_tags": [],
+        "max_token_uses": 1
+      },
+      "routes": [],
+      "registered_at": "2026-08-11T09:33:23.185796874Z"
+    },
+    {
+      "node_id": "node-30c455638eba4281a25bb8ec2c8b742b",
+      "hostname": "uc-k8sp4",
+      "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
+      "vpn_ip": "10.250.0.11",
+      "identity_public_key": "b006Zhq9VJP714nlwPyLR+kizn0HMh5lxc+fIvT+gvY=",
+      "wireguard_public_key": "UGuKtpuVB7spVjCCXbHnOrkHjLqYPBvCWhByUAQmsEY=",
+      "role": "worker",
+      "tags": [
+        "kubernetes-control-plane",
+        "kubernetes-ha-545a7a1911f9580a"
+      ],
+      "endpoint_candidates": [
+        {
+          "node_id": "node-30c455638eba4281a25bb8ec2c8b742b",
+          "kind": "public_udp",
+          "addr": "163.220.236.54:51820",
+          "observed_at": "2026-10-23T11:13:01.609693739Z",
+          "priority": 80,
+          "cost": 20,
+          "source": "stun_probe"
+        },
+        {
+          "node_id": "node-30c455638eba4281a25bb8ec2c8b742b",
+          "kind": "local_udp",
+          "addr": "163.220.236.54:51820",
+          "observed_at": "2026-10-23T11:13:01.609693739Z",
+          "priority": 70,
+          "cost": 30,
+          "source": "stun_probe"
+        }
+      ],
+      "relay_capability": {
+        "enabled_by_policy": true,
+        "public_endpoint": "163.220.236.54:18445",
+        "admission_url": "http://10.250.0.11:18447",
+        "max_sessions": 10000,
+        "active_sessions": 0,
+        "max_mbps": 1000,
+        "e2e_only": true
+      },
+      "token_policy": {
+        "allow_join": true,
+        "allow_relay": true,
+        "allowed_routes": [],
+        "allowed_tags": [
+          "kubernetes-control-plane",
+          "kubernetes-ha-545a7a1911f9580a"
+        ],
+        "max_token_uses": 1
+      },
+      "routes": [],
+      "registered_at": "2026-09-15T12:19:04.125007433Z"
+    },
+    {
+      "node_id": "node-9befa279a7f75a740e5fb4e3b58ca9ee",
+      "hostname": "uc-k8sp2",
+      "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
+      "vpn_ip": "10.250.0.5",
+      "identity_public_key": "d80ASQJhxMbP20DwO7BTjmTfube7bBAXWOr1pjOni9E=",
+      "wireguard_public_key": "WI+4A3GFuhAwPyf6OegC3HCBP5u/M7mmkTQSBsPQnwc=",
+      "role": "worker",
+      "tags": [
+        "kubernetes-control-plane",
+        "kubernetes-control-plane-only",
+        "kubernetes-ha-545a7a1911f9580a"
+      ],
+      "endpoint_candidates": [
+        {
+          "node_id": "node-9befa279a7f75a740e5fb4e3b58ca9ee",
+          "kind": "public_udp",
+          "addr": "163.220.236.52:51820",
+          "observed_at": "2026-10-23T11:13:05.169394963Z",
+          "priority": 80,
+          "cost": 20,
+          "source": "stun_probe"
+        },
+        {
+          "node_id": "node-9befa279a7f75a740e5fb4e3b58ca9ee",
+          "kind": "local_udp",
+          "addr": "163.220.236.52:51820",
+          "observed_at": "2026-10-23T11:13:05.169394963Z",
+          "priority": 70,
+          "cost": 30,
+          "source": "stun_probe"
+        }
+      ],
+      "relay_capability": null,
+      "token_policy": {
+        "allow_join": true,
+        "allow_relay": false,
+        "allowed_routes": [],
+        "allowed_tags": [
+          "kubernetes-control-plane",
+          "kubernetes-control-plane-only",
+          "kubernetes-ha-545a7a1911f9580a"
+        ],
+        "max_token_uses": 1
+      },
+      "routes": [],
+      "registered_at": "2026-09-15T09:54:01.080460Z"
+    },
+    {
+      "node_id": "node-af375fc07e62d98e36d0ba0bfdcbea51",
+      "hostname": "uc-k8sp1",
+      "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
+      "vpn_ip": "10.250.0.4",
+      "identity_public_key": "o5npxC0RhLOra2uR2H9/N8VhWrOCDgm7HMgJq5rh11k=",
+      "wireguard_public_key": "JXsRmnLGAlgS2pbqCQfPKYiXpaL1Vd4PhzEzC7emSxc=",
+      "role": "worker",
+      "tags": [
+        "kubernetes-control-plane",
+        "kubernetes-control-plane-only",
+        "kubernetes-ha-545a7a1911f9580a"
+      ],
+      "endpoint_candidates": [
+        {
+          "node_id": "node-af375fc07e62d98e36d0ba0bfdcbea51",
+          "kind": "public_udp",
+          "addr": "163.220.236.51:51820",
+          "observed_at": "2026-09-15T09:54:02.144672237Z",
+          "priority": 80,
+          "cost": 20,
+          "source": "stun_probe"
+        },
+        {
+          "node_id": "node-af375fc07e62d98e36d0ba0bfdcbea51",
+          "kind": "local_udp",
+          "addr": "163.220.236.51:51820",
+          "observed_at": "2026-09-15T09:54:02.144672237Z",
+          "priority": 70,
+          "cost": 30,
+          "source": "stun_probe"
+        }
+      ],
+      "relay_capability": null,
+      "token_policy": {
+        "allow_join": true,
+        "allow_relay": false,
+        "allowed_routes": [],
+        "allowed_tags": [
+          "kubernetes-control-plane",
+          "kubernetes-control-plane-only",
+          "kubernetes-ha-545a7a1911f9580a"
+        ],
+        "max_token_uses": 1
+      },
+      "routes": [],
+      "registered_at": "2026-09-15T09:54:01.079967Z"
+    },
+    {
+      "node_id": "node-d01718fd82a2f81b25c95fe9bab7d1d6",
+      "hostname": "uc-k8s3p",
+      "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
+      "vpn_ip": "10.250.0.6",
+      "identity_public_key": "Op9SeuobxQ7wMohhQgXu129JXHjKiUi2Bz+HoNi8CZY=",
+      "wireguard_public_key": "sQ1YKa8+cW5l8ZhlOU/1rIfrYW5sFAxtkvan51qo9iM=",
+      "role": "worker",
+      "tags": [
+        "kubernetes-control-plane",
+        "kubernetes-control-plane-only",
+        "kubernetes-ha-545a7a1911f9580a"
+      ],
+      "endpoint_candidates": [
+        {
+          "node_id": "node-d01718fd82a2f81b25c95fe9bab7d1d6",
+          "kind": "public_udp",
+          "addr": "163.220.236.53:51820",
+          "observed_at": "2026-10-23T11:12:51.329215609Z",
+          "priority": 80,
+          "cost": 20,
+          "source": "stun_probe"
+        },
+        {
+          "node_id": "node-d01718fd82a2f81b25c95fe9bab7d1d6",
+          "kind": "local_udp",
+          "addr": "163.220.236.53:51820",
+          "observed_at": "2026-10-23T11:12:51.329215609Z",
+          "priority": 70,
+          "cost": 30,
+          "source": "stun_probe"
+        }
+      ],
+      "relay_capability": null,
+      "token_policy": {
+        "allow_join": true,
+        "allow_relay": false,
+        "allowed_routes": [],
+        "allowed_tags": [
+          "kubernetes-control-plane",
+          "kubernetes-control-plane-only",
+          "kubernetes-ha-545a7a1911f9580a"
+        ],
+        "max_token_uses": 1
+      },
+      "routes": [],
+      "registered_at": "2026-09-15T09:54:01.080854Z"
+    },
+    {
+      "node_id": "node-d295b84052d4a78d647b9b704c00c13e",
+      "hostname": "uc-k8sp5",
+      "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
+      "vpn_ip": "10.250.0.2",
+      "identity_public_key": "tgl5kvDTCFUCr09Rsg551HfTyiE5RXeRwjgjpxFOEho=",
+      "wireguard_public_key": "cz5agll84B9MmGmX7eHTs3UEskIk9AQqhBq/5LGqs2k=",
+      "role": "worker",
+      "tags": [
+        "kubernetes-control-plane",
+        "kubernetes-ha-545a7a1911f9580a"
+      ],
+      "endpoint_candidates": [
+        {
+          "node_id": "node-d295b84052d4a78d647b9b704c00c13e",
+          "kind": "public_udp",
+          "addr": "163.220.236.45:51820",
+          "observed_at": "2026-10-23T11:12:51.362646696Z",
+          "priority": 80,
+          "cost": 20,
+          "source": "stun_probe"
+        },
+        {
+          "node_id": "node-d295b84052d4a78d647b9b704c00c13e",
+          "kind": "local_udp",
+          "addr": "163.220.236.45:51820",
+          "observed_at": "2026-10-23T11:12:51.362646696Z",
+          "priority": 70,
+          "cost": 30,
+          "source": "stun_probe"
+        }
+      ],
+      "relay_capability": {
+        "enabled_by_policy": true,
+        "public_endpoint": "163.220.236.45:18445",
+        "admission_url": "http://10.250.0.2:18447",
+        "max_sessions": 10000,
+        "active_sessions": 0,
+        "max_mbps": 1000,
+        "e2e_only": true
+      },
+      "token_policy": {
+        "allow_join": true,
+        "allow_relay": true,
+        "allowed_routes": [],
+        "allowed_tags": [
+          "kubernetes-control-plane",
+          "kubernetes-ha-545a7a1911f9580a"
+        ],
+        "max_token_uses": 1
+      },
+      "routes": [],
+      "registered_at": "2026-09-14T13:27:36.840373723Z"
+    }
+  ]
+}

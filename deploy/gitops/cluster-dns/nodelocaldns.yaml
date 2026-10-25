@@ -96,7 +96,7 @@ data:
         reload
         loop
         bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
-        forward . __PILLAR__UPSTREAM__SERVERS__ {
+        forward . /etc/heteronetwork/upstream-resolv.conf {
             max_concurrent 1000
         }
         prometheus :9253
@@ -124,7 +124,7 @@ spec:
         k8s-app: node-local-dns
         kubernetes.io/cluster-service: "true"
       annotations:
-        heteronetwork.internal/config-revision: "3"
+        heteronetwork.internal/config-revision: "4"
         prometheus.io/port: "9253"
         prometheus.io/scrape: "true"
     spec:
@@ -200,6 +200,10 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
           volumeMounts:
+            # Persisted by host provisioning; valid before systemd-resolved is ready.
+            - name: upstream-resolver
+              mountPath: /etc/heteronetwork/upstream-resolv.conf
+              readOnly: true
             - name: xtables-lock
               mountPath: /run/xtables.lock
             - name: config-volume
@@ -207,6 +211,10 @@ spec:
             - name: kube-dns-config
               mountPath: /etc/kube-dns
       volumes:
+        - name: upstream-resolver
+          hostPath:
+            path: /etc/kubernetes/resolv.conf
+            type: File
         - name: xtables-lock
           hostPath:
             path: /run/xtables.lock

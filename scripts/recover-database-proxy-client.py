@@ -172,7 +172,13 @@ def proxy_metadata(directory, identity):
     manifest = parse_manifest((directory / "manifest.env").read_bytes())
     members = parse_mapping(manifest.get("HETERONETWORK_DB_MEMBERS", ""))
     identities = parse_mapping(manifest.get("HETERONETWORK_DB_MEMBER_IDENTITIES", ""))
-    require(members == EXPECTED_MEMBERS,
+    revision = manifest.get("HETERONETWORK_DB_TOPOLOGY_REVISION", "")
+    require(revision.isascii() and revision.isdigit() and int(revision) > 0,
+            "database topology revision is invalid")
+    expected = dict(EXPECTED_MEMBERS)
+    if int(revision) >= 4 and members.get('db-h') == '100.65.54.75':
+        expected['db-h'] = '100.65.54.75'
+    require(members == expected,
             "proxy bundle does not match the declared database topology")
     require(set(members) == set(identities), "database member identities do not match members")
     require(all(SAFE_NODE_ID.fullmatch(value) for value in identities.values()),

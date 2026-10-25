@@ -1,0 +1,100 @@
+- name: Recover sealed Secret Manager voters from independent host custodians
+  hosts: master_only
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Inspect the host-bound credential without decrypting it
+      ansible.builtin.stat:
+        path: /etc/heteronetwork/openbao-custody/unseal-share.cred
+        follow: false
+      register: custody
+
+    - name: Require a protected credential on this dedicated custodian
+      ansible.builtin.assert:
+        that:
+          - custody.stat.isreg | default(false)
+          - not (custody.stat.islnk | default(false))
+          - custody.stat.uid == 0
+          - custody.stat.mode == '0600'
+          - inventory_hostname in ['uc-k8sp1', 'uc-k8sp2', 'uc-k8s3p']
+
+    - name: Install the separate Secret Manager custodian implementation
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/../IPA-RS-HeteroCloud-SecretManager/scripts/custodian-unseal.py"
+        dest: /opt/heteronetwork/libexec/openbao-custodian-unseal.py
+        owner: root
+        group: root
+        mode: '0755'
+      register: custodian_code
+
+    - name: Install the host-credential service without copying any key share
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-openbao-custodian.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Submit only this host's Secret Manager recovery share to verified voters
+          Wants=network-online.target
+          After=network-online.target heteronetwork-agent.service kubelet.service
+          [Service]
+          Type=oneshot
+          User=root
+          LoadCredentialEncrypted=unseal-share:/etc/heteronetwork/openbao-custody/unseal-share.cred
+          RuntimeDirectory=heteronetwork-openbao-custodian
+          RuntimeDirectoryMode=0700
+          ExecStart=/usr/bin/python3 /opt/heteronetwork/libexec/openbao-custodian-unseal.py --node {{ inventory_hostname }}
+          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          TimeoutStartSec=100
+          MemoryMax=128M
+          CPUQuota=30%
+          LimitCORE=0
+          NoNewPrivileges=yes
+          CapabilityBoundingSet=
+          PrivateTmp=yes
+          PrivateDevices=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          ProtectKernelTunables=yes
+          ProtectKernelModules=yes
+          ProtectControlGroups=yes
+          RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+          RestrictSUIDSGID=yes
+          IPAddressDeny=any
+          IPAddressAllow=127.0.0.0/8
+          IPAddressAllow=10.244.0.0/16
+          IPAddressAllow=10.250.0.0/24
+      register: custodian_unit
+
+    - name: Install the bounded retry timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-openbao-custodian.timer
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Retry Secret Manager recovery after host or voter restarts
+          [Timer]
+          OnBootSec=30s
+          OnUnitInactiveSec=20s
+          RandomizedDelaySec=3s
+          Unit=heteronetwork-openbao-custodian.service
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable future automatic recovery
+      ansible.builtin.systemd_service:
+        name: heteronetwork-openbao-custodian.timer
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Verify the custodian can inspect the healthy voters now
+      ansible.builtin.systemd_service:
+        name: heteronetwork-openbao-custodian.service
+        state: started

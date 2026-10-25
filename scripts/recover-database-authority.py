@@ -29,6 +29,7 @@ EXPECTED_DCS = {
 LEGACY_DCS = {**EXPECTED_MEMBERS, "db-g": "100.94.130.38"}
 REPLACEMENT_DCS_REVISION = 3
 EXPECTED_RETIRED_MEMBERS = 4
+SYNC_REPLICA_REVISION = 4
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_BYTES = 128 * 1024 * 1024
 KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -288,8 +289,13 @@ def inspect_authority(bundle, archive):
             "protected authority is missing a recovered member identity")
     require(len(set(identities.values())) == len(identities),
             "protected member identities are not unique")
-    retired_members = set(members) - set(EXPECTED_MEMBERS)
-    retired_identities = set(identities) - set(EXPECTED_MEMBERS)
+    # db-h is an existing DCS voter promoted to a full synchronous replica.
+    # Preserve that explicit migration rather than treating it as an old member.
+    retained = dict(EXPECTED_MEMBERS)
+    if revision >= SYNC_REPLICA_REVISION and members.get("db-h") == EXPECTED_DCS["db-h"]:
+        retained["db-h"] = EXPECTED_DCS["db-h"]
+    retired_members = set(members) - set(retained)
+    retired_identities = set(identities) - set(retained)
     require(retired_members == retired_identities,
             "retired member and identity sets do not match")
     require(len(retired_members) in (0, EXPECTED_RETIRED_MEMBERS),
@@ -305,6 +311,7 @@ def inspect_authority(bundle, archive):
         "retired": retired_members,
         "revision": revision,
         "dcs": expected_dcs,
+        "retained": retained,
         "manifest": expanded_manifest,
     }
 
@@ -312,10 +319,10 @@ def inspect_authority(bundle, archive):
 def render_manifest(authority):
     values = dict(authority["values"])
     values["HETERONETWORK_DB_MEMBERS"] = ",".join(
-        f"{name}={address}" for name, address in EXPECTED_MEMBERS.items()
+        f"{name}={address}" for name, address in authority["retained"].items()
     )
     values["HETERONETWORK_DB_MEMBER_IDENTITIES"] = ",".join(
-        f"{name}={authority['identities'][name]}" for name in EXPECTED_MEMBERS
+        f"{name}={authority['identities'][name]}" for name in authority["retained"]
     )
     values["HETERONETWORK_DB_DCS_MEMBERS"] = ",".join(
         f"{name}={address}" for name, address in authority["dcs"].items()

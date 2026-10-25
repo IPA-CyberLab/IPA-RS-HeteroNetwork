@@ -34,7 +34,7 @@ data:
            ttl 30
         }
         prometheus :9153
-        forward . /etc/resolv.conf {
+        forward . /etc/heteronetwork/upstream-resolv.conf {
            max_concurrent 1000
         }
         cache 30 {
@@ -178,6 +178,10 @@ spec:
               drop:
                 - ALL
           volumeMounts:
+            # Persisted by host provisioning; valid before systemd-resolved is ready.
+            - name: upstream-resolver
+              mountPath: /etc/heteronetwork/upstream-resolv.conf
+              readOnly: true
             - name: config-volume
               mountPath: /etc/coredns
               readOnly: true
@@ -185,6 +189,10 @@ spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
       volumes:
+        - name: upstream-resolver
+          hostPath:
+            path: /etc/kubernetes/resolv.conf
+            type: File
         - name: config-volume
           configMap:
             name: coredns

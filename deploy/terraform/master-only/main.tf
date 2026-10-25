@@ -41,7 +41,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/node-root-storage.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/flash-backups.yaml" && f != "ansible/flash-operations.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/runtime-restart.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/database-sync-replica.yaml" && f != "ansible/overlay-boot-recovery.yaml" && f != "ansible/openbao-custodian.yaml" && f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/node-root-storage.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/flash-backups.yaml" && f != "ansible/flash-operations.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/runtime-restart.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -74,6 +74,12 @@ locals {
         }
         postgres_members = {
           hosts = merge(
+            try(local.enrollment_issuer.postgres_role, "") == "member" ? {
+              (local.enrollment_issuer.name) = merge({ for key, value in local.enrollment_issuer : key => value if key != "name" }, {
+                ansible_host            = local.enrollment_issuer.ssh_host
+                ansible_ssh_common_args = "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -o 'ProxyCommand=ssh -i ${pathexpand(var.ssh_private_key_path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${abspath(var.work_dir)}/known_hosts -W %h:%p mizuame@${local.bootstrap.ssh_host}'"
+              })
+            } : {},
             {
               for name, node in local.standard_nodes : name => merge(node, { ansible_host = node.ssh_host })
               if try(node.postgres_role, "") == "member"
@@ -554,6 +560,12 @@ resource "terraform_data" "database_proxy_configuration" {
 resource "terraform_data" "database_ha_configuration" {
   input = {
     members = merge(
+      try(local.enrollment_issuer.postgres_role, "") == "member" ? {
+        (local.enrollment_issuer.name) = {
+          postgres_name = local.enrollment_issuer.postgres_name
+          address       = local.enrollment_issuer.tailscale_ip
+        }
+      } : {},
       {
         for name, node in local.standard_nodes : name => {
           postgres_name = node.postgres_name

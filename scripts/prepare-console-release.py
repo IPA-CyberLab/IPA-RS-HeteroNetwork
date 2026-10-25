@@ -136,6 +136,11 @@ def inventory(repo_root, work_dir, ssh_key, checksums):
                     }
                 }},
                 "postgres_members": {"hosts": {
+                    **({issuer["name"]: {
+                        **{key: value for key, value in issuer.items() if key != "name"},
+                        "ansible_host": issuer["ssh_host"],
+                        "ansible_ssh_common_args": proxy,
+                    }} if issuer.get("postgres_role") == "member" else {}),
                     **{
                         name: {**node, "ansible_host": node["ssh_host"]}
                         for name, node in standard_nodes.items()

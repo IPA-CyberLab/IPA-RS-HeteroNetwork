@@ -18,6 +18,18 @@ spec:
       # Monitoring is isolated from the low-IOPS control-plane members. Three
       # host-network replicas retain one endpoint after any two node faults.
       values: |
+        redis:
+          sentinel:
+            quorum: 2
+          replica:
+            # Three eligible application hosts; dedicated custodians stay excluded.
+            replicaCount: 3
+            pdb:
+              minAvailable: 2
+            extraFlags:
+              # Only an incomplete tail up to 4 KiB may be recovered automatically.
+              - --aof-load-corrupt-tail-max-size
+              - "4096"
         monitoring:
           prometheus:
             nodeSelector:
@@ -34,6 +46,9 @@ spec:
               - ichikawap1
               - uc-k8sp4
       parameters:
+        # Preserve the approved security release while reconciling infrastructure.
+        - name: image.tag
+          value: "security-1e0ba0f806c40660ad3a2527fcea5e28676b5542-39580680976@sha256:e95afea05cf01936748872adb8af3d75da0a02f56eb17dacd883f87e73f3c090"
         - name: monitoring.prometheus.replicaCount
           value: "3"
         - name: monitoring.grafana.replicaCount

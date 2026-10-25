@@ -345,7 +345,7 @@
       when: postgres_role == 'member'
 
 - name: Demote the retired enrollment database member to a proxy-only client
-  hosts: enrollment_issuer
+  hosts: enrollment_issuer:!postgres_members
   gather_facts: false
   become: true
   vars:

@@ -30,12 +30,12 @@ def prepare(work_dir, ssh_key):
     voters = groups["postgres_dcs_only"]["hosts"]
     CONSOLE.require(
         {(value["postgres_name"], value["tailscale_ip"]) for value in members.values()}
-        == {("db-b", "100.96.127.54"), ("db-e", "100.111.33.52")},
+        == {("db-b", "100.96.127.54"), ("db-e", "100.111.33.52"), ("db-h", "100.65.54.75")},
         "Database member inventory does not match the recovered topology",
     )
     CONSOLE.require(
         {(value["postgres_name"], value["tailscale_ip"]) for value in voters.values()}
-        == {("db-h", "100.65.54.75")},
+        == set(),
         "DCS voter inventory does not match the recovered topology",
     )
     CONSOLE.write_private(
