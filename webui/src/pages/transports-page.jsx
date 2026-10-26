@@ -10,6 +10,7 @@ import { age, nodeDisplayName } from "../utils.js";
 
 const reasons = {
   udp_probe_timeout: "UDP応答なし", remote_http_tunnel: "接続元がHTTPトンネルを選択",
+  tcp_unavailable: "TCP接続失敗", tcp_tunnel_unavailable:"TCPトンネル切断",
   https_unavailable: "HTTPS接続失敗", http_unavailable: "HTTP接続失敗",
   http_tunnel_unavailable: "HTTPトンネル切断", authentication_failed: "認証失敗",
   tunnel_idle_or_closed: "通信停止・セッション終了", tunnel_stopped: "接続終了",
@@ -60,7 +61,7 @@ export function TransportsPage({ overview }) {
   const columns = [
     { id: "source", header: "報告ノード", cell: (r) => name(r.source) },
     { id: "peer", header: "接続先 / 方向", cell: (r) => r.peer ? `${name(r.peer)} / ${r.direction === "incoming" ? "受信" : "送信"}` : "接続の報告なし" },
-    { id: "mode", header: "通信方式", cell: (r) => ({ udp: "UDP", https: "HTTPS / TCP", http: "HTTP / TCP" })[r.transport] || "未報告" },
+    { id: "mode", header: "通信方式", cell: (r) => ({ udp: "UDP", tcp:"TCP", https: "HTTPS / TCP", http: "HTTP / TCP" })[r.transport] || "未報告" },
     { id: "phase", header: "状態", cell: (r) => {
       const stale = !r.updated_at || Date.now() - Date.parse(r.updated_at) > 90000 || Date.now() - Date.parse(r.observed_at) > 90000;
       return <StatusIndicator type={stale ? "warning" : r.phase === "connected" ? "success" : r.phase === "failed" ? "error" : "in-progress"}>{stale ? "未報告・更新停止" : phaseNames[r.phase] || r.phase}</StatusIndicator>;
@@ -75,7 +76,7 @@ export function TransportsPage({ overview }) {
   ];
   return <SpaceBetween size="l">
     {error ? <ErrorAlert error={error} onRetry={() => load()} /> : null}
-    <ResourceTable header="通信方式" description="UDPからHTTPS・HTTPへの切り替えを5秒ごとに確認します。通信量はこのプロセスの起動以降の値で、報告停止を通信量0として扱いません。"
+    <ResourceTable header="通信方式" description="UDPからTCP・HTTPS・HTTPへの切り替えを5秒ごとに確認します。通信量はこのプロセスの起動以降の値で、報告停止を通信量0として扱いません。"
       items={rows} columns={columns} trackBy="id" pageSize={20}
       actions={<SpaceBetween size="s" direction="horizontal"><Select selectedOption={source} options={options} ariaLabel="報告ノード" onChange={({ detail }) => { setSource(detail.selectedOption); setCursors([""]); }} /><Button loading={busy} onClick={() => load()}>更新</Button></SpaceBetween>}
       emptyTitle={busy ? "通信状態を取得しています" : "通信状態の報告がありません"} />

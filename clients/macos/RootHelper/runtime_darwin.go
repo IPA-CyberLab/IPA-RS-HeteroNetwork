@@ -337,6 +337,7 @@ func transportConfiguration(configuration tunnelConfiguration) transport.Configu
 		ClientNodeID: configuration.ClientNodeID, GatewayNodeID: configuration.GatewayNodeID,
 		PrivateKey: configuration.PrivateKey, GatewayWireGuardPublicKey: configuration.GatewayWireGuardPublicKey,
 		GatewayEndpoint: configuration.GatewayEndpoint, GatewayHTTPTunnelURLs: configuration.GatewayHTTPTunnelURLs,
+		GatewayTCPTunnelEndpoints: configuration.GatewayTCPTunnelEndpoints,
 	}
 }
 
@@ -380,7 +381,8 @@ func (tunnel *activeTunnel) update(configuration tunnelConfiguration) error {
 		configuration.GatewayWireGuardPublicKey != tunnel.configuration.GatewayWireGuardPublicKey ||
 		configuration.GatewayEndpoint != tunnel.configuration.GatewayEndpoint ||
 		configuration.GatewayNodeID != tunnel.configuration.GatewayNodeID ||
-		!slices.Equal(configuration.GatewayHTTPTunnelURLs, tunnel.configuration.GatewayHTTPTunnelURLs)
+		!slices.Equal(configuration.GatewayHTTPTunnelURLs, tunnel.configuration.GatewayHTTPTunnelURLs) ||
+		!slices.Equal(configuration.GatewayTCPTunnelEndpoints, tunnel.configuration.GatewayTCPTunnelEndpoints)
 	if changedTransport {
 		var err error
 		proxy, err = transport.Start(transportConfiguration(configuration))

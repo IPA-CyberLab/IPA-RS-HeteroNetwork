@@ -28,6 +28,7 @@ pub struct RelayHttpState {
     admission_bearer_token: Option<Arc<str>>,
     operator_api_bearer_token: Option<Arc<str>>,
     http_transport: Option<Arc<ipars_http_tunnel::TunnelHub>>,
+    tcp_endpoint: Option<std::net::SocketAddr>,
 }
 
 impl RelayHttpState {
@@ -37,6 +38,7 @@ impl RelayHttpState {
             admission_bearer_token: None,
             operator_api_bearer_token: None,
             http_transport: None,
+            tcp_endpoint: None,
         }
     }
 
@@ -49,6 +51,47 @@ impl RelayHttpState {
             backend, maximum,
         )));
         self
+    }
+
+    pub fn with_tcp_endpoint(mut self, endpoint: std::net::SocketAddr) -> Self {
+        self.tcp_endpoint = Some(endpoint);
+        self
+    }
+    pub fn tcp_authorizer(&self) -> ipars_http_tunnel::tcp::Authorizer {
+        let state = self.clone();
+        Arc::new(move |request, body| {
+            let state = state.clone();
+            Box::pin(async move {
+                if !request.relay {
+                    return Err(ipars_http_tunnel::TunnelError::Unauthorized);
+                }
+                let hub = state
+                    .http_transport
+                    .clone()
+                    .ok_or(ipars_http_tunnel::TunnelError::Unauthorized)?;
+                let (session, expires) = state
+                    .relay
+                    .table()
+                    .write()
+                    .await
+                    .authorize_http_announcement(&request.node, &body)
+                    .map_err(|_| ipars_http_tunnel::TunnelError::Unauthorized)?;
+                let lifetime = (expires - chrono::Utc::now())
+                    .to_std()
+                    .map_err(|_| ipars_http_tunnel::TunnelError::Unauthorized)?;
+                let opened = hub
+                    .open(
+                        request.node.clone(),
+                        ipars_types::api::DataPlaneTransport::Tcp,
+                        &body,
+                        false,
+                        lifetime,
+                        format!("{session}:{}", request.node),
+                    )
+                    .await?;
+                Ok((hub, opened))
+            })
+        })
     }
 
     pub fn require_operator_api_bearer_token(mut self, token: String) -> Self {
@@ -119,6 +162,7 @@ async fn healthz() -> Json<HealthResponse> {
 
 async fn status(State(state): State<RelayHttpState>) -> Json<RelayStatusResponse> {
     let mut status = state.relay.status().await;
+    status.tcp_endpoint = state.tcp_endpoint;
     if let Some(hub) = &state.http_transport {
         status.http_transports = hub.observations();
     }
@@ -1066,7 +1110,16 @@ mod tests {
                 right_addr: right.local_addr()?,
             })
             .await?;
-        let app = router(RelayHttpState::new(service).with_http_transport(backend, 16));
+        let state = RelayHttpState::new(service).with_http_transport(backend, 16);
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_endpoint = tcp_listener.local_addr()?;
+        let (tcp_shutdown, tcp_receiver) = tokio::sync::watch::channel(false);
+        let tcp_serving = tokio::spawn(ipars_http_tunnel::tcp::serve(
+            tcp_listener,
+            state.tcp_authorizer(),
+            tcp_receiver,
+        ));
+        let app = router(state);
         let announcement = |node: &str, other: &str| {
             encode_relay_endpoint_probe(
                 &admitted.session_id,
@@ -1220,6 +1273,51 @@ mod tests {
             }
         }
         assert!(found);
+        let left_tcp = ipars_http_tunnel::tcp::TcpTunnel::open(
+            tcp_endpoint,
+            &NodeId::from_string("left"),
+            announcement("left", "right")?,
+            None,
+            &Default::default(),
+        )
+        .await?;
+        let mut batch = Vec::new();
+        append_packet(&mut batch, &frame)?;
+        left_tcp.send(batch).await?;
+        let mut found = false;
+        for _ in 0..3 {
+            if collect(right_http.token.clone()).await?.contains(&packet) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "native TCP to HTTP relay failed");
+        let right_tcp = ipars_http_tunnel::tcp::TcpTunnel::open(
+            tcp_endpoint,
+            &NodeId::from_string("right"),
+            announcement("right", "left")?,
+            None,
+            &Default::default(),
+        )
+        .await?;
+        let reply = encode_relay_datagram_with_route(
+            &admitted.session_id,
+            &admitted.session_token,
+            &NodeId::from_string("right"),
+            &NodeId::from_string("left"),
+            &response_packet,
+        )?;
+        let mut batch = Vec::new();
+        append_packet(&mut batch, &reply)?;
+        right_tcp.send(batch).await?;
+        let mut found = false;
+        for _ in 0..3 {
+            if left_tcp.receive().await?.contains(&response_packet) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "native TCP to native TCP relay failed");
         let mut forged = announcement("left", "right")?;
         let last = forged.len() - 1;
         forged[last] ^= 1;
@@ -1235,6 +1333,8 @@ mod tests {
             .status(),
             StatusCode::UNAUTHORIZED
         );
+        tcp_shutdown.send(true)?;
+        tcp_serving.await??;
         shutdown.send(true)?;
         serving.await??;
         Ok(())

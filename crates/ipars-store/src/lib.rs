@@ -439,7 +439,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     ) -> Result<(), ControlPlaneError> {
         sqlx::query("INSERT INTO node_transport_snapshots(node_id, observed_at, record_json) VALUES (?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET observed_at = excluded.observed_at, record_json = excluded.record_json WHERE excluded.observed_at >= node_transport_snapshots.observed_at")
             .bind(record.node_id.as_str()).bind(record.observed_at.timestamp_millis())
-            .bind(serde_json::to_string(&record).map_err(json_error)?)
+            .bind(encode_transport_record(&record)?)
             .execute(&self.pool).await.map_err(sql_error)?;
         Ok(())
     }
@@ -467,7 +467,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         rows.into_iter()
             .map(|row| {
                 let record: String = row.try_get("record_json").map_err(sql_error)?;
-                serde_json::from_str(&record).map_err(json_error)
+                decode_transport_record(&record)
             })
             .collect()
     }
@@ -2391,7 +2391,7 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
     ) -> Result<(), ControlPlaneError> {
         sqlx::query("INSERT INTO node_transport_snapshots(node_id, observed_at, record_json) VALUES ($1, $2, $3) ON CONFLICT(node_id) DO UPDATE SET observed_at = excluded.observed_at, record_json = excluded.record_json WHERE excluded.observed_at >= node_transport_snapshots.observed_at")
             .bind(record.node_id.as_str()).bind(record.observed_at.timestamp_millis())
-            .bind(serde_json::to_string(&record).map_err(json_error)?)
+            .bind(encode_transport_record(&record)?)
             .execute(&self.pool).await.map_err(sql_error)?;
         Ok(())
     }
@@ -2419,7 +2419,7 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         rows.into_iter()
             .map(|row| {
                 let record: String = row.try_get("record_json").map_err(sql_error)?;
-                serde_json::from_str(&record).map_err(json_error)
+                decode_transport_record(&record)
             })
             .collect()
     }
@@ -4469,6 +4469,77 @@ fn node_insert_error(error: sqlx::Error, node_id: &NodeId, vpn_ip: &VpnIp) -> Co
 
 fn json_error(error: serde_json::Error) -> ControlPlaneError {
     ControlPlaneError::Store(error.to_string())
+}
+
+// Keep the v1 `connections` array readable by an older control plane whose
+// transport enum has no TCP variant. New readers restore the optional TCP
+// extension; no control-plane signature payload is changed by this DB codec.
+fn encode_transport_record(
+    record: &ipars_types::api::TransportNodeSnapshot,
+) -> Result<String, ControlPlaneError> {
+    let mut value = serde_json::to_value(record).map_err(json_error)?;
+    let connections = value["snapshot"]["connections"]
+        .as_array_mut()
+        .ok_or_else(|| ControlPlaneError::Store("invalid transport snapshot".to_string()))?;
+    let mut tcp = Vec::new();
+    let mut indices = Vec::new();
+    let mut index = 0_usize;
+    connections.retain(|connection| {
+        let native = connection["transport"] == "tcp";
+        if native {
+            tcp.push(connection.clone());
+            indices.push(index);
+        }
+        index += 1;
+        !native
+    });
+    if !tcp.is_empty() {
+        value["snapshot"]["tcp_connections"] = serde_json::Value::Array(tcp);
+        value["snapshot"]["tcp_connection_indices"] =
+            serde_json::to_value(indices).map_err(json_error)?;
+    }
+    serde_json::to_string(&value).map_err(json_error)
+}
+fn decode_transport_record(
+    record: &str,
+) -> Result<ipars_types::api::TransportNodeSnapshot, ControlPlaneError> {
+    let mut value: serde_json::Value = serde_json::from_str(record).map_err(json_error)?;
+    let snapshot = value["snapshot"]
+        .as_object_mut()
+        .ok_or_else(|| ControlPlaneError::Store("invalid transport snapshot".to_string()))?;
+    let tcp = snapshot
+        .remove("tcp_connections")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let positions = snapshot.remove("tcp_connection_indices");
+    let connections = snapshot
+        .get_mut("connections")
+        .and_then(|value| value.as_array_mut())
+        .ok_or_else(|| ControlPlaneError::Store("invalid transport snapshot".to_string()))?;
+    if let Some(positions) = positions {
+        let positions: Vec<usize> = serde_json::from_value(positions).map_err(json_error)?;
+        let total = connections.len() + tcp.len();
+        let indices = positions.into_iter().collect::<BTreeSet<_>>();
+        if indices.len() != tcp.len() || indices.iter().any(|index| *index >= total) {
+            return Err(ControlPlaneError::Store(
+                "invalid transport ordering".to_string(),
+            ));
+        }
+        let mut legacy = std::mem::take(connections).into_iter();
+        let mut tcp = tcp.into_iter();
+        for index in 0..total {
+            let observation = if indices.contains(&index) {
+                tcp.next()
+            } else {
+                legacy.next()
+            }
+            .ok_or_else(|| ControlPlaneError::Store("invalid transport ordering".to_string()))?;
+            connections.push(observation);
+        }
+    } else {
+        connections.extend(tcp);
+    }
+    serde_json::from_value(value).map_err(json_error)
 }
 
 #[cfg(test)]
@@ -6883,9 +6954,30 @@ mod tests {
         let record = TransportNodeSnapshot {
             node_id: node.node_id.clone(),
             observed_at: now,
-            snapshot: NodeTransportSnapshot::default(),
+            snapshot: {
+                let mut connection = ipars_types::api::TransportObservation::new(
+                    node.node_id.clone(),
+                    "tcp://8.8.8.8:51820".to_string(),
+                );
+                connection.transport = ipars_types::api::DataPlaneTransport::Tcp;
+                let mut udp = connection.clone();
+                udp.transport = ipars_types::api::DataPlaneTransport::Udp;
+                NodeTransportSnapshot {
+                    connections: vec![connection, udp],
+                    ..Default::default()
+                }
+            },
         };
         first.upsert_transport_snapshot(record.clone()).await?;
+        let stored: String = sqlx::query_scalar(
+            "SELECT record_json FROM node_transport_snapshots WHERE node_id = ?",
+        )
+        .bind(node.node_id.as_str())
+        .fetch_one(&first.pool)
+        .await?;
+        let legacy: serde_json::Value = serde_json::from_str(&stored)?;
+        assert_eq!(legacy["snapshot"]["connections"][0]["transport"], "udp");
+        assert_eq!(legacy["snapshot"]["tcp_connections"][0]["transport"], "tcp");
         let mut stale = record.clone();
         stale.observed_at = now - Duration::seconds(1);
         first.upsert_transport_snapshot(stale).await?;

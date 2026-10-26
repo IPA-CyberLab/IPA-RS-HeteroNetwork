@@ -120,6 +120,8 @@ spec:
         - protocol: UDP
           port: {{ .Values.agent.relayService.udpTargetPort }}
         - protocol: TCP
+          port: {{ .Values.agent.relayService.udpTargetPort }}
+        - protocol: TCP
           port: {{ .Values.agent.relayService.httpTargetPort }}
 {{- end }}
 {{- if and $networkPolicyEnabled $kubernetesPluginEnabled }}

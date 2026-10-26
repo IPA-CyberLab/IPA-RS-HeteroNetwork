@@ -13,6 +13,7 @@ public sealed record TunnelProfile(
     string GatewayEndpoint,
     IReadOnlyList<string> AllowedIps)
 {
+    public IReadOnlyList<string> TcpTunnelEndpoints { get; init; } = [];
     public IReadOnlyList<string> HttpTunnelUrls { get; init; } = [];
     public static TunnelProfile FromSession(ClientSession session, int gatewayIndex = 0)
     {
@@ -78,6 +79,8 @@ public sealed record TunnelProfile(
             endpoint.Address,
             allowedIps)
         {
+            TcpTunnelEndpoints = session.PeerMap.TcpTunnelEndpoints.TryGetValue(gateway.NodeId, out var tcpEndpoints)
+                ? tcpEndpoints : [],
             HttpTunnelUrls = session.PeerMap.HttpTunnelUrls.TryGetValue(gateway.NodeId, out var urls) ? urls : [],
         };
     }

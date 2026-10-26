@@ -4577,6 +4577,8 @@ mod tests {
         Json(RotateWireGuardKeyResponse {
             node,
             peer_map: PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -6986,6 +6988,8 @@ mod tests {
             Vec::new(),
         );
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -7229,6 +7233,8 @@ mod tests {
         };
         runtime
             .record_peer_map_snapshot(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -8296,6 +8302,8 @@ mod tests {
         peer.wireguard_public_key = client.wireguard_public_key_b64;
         runtime
             .record_peer_map_snapshot(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: Some(1),
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::new(),
@@ -8305,7 +8313,8 @@ mod tests {
             })
             .await;
         let backend = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
-        let app = crate::transport::router(runtime.clone(), backend.local_addr()?, None);
+        let (app, tcp_authorize) =
+            crate::transport::transports(runtime.clone(), backend.local_addr()?, None);
         let mut first = vec![0; 148];
         first[0] = 1;
         let body = ipars_http_tunnel::encode_open(&first, &Default::default())?;
@@ -8341,6 +8350,29 @@ mod tests {
             app.clone().oneshot(request(body, &proof)?).await?.status(),
             StatusCode::UNAUTHORIZED
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = listener.local_addr()?;
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let tcp = tokio::spawn(ipars_http_tunnel::tcp::serve(
+            listener,
+            tcp_authorize,
+            receiver,
+        ));
+        let connection = ipars_http_tunnel::tcp::TcpTunnel::open(
+            endpoint,
+            &client.node_id,
+            first,
+            Some(&auth),
+            &Default::default(),
+        )
+        .await?;
+        assert_eq!(
+            runtime.transport_snapshot().await.connections[0].transport,
+            ipars_types::api::DataPlaneTransport::Tcp
+        );
+        drop(connection);
+        shutdown.send(true)?;
+        tcp.await??;
         let observed = runtime.transport_snapshot().await;
         assert_eq!(observed.connections.len(), 1);
         assert_eq!(observed.connections[0].peer, client.node_id);

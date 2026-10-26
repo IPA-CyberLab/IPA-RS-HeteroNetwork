@@ -408,11 +408,12 @@ test("transport panel shows HTTP fallback, failures and stale reports", async ({
     await route.fulfill({ json: { items: [{ node_id: nodes[0].node.node_id, observed_at: new Date().toISOString(), snapshot: { connections: [{
       peer: nodes[1].node.node_id, direction: "outgoing", transport: "https", phase: "connected", endpoint: "https://8.8.8.8/v1/tunnels/wireguard/open",
       tx_bytes: 1048576, rx_bytes: 2097152, switches: 2, reconnects: 1, fallback_reason: "udp_probe_timeout", failures: { https_unavailable: 1 }, updated_at: new Date().toISOString(),
-    }] } }], unreported: [nodes[2].node.node_id], next_cursor: null } });
+    }, { peer: nodes[3].node.node_id, direction:"outgoing",transport:"tcp",phase:"connected",endpoint:"tcp://8.8.8.8:51820",tx_bytes:4096,rx_bytes:8192,switches:1,reconnects:0,updated_at:new Date().toISOString() }] } }], unreported: [nodes[2].node.node_id], next_cursor: null } });
   });
   await page.goto("/ui/#/transports");
   await expect(page.getByRole("heading", { name: "通信方式", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "HTTPS / TCP", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "TCP", exact:true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "1 MiB / 2 MiB", exact: true })).toBeVisible();
   await expect(page.getByText("UDP応答なし", { exact: true })).toBeVisible();
   await expect(page.getByText("HTTPS接続失敗: 1", { exact: true })).toBeVisible();

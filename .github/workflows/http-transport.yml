@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
   push:
     branches: [master]
-    paths: ['crates/**', 'clients/transport/**', 'Cargo.toml', 'Cargo.lock', 'webui/src/**', 'webui/e2e/**', '.github/workflows/http-transport.yml']
+    paths: ['crates/**', 'charts/**', 'docker/**', 'scripts/helm-smoke.sh', 'clients/transport/**', 'Cargo.toml', 'Cargo.lock', 'webui/src/**', 'webui/e2e/**', '.github/workflows/http-transport.yml']
   pull_request:
-    paths: ['crates/**', 'clients/transport/**', 'Cargo.toml', 'Cargo.lock', 'webui/src/**', 'webui/e2e/**', '.github/workflows/http-transport.yml']
+    paths: ['crates/**', 'charts/**', 'docker/**', 'scripts/helm-smoke.sh', 'clients/transport/**', 'Cargo.toml', 'Cargo.lock', 'webui/src/**', 'webui/e2e/**', '.github/workflows/http-transport.yml']
 permissions:
   contents: read
 concurrency:
@@ -42,7 +42,7 @@ jobs:
         with: {persist-credentials: false}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: {go-version: '1.27.2', cache: false}
-      - name: Test HTTP and verified HTTPS fallback with race detection
+      - name: Test TCP, HTTP and verified HTTPS fallback with race detection
         working-directory: clients/transport
         run: go test -mod=readonly -race ./...
       - name: Build the actual native transport process
@@ -59,3 +59,14 @@ jobs:
       - run: npm run test:webui
       - run: npx playwright install --with-deps chromium
       - run: npm run test:webui:e2e -- --workers=2
+
+  helm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HETERONETWORK_HELM_IMAGE: alpine/helm@sha256:31ce11c4ee98c5e1e13628ead9212e665f32c3277cae63bd55ced32989089f3e
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: {persist-credentials: false}
+      - name: Validate chart ports and network policies
+        run: scripts/helm-smoke.sh

@@ -137,7 +137,7 @@ func TestUDPBlockedFallbackHTTPSAndHTTP(t *testing.T) {
 				httpTransport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 			}
 			client := &http.Client{Transport: httpTransport, Timeout: 25 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-			p, err := start(Configuration{ClientNodeID: "client", GatewayNodeID: "gateway", PrivateKey: private, GatewayWireGuardPublicKey: public, GatewayEndpoint: blackhole.LocalAddr().String(), GatewayHTTPTunnelURLs: []string{server.URL + "/v1/tunnels/wireguard/open"}}, client)
+			p, err := start(Configuration{ClientNodeID: "client", GatewayNodeID: "gateway", PrivateKey: private, GatewayWireGuardPublicKey: public, GatewayEndpoint: blackhole.LocalAddr().String(), GatewayTCPTunnelEndpoints: []string{"127.0.0.1:1"}, GatewayHTTPTunnelURLs: []string{server.URL + "/v1/tunnels/wireguard/open"}}, client)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -162,6 +162,9 @@ func TestUDPBlockedFallbackHTTPSAndHTTP(t *testing.T) {
 			}
 			if status.Transport != expectedMode || status.Switches != 1 || status.RXBytes == 0 {
 				t.Fatalf("missing telemetry: %+v", status)
+			}
+			if status.Failures["tcp_unavailable"] != 1 {
+				t.Fatal("TCP failure was not recorded before HTTP fallback")
 			}
 			status.Failures["outside_mutation"] = 9
 			if p.Snapshot().Failures["outside_mutation"] != 0 {

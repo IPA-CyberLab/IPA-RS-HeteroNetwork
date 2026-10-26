@@ -1082,6 +1082,8 @@ pub struct AgentRuntime {
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
     http_gateway: std::sync::RwLock<Option<Arc<ipars_http_tunnel::TunnelHub>>>,
     http_gateway_urls: std::sync::RwLock<Vec<String>>,
+    tcp_gateway_port: std::sync::RwLock<Option<u16>>,
+    tcp_relay_endpoints: tokio::sync::RwLock<Vec<SocketAddr>>,
     relay_http_status: tokio::sync::RwLock<Vec<ipars_types::api::TransportObservation>>,
     udp_transport_status: tokio::sync::RwLock<Vec<ipars_types::api::TransportObservation>>,
     http_peer_keys: tokio::sync::RwLock<BTreeMap<NodeId, String>>,
@@ -1264,6 +1266,7 @@ impl AgentRelayAdmissionFailureReasonCounters {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelaySessionState {
+    pub relay_tcp_endpoints: Vec<SocketAddr>,
     pub relay_http_urls: Vec<String>,
     pub peer: NodeId,
     pub relay_node: NodeId,
@@ -1277,6 +1280,7 @@ pub struct RelaySessionState {
 
 #[derive(Debug)]
 struct HttpTransportTask {
+    tcp_endpoints: Vec<SocketAddr>,
     udp_endpoint: SocketAddr,
     urls: Vec<String>,
     public_key: String,
@@ -1926,6 +1930,8 @@ impl AgentRuntime {
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
             http_gateway: std::sync::RwLock::new(None),
             http_gateway_urls: std::sync::RwLock::new(Vec::new()),
+            tcp_gateway_port: std::sync::RwLock::new(None),
+            tcp_relay_endpoints: tokio::sync::RwLock::new(Vec::new()),
             relay_http_status: tokio::sync::RwLock::new(Vec::new()),
             udp_transport_status: tokio::sync::RwLock::new(Vec::new()),
             http_peer_keys: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -2269,6 +2275,16 @@ impl AgentRuntime {
         *self.udp_transport_status.write().await = observations;
     }
 
+    pub fn set_tcp_gateway_port(&self, port: u16) {
+        *self
+            .tcp_gateway_port
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(port);
+    }
+    pub async fn set_tcp_relay_endpoints(&self, endpoints: Vec<SocketAddr>) {
+        *self.tcp_relay_endpoints.write().await = endpoints;
+    }
+
     pub async fn transport_snapshot(&self) -> ipars_types::api::NodeTransportSnapshot {
         let mut connections = self
             .http_transport_status
@@ -2298,7 +2314,24 @@ impl AgentRuntime {
             connections.extend(hub.observations());
         }
         connections.truncate(4096);
+        let public_ip = self
+            .nat_classification
+            .read()
+            .await
+            .as_ref()
+            .and_then(NatClassification::publicly_reachable_ip);
+        let tcp_tunnel_endpoints = public_ip
+            .zip(
+                *self
+                    .tcp_gateway_port
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+            .map(|(ip, port)| vec![SocketAddr::new(ip, port)])
+            .unwrap_or_default();
         ipars_types::api::NodeTransportSnapshot {
+            tcp_tunnel_endpoints,
+            tcp_relay_endpoints: self.tcp_relay_endpoints.read().await.clone(),
             http_tunnel_urls: self
                 .http_gateway_urls
                 .read()
@@ -2322,7 +2355,15 @@ impl AgentRuntime {
             .and_then(|map| map.http_tunnel_urls.get(&peer.node_id))
             .cloned()
             .unwrap_or_default();
-        if urls.is_empty() {
+        let tcp_endpoints = self
+            .latest_peer_map
+            .read()
+            .await
+            .as_ref()
+            .and_then(|map| map.tcp_tunnel_endpoints.get(&peer.node_id))
+            .cloned()
+            .unwrap_or_default();
+        if urls.is_empty() && tcp_endpoints.is_empty() {
             return Ok(None);
         }
         let mut tasks = self.http_transport_tasks.lock().await;
@@ -2330,6 +2371,7 @@ impl AgentRuntime {
             if !task.task.is_finished()
                 && task.udp_endpoint == endpoint
                 && task.urls == urls
+                && task.tcp_endpoints == tcp_endpoints
                 && task.public_key == peer.wireguard_public_key
             {
                 return Ok(Some(task.local_endpoint));
@@ -2363,6 +2405,7 @@ impl AgentRuntime {
             ipars_types::api::TransportObservation::new(peer.node_id.clone(), endpoint.to_string()),
         ));
         let proxy = ipars_http_tunnel::DatagramProxy {
+            tcp_endpoints: tcp_endpoints.clone(),
             node: state.node_id,
             peer: peer.node_id.clone(),
             udp_endpoint: endpoint,
@@ -2384,6 +2427,7 @@ impl AgentRuntime {
         tasks.insert(
             peer.node_id.clone(),
             HttpTransportTask {
+                tcp_endpoints,
                 udp_endpoint: endpoint,
                 urls,
                 public_key: peer.wireguard_public_key.clone(),
@@ -4928,19 +4972,38 @@ impl AgentRuntime {
                 peer_map.http_tunnel_protocol = previous.http_tunnel_protocol;
             }
         }
+        if peer_map.tcp_tunnel_protocol.is_none() {
+            if let Some(previous) = self.latest_peer_map.read().await.as_ref() {
+                peer_map.tcp_tunnel_endpoints = previous
+                    .tcp_tunnel_endpoints
+                    .iter()
+                    .filter(|(id, _)| {
+                        peer_map.peers.iter().any(|node| {
+                            &node.node_id == *id
+                                && previous.peers.iter().any(|old| {
+                                    old.node_id == node.node_id
+                                        && old.wireguard_public_key == node.wireguard_public_key
+                                })
+                        })
+                    })
+                    .map(|(id, endpoints)| (id.clone(), endpoints.clone()))
+                    .collect();
+                peer_map.tcp_tunnel_protocol = previous.tcp_tunnel_protocol;
+            }
+        }
         *self.http_peer_keys.write().await = peer_map
             .peers
             .iter()
             .map(|peer| (peer.node_id.clone(), peer.wireguard_public_key.clone()))
             .collect();
-        self.http_transport_tasks
-            .lock()
-            .await
-            .retain(|peer, _| peer_map.http_tunnel_urls.contains_key(peer));
-        self.http_transport_status
-            .write()
-            .await
-            .retain(|peer, _| peer_map.http_tunnel_urls.contains_key(peer));
+        self.http_transport_tasks.lock().await.retain(|peer, _| {
+            peer_map.http_tunnel_urls.contains_key(peer)
+                || peer_map.tcp_tunnel_endpoints.contains_key(peer)
+        });
+        self.http_transport_status.write().await.retain(|peer, _| {
+            peer_map.http_tunnel_urls.contains_key(peer)
+                || peer_map.tcp_tunnel_endpoints.contains_key(peer)
+        });
         let current_peers = peer_map
             .peers
             .iter()
@@ -8946,6 +9009,13 @@ pub fn bootstrap_peer_map_cache(
     }
 
     let cache = PeerMap {
+        tcp_tunnel_protocol: peer_map.tcp_tunnel_protocol,
+        tcp_tunnel_endpoints: peer_map
+            .tcp_tunnel_endpoints
+            .iter()
+            .filter(|(id, _)| peers.iter().any(|peer| &peer.node_id == *id))
+            .map(|(id, endpoints)| (id.clone(), endpoints.clone()))
+            .collect(),
         http_tunnel_protocol: peer_map.http_tunnel_protocol,
         http_tunnel_urls: peer_map
             .http_tunnel_urls
@@ -8965,6 +9035,7 @@ pub fn bootstrap_peer_map_cache(
 fn bootstrap_peer_cache_recovery_eq(left: &PeerMap, right: &PeerMap) -> bool {
     left.cluster_id == right.cluster_id
         && left.http_tunnel_urls == right.http_tunnel_urls
+        && left.tcp_tunnel_endpoints == right.tcp_tunnel_endpoints
         && left.bootstrap_endpoints == right.bootstrap_endpoints
         && left.peers.len() == right.peers.len()
         && left.peers.iter().zip(&right.peers).all(|(left, right)| {
@@ -10602,6 +10673,8 @@ mod tests {
             peers.push(peer);
         }
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -10998,6 +11071,7 @@ mod tests {
         let peer = NodeId::from_string("peer-a");
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11358,6 +11432,7 @@ mod tests {
         );
         let peer = NodeId::from_string("peer-a");
         let session = RelaySessionState {
+            relay_tcp_endpoints: Vec::new(),
             relay_http_urls: Vec::new(),
             peer: peer.clone(),
             relay_node: NodeId::from_string("relay-a"),
@@ -11386,6 +11461,7 @@ mod tests {
         let active_peer = NodeId::from_string("peer-active");
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: expired_peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11399,6 +11475,7 @@ mod tests {
             .await;
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: active_peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11449,6 +11526,7 @@ mod tests {
         let expired_peer = NodeId::from_string("peer-expired");
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: expired_peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11488,6 +11566,7 @@ mod tests {
         let peer = NodeId::from_string("peer-a");
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11522,6 +11601,7 @@ mod tests {
         let active_peer = NodeId::from_string("peer-active");
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: expired_peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11534,6 +11614,7 @@ mod tests {
             })
             .await;
         let active_session = RelaySessionState {
+            relay_tcp_endpoints: Vec::new(),
             relay_http_urls: Vec::new(),
             peer: active_peer.clone(),
             relay_node: NodeId::from_string("relay-a"),
@@ -11574,6 +11655,7 @@ mod tests {
         let peer = NodeId::from_string("peer-a");
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11634,6 +11716,7 @@ mod tests {
             .await?;
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: peer.clone(),
                 relay_node,
@@ -11676,6 +11759,7 @@ mod tests {
         let peer = NodeId::from_string("peer-a");
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: peer.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11760,6 +11844,7 @@ mod tests {
             .await?;
         let forwarder = UdpRelayFrameForwarder::new(
             RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: NodeId::from_string("right"),
                 relay_node: admission.relay_node,
@@ -11811,6 +11896,7 @@ mod tests {
         ));
         let forwarder = UdpRelayFrameForwarder::new(
             RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: NodeId::from_string("right"),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11889,6 +11975,7 @@ mod tests {
         ));
         let forwarder = UdpRelayFrameForwarder::new(
             RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: NodeId::from_string("right"),
                 relay_node: NodeId::from_string("relay-a"),
@@ -11967,6 +12054,7 @@ mod tests {
         ));
         let forwarder = UdpRelayFrameForwarder::new(
             RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: NodeId::from_string("right"),
                 relay_node: NodeId::from_string("relay-a"),
@@ -12086,6 +12174,7 @@ mod tests {
         ));
         let forwarder = UdpRelayFrameForwarder::new(
             RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: NodeId::from_string("right"),
                 relay_node: admission.relay_node.clone(),
@@ -12526,6 +12615,8 @@ mod tests {
         )
         .with_lazy_connect_runtime(runtime.clone());
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -12573,6 +12664,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -12857,6 +12950,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -12900,6 +12995,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -12961,6 +13058,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13011,6 +13110,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13053,6 +13154,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13115,6 +13218,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13171,6 +13276,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13215,6 +13322,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13277,6 +13386,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13372,6 +13483,8 @@ mod tests {
 
         let summary = applier
             .apply_bootstrap_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13430,6 +13543,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13452,6 +13567,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13514,6 +13631,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13574,6 +13693,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13628,6 +13749,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13638,6 +13761,8 @@ mod tests {
             .await?;
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13702,6 +13827,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13712,6 +13839,8 @@ mod tests {
             .await?;
         let summary = applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13763,6 +13892,7 @@ mod tests {
             .await?;
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: peer_id.clone(),
                 relay_node: relay_id,
@@ -13802,6 +13932,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -13847,6 +13979,7 @@ mod tests {
             .await;
         runtime
             .upsert_relay_session(RelaySessionState {
+                relay_tcp_endpoints: Vec::new(),
                 relay_http_urls: Vec::new(),
                 peer: peer_id.clone(),
                 relay_node: NodeId::from_string("relay-a"),
@@ -13896,6 +14029,8 @@ mod tests {
             Vec::new(),
         );
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -14251,6 +14386,8 @@ mod tests {
         );
         pinned_peer.role = Role::control_plane();
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -14344,6 +14481,8 @@ mod tests {
             Vec::new(),
         );
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -14402,6 +14541,8 @@ mod tests {
         );
         client.role = Role::client();
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -15213,6 +15354,8 @@ mod tests {
         let mut peers = backbone.clone();
         peers.push(route_owner.clone());
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -15325,6 +15468,8 @@ mod tests {
         runtime.record_neighbor_map_snapshot(neighbor_map).await?;
         runtime
             .record_peer_map_snapshot(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -15812,6 +15957,8 @@ mod tests {
         }];
         runtime.record_neighbor_map_snapshot(neighbor_map).await?;
         let empty_peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
@@ -16035,6 +16182,8 @@ mod tests {
 
         runtime
             .record_peer_map_snapshot(PeerMap {
+                tcp_tunnel_protocol: None,
+                tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
                 http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -17939,6 +18088,8 @@ mod tests {
     async fn peer_map_sync_fetches_and_applies_once() -> Result<(), AgentError> {
         let node_id = NodeId::from_string("local");
         let peer_map = PeerMap {
+            tcp_tunnel_protocol: None,
+            tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
             http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),

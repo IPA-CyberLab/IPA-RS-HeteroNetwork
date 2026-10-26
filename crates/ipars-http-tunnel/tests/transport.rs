@@ -315,6 +315,13 @@ async fn responder(socket: UdpSocket, mut tunnel: Tunn) {
 
 #[tokio::test]
 async fn udp_blackhole_falls_back_and_carries_real_encrypted_wireguard_bidirectionally() {
+    encrypted_fallback(false).await;
+}
+#[tokio::test]
+async fn udp_blackhole_uses_native_tcp_without_http_and_recovers_udp() {
+    encrypted_fallback(true).await;
+}
+async fn encrypted_fallback(native_tcp: bool) {
     let backend = UdpSocket::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|error| panic!("test fixture failed: {error:?}"));
@@ -324,6 +331,50 @@ async fn udp_blackhole_falls_back_and_carries_real_encrypted_wireguard_bidirecti
         .unwrap_or_else(|error| panic!("test fixture failed: {error:?}"));
     let responder = tokio::spawn(responder(backend, server));
     let (url, hub, http_server) = fixture(backend_addr).await;
+    let (tcp_shutdown, tcp_receiver) = watch::channel(false);
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("TCP fixture: {e}"));
+    let tcp_endpoint = tcp_listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("TCP fixture: {e}"));
+    let tcp_hub = hub.clone();
+    let (_, tcp_auth) = auths();
+    let authorize: ipars_http_tunnel::tcp::Authorizer = Arc::new(move |request, body| {
+        let hub = tcp_hub.clone();
+        let auth = tcp_auth.clone();
+        Box::pin(async move {
+            if request.relay {
+                return Err(TunnelError::Unauthorized);
+            }
+            auth.verify(
+                &request.node,
+                request.timestamp,
+                &request.nonce,
+                &body,
+                &request.proof,
+            )?;
+            hub.consume_nonce(&request.node, &request.nonce, request.timestamp)?;
+            let (first, diagnostics) = decode_open(&body)?;
+            let opened = hub
+                .open(
+                    request.node.clone(),
+                    DataPlaneTransport::Tcp,
+                    first,
+                    false,
+                    Duration::from_secs(300),
+                    request.node.to_string(),
+                )
+                .await?;
+            hub.diagnostics(&opened.token, diagnostics).await?;
+            Ok((hub, opened))
+        })
+    });
+    let tcp_server = tokio::spawn(ipars_http_tunnel::tcp::serve(
+        tcp_listener,
+        authorize,
+        tcp_receiver,
+    ));
     // A bound socket intentionally discards every outgoing WAN UDP packet.
     let blackhole = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -347,6 +398,11 @@ async fn udp_blackhole_falls_back_and_carries_real_encrypted_wireguard_bidirecti
     let (shutdown, receiver) = watch::channel(false);
     let (auth, _) = auths();
     let proxy = DatagramProxy {
+        tcp_endpoints: if native_tcp {
+            vec![tcp_endpoint]
+        } else {
+            Vec::new()
+        },
         node: id("client"),
         peer: id("gateway"),
         udp_endpoint: blackhole
@@ -355,7 +411,7 @@ async fn udp_blackhole_falls_back_and_carries_real_encrypted_wireguard_bidirecti
         wireguard_endpoint: wireguard
             .local_addr()
             .unwrap_or_else(|error| panic!("test fixture failed: {error:?}")),
-        open_urls: vec![url],
+        open_urls: if native_tcp { Vec::new() } else { vec![url] },
         relay: None,
         auth: Some(auth),
         status: status.clone(),
@@ -413,7 +469,14 @@ async fn udp_blackhole_falls_back_and_carries_real_encrypted_wireguard_bidirecti
         .lock()
         .unwrap_or_else(|error| panic!("test fixture failed: {error:?}"))
         .clone();
-    assert_eq!(snapshot.transport, DataPlaneTransport::Http);
+    assert_eq!(
+        snapshot.transport,
+        if native_tcp {
+            DataPlaneTransport::Tcp
+        } else {
+            DataPlaneTransport::Http
+        }
+    );
     assert!(snapshot.tx_bytes > 0 && snapshot.rx_bytes > 0);
     assert_eq!(snapshot.failures["udp_probe_timeout"], 1);
     assert!(hub
@@ -483,6 +546,8 @@ async fn udp_blackhole_falls_back_and_carries_real_encrypted_wireguard_bidirecti
         .unwrap_or_else(|error| panic!("test fixture failed: {error:?}"));
     responder.abort();
     http_server.abort();
+    let _ = tcp_shutdown.send(true);
+    let _ = tcp_server.await;
 }
 
 #[tokio::test]
@@ -553,4 +618,52 @@ async fn hub_replaces_same_scope_rejects_concurrent_polls_and_reclaims_closed_cl
         )
         .await
         .is_ok());
+}
+
+#[tokio::test]
+async fn tcp_rejects_unbounded_and_http_openings_before_authorization() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("bind: {e}"));
+    let endpoint = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("address: {e}"));
+    let authorize: ipars_http_tunnel::tcp::Authorizer =
+        Arc::new(|_, _| Box::pin(async { panic!("invalid opening reached authorization") }));
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(ipars_http_tunnel::tcp::serve(listener, authorize, receiver));
+    for invalid_http in [true, false] {
+        let mut stream = tokio::net::TcpStream::connect(endpoint)
+            .await
+            .unwrap_or_else(|e| panic!("connect: {e}"));
+        if invalid_http {
+            stream
+                .write_all(b"GET / HTTP/1.1\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("write: {e}"));
+        } else {
+            stream
+                .write_all(ipars_http_tunnel::tcp::PREFACE)
+                .await
+                .unwrap_or_else(|e| panic!("write: {e}"));
+            stream
+                .write_u16(4097)
+                .await
+                .unwrap_or_else(|e| panic!("write: {e}"));
+            stream
+                .write_u32(1)
+                .await
+                .unwrap_or_else(|e| panic!("write: {e}"));
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream.read_u8())
+                .await
+                .unwrap_or_else(|e| panic!("bounded rejection: {e}"))
+                .unwrap_or_else(|e| panic!("read: {e}")),
+            1
+        );
+    }
+    let _ = shutdown.send(true);
+    let _ = task.await;
 }

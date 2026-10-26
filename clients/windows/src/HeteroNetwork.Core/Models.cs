@@ -143,14 +143,27 @@ public sealed record PeerMap(
     [JsonPropertyName("http_tunnel_protocol")]
     public int? HttpTunnelProtocol { get; init; }
 
+    [JsonPropertyName("tcp_tunnel_endpoints")]
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> TcpTunnelEndpoints { get; init; }
+        = new Dictionary<string, IReadOnlyList<string>>();
+    [JsonPropertyName("tcp_tunnel_protocol")]
+    public int? TcpTunnelProtocol { get; init; }
+
     public PeerMap PreserveLegacyTransport(PeerMap previous)
     {
-        if (HttpTunnelProtocol is not null) return this;
-        var retained = previous.HttpTunnelUrls.Where(entry => Peers.Any(node =>
-            node.NodeId == entry.Key && previous.Peers.Any(old =>
-                old.NodeId == node.NodeId && old.WireGuardPublicKey == node.WireGuardPublicKey)))
-            .ToDictionary(entry => entry.Key, entry => entry.Value);
-        return this with { HttpTunnelUrls = retained, HttpTunnelProtocol = previous.HttpTunnelProtocol };
+        IReadOnlyDictionary<string, IReadOnlyList<string>> Retained(
+            IReadOnlyDictionary<string, IReadOnlyList<string>> catalog) =>
+            catalog.Where(entry => Peers.Any(node =>
+                node.NodeId == entry.Key && previous.Peers.Any(old =>
+                    old.NodeId == node.NodeId && old.WireGuardPublicKey == node.WireGuardPublicKey)))
+                .ToDictionary(entry => entry.Key, entry => entry.Value);
+        return this with
+        {
+            HttpTunnelUrls = HttpTunnelProtocol is null ? Retained(previous.HttpTunnelUrls) : HttpTunnelUrls,
+            HttpTunnelProtocol = HttpTunnelProtocol ?? previous.HttpTunnelProtocol,
+            TcpTunnelEndpoints = TcpTunnelProtocol is null ? Retained(previous.TcpTunnelEndpoints) : TcpTunnelEndpoints,
+            TcpTunnelProtocol = TcpTunnelProtocol ?? previous.TcpTunnelProtocol,
+        };
     }
 }
 

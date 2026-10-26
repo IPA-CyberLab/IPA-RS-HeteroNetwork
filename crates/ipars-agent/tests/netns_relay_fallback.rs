@@ -310,6 +310,7 @@ async fn run_forwarder() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let forwarder = UdpRelayFrameForwarder::new(
         RelaySessionState {
+            relay_tcp_endpoints: Vec::new(),
             relay_http_urls: Vec::new(),
             peer: NodeId::from_string(RIGHT_NODE),
             relay_node: NodeId::from_string(RELAY_NODE),

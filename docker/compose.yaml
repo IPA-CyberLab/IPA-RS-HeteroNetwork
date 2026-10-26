@@ -145,6 +145,7 @@ services:
       - HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_PATH=/run/secrets/heteronetwork-relay-operator-api-bearer-token
     ports:
       - "51820:51820/udp"
+      - "51820:51820/tcp"
       - "9580:9580"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9580/healthz >/dev/null"]

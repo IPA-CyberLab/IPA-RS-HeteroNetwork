@@ -14,6 +14,7 @@ internal sealed class TunnelTransportConfiguration
     [JsonPropertyName("gateway_endpoint")] public string GatewayEndpoint { get; set; } = "";
     [JsonPropertyName("gateway_wireguard_public_key")] public string GatewayWireGuardPublicKey { get; set; } = "";
     [JsonPropertyName("gateway_http_tunnel_urls")] public IReadOnlyList<string> GatewayHttpTunnelUrls { get; set; } = [];
+    [JsonPropertyName("gateway_tcp_tunnel_endpoints")] public IReadOnlyList<string> GatewayTcpTunnelEndpoints {get;set;} = [];
     [JsonPropertyName("private_key")] public string? PrivateKey { get; set; }
     [JsonPropertyName("proxy_url")] public string? ProxyUrl { get; set; }
 }

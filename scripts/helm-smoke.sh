@@ -702,6 +702,8 @@ assert_rendered_contains relay-service "--relay-node-id-path"
 assert_rendered_contains relay-service "HETERONETWORK_RELAY_PUBLIC_ENDPOINT"
 assert_rendered_contains relay-service "containerPort: 51830"
 assert_rendered_contains relay-service "targetPort: 51830"
+assert_rendered_contains relay-service "name: relay-tcp"
+assert_rendered_contains relay-service "appProtocol: heteronetwork.io/relay-tcp"
 assert_rendered_contains relay-service "readOnlyRootFilesystem: true"
 
 template_fails relay-advertisement-loopback-public-endpoint \

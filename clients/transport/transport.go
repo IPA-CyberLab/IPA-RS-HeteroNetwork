@@ -28,6 +28,7 @@ const transportMaximumPacket = 65507
 const transportMaximumBatch = 256 * 1024
 
 type Configuration struct {
+	GatewayTCPTunnelEndpoints []string `json:"gateway_tcp_tunnel_endpoints,omitempty"`
 	ClientNodeID              string   `json:"client_node_id"`
 	GatewayNodeID             string   `json:"gateway_node_id"`
 	PrivateKey                string   `json:"private_key"`
@@ -115,10 +116,13 @@ func transportProof(key []byte, node, gateway string, timestamp int64, nonce str
 }
 
 func Start(configuration Configuration) (*Proxy, error) {
-	if len(configuration.GatewayHTTPTunnelURLs) == 0 {
+	if len(configuration.GatewayHTTPTunnelURLs) == 0 && len(configuration.GatewayTCPTunnelEndpoints) == 0 {
 		return nil, nil
 	}
 	if err := ValidateURLs(configuration.GatewayHTTPTunnelURLs); err != nil {
+		return nil, err
+	}
+	if err := ValidateTCPEndpoints(configuration.GatewayTCPTunnelEndpoints); err != nil {
 		return nil, err
 	}
 	for _, node := range []string{configuration.ClientNodeID, configuration.GatewayNodeID} {
@@ -233,15 +237,11 @@ type transportOpen struct {
 func (p *Proxy) open(ctx context.Context, endpoint string, first []byte) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	p.mu.Lock()
-	diagnostics, encodeErr := json.Marshal(p.status.Failures)
-	p.mu.Unlock()
-	if encodeErr != nil || len(diagnostics) > 2048 {
-		return "", errors.New("invalid transport diagnostics")
+	body, err := p.openingBody(first)
+	if err != nil {
+		return "", err
 	}
-	body := append([]byte("HNT1"), byte(len(diagnostics)>>8), byte(len(diagnostics)))
-	body = append(body, diagnostics...)
-	body = append(body, first...)
+
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -462,7 +462,11 @@ func (p *Proxy) run(ctx context.Context) {
 			outgoing = nil
 			p.mu.Lock()
 			p.status.Phase = "reconnecting"
-			p.status.LastError = "http_tunnel_unavailable"
+			if p.status.Transport == "tcp" {
+				p.status.LastError = "tcp_tunnel_unavailable"
+			} else {
+				p.status.LastError = "http_tunnel_unavailable"
+			}
 			p.status.Reconnects++
 			p.mu.Unlock()
 			retryAt = time.Now().Add(backoff)
@@ -500,8 +504,24 @@ func (p *Proxy) run(ctx context.Context) {
 			p.status.Failures["udp_probe_timeout"]++
 			p.mu.Unlock()
 			go func() {
+				var stream *tcpSession
 				var token, endpoint string
-				for _, candidate := range p.configuration.GatewayHTTPTunnelURLs {
+				for _, candidate := range p.configuration.GatewayTCPTunnelEndpoints {
+					opened, err := p.openTCP(httpCtx, candidate, initial)
+					if err == nil {
+						stream = opened
+						endpoint = "tcp://" + candidate
+						break
+					}
+					p.mu.Lock()
+					p.status.Failures["tcp_unavailable"]++
+					p.mu.Unlock()
+				}
+				httpCandidates := p.configuration.GatewayHTTPTunnelURLs
+				if stream != nil {
+					httpCandidates = nil
+				}
+				for _, candidate := range httpCandidates {
 					if opened, err := p.open(httpCtx, candidate, initial); err == nil {
 						token = opened
 						endpoint = candidate
@@ -516,7 +536,7 @@ func (p *Proxy) run(ctx context.Context) {
 						p.mu.Unlock()
 					}
 				}
-				if token == "" {
+				if token == "" && stream == nil {
 					if httpCtx.Err() == nil {
 						select {
 						case failures <- httpGeneration:
@@ -525,10 +545,28 @@ func (p *Proxy) run(ctx context.Context) {
 					}
 					return
 				}
+				if stream != nil {
+					defer stream.close()
+					done := make(chan struct{})
+					defer close(done)
+					go func() {
+						select {
+						case <-httpCtx.Done():
+							stream.close()
+						case <-done:
+						}
+					}()
+				}
+				if httpCtx.Err() != nil {
+					return
+				}
+
 				packetsURL := strings.TrimSuffix(endpoint, "/open") + "/packets"
 				p.mu.Lock()
 				mode := "http"
-				if strings.HasPrefix(endpoint, "https:") {
+				if strings.HasPrefix(endpoint, "tcp:") {
+					mode = "tcp"
+				} else if strings.HasPrefix(endpoint, "https:") {
 					mode = "https"
 				}
 				if p.status.Transport != mode {
@@ -551,7 +589,13 @@ func (p *Proxy) run(ctx context.Context) {
 						}
 					}()
 					for {
-						body, err := p.request(receiveCtx, http.MethodGet, packetsURL, token, nil)
+						var body []byte
+						var err error
+						if stream != nil {
+							body, err = stream.receive()
+						} else {
+							body, err = p.request(receiveCtx, http.MethodGet, packetsURL, token, nil)
+						}
 						if err != nil {
 							if receiveCtx.Err() == nil {
 								select {
@@ -591,7 +635,13 @@ func (p *Proxy) run(ctx context.Context) {
 						body := make([]byte, 2, len(packet)+2)
 						binary.BigEndian.PutUint16(body, uint16(len(packet)))
 						body = append(body, packet...)
-						if _, err := p.request(httpCtx, http.MethodPost, packetsURL, token, body); err != nil {
+						var err error
+						if stream != nil {
+							err = stream.send(body)
+						} else {
+							_, err = p.request(httpCtx, http.MethodPost, packetsURL, token, body)
+						}
+						if err != nil {
 							if httpCtx.Err() == nil {
 								select {
 								case failures <- httpGeneration:

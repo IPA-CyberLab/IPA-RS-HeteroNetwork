@@ -1,6 +1,7 @@
 //! Bounded datagram transport over ordinary HTTP requests. WireGuard remains
 //! responsible for end-to-end authentication and encryption. No Upgrade, UDP,
 //! HTTP/3, or incoming client port is required on the external network.
+pub mod tcp;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -365,6 +366,10 @@ impl TunnelHub {
         Ok(body)
     }
 
+    pub async fn touch(&self, token: &str) -> Result<(), TunnelError> {
+        self.session(token).await.map(|_| ())
+    }
+
     pub async fn close(&self, token: &str) {
         self.sessions.lock().await.remove(token);
     }
@@ -667,6 +672,30 @@ fn serde_json_from_bytes<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<
     serde_json::from_slice(body).map_err(|_| TunnelError::InvalidPacket)
 }
 
+enum ReliableTunnel {
+    Tcp(tcp::TcpTunnel),
+    Http(HttpTunnel),
+}
+impl ReliableTunnel {
+    fn first_packet(&self) -> &[u8] {
+        match self {
+            Self::Tcp(_) => &[],
+            Self::Http(tunnel) => &tunnel.first_packet,
+        }
+    }
+    async fn send(&self, body: Vec<u8>) -> Result<(), TunnelError> {
+        match self {
+            Self::Tcp(tunnel) => tunnel.send(body).await,
+            Self::Http(tunnel) => tunnel.send(body).await,
+        }
+    }
+    async fn receive(&self) -> Result<Vec<Vec<u8>>, TunnelError> {
+        match self {
+            Self::Tcp(tunnel) => tunnel.receive().await,
+            Self::Http(tunnel) => tunnel.receive().await,
+        }
+    }
+}
 #[derive(Clone)]
 pub struct RelayEnvelope {
     pub announcement: Vec<u8>,
@@ -682,6 +711,7 @@ pub struct DatagramProxy {
     pub udp_endpoint: SocketAddr,
     pub wireguard_endpoint: SocketAddr,
     pub open_urls: Vec<String>,
+    pub tcp_endpoints: Vec<SocketAddr>,
     pub relay: Option<RelayEnvelope>,
     pub auth: Option<TunnelAuth>,
     pub status: Arc<Mutex<TransportObservation>>,
@@ -826,7 +856,7 @@ impl DatagramProxy {
                             http_tx = None; received_udp = false;
                             retry_at = Instant::now() + retry_delay;
                             retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-                            update(&self.status, |s| { s.phase = TransportPhase::Reconnecting; s.reconnects += 1; s.last_error = Some("http_tunnel_unavailable".to_string()); });
+                            update(&self.status, |s| { s.phase = TransportPhase::Reconnecting; s.reconnects += 1; s.last_error = Some(if s.transport==DataPlaneTransport::Tcp{"tcp_tunnel_unavailable"}else{"http_tunnel_unavailable"}.to_string()); });
                         }
                     }
                 }
@@ -845,6 +875,7 @@ impl DatagramProxy {
                     return_udp_after = Instant::now() + Duration::from_secs(30);
                     next_udp_probe = Instant::now() + Duration::from_secs(60);
                     let node = self.node.clone(); let urls = self.open_urls.clone();
+                    let tcp_endpoints = self.tcp_endpoints.clone();
                     let auth = self.auth.clone();
                     let status = self.status.clone(); let client = client.clone(); let events = event_tx.clone();
                     let (sender, mut outgoing) = mpsc::channel::<Vec<u8>>(MAX_BATCH_PACKETS);
@@ -857,12 +888,19 @@ impl DatagramProxy {
                     });
                     http_task = Some(AbortTask(tokio::spawn(async move {
                         let mut opened = None;
-                        for url in urls {
+                        let candidates=tcp_endpoints.into_iter().map(|endpoint|format!("tcp://{endpoint}")).chain(urls);
+                        for url in candidates {
                             let failures = status.lock().unwrap_or_else(|e| e.into_inner()).failures.clone();
-                            match HttpTunnel::open(client.clone(), &url, &node, initial.clone(), auth.as_ref(), &failures).await {
+                            let result=if let Some(endpoint)=url.strip_prefix("tcp://") {
+                                match endpoint.parse::<SocketAddr>() {
+                                    Ok(endpoint)=>tcp::TcpTunnel::open(endpoint,&node,initial.clone(),auth.as_ref(),&failures).await.map(ReliableTunnel::Tcp),
+                                    Err(_)=>Err(TunnelError::InvalidPacket),
+                                }
+                            }else{HttpTunnel::open(client.clone(), &url, &node, initial.clone(), auth.as_ref(), &failures).await.map(ReliableTunnel::Http)};
+                            match result {
                                 Ok(tunnel) => {
                                     update(&status, |s| {
-                                        let transport = if url.starts_with("https:") { DataPlaneTransport::Https } else { DataPlaneTransport::Http };
+                                        let transport = if url.starts_with("tcp:"){DataPlaneTransport::Tcp}else if url.starts_with("https:") { DataPlaneTransport::Https } else { DataPlaneTransport::Http };
                                         if s.transport != transport { s.switches += 1; }
                                         s.transport = transport; s.endpoint = url; s.last_error = None;
                                         s.phase = TransportPhase::Connected;
@@ -870,7 +908,7 @@ impl DatagramProxy {
                                     opened = Some(tunnel); break;
                                 }
                                 Err(error) => {
-                                    let protocol = if url.starts_with("https:") { "https" } else { "http" };
+                                    let protocol = if url.starts_with("tcp:"){"tcp"}else if url.starts_with("https:") { "https" } else { "http" };
                                     let reason = match error {
                                         TunnelError::Status(407) => "proxy_authentication_required",
                                         TunnelError::Status(401 | 403) => "authentication_failed",
@@ -884,7 +922,7 @@ impl DatagramProxy {
                         }
                         let Some(tunnel) = opened else { let _ = events.send((http_generation, Err(()))).await; return; };
                         let tunnel = Arc::new(tunnel);
-                        if !tunnel.first_packet.is_empty() && events.send((http_generation, Ok(tunnel.first_packet.clone()))).await.is_err() { return; }
+                        if !tunnel.first_packet().is_empty() && events.send((http_generation, Ok(tunnel.first_packet().to_vec()))).await.is_err() { return; }
                         {
                             for packet in queued {
                                 let mut body = Vec::new();

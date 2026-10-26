@@ -2937,6 +2937,10 @@ pub mod api {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PeerMap {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tcp_tunnel_protocol: Option<u16>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub tcp_tunnel_endpoints: BTreeMap<NodeId, Vec<std::net::SocketAddr>>,
         pub cluster_id: ClusterId,
         pub peers: Vec<NodeRecord>,
         #[serde(default)]
@@ -3000,6 +3004,10 @@ pub mod api {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct HttpTransportPeerResponse {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tcp_tunnel_endpoints: Vec<std::net::SocketAddr>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tcp_relay_endpoints: Vec<std::net::SocketAddr>,
         pub peer: NodeRecord,
         pub http_tunnel_urls: Vec<String>,
     }
@@ -3097,6 +3105,7 @@ pub mod api {
     pub enum DataPlaneTransport {
         #[default]
         Udp,
+        Tcp,
         Http,
         Https,
     }
@@ -3169,6 +3178,10 @@ pub mod api {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct NodeTransportSnapshot {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tcp_tunnel_endpoints: Vec<std::net::SocketAddr>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tcp_relay_endpoints: Vec<std::net::SocketAddr>,
         #[serde(default)]
         pub http_tunnel_urls: Vec<String>,
         #[serde(default)]
@@ -3912,6 +3925,8 @@ pub mod api {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RelayStatusResponse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tcp_endpoint: Option<std::net::SocketAddr>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub http_transports: Vec<TransportObservation>,
         pub relay_node: NodeId,

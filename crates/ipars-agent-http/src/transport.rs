@@ -31,9 +31,57 @@ pub fn router(
     backend: SocketAddr,
     relay: Option<(String, String)>,
 ) -> Router {
+    transports(runtime, backend, relay).0
+}
+
+pub fn transports(
+    runtime: Arc<AgentRuntime>,
+    backend: SocketAddr,
+    relay: Option<(String, String)>,
+) -> (Router, ipars_http_tunnel::tcp::Authorizer) {
     let hub = Arc::new(TunnelHub::new(backend, 2048));
     runtime.set_http_gateway(hub.clone());
-    Router::new()
+    let state = GatewayState {
+        runtime,
+        hub,
+        relay: relay.map(|(url, token)| (url, Arc::from(token))),
+        client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default(),
+        authorizing: Arc::new(tokio::sync::Semaphore::new(32)),
+        lookup_budget: Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0))),
+    };
+    let tcp_state = state.clone();
+    let authorize: ipars_http_tunnel::tcp::Authorizer = Arc::new(move |request, body| {
+        let state = tcp_state.clone();
+        Box::pin(async move {
+            if request.relay {
+                return Err(TunnelError::Unauthorized);
+            }
+            let opened = open_session(
+                &state,
+                request.node,
+                request.timestamp,
+                &request.nonce,
+                &request.proof,
+                &body,
+                ipars_types::api::DataPlaneTransport::Tcp,
+            )
+            .await
+            .map_err(|status| {
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    TunnelError::Capacity
+                } else {
+                    TunnelError::Unauthorized
+                }
+            })?;
+            Ok((state.hub, opened))
+        })
+    });
+    let app = Router::new()
         .route("/v1/tunnels/wireguard/open", post(open))
         .route(
             "/v1/tunnels/wireguard/packets",
@@ -45,19 +93,8 @@ pub fn router(
             Arc::new(tokio::sync::Semaphore::new(128)),
             bound_posts,
         ))
-        .with_state(GatewayState {
-            runtime,
-            hub,
-            relay: relay.map(|(url, token)| (url, Arc::from(token))),
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
-            authorizing: Arc::new(tokio::sync::Semaphore::new(32)),
-            lookup_budget: Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0))),
-        })
+        .with_state(state);
+    (app, authorize)
 }
 
 async fn bound_posts(
@@ -132,32 +169,60 @@ async fn open(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
+    let node = NodeId::from_string(header(&headers, NODE_HEADER)?);
+    let timestamp = header(&headers, TIME_HEADER)?
+        .parse::<i64>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let transport = if headers
+        .get("x-forwarded-proto")
+        .is_some_and(|v| v == "https")
+    {
+        ipars_types::api::DataPlaneTransport::Https
+    } else {
+        ipars_types::api::DataPlaneTransport::Http
+    };
+    let opened = open_session(
+        &state,
+        node,
+        timestamp,
+        header(&headers, NONCE_HEADER)?,
+        header(&headers, PROOF_HEADER)?,
+        &body,
+        transport,
+    )
+    .await?;
+    Ok(([("Cache-Control", "no-store")], Json(opened)).into_response())
+}
+
+async fn open_session(
+    state: &GatewayState,
+    node: NodeId,
+    timestamp: i64,
+    nonce: &str,
+    proof: &str,
+    body: &[u8],
+    transport: ipars_types::api::DataPlaneTransport,
+) -> Result<ipars_http_tunnel::OpenResponse, StatusCode> {
     let _authorizing = state
         .authorizing
         .try_acquire()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
-    let (packet, diagnostics) = ipars_http_tunnel::decode_open(&body).map_err(failure)?;
+    let (packet, diagnostics) = ipars_http_tunnel::decode_open(body).map_err(failure)?;
     if !ipars_http_tunnel::wireguard_packet(packet) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let node = NodeId::from_string(header(&headers, NODE_HEADER)?);
-    if node.as_str().len() > 128 {
+    if node.as_str().is_empty() || node.as_str().len() > 128 {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let timestamp = header(&headers, TIME_HEADER)?
-        .parse::<i64>()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let nonce = header(&headers, NONCE_HEADER)?;
-    let proof = header(&headers, PROOF_HEADER)?;
     validate_proof_headers(timestamp, nonce, proof)?;
     if state.runtime.http_tunnel_peer_is_known(&node).await {
         state
             .runtime
-            .verify_http_tunnel(&node, timestamp, nonce, &body, proof)
+            .verify_http_tunnel(&node, timestamp, nonce, body, proof)
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
     } else {
-        allow_lookup(&state)?;
+        allow_lookup(state)?;
         let peer = state
             .runtime
             .query_http_transport_peer(node.clone(), None)
@@ -168,7 +233,7 @@ async fn open(
         }
         state
             .runtime
-            .verify_http_transport_key(&peer.peer, timestamp, nonce, &body, proof)
+            .verify_http_transport_key(&peer.peer, timestamp, nonce, body, proof)
             .await
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
     }
@@ -176,14 +241,6 @@ async fn open(
         .hub
         .consume_nonce(&node, nonce, timestamp)
         .map_err(failure)?;
-    let transport = if headers
-        .get("x-forwarded-proto")
-        .is_some_and(|v| v == "https")
-    {
-        ipars_types::api::DataPlaneTransport::Https
-    } else {
-        ipars_types::api::DataPlaneTransport::Http
-    };
     let opened = state
         .hub
         .open(
@@ -201,7 +258,7 @@ async fn open(
         .diagnostics(&opened.token, diagnostics)
         .await
         .map_err(failure)?;
-    Ok(([("Cache-Control", "no-store")], Json(opened)).into_response())
+    Ok(opened)
 }
 
 async fn admit(

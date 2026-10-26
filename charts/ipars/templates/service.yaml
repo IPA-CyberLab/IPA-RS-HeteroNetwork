@@ -741,6 +741,16 @@ spec:
       {{- if and $relayExternal (ne $relayUdpNodePort 0) }}
       nodePort: {{ $relayUdpNodePort }}
       {{- end }}
+    {{- if and (ne $relayUdpPort $relayHttpPort) (ne $relayUdpTargetPort $relayHttpTargetPort) }}
+    - name: relay-tcp
+      protocol: TCP
+      appProtocol: heteronetwork.io/relay-tcp
+      port: {{ .Values.agent.relayService.udpPort }}
+      targetPort: {{ .Values.agent.relayService.udpTargetPort }}
+      {{- if and $relayExternal (ne $relayUdpNodePort 0) }}
+      nodePort: {{ $relayUdpNodePort }}
+      {{- end }}
+    {{- end }}
     - name: relay-http
       protocol: TCP
       {{- if .Values.agent.relayService.httpAppProtocol }}

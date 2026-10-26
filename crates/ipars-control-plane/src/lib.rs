@@ -3202,17 +3202,19 @@ where
             return Err(ControlPlaneError::RelayDenied);
         }
         let ids = BTreeSet::from([peer.node_id.clone()]);
-        let http_tunnel_urls = self
+        let snapshot = self
             .store
             .list_transport_snapshots(Some(&ids))
             .await?
             .into_iter()
             .find(|record| (Utc::now() - record.observed_at).num_seconds() < 90)
-            .map(|record| record.snapshot.http_tunnel_urls)
+            .map(|record| record.snapshot)
             .unwrap_or_default();
         Ok(ipars_types::api::HttpTransportPeerResponse {
             peer,
-            http_tunnel_urls,
+            http_tunnel_urls: snapshot.http_tunnel_urls,
+            tcp_tunnel_endpoints: snapshot.tcp_tunnel_endpoints,
+            tcp_relay_endpoints: snapshot.tcp_relay_endpoints,
         })
     }
 
@@ -5299,12 +5301,15 @@ where
             .as_ref()
             .and_then(|ad| ad.transport.as_ref())
         {
-            validate_transport_snapshot(snapshot, request.nat_classification.as_ref()).map_err(
-                |reason| ControlPlaneError::NodeUpdateRejected {
-                    node_id: request.node_id.clone(),
-                    reason,
-                },
-            )?;
+            validate_transport_snapshot(
+                snapshot,
+                request.nat_classification.as_ref(),
+                request.relay_capability.as_ref(),
+            )
+            .map_err(|reason| ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason,
+            })?;
         }
         validate_node_health_shape(
             &request.health,
@@ -5981,18 +5986,36 @@ where
             .iter()
             .map(|node| node.node_id.clone())
             .collect::<BTreeSet<_>>();
-        let http_tunnel_urls = self
+        let snapshots = self
             .store
             .list_transport_snapshots(Some(&peer_ids))
             .await?
             .into_iter()
-            .filter(|record| {
-                (generated_at - record.observed_at).num_seconds() < 90
-                    && !record.snapshot.http_tunnel_urls.is_empty()
+            .filter(|record| (generated_at - record.observed_at).num_seconds() < 90)
+            .collect::<Vec<_>>();
+        let http_tunnel_urls = snapshots
+            .iter()
+            .filter(|record| !record.snapshot.http_tunnel_urls.is_empty())
+            .map(|record| {
+                (
+                    record.node_id.clone(),
+                    record.snapshot.http_tunnel_urls.clone(),
+                )
             })
-            .map(|record| (record.node_id, record.snapshot.http_tunnel_urls))
+            .collect();
+        let tcp_tunnel_endpoints = snapshots
+            .iter()
+            .filter(|record| !record.snapshot.tcp_tunnel_endpoints.is_empty())
+            .map(|record| {
+                (
+                    record.node_id.clone(),
+                    record.snapshot.tcp_tunnel_endpoints.clone(),
+                )
+            })
             .collect();
         Ok(PeerMap {
+            tcp_tunnel_protocol: Some(1),
+            tcp_tunnel_endpoints,
             http_tunnel_protocol: Some(1),
             http_tunnel_urls,
             cluster_id: self.config.cluster_id.clone(),
@@ -6429,9 +6452,35 @@ fn insert_preferred_gateway_route(routes: &mut BTreeMap<IpNet, Route>, route: Ro
 fn validate_transport_snapshot(
     snapshot: &ipars_types::api::NodeTransportSnapshot,
     nat: Option<&NatClassification>,
+    relay: Option<&RelayCapability>,
 ) -> Result<(), String> {
-    if snapshot.connections.len() > 4096 || snapshot.http_tunnel_urls.len() > 8 {
+    if snapshot.connections.len() > 4096
+        || snapshot.http_tunnel_urls.len() > 8
+        || snapshot.tcp_tunnel_endpoints.len() > 8
+        || snapshot.tcp_relay_endpoints.len() > 8
+    {
         return Err("transport snapshot exceeds its bounds".to_string());
+    }
+    for (endpoints, expected_ip) in [
+        (
+            &snapshot.tcp_tunnel_endpoints,
+            nat.and_then(NatClassification::publicly_reachable_ip),
+        ),
+        (
+            &snapshot.tcp_relay_endpoints,
+            relay.and_then(|relay| relay.public_endpoint.map(|endpoint| endpoint.ip())),
+        ),
+    ] {
+        for endpoint in endpoints {
+            if endpoint.port() == 0
+                || !socket_addr_is_globally_routable(*endpoint)
+                || Some(endpoint.ip()) != expected_ip
+            {
+                return Err(
+                    "TCP tunnel endpoint does not match its advertised public service".to_string(),
+                );
+            }
+        }
     }
     for endpoint in &snapshot.http_tunnel_urls {
         let url = url::Url::parse(endpoint).map_err(|_| "invalid HTTP tunnel endpoint")?;
@@ -6493,7 +6542,7 @@ fn validate_transport_snapshot(
         if connection.endpoint.parse::<std::net::SocketAddr>().is_err() {
             let url = url::Url::parse(&connection.endpoint)
                 .map_err(|_| "invalid transport observation endpoint")?;
-            if !matches!(url.scheme(), "http" | "https")
+            if !matches!(url.scheme(), "http" | "https" | "tcp")
                 || !url.username().is_empty()
                 || url.password().is_some()
                 || url.query().is_some()
@@ -16917,6 +16966,8 @@ mod tests {
                 node_id: peer.node_id.clone(),
                 observed_at: Utc::now(),
                 snapshot: NodeTransportSnapshot {
+                    tcp_tunnel_endpoints: Vec::new(),
+                    tcp_relay_endpoints: Vec::new(),
                     http_tunnel_urls: urls.clone(),
                     connections: Vec::new(),
                 },
@@ -16957,14 +17008,14 @@ mod tests {
             "http://8.8.8.8/v1/tunnels/wireguard/open?token=secret".to_string(),
         );
         snapshot.connections.push(connection.clone());
-        assert!(validate_transport_snapshot(&snapshot, None).is_err());
+        assert!(validate_transport_snapshot(&snapshot, None, None).is_err());
         connection.endpoint = "8.8.8.8:51820".to_string();
         snapshot.connections[0] = connection;
-        assert!(validate_transport_snapshot(&snapshot, None).is_ok());
+        assert!(validate_transport_snapshot(&snapshot, None, None).is_ok());
         snapshot.connections[0].last_error = Some("leaked token".to_string());
-        assert!(validate_transport_snapshot(&snapshot, None).is_err());
+        assert!(validate_transport_snapshot(&snapshot, None, None).is_err());
         snapshot.connections[0].last_error = None;
         snapshot.http_tunnel_urls = vec!["http://127.0.0.1/v1/tunnels/wireguard/open".to_string()];
-        assert!(validate_transport_snapshot(&snapshot, None).is_err());
+        assert!(validate_transport_snapshot(&snapshot, None, None).is_err());
     }
 }

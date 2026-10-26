@@ -1650,6 +1650,11 @@ spec:
             - name: relay-udp
               containerPort: {{ int .Values.agent.relayService.udpTargetPort }}
               protocol: UDP
+            {{- if ne (int .Values.agent.relayService.udpTargetPort) (int .Values.agent.relayService.httpTargetPort) }}
+            - name: relay-tcp
+              containerPort: {{ int .Values.agent.relayService.udpTargetPort }}
+              protocol: TCP
+            {{- end }}
             - name: relay-http
               containerPort: {{ int .Values.agent.relayService.httpTargetPort }}
               protocol: TCP

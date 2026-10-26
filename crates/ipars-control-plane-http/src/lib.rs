@@ -638,7 +638,7 @@ where
         .route(
             "/v1/transport-capabilities",
             get(|| async {
-                Json(serde_json::json!({"http_tunnel_protocol":1,"transport_observations":true}))
+                Json(serde_json::json!({"http_tunnel_protocol":1,"transport_observations":true,"tcp_tunnel_protocol":1}))
             }),
         )
         .route(
@@ -7686,6 +7686,7 @@ fn render_transport_metrics(
         for connection in &snapshot.snapshot.connections {
             let protocol = match connection.transport {
                 DataPlaneTransport::Udp => "udp",
+                DataPlaneTransport::Tcp => "tcp",
                 DataPlaneTransport::Http => "http",
                 DataPlaneTransport::Https => "https",
             };
