@@ -15,8 +15,10 @@ database transaction. This also works during a rolling control-plane upgrade;
 the credential never enters command arguments or logs. Rejoining a registered
 node preserves its administrative tags. New control planes additionally exclude
 stopped nodes from gateways, relays and service-owner selection, and the console
-labels them `停止中`. To resume, change the roster state to `active`, restore the
-Node/Longhorn scheduling declarations, and apply the reviewed IaC changes.
+labels them `停止中`. To resume, change the roster state to `active`, run
+`python3 deploy/terraform/master-only/render.py` (also run by the publisher),
+and apply the reviewed IaC changes. The renderer restores the original scheduling
+and discovery declarations from that single lifecycle flag.
 
 `terraform_data.gvisor_configuration` installs the checksum-pinned Flash runtime
 installer and gVisor package on `uc-k8sp4` and `uc-k8sp5`. These hosts can run CPU

@@ -4,6 +4,10 @@ from pathlib import Path
 import tempfile
 import unittest
 import importlib.util
+import shutil
+import subprocess
+import sys
+import yaml
 
 from node_lifecycle import ROSTER, active_peers, gateway_ips, stopped_hosts
 
@@ -62,3 +66,27 @@ class NodeLifecycleTests(unittest.TestCase):
         self.assertEqual(environment["PGSSLROOTCERT"], "/protected/ca.crt")
         self.assertEqual(environment["PGPASSWORD"], "p@ss:word")
         self.assertEqual(environment["PGHOST"], "db.internal")
+
+    def test_rendered_placement_follows_stop_and_resume_flag(self):
+        root = ROSTER.parents[3]
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            module = temporary / "deploy/terraform/master-only"
+            module.mkdir(parents=True)
+            for name in ["render.py", "nodes.json", "standard-nodes.json", "edge-nodes.json"]:
+                shutil.copy2(ROSTER.parent / name, module / name)
+            (temporary / "scripts").mkdir()
+            shutil.copy2(root / "scripts/node_lifecycle.py", temporary / "scripts/node_lifecycle.py")
+            for name in ["control-plane-only", "standard-nodes"]:
+                (temporary / "deploy/gitops" / name).mkdir(parents=True)
+            (temporary / "deploy/kubernetes").mkdir()
+            shutil.copy2(root / "deploy/kubernetes/control-plane-only-policy.yaml", temporary / "deploy/kubernetes/control-plane-only-policy.yaml")
+            for state in ["stopped", "active"]:
+                self.roster["node_states"]["uc-k8sp4"]["state"] = state
+                (module / "overlay-boot-peers.json").write_text(json.dumps(self.roster))
+                subprocess.run([sys.executable, str(module / "render.py")], check=True, capture_output=True)
+                resources = list(yaml.safe_load_all((temporary / "deploy/gitops/standard-nodes/nodes.yaml").read_text()))
+                node = next(r for r in resources if r["apiVersion"] == "v1" and r["metadata"]["name"] == "uc-k8sp4")
+                storage = next(r for r in resources if r["apiVersion"].startswith("longhorn.io/") and r["metadata"]["name"] == "uc-k8sp4")
+                self.assertEqual(node["spec"]["unschedulable"], state == "stopped")
+                self.assertEqual(storage["spec"]["allowScheduling"], state == "active")

@@ -2,9 +2,39 @@
 """Render the GitOps node inventory from Terraform's public host inventory."""
 import json
 from pathlib import Path
+import sys
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / 'scripts'))
+from node_lifecycle import stopped_hosts
+
+roster = json.loads((Path(__file__).parent / 'overlay-boot-peers.json').read_text())
+stopped = stopped_hosts(roster)
+
+
+def apply_lifecycle(resources):
+    for resource in resources:
+        name = resource['metadata']['name']
+        if name not in stopped:
+            continue
+        if resource['apiVersion'] == 'v1' and resource['kind'] == 'Node':
+            labels = resource['metadata'].setdefault('labels', {})
+            labels['heteronetwork.io/lifecycle'] = 'stopped'
+            for key in ['networking.heteronetwork.io/public-ingress', 'database.heteronetwork.io/proxy-ready',
+                        'monitoring.heteronetwork.io/ha', 'networking.heteronetwork.io/overlay-dns-sync',
+                        'flash.heterocloud.io/gvisor-ready']:
+                labels[key] = 'false'
+            resource['metadata'].setdefault('annotations', {}).update({
+                'networking.heteronetwork.io/public-ingress-enabled': 'false',
+                'heteronetwork.io/lifecycle-reason': roster['node_states'][name]['reason']})
+            resource.setdefault('spec', {})['unschedulable'] = True
+        elif resource['apiVersion'].startswith('longhorn.io/') and resource['kind'] == 'Node':
+            resource['spec']['allowScheduling'] = False
+            for disk in resource['spec'].get('disks', {}).values():
+                disk['allowScheduling'] = False
+    return resources
+
 nodes = json.loads((Path(__file__).parent / 'nodes.json').read_text())
 resources = []
 for name, node in nodes.items():
@@ -28,7 +58,7 @@ for name, node in nodes.items():
             'argocd.argoproj.io/sync-wave': '0'}},
         'spec': {'allowScheduling': False}})
 dest = ROOT / 'deploy/gitops/control-plane-only'
-(dest / 'nodes.yaml').write_text(yaml.safe_dump_all(resources,sort_keys=False))
+(dest / 'nodes.yaml').write_text(yaml.safe_dump_all(apply_lifecycle(resources),sort_keys=False))
 policies = list(yaml.safe_load_all((ROOT / 'deploy/kubernetes/control-plane-only-policy.yaml').read_text()))
 for policy in policies:
     policy['metadata'].setdefault('annotations', {})['argocd.argoproj.io/sync-wave'] = '-3' if policy['kind']=='ValidatingAdmissionPolicy' else '-2'
@@ -61,4 +91,4 @@ for edge in ('bootstrap', 'enrollment_issuer'):
                   'networking.heteronetwork.io/overlay-dns-sync':'true'},
         'annotations':{'argocd.argoproj.io/sync-options':'Prune=false,Delete=false',
                        'argocd.argoproj.io/sync-wave':'0'}}})
-(standard_dest/'nodes.yaml').write_text(yaml.safe_dump_all(standard_resources,sort_keys=False))
+(standard_dest/'nodes.yaml').write_text(yaml.safe_dump_all(apply_lifecycle(standard_resources),sort_keys=False))
