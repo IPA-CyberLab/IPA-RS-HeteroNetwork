@@ -9040,10 +9040,8 @@ async fn run_relay(
         let endpoint = args.tcp_listen.unwrap_or(udp_addr);
         match tokio::net::TcpListener::bind(endpoint).await {
             Ok(listener) => {
-                http_state = http_state.with_tcp_endpoint(SocketAddr::new(
-                    public_endpoint.ip(),
-                    args.tcp_public_port.unwrap_or(public_endpoint.port()),
-                ));
+                http_state =
+                    http_state.with_tcp_endpoint(relay_tcp_public_endpoint(&args, public_endpoint));
                 let authorize = http_state.tcp_authorizer();
                 Some(tokio::spawn(async move {
                     if let Err(error) =
@@ -9069,6 +9067,14 @@ async fn run_relay(
         task.abort();
     }
     http_result
+}
+
+fn relay_tcp_public_endpoint(args: &RelayArgs, public_endpoint: SocketAddr) -> SocketAddr {
+    let port = args
+        .tcp_public_port
+        .or_else(|| args.tcp_listen.map(|endpoint| endpoint.port()))
+        .unwrap_or(public_endpoint.port());
+    SocketAddr::new(public_endpoint.ip(), port)
 }
 
 fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
@@ -45087,6 +45093,39 @@ exec sleep 60
             anyhow::bail!("expected agent");
         };
         assert!(validate_agent_runtime_config(&args).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_transport_relay_advertises_configured_tcp_port() -> anyhow::Result<()> {
+        for (flags, expected) in [
+            (vec![], "8.8.4.4:51820"),
+            (vec!["--tcp-listen", "0.0.0.0:443"], "8.8.4.4:443"),
+            (
+                vec!["--tcp-listen", "0.0.0.0:443", "--tcp-public-port", "8443"],
+                "8.8.4.4:8443",
+            ),
+        ] {
+            let mut argv = vec![
+                "iparsd",
+                "relay",
+                "--relay-node-id",
+                "relay-test",
+                "--public-endpoint",
+                "8.8.4.4:51820",
+                "--admission-url",
+                "http://8.8.4.4:9580",
+            ];
+            argv.extend(flags);
+            let Command::Relay(args) = Cli::try_parse_from(argv)?.command else {
+                anyhow::bail!("expected relay");
+            };
+            validate_relay_config(&args)?;
+            assert_eq!(
+                relay_tcp_public_endpoint(&args, args.public_endpoint.unwrap()),
+                expected.parse::<SocketAddr>()?
+            );
+        }
         Ok(())
     }
 
