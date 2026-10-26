@@ -1298,6 +1298,23 @@ promote_control_services() {
   fi
 }
 
+node_ports_library=$filesystem_root/opt/heteronetwork/libexec/node-ports.sh
+if [ ! -f "$node_ports_library" ] && [ -z "$filesystem_root" ]; then
+  node_ports_library=$(dirname -- "$0")/node-ports.sh
+fi
+if [ ! -f "$node_ports_library" ] || [ -L "$node_ports_library" ]; then
+  demote_and_exit "port configuration library is missing or invalid"
+fi
+. "$node_ports_library"
+node_ports_defaults
+node_ports_owner=0
+if [ -n "$filesystem_root" ]; then
+  node_ports_owner=$(id -u)
+fi
+if ! node_ports_load "$filesystem_root/etc/heteronetwork/node-ports.env" "$node_ports_owner" || ! node_ports_validate; then
+  demote_and_exit "port configuration is invalid"
+fi
+
 if ! load_bootstrap; then
   demote_and_exit "bootstrap configuration is missing or invalid"
 fi
@@ -1396,6 +1413,9 @@ nat_local_addr=$(jq -er '
     end
 ' "$status_file") ||
   demote_and_exit "Agent public endpoint is invalid"
+if ! node_ports_wireguard_matches "$nat_local_addr"; then
+  demote_and_exit "observed WireGuard port differs from the declared public port or overlaps Relay/STUN"
+fi
 
 case "$nat_local_addr" in
   \[*)
@@ -1413,8 +1433,8 @@ case "$nat_local_addr" in
       demote_and_exit "Agent public endpoint is malformed IPv6"
     fi
     public_url_host="[$public_ip]"
-    relay_public_endpoint="[$public_ip]:18445"
-    stun_listen='[::]:19444'
+    relay_public_endpoint="[$public_ip]:$node_relay_advertise_port"
+    stun_listen="[::]:$node_stun_listen_port"
     ;;
   *)
     public_ip=$(jq -er '
@@ -1431,8 +1451,8 @@ case "$nat_local_addr" in
       demote_and_exit "Agent public endpoint is malformed IPv4"
     fi
     public_url_host=$public_ip
-    relay_public_endpoint="$public_ip:18445"
-    stun_listen='0.0.0.0:19444'
+    relay_public_endpoint="$public_ip:$node_relay_advertise_port"
+    stun_listen="0.0.0.0:$node_stun_listen_port"
     ;;
 esac
 
@@ -1441,8 +1461,11 @@ if ! valid_ipv4 "$vpn_ip"; then
 fi
 
 public_https_url="https://$public_url_host"
-stun_public_url="udp://$public_url_host:19444"
-relay_public_url="udp://$public_url_host:18445"
+if [ "$node_https_advertise_port" != 443 ]; then
+  public_https_url="$public_https_url:$node_https_advertise_port"
+fi
+stun_public_url="udp://$public_url_host:$node_stun_advertise_port"
+relay_public_url="udp://$public_url_host:$node_relay_advertise_port"
 relay_admission_url="http://$vpn_ip:18447"
 relay_status_url="$relay_admission_url/v1/status"
 

@@ -144,6 +144,9 @@ export HETERONETWORK_SMOKE_GATEWAY_STATUS_FIXTURE=$gateway_fixture
 export HETERONETWORK_SMOKE_STATE=$fake_state
 export HETERONETWORK_SMOKE_SYSTEMCTL_LOG=$systemctl_log
 
+mkdir -p "$test_root/root/opt/heteronetwork/libexec"
+cp "$script_dir/node-ports.sh" "$test_root/root/opt/heteronetwork/libexec/node-ports.sh"
+
 public_services_dir=$test_root/root/etc/heteronetwork/public-services
 password_file=$test_root/root/etc/heteronetwork/postgres-autopilot/bundle/secrets/application.password
 ca_file=$test_root/root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
@@ -285,10 +288,14 @@ EOF
 write_gateway_status() {
   gateway_status_ip=$1
   gateway_status_phase=${2:-ready}
+  gateway_status_port=${3:-443}
   case "$gateway_status_ip" in
     *:*) gateway_status_host="[$gateway_status_ip]" ;;
     *) gateway_status_host=$gateway_status_ip ;;
   esac
+  if [ "$gateway_status_port" != 443 ]; then
+    gateway_status_host="$gateway_status_host:$gateway_status_port"
+  fi
   cat >"$gateway_fixture" <<EOF
 {
   "public_gateway": {
@@ -959,6 +966,48 @@ run_reconciler
 run_reconciler
 grep -Fqx "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL=\"$managed_issuer\"" \
   "$services_env" || fail "managed Keycloak auth did not use the HA overlay origin"
+
+# Ports declared during enrollment must survive repeated reconciliation, with
+# independent local listeners and public router mappings (IPv4 and IPv6).
+ports_file=$test_root/root/etc/heteronetwork/node-ports.env
+cat >"$ports_file" <<EOF
+WIREGUARD_LISTEN_PORT=30100
+WIREGUARD_PUBLIC_PORT=40100
+RELAY_LISTEN_PORT=30101
+RELAY_PUBLIC_PORT=40101
+STUN_LISTEN_PORT=30102
+STUN_PUBLIC_PORT=40102
+HTTPS_LISTEN_PORT=8443
+HTTPS_PUBLIC_PORT=9443
+EOF
+chmod 0600 "$ports_file"
+for public_ip in 163.220.236.51 2001:db8::51; do
+  case "$public_ip" in
+    *:*) public_host="[$public_ip]"; expected_stun_listen='[::]:30102' ;;
+    *) public_host=$public_ip; expected_stun_listen='0.0.0.0:30102' ;;
+  esac
+  prepare_dependencies "$public_host:40101"
+  write_gateway_status "$public_ip" ready 9443
+  reset_auto_services
+  write_mapped_status "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" 10.10.10.103:30100 "$public_host:40100"
+  run_reconciler
+  run_reconciler
+  run_reconciler
+  assert_active heteronetwork-control-plane.service
+  grep -Fqx "HETERONETWORK_STUN_LISTEN=\"$expected_stun_listen\"" "$udp_services_env" ||
+    fail "custom STUN listener was lost"
+  grep -Fqx "HETERONETWORK_ADVERTISE_STUN_URL=\"udp://$public_host:40102\"" "$services_env" ||
+    fail "custom public STUN port was lost"
+  grep -Fqx "HETERONETWORK_ADVERTISE_RELAY_URL=\"udp://$public_host:40101\"" "$services_env" ||
+    fail "custom public Relay port was lost"
+  grep -Fq "https://$public_host:9443" "$services_env" || fail "custom HTTPS port was lost"
+done
+
+# A declaration is not proof that NAT actually exposes that WireGuard port.
+write_mapped_status "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" 10.10.10.103:30100 163.220.236.51:40999
+run_reconciler
+assert_demoted
+grep -q 'observed WireGuard port differs' "$output_log" || fail "mismatched WireGuard port was accepted"
 
 if grep -Fq "$secret" "$output_log" ||
   grep -Fq "$secret" "$systemctl_log" ||

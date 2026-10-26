@@ -400,7 +400,8 @@ class NativeStageTests(unittest.TestCase):
         artifact_path = packaged / "heteronetwork-release-artifact.json"
         artifact = json.loads(artifact_path.read_text())
         bundle = artifact["native"]["linux-amd64"]
-        self.assertEqual(len(bundle["files"]), 12)
+        self.assertEqual(len(bundle["files"]), 13)
+        self.assertIn("libexec/node-ports.sh", bundle["files"])
         node(HERE / "release-channels.mjs", "stage", self.channels, artifact_path, "0")
         result = stage.prepare(self.root, self.channels, "dev", packaged / bundle["asset"])
         slot = Path(result["slot"])

@@ -117,6 +117,53 @@ ports to the node's matching listeners: `51820` for WireGuard, `18445` for
 Relay, and `19444` for STUN. Those UDP services do not require the public HTTPS
 gateway route; only public Signal promotion requires TCP `443`.
 
+The Linux enrollment form also has **ポート設定**. Declare each service's local
+listen port and, when different, its public router port. The same settings are
+available on the generated command or downloaded script:
+
+```sh
+sudo sh install-heteronetwork.sh \
+  --wireguard-listen-port 30100 --wireguard-public-port 40100 \
+  --relay-listen-port 30101 --relay-public-port 40101 \
+  --stun-listen-port 30102 --stun-public-port 40102 \
+  --https-listen-port 8443 --https-public-port 9443
+```
+
+For this example, forward public UDP `40100/40101/40102` to local UDP
+`30100/30101/30102`, and public TCP `9443` to local TCP `8443`. Configure those
+router/firewall rules separately. Unspecified listen ports keep the defaults
+`51820/18445/19444/443`. A blank public port in the form, or `--*-public-port auto`
+on the command, uses the listen port for Relay/STUN/HTTPS and the actual STUN
+observation for WireGuard. An explicit WireGuard public port is an expectation,
+not a fabricated candidate: automatic public services are withdrawn if STUN
+observes a different port. UDP listeners must be distinct and must not conflict
+with the Agent's internal DNS/probe/transit listeners.
+
+The authenticated `POST /v1/admin/enrollment` API accepts an optional `ports`
+object. For example, `{"relay_listen_port":30101,"relay_public_port":40101}`
+changes only Relay. Supported names are `{wireguard,relay,stun,https}_listen_port`
+and `{wireguard,relay,stun,https}_public_port`; public ports may be `null` for
+automatic selection. Invalid ranges, duplicate UDP ports, internal listener
+conflicts and unknown fields are rejected. Older requests without `ports`
+continue to work. Both returned installer delivery methods carry the declaration.
+
+Enrollment saves the profile in the root-owned, mode-0600
+`/etc/heteronetwork/node-ports.env` and installs the Agent's `06-node-ports.conf`
+systemd drop-in. Relay/STUN listeners and the advertised service URLs use this
+profile, including IPv6 addresses and different public/local ports. Reboots and
+automatic `--promote-existing` runs retain it; a failed installation restores the
+previous profile together with the Relay transaction. Subsequent enrollment
+declarations override the saved profile, and explicit command arguments override
+the declaration in a downloaded script.
+
+Changing HTTPS's application port does not change ACME's external validation
+ports. The automatic IP certificate still needs public TCP `80` (HTTP-01) or
+`443` (TLS-ALPN-01) routed to its corresponding local challenge listener. With
+neither reachable, automatic public HTTPS cannot become healthy. See Caddy's
+[HTTPS port option](https://caddyserver.com/docs/caddyfile/options#https-port)
+and [ACME challenge options](https://caddyserver.com/docs/caddyfile/directives/tls).
+The VPN Signal, Relay and STUN roles retain their independent health checks.
+
 An idle ACL-visible peer remains installed in WireGuard as a passive quarantine
 entry with its overlay `/32` AllowedIP and host route, a loopback discard hold
 endpoint, no keepalive, and a public key distinct from the advertised real peer

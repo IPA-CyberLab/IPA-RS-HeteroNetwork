@@ -10,6 +10,7 @@ import { validateArtifact } from './release-channels.mjs';
 
 export const BINARIES = ['ipars', 'iparsd', 'ipars-k8s-controller'];
 export const HELPERS = [
+  'node-ports.sh',
   'public-services-bootstrap.sh', 'public-services-autopilot.sh',
   'postgres-ha-node.sh', 'postgres-ha-autopilot.sh',
   'keycloak-ha-node.sh', 'keycloak-autopilot.sh',

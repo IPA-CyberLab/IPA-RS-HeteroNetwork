@@ -167,6 +167,8 @@ async function installMockBackend(page) {
         auth_enabled: false,
         operator_token_enabled: true,
         local_agent: false,
+        node_enrollment_enabled: true,
+        client_enrollment_enabled: true,
       },
       "/v1/admin/overview": localOverview,
       "/v1/admin/keycloak-placement": {
@@ -242,6 +244,42 @@ async function installDelayedLoginBackend(page, options = {}) {
     await route.fulfill({ status: 404, body: "not found" });
   });
 }
+
+test("node enrollment submits distinct local and public ports", async ({ page }) => {
+  await installMockBackend(page);
+  const submissions = [];
+  await page.route("**/v1/admin/enrollment", async (route) => {
+    submissions.push(route.request().postDataJSON());
+    await route.fulfill({ json: {
+      install_command: "sudo sh install.sh --relay-listen-port 30101 --relay-public-port 40101",
+      install_script: "#!/bin/sh\nexit 0\n", max_uses: 1, architecture: "linux-amd64",
+      expires_at: "2026-11-01T00:00:00Z", token: {},
+    } });
+  });
+  await page.goto("/ui/#/enrollment");
+  await page.getByRole("button", { name: "ポート設定", exact: true }).click();
+  await page.getByLabel("WireGuard (UDP) 待ち受けポート", { exact: true }).fill("30100");
+  await page.getByLabel("WireGuard (UDP) 公開ポート", { exact: true }).fill("40100");
+  await page.getByLabel("Relay (UDP) 待ち受けポート", { exact: true }).fill("30101");
+  await page.getByLabel("Relay (UDP) 公開ポート", { exact: true }).fill("40101");
+  await page.getByLabel("STUN (UDP) 待ち受けポート", { exact: true }).fill("30102");
+  await page.getByLabel("STUN (UDP) 公開ポート", { exact: true }).fill("40102");
+  await page.getByLabel("HTTPS (TCP) 待ち受けポート", { exact: true }).fill("8443");
+  await page.getByLabel("HTTPS (TCP) 公開ポート", { exact: true }).fill("9443");
+  await page.getByRole("button", { name: "インストールコマンドを生成", exact: true }).click();
+  await expect(page.getByText("sudo sh install.sh --relay-listen-port 30101 --relay-public-port 40101")).toBeVisible();
+  expect(submissions).toHaveLength(1);
+  expect(submissions[0].ports).toEqual({
+    wireguard_listen_port: 30100, wireguard_public_port: 40100,
+    relay_listen_port: 30101, relay_public_port: 40101,
+    stun_listen_port: 30102, stun_public_port: 40102,
+    https_listen_port: 8443, https_public_port: 9443,
+  });
+  await page.getByLabel("Relay (UDP) 待ち受けポート", { exact: true }).fill("65536");
+  await page.getByRole("button", { name: "インストールコマンドを生成", exact: true }).click();
+  await expect(page.getByText("ポート番号は1から65535の整数で指定してください。").first()).toBeVisible();
+  expect(submissions).toHaveLength(1);
+});
 
 test("login action works before the full Cloudscape bundle is available", async ({ page }) => {
   const appGate = { started: deferred(), release: deferred() };

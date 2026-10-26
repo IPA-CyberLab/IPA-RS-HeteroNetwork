@@ -36,6 +36,7 @@ tar -xzf "$archive" -C "$stage"
 readonly daemon_source="$stage/target/release/iparsd"
 readonly cli_source="$stage/target/release/ipars"
 readonly autopilot_source="$stage/scripts/public-services-autopilot.sh"
+readonly node_ports_source="$stage/scripts/node-ports.sh"
 readonly auth_reconciler_source="$stage/scripts/reconcile-owner-console-auth.sh"
 readonly e2e_source="$stage/scripts/heteronetwork-console-e2e.sh"
 readonly lighttpd_proxy_source="$stage/deploy/lighttpd/99-heteronetwork-console.conf"
@@ -44,6 +45,7 @@ for source in \
   "$daemon_source" \
   "$cli_source" \
   "$autopilot_source" \
+  "$node_ports_source" \
   "$auth_reconciler_source" \
   "$e2e_source" \
   "$lighttpd_proxy_source" \
@@ -64,6 +66,7 @@ install -d -o root -g root -m 0755 "$install_root/bin" "$install_root/libexec"
 install_atomically "$daemon_source" "$install_root/bin/iparsd"
 install_atomically "$cli_source" "$install_root/bin/ipars"
 install_atomically "$autopilot_source" "$install_root/libexec/public-services-autopilot.sh"
+install_atomically "$node_ports_source" "$install_root/libexec/node-ports.sh"
 install_atomically "$auth_reconciler_source" "$install_root/libexec/reconcile-owner-console-auth.sh"
 install_atomically "$e2e_source" "$install_root/libexec/heteronetwork-console-e2e.sh"
 

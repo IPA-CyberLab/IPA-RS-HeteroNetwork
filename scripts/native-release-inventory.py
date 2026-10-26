@@ -18,6 +18,7 @@ import time
 INSTALL = "/opt/heteronetwork"
 BINARIES = ("ipars", "iparsd", "ipars-k8s-controller")
 HELPERS = (
+    "node-ports.sh",
     "public-services-bootstrap.sh", "public-services-autopilot.sh",
     "postgres-ha-node.sh", "postgres-ha-autopilot.sh",
     "keycloak-ha-node.sh", "keycloak-autopilot.sh",

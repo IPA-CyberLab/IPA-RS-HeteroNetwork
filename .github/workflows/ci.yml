@@ -87,6 +87,8 @@ jobs:
 
       - name: Validate automatic public-service promotion
         run: |
+          sh -n scripts/node-ports.sh
+          sh scripts/node-ports-smoke.sh
           sh -n scripts/public-services-autopilot.sh
           sh -n scripts/public-services-autopilot-smoke.sh
           sh -n scripts/public-services-bootstrap.sh

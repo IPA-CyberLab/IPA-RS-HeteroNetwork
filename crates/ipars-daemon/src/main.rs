@@ -229,7 +229,7 @@ const PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH: &str =
     "/var/lib/heteronetwork/public-services-promotion.sh";
 const PUBLIC_SERVICES_BOOTSTRAP_GENERATION_PATH: &str =
     "/etc/heteronetwork/public-services/bootstrap-generation";
-const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "4";
+const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "5";
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
 const ADVERTISED_SIGNAL_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -981,6 +981,18 @@ struct AgentArgs {
         default_value_t = true
     )]
     public_web_gateway_enabled: bool,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_LISTEN_PORT",
+        default_value_t = 443
+    )]
+    public_web_gateway_listen_port: u16,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_PUBLIC_PORT",
+        default_value_t = 443
+    )]
+    public_web_gateway_public_port: u16,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION",
@@ -2132,6 +2144,10 @@ fn preflight_agent_runtime_with_path_and_checks(
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     let packet_flow_detector = effective_packet_flow_detector(args);
     validate_agent_api_auth_config(args)?;
+    anyhow::ensure!(
+        args.public_web_gateway_listen_port > 0 && args.public_web_gateway_public_port > 0,
+        "public Web gateway listen and public ports must be greater than zero"
+    );
     if args.enroll_only {
         anyhow::ensure!(
             args.join_token.is_some() || args.join_token_path.is_some(),
@@ -9309,6 +9325,8 @@ async fn run_agent(
                 runtime.clone(),
                 status.clone(),
                 PublicWebGatewayConfig {
+                    listen_port: args.public_web_gateway_listen_port,
+                    public_port: args.public_web_gateway_public_port,
                     admin_socket: args.public_web_gateway_admin_socket.clone(),
                     extra_caddyfile: args.public_web_gateway_extra_caddyfile.clone(),
                     control_plane_upstream: args.public_web_gateway_control_plane_upstream,
@@ -14234,6 +14252,8 @@ struct AgentApiErrorResponse {
 
 #[derive(Clone)]
 struct PublicWebGatewayConfig {
+    listen_port: u16,
+    public_port: u16,
     admin_socket: PathBuf,
     extra_caddyfile: Option<PathBuf>,
     control_plane_upstream: Option<SocketAddr>,
@@ -14379,10 +14399,15 @@ fn load_public_web_gateway_extra_config(
     }
 }
 
-fn public_web_gateway_url(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(ip) => format!("https://{ip}/"),
-        IpAddr::V6(ip) => format!("https://[{ip}]/"),
+fn public_web_gateway_url(ip: IpAddr, port: u16) -> String {
+    let host = match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    if port == 443 {
+        format!("https://{host}/")
+    } else {
+        format!("https://{host}:{port}/")
     }
 }
 
@@ -14395,12 +14420,18 @@ fn public_web_gateway_caddyfile(
         "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n",
         config.admin_socket.display()
     );
+    if config.listen_port != 443 {
+        let _ = writeln!(caddyfile, "\thttps_port {}", config.listen_port);
+    }
     if let Some(target) = target {
         let _ = writeln!(caddyfile, "\tdefault_bind {}", target.bind_ip);
     }
     caddyfile.push_str("}\n");
     if let Some(target) = target {
-        let site = public_web_gateway_url(target.public_ip);
+        // The site identifier is also the certificate identifier. Caddy's
+        // https_port selects the local listener; the advertised port can be
+        // different when the router forwards a public port to this listener.
+        let site = public_web_gateway_url(target.public_ip, 443);
         let site = site.trim_end_matches('/');
         let _ = writeln!(
             caddyfile,
@@ -14609,7 +14640,7 @@ fn start_public_web_gateway(
                 }
             };
             let desired_ip = desired_target.map(|target| target.public_ip);
-            let desired_url = desired_ip.map(public_web_gateway_url);
+            let desired_url = desired_ip.map(|ip| public_web_gateway_url(ip, config.public_port));
             let extra = match load_public_web_gateway_extra_config(&config) {
                 Ok(extra) => extra,
                 Err(error) => {
@@ -22982,9 +23013,51 @@ mod tests {
     }
 
     #[test]
+    fn public_web_gateway_custom_ports_keep_local_and_public_addresses_separate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = PublicWebGatewayConfig {
+            listen_port: 8443,
+            public_port: 9443,
+            admin_socket: PathBuf::from("/run/gateway.sock"),
+            extra_caddyfile: None,
+            control_plane_upstream: Some("10.250.0.4:19088".parse()?),
+            signal_upstream: None,
+            relay_admission_upstream: None,
+            reconcile_interval: Duration::from_secs(5),
+            probe_timeout: Duration::from_secs(5),
+            classification_max_age: Duration::from_secs(45),
+        };
+        for (ip, host) in [
+            ("203.0.113.10", "203.0.113.10"),
+            ("2001:db8::10", "[2001:db8::10]"),
+        ] {
+            let ip: IpAddr = ip.parse()?;
+            let rendered = public_web_gateway_caddyfile(
+                &config,
+                Some(PublicWebGatewayTarget {
+                    public_ip: ip,
+                    bind_ip: "10.10.10.103".parse()?,
+                }),
+                &empty_public_web_gateway_extra_config(),
+            );
+            assert!(rendered.contains("\thttps_port 8443\n"));
+            assert!(rendered.contains(&format!("https://{host} {{")));
+            assert!(!rendered.contains(":9443"));
+            assert_eq!(
+                public_web_gateway_url(ip, config.public_port),
+                format!("https://{host}:9443/")
+            );
+            assert_eq!(public_web_gateway_url(ip, 443), format!("https://{host}/"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let mut config = PublicWebGatewayConfig {
+            listen_port: 443,
+            public_port: 443,
             admin_socket: socket.to_path_buf(),
             extra_caddyfile: None,
             control_plane_upstream: None,

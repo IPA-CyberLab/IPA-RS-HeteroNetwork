@@ -92,7 +92,7 @@ const KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS: usize = 5;
 const KEYCLOAK_AUTOPILOT_MAX_CANDIDATES: usize = 64;
 const KEYCLOAK_AUTOPILOT_LEASE_SECONDS: u64 = 45;
 const KEYCLOAK_AUTOPILOT_RECONCILE_SECONDS: u64 = 15;
-const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "4";
+const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "5";
 const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
 const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
@@ -2567,6 +2567,119 @@ struct AdminNodeEnrollmentRequest {
     max_uses: Option<u32>,
     #[serde(default)]
     setup: NodeEnrollmentSetup,
+    #[serde(default)]
+    ports: Option<NodeEnrollmentPorts>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NodeEnrollmentPorts {
+    wireguard_listen_port: u16,
+    wireguard_public_port: Option<u16>,
+    relay_listen_port: u16,
+    relay_public_port: Option<u16>,
+    stun_listen_port: u16,
+    stun_public_port: Option<u16>,
+    https_listen_port: u16,
+    https_public_port: Option<u16>,
+}
+
+impl Default for NodeEnrollmentPorts {
+    fn default() -> Self {
+        Self {
+            wireguard_listen_port: 51820,
+            wireguard_public_port: None,
+            relay_listen_port: NODE_ENROLLMENT_RELAY_UDP_PORT,
+            relay_public_port: None,
+            stun_listen_port: 19444,
+            stun_public_port: None,
+            https_listen_port: 443,
+            https_public_port: None,
+        }
+    }
+}
+
+impl NodeEnrollmentPorts {
+    fn values(self) -> [(&'static str, Option<u16>); 8] {
+        [
+            ("wireguard-listen-port", Some(self.wireguard_listen_port)),
+            ("wireguard-public-port", self.wireguard_public_port),
+            ("relay-listen-port", Some(self.relay_listen_port)),
+            ("relay-public-port", self.relay_public_port),
+            ("stun-listen-port", Some(self.stun_listen_port)),
+            ("stun-public-port", self.stun_public_port),
+            ("https-listen-port", Some(self.https_listen_port)),
+            ("https-public-port", self.https_public_port),
+        ]
+    }
+
+    fn validate(self) -> Result<(), NodeEnrollmentApiError> {
+        if self.values().iter().any(|(_, value)| *value == Some(0)) {
+            return Err(NodeEnrollmentApiError::bad_request(
+                "ports must be between 1 and 65535",
+            ));
+        }
+        let local_udp = [
+            self.wireguard_listen_port,
+            self.relay_listen_port,
+            self.stun_listen_port,
+        ];
+        let public_udp = [
+            self.wireguard_public_port,
+            Some(self.relay_public_port.unwrap_or(self.relay_listen_port)),
+            Some(self.stun_public_port.unwrap_or(self.stun_listen_port)),
+        ];
+        if local_udp.into_iter().collect::<BTreeSet<_>>().len() != 3
+            || public_udp
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != public_udp.into_iter().flatten().count()
+        {
+            return Err(NodeEnrollmentApiError::bad_request(
+                "WireGuard, Relay and STUN require distinct UDP ports",
+            ));
+        }
+        if local_udp
+            .iter()
+            .any(|port| matches!(port, 53 | 51821 | 51822))
+            || matches!(
+                self.https_listen_port,
+                80 | 9780 | 9781 | 18447 | 19088 | 19443 | 19446
+            )
+        {
+            return Err(NodeEnrollmentApiError::bad_request(
+                "port conflicts with an internal listener",
+            ));
+        }
+        Ok(())
+    }
+
+    fn installer_arguments(self) -> String {
+        self.values()
+            .into_iter()
+            .map(|(name, value)| {
+                format!(
+                    " --{name} {}",
+                    value.map_or_else(|| "auto".to_string(), |port| port.to_string())
+                )
+            })
+            .collect()
+    }
+
+    fn installer_assignments(self) -> String {
+        self.values()
+            .into_iter()
+            .map(|(name, value)| {
+                format!(
+                    "node_{}={}\n",
+                    name.replace('-', "_"),
+                    value.map_or_else(String::new, |port| port.to_string())
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2588,6 +2701,7 @@ struct AdminNodeEnrollmentResponse {
     cli_binary_sha256: String,
     architecture: &'static str,
     setup: NodeEnrollmentSetup,
+    ports: Option<NodeEnrollmentPorts>,
 }
 
 #[derive(Debug)]
@@ -2673,6 +2787,9 @@ where
         ));
     }
     let max_uses = node_enrollment_max_uses(&request)?;
+    if let Some(ports) = request.ports {
+        ports.validate()?;
+    }
     if request.setup == NodeEnrollmentSetup::KubernetesHaControlPlane
         && (!request.reusable || max_uses != KUBERNETES_HA_CONTROL_PLANE_COUNT)
     {
@@ -2782,7 +2899,7 @@ where
                 "Keycloak autopilot API bearer token is not configured",
             )
         })?;
-    let install_script = node_enrollment_install_script(
+    let install_script = node_enrollment_install_script_with_ports(
         enrollment,
         &token,
         &encoded_token,
@@ -2790,9 +2907,13 @@ where
         &directory.bootstrap_endpoints,
         &database_autopilot_bearer_token,
         &keycloak_autopilot_bearer_token,
+        request.ports,
     );
-    let install_command =
+    let mut install_command =
         node_enrollment_install_command(enrollment, &encoded_token, &bootstrap_endpoints);
+    if let Some(ports) = request.ports {
+        install_command.push_str(&ports.installer_arguments());
+    }
     let payload = AdminNodeEnrollmentResponse {
         token,
         expires_at,
@@ -2803,6 +2924,7 @@ where
         cli_binary_sha256: enrollment.cli_binary.sha256.to_string(),
         architecture: NODE_ENROLLMENT_ARCH,
         setup: request.setup,
+        ports: request.ports,
     };
     let mut response = Json(payload).into_response();
     apply_node_enrollment_security_headers(&mut response);
@@ -3374,9 +3496,37 @@ fn node_enrollment_install_script(
     database_autopilot_bearer_token: &str,
     keycloak_autopilot_bearer_token: &str,
 ) -> String {
+    node_enrollment_install_script_with_ports(
+        enrollment,
+        token,
+        encoded_token,
+        bootstrap_endpoints,
+        promotion_download_endpoints,
+        database_autopilot_bearer_token,
+        keycloak_autopilot_bearer_token,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_enrollment_install_script_with_ports(
+    enrollment: &NodeEnrollmentConfig,
+    token: &SignedJoinToken,
+    encoded_token: &str,
+    bootstrap_endpoints: &[BootstrapEndpoint],
+    promotion_download_endpoints: &[BootstrapEndpoint],
+    database_autopilot_bearer_token: &str,
+    keycloak_autopilot_bearer_token: &str,
+    ports: Option<NodeEnrollmentPorts>,
+) -> String {
     const TEMPLATE: &str = r#"#!/bin/sh
 # HETERONETWORK_PUBLIC_SERVICES_GENERATION=__PUBLIC_SERVICES_TARGET_GENERATION__
 set -eu
+
+__NODE_PORTS_LIBRARY__
+node_ports_defaults
+node_ports_load /etc/heteronetwork/node-ports.env
+__NODE_PORTS_DECLARATION__
 
 relay_enabled=1
 public_services_enabled=1
@@ -3384,6 +3534,25 @@ promote_existing=0
 mapped_public_ip=
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --wireguard-listen-port|--wireguard-public-port|--relay-listen-port|--relay-public-port|--stun-listen-port|--stun-public-port|--https-listen-port|--https-public-port|--wireguard-listen-port=*|--wireguard-public-port=*|--relay-listen-port=*|--relay-public-port=*|--stun-listen-port=*|--stun-public-port=*|--https-listen-port=*|--https-public-port=*)
+      node_port_option=${1%%=*}
+      case "$1" in
+        *=*) node_port_argument=${1#*=} ;;
+        *)
+          shift
+          [ "$#" -gt 0 ] || { echo "$node_port_option requires a port" >&2; exit 2; }
+          node_port_argument=$1
+          ;;
+      esac
+      case "$node_port_option:$node_port_argument" in
+        *-public-port:auto) node_port_argument= ;;
+      esac
+      node_port_key=$(printf '%s' "${node_port_option#--}" | tr 'a-z-' 'A-Z_')
+      node_ports_assign "$node_port_key" "$node_port_argument" || {
+        echo "$node_port_option must be a port from 1 to 65535 (public ports also accept auto)" >&2
+        exit 2
+      }
+      ;;
     --promote-existing)
       promote_existing=1
       ;;
@@ -3407,12 +3576,13 @@ while [ "$#" -gt 0 ]; do
       ;;
     *)
       echo "Unknown HeteroNetwork installer argument: $1" >&2
-      echo "Usage: $0 [--promote-existing] [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]" >&2
+      echo "Usage: $0 [--promote-existing] [--mapped-public-ip IP] [--{wireguard,relay,stun,https}-listen-port PORT] [--{wireguard,relay,stun,https}-public-port PORT|auto] [--disable-relay] [--disable-public-services]" >&2
       exit 2
       ;;
   esac
   shift
 done
+node_ports_validate || exit 2
 
 if [ -n "$mapped_public_ip" ]; then
   case "$mapped_public_ip" in
@@ -3533,6 +3703,9 @@ relay_snapshot_dir="$tmp_dir/relay-rollback"
 relay_snapshot_manifest="$relay_snapshot_dir/manifest"
 relay_snapshot_directory_manifest="$relay_snapshot_dir/directories"
 relay_transaction_paths='
+/etc/heteronetwork/node-ports.env
+/etc/systemd/system/heteronetwork-agent.service.d/06-node-ports.conf
+/opt/heteronetwork/libexec/node-ports.sh
 /etc/sysusers.d/heteronetwork-relay.conf
 /etc/heteronetwork/relay-admission.token
 /etc/heteronetwork/relay-server-admission.token
@@ -3548,6 +3721,9 @@ relay_transaction_paths='
 /etc/systemd/system/ipars-relay.timer
 '
 relay_transaction_temporary_paths='
+/etc/heteronetwork/.node-ports.env.new
+/etc/systemd/system/heteronetwork-agent.service.d/.06-node-ports.conf.new
+/opt/heteronetwork/libexec/.node-ports.sh.new
 /etc/heteronetwork/.relay-admission.token.new
 /etc/heteronetwork/.relay-server-admission.token.new
 /etc/systemd/system/heteronetwork-agent.service.d/.05-mapped-public.conf.new
@@ -4248,7 +4424,9 @@ if [ "$promote_existing" -eq 0 ]; then
   token_file="$tmp_dir/join-token.json"
   printf '%s' "$auth" | base64 -d >"$token_file"
   chmod 0600 "$token_file"
-  /opt/heteronetwork/bin/iparsd agent --join-token-path "$token_file" --enroll-only
+  /opt/heteronetwork/bin/iparsd agent --join-token-path "$token_file" --enroll-only \
+    --wireguard-listen-port "$node_wireguard_listen_port" \
+    --stun-bind "0.0.0.0:$node_wireguard_listen_port"
   heteronetwork_enrolled_node_id=$(
     jq -er '.node_id | select(type == "string" and length > 0 and length <= 255)' \
       /var/lib/heteronetwork/agent.json
@@ -4274,6 +4452,25 @@ else
 fi
 
 install -d -o root -g root -m 0755 /etc/heteronetwork
+install -d -o root -g root -m 0755 /opt/heteronetwork/libexec /etc/systemd/system/heteronetwork-agent.service.d
+node_ports_write >/etc/heteronetwork/.node-ports.env.new
+chmod 0600 /etc/heteronetwork/.node-ports.env.new
+mv -f /etc/heteronetwork/.node-ports.env.new /etc/heteronetwork/node-ports.env
+cat >/opt/heteronetwork/libexec/.node-ports.sh.new <<'HETERONETWORK_NODE_PORTS'
+__NODE_PORTS_LIBRARY__
+HETERONETWORK_NODE_PORTS
+chmod 0644 /opt/heteronetwork/libexec/.node-ports.sh.new
+mv -f /opt/heteronetwork/libexec/.node-ports.sh.new /opt/heteronetwork/libexec/node-ports.sh
+cat >/etc/systemd/system/heteronetwork-agent.service.d/.06-node-ports.conf.new <<PORTS_UNIT
+[Service]
+Environment=HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT=$node_wireguard_listen_port
+Environment=HETERONETWORK_AGENT_STUN_BIND=0.0.0.0:$node_wireguard_listen_port
+Environment=HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_LISTEN_PORT=$node_https_listen_port
+Environment=HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_PUBLIC_PORT=$node_https_advertise_port
+PORTS_UNIT
+chmod 0644 /etc/systemd/system/heteronetwork-agent.service.d/.06-node-ports.conf.new
+mv -f /etc/systemd/system/heteronetwork-agent.service.d/.06-node-ports.conf.new \
+  /etc/systemd/system/heteronetwork-agent.service.d/06-node-ports.conf
 install -d -o root -g root -m 0755 /etc/sysusers.d
 cat >/etc/sysusers.d/heteronetwork-gateway.conf <<'SYSUSERS'
 u heteronetwork-gateway - "HeteroNetwork Dynamic Public Web Gateway" /var/lib/heteronetwork-gateway
@@ -4444,6 +4641,14 @@ fi
         String::new()
     };
     TEMPLATE
+        .replace(
+            "__NODE_PORTS_LIBRARY__",
+            include_str!("../../../scripts/node-ports.sh"),
+        )
+        .replace(
+            "__NODE_PORTS_DECLARATION__",
+            &ports.map_or_else(String::new, NodeEnrollmentPorts::installer_assignments),
+        )
         .replace(
             "__PUBLIC_SERVICES_TARGET_GENERATION__",
             PUBLIC_SERVICES_BOOTSTRAP_GENERATION,
@@ -4698,6 +4903,7 @@ HETERONETWORK_RELAY_ADMISSION_UNIT
 #!/bin/sh
 set -eu
 
+__NODE_PORTS_LIBRARY__
 agent_status_url=http://127.0.0.1:9780/v1/status
 agent_service=heteronetwork-agent.service
 relay_service=heteronetwork-relay.service
@@ -4987,6 +5193,10 @@ withdraw_relay_and_exit() {
 
 install -d -o root -g root -m 0755 /run/heteronetwork-relay-autopilot
 cleanup_random_temporary_files
+node_ports_defaults
+if ! node_ports_load /etc/heteronetwork/node-ports.env || ! node_ports_validate; then
+  withdraw_relay_and_exit
+fi
 status_file=$(mktemp /run/heteronetwork-relay-autopilot/status.XXXXXX)
 if ! curl --fail --silent --show-error --max-time 5 --max-filesize 1048576 \
   "$agent_status_url" >"$status_file"; then
@@ -5036,6 +5246,12 @@ fi
 
 node_id=$(jq -r '.node_id' "$status_file")
 vpn_ip=$(jq -r '.vpn_ip' "$status_file")
+wireguard_observed_endpoint=$(jq -er '.nat_classification.observed_endpoint' "$status_file") || {
+  withdraw_relay_and_exit
+}
+if ! node_ports_wireguard_matches "$wireguard_observed_endpoint"; then
+  withdraw_relay_and_exit
+fi
 public_ip=$(jq -er '
   .nat_classification
   | (if .connectivity_state == "mapped_public" then
@@ -5057,15 +5273,15 @@ case "$public_ip" in
     case "$public_ip" in
       ''|*[!0-9A-Fa-f:.]*) withdraw_relay_and_exit ;;
     esac
-    relay_udp_listen="[::]:__RELAY_UDP_PORT__"
-    relay_public_endpoint="[$public_ip]:__RELAY_UDP_PORT__"
+    relay_udp_listen="[::]:$node_relay_listen_port"
+    relay_public_endpoint="[$public_ip]:$node_relay_advertise_port"
     ;;
   *)
     case "$public_ip" in
       ''|*[!0-9.]*) withdraw_relay_and_exit ;;
     esac
-    relay_udp_listen="0.0.0.0:__RELAY_UDP_PORT__"
-    relay_public_endpoint="$public_ip:__RELAY_UDP_PORT__"
+    relay_udp_listen="0.0.0.0:$node_relay_listen_port"
+    relay_public_endpoint="$public_ip:$node_relay_advertise_port"
     ;;
 esac
 
@@ -5273,8 +5489,8 @@ __RELAY_CLEANUP__fi
             &NODE_ENROLLMENT_RELAY_RECONCILE_INTERVAL_SECONDS.to_string(),
         )
         .replace(
-            "__RELAY_UDP_PORT__",
-            &NODE_ENROLLMENT_RELAY_UDP_PORT.to_string(),
+            "__NODE_PORTS_LIBRARY__",
+            include_str!("../../../scripts/node-ports.sh"),
         )
         .replace(
             "__RELAY_HTTP_PORT__",
@@ -10109,6 +10325,131 @@ mod tests {
             String::from_utf8_lossy(&command_syntax.stderr)
         );
         let token: SignedJoinToken = serde_json::from_value(response_body["token"].clone())?;
+        // Both delivery paths (the downloaded one-liner and the inline script)
+        // must apply the same enrollment declaration before any installation.
+        let custom_ports = serde_json::json!({
+            "wireguard_listen_port": 30100, "wireguard_public_port": 40100,
+            "relay_listen_port": 30101, "relay_public_port": 40101,
+            "stun_listen_port": 30102, "stun_public_port": 40102,
+            "https_listen_port": 8443, "https_public_port": 9443
+        });
+        let mut custom_request = request_body.clone();
+        custom_request["ports"] = custom_ports.clone();
+        let custom_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&custom_request)?))?,
+            )
+            .await?;
+        assert_eq!(custom_response.status(), StatusCode::OK);
+        let custom_response: Value = serde_json::from_slice(
+            &axum::body::to_bytes(custom_response.into_body(), usize::MAX).await?,
+        )?;
+        assert_eq!(custom_response["ports"], custom_ports);
+        let custom_script = custom_response["install_script"]
+            .as_str()
+            .ok_or("missing custom script")?;
+        let custom_command = custom_response["install_command"]
+            .as_str()
+            .ok_or("missing custom command")?;
+        let port_arguments =
+            serde_json::from_value::<NodeEnrollmentPorts>(custom_ports)?.installer_arguments();
+        assert!(custom_command.ends_with(&port_arguments));
+        let run_preamble =
+            |script: &str, arguments: &[&str]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                let preamble = script
+                    .split_once("if [ -n \"$mapped_public_ip\" ]; then")
+                    .ok_or("installer omitted argument validation")?
+                    .0;
+                let harness = format!("{preamble}\nnode_ports_write\n").replace(
+                    "node_ports_load /etc/heteronetwork/node-ports.env",
+                    "# isolated installer preflight",
+                );
+                let mut child = std::process::Command::new("sh")
+                    .arg("-s")
+                    .arg("--")
+                    .args(arguments)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                child
+                    .stdin
+                    .take()
+                    .ok_or("missing preflight stdin")?
+                    .write_all(harness.as_bytes())?;
+                let result = child.wait_with_output()?;
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                Ok(result.stdout)
+            };
+        let flag_words = port_arguments.split_whitespace().collect::<Vec<_>>();
+        let inline_ports = run_preamble(custom_script, &[])?;
+        assert_eq!(inline_ports, run_preamble(generated_script, &flag_words)?);
+        assert!(String::from_utf8(inline_ports)?.contains("RELAY_PUBLIC_PORT=40101\n"));
+        for (ports, expected_status) in [
+            (
+                serde_json::json!({"relay_listen_port": 0}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"stun_public_port": 65536}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({"relay_listen_port": 51820}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"relay_public_port": 19444}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"wireguard_listen_port": 51821}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"https_listen_port": 9780}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"relay_listen_port": "30101; id"}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({"unknown_port": 30100}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let mut invalid_request = request_body.clone();
+            invalid_request["ports"] = ports;
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/admin/enrollment")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                        )
+                        .body(Body::from(serde_json::to_vec(&invalid_request)?))?,
+                )
+                .await?;
+            assert_eq!(response.status(), expected_status);
+        }
         assert_eq!(token.claims.bootstrap_endpoints.len(), 10);
         assert_eq!(
             token
@@ -10161,7 +10502,7 @@ mod tests {
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
         assert!(generated_script.contains(
-            "Usage: $0 [--promote-existing] [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]"
+            "Usage: $0 [--promote-existing] [--mapped-public-ip IP] [--{wireguard,relay,stun,https}-listen-port PORT] [--{wireguard,relay,stun,https}-public-port PORT|auto] [--disable-relay] [--disable-public-services]"
         ));
         assert!(generated_script.contains("promote_existing=0"));
         assert!(generated_script.contains("ensure_system_user()"));
@@ -10325,8 +10666,8 @@ mod tests {
         assert!(generated_script.contains("($nat.strategy == \"direct_candidate\")"));
         assert!(generated_script.contains("sub(\"\\\\.[0-9]+Z$\"; \"Z\")"));
         assert!(generated_script.contains("($assessed >= (now - 45))"));
-        assert!(generated_script.contains("relay_udp_listen=\"0.0.0.0:18445\""));
-        assert!(generated_script.contains("relay_udp_listen=\"[::]:18445\""));
+        assert!(generated_script.contains("relay_udp_listen=\"0.0.0.0:$node_relay_listen_port\""));
+        assert!(generated_script.contains("relay_udp_listen=\"[::]:$node_relay_listen_port\""));
         assert!(generated_script.contains("relay_http_listen=\"$vpn_ip:18447\""));
         assert!(generated_script.contains("relay_http_listen=\"[$vpn_ip]:18447\""));
         assert!(generated_script.contains(
@@ -12455,6 +12796,7 @@ exit 47
             reusable: true,
             max_uses: Some(1),
             setup: NodeEnrollmentSetup::NetworkOnly,
+            ports: None,
         };
         assert!(node_enrollment_max_uses(&invalid).is_err());
         let valid = AdminNodeEnrollmentRequest {

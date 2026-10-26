@@ -23,6 +23,17 @@ const roleOptions = [
   { value: "gateway", label: "ゲートウェイ" },
 ];
 
+const portServices = [
+  { id: "wireguard", label: "WireGuard (UDP)", port: "51820" },
+  { id: "relay", label: "Relay (UDP)", port: "18445" },
+  { id: "stun", label: "STUN (UDP)", port: "19444" },
+  { id: "https", label: "HTTPS (TCP)", port: "443" },
+];
+
+const defaultPorts = Object.fromEntries(portServices.flatMap(({ id, port }) => [
+  [`${id}_listen_port`, port], [`${id}_public_port`, ""],
+]));
+
 function Result({ mode, result, onReset, onNotify }) {
   if (!result) return null;
   const primaryValue =
@@ -130,6 +141,7 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
   const [reusable, setReusable] = useState(false);
   const [expirationDays, setExpirationDays] = useState("7");
   const [maxUses, setMaxUses] = useState("10");
+  const [ports, setPorts] = useState(defaultPorts);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
 
@@ -162,6 +174,18 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
       return;
     }
     try {
+      const declaredPorts = {};
+      if (mode === "linux") {
+        for (const [key, value] of Object.entries(ports)) {
+          if (value === "" && key.endsWith("_public_port")) {
+            declaredPorts[key] = null;
+          } else if (!/^[1-9][0-9]{0,4}$/.test(value) || Number(value) > 65535) {
+            throw new Error("ポート番号は1から65535の整数で指定してください。");
+          } else {
+            declaredPorts[key] = Number(value);
+          }
+        }
+      }
       const body =
         mode === "desktop"
           ? { expires_in_seconds: days * 86400 }
@@ -171,6 +195,8 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
               tags: csvValues(tags),
               reusable,
               max_uses: reusable ? uses : 1,
+              ports: Object.keys(ports).some((key) => ports[key] !== defaultPorts[key])
+                ? declaredPorts : undefined,
             };
       const issued = await onIssue(mode, body);
       setResult(issued);
@@ -265,6 +291,32 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
                   </SpaceBetween>
                 ) : null}
               </ColumnLayout>
+              {mode === "linux" ? (
+                <ExpandableSection headerText="ポート設定">
+                  <SpaceBetween size="m">
+                    <Box>
+                      公開ポートが空欄の場合、WireGuardはSTUNで検出したポート、
+                      その他は待ち受けポートを使用します。NAT配下ではルーターの転送先に合わせてください。
+                    </Box>
+                    {portServices.map(({ id, label }) => (
+                      <ColumnLayout key={id} columns={2}>
+                        <FormField label={`${label} 待ち受けポート`}>
+                          <Input type="number" value={ports[`${id}_listen_port`]}
+                            onChange={({ detail }) => setPorts((previous) => ({ ...previous, [`${id}_listen_port`]: detail.value }))} />
+                        </FormField>
+                        <FormField label={`${label} 公開ポート`}>
+                          <Input type="number" value={ports[`${id}_public_port`]} placeholder="自動"
+                            onChange={({ detail }) => setPorts((previous) => ({ ...previous, [`${id}_public_port`]: detail.value }))} />
+                        </FormField>
+                      </ColumnLayout>
+                    ))}
+                    <Box variant="small">
+                      HTTPSの自動証明書発行には、証明書認証用のTCP 80または443への到達性が別途必要です。
+                      ポート指定後も公開ノードの判定とヘルスチェックを行います。
+                    </Box>
+                  </SpaceBetween>
+                </ExpandableSection>
+              ) : null}
             </SpaceBetween>
           </Container>
         </Form>

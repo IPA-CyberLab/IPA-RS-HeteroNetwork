@@ -47,6 +47,7 @@ readonly -a DATABASE_NODE_NAMES=(
   mizuame-nucboxg5
 )
 readonly -a RECOVERY_SCRIPT_NAMES=(
+  node-ports.sh
   keycloak-autopilot.sh
   keycloak-ha-node.sh
   kubeadm-ha-autopilot.sh

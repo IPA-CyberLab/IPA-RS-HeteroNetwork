@@ -38,6 +38,8 @@ Use an existing HeteroNetwork management console:
 The generated command contains a short-lived enrollment token and the exact
 release checksum. Do not assign a VPN address or create a Kubernetes join
 command manually.
+Use **ポート設定** in the enrollment form to declare nonstandard listen/public
+ports; the [operations runbook](docs/OPERATIONS.md) also lists installer flags.
 
 For the first public node or a deployment without an existing console, follow
 the [operations runbook](docs/OPERATIONS.md).
