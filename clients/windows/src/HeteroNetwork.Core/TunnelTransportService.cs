@@ -68,7 +68,7 @@ internal sealed class TunnelTransportService : IDisposable
                 var line = process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
                 using var ready = JsonDocument.Parse(line ?? "{}");
                 var endpoint = ready.RootElement.GetProperty("endpoint").GetString();
-                if (!IPEndPoint.TryParse(endpoint, out var local) || !IPAddress.IsLoopback(local.Address) || local.Port == 0)
+                if (endpoint is null || !IPEndPoint.TryParse(endpoint, out var local) || !IPAddress.IsLoopback(local.Address) || local.Port == 0)
                     throw new InvalidOperationException("The transport runtime returned an invalid endpoint.");
                 var originalEndpoint = "Endpoint = " + metadata.GatewayEndpoint;
                 if (!text.Contains(originalEndpoint, StringComparison.Ordinal))

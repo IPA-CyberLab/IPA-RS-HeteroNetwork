@@ -7792,7 +7792,10 @@ impl RuntimePeerEndpointResolver {
         self.http_wireguard_endpoint = Some(wireguard_endpoint);
         self
     }
-    async fn selected_endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError> {
+    async fn selected_endpoint_for_peer(
+        &self,
+        peer: &NodeRecord,
+    ) -> Result<Option<String>, AgentError> {
         let local_candidates = self.runtime.status().await.candidates;
         let overlay_endpoint = self
             .runtime
@@ -7866,7 +7869,6 @@ impl RuntimePeerEndpointResolver {
                 .or_else(|| preferred_endpoint(peer))),
         }
     }
-
 }
 
 #[async_trait]
@@ -7878,13 +7880,23 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
     }
 
     async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError> {
-        let Some(selected) = self.selected_endpoint_for_peer(peer).await? else {return Ok(None);};
-        if let Some(wireguard_endpoint)=self.http_wireguard_endpoint {
-            if let Ok(endpoint)=selected.parse::<SocketAddr>() {
+        let Some(selected) = self.selected_endpoint_for_peer(peer).await? else {
+            return Ok(None);
+        };
+        if let Some(wireguard_endpoint) = self.http_wireguard_endpoint {
+            if let Ok(endpoint) = selected.parse::<SocketAddr>() {
                 // Preserve selected overlay/relay forwarders. Only wrap a
                 // direct peer endpoint, after the routing decision is made.
-                if peer.endpoint_candidates.iter().any(|candidate|candidate.addr==endpoint) {
-                    if let Some(proxy)=self.runtime.ensure_http_peer_transport(peer,endpoint,wireguard_endpoint).await? {
+                if peer
+                    .endpoint_candidates
+                    .iter()
+                    .any(|candidate| candidate.addr == endpoint)
+                {
+                    if let Some(proxy) = self
+                        .runtime
+                        .ensure_http_peer_transport(peer, endpoint, wireguard_endpoint)
+                        .await?
+                    {
                         return Ok(Some(proxy.to_string()));
                     }
                 }
