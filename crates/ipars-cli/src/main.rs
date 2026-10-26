@@ -11458,6 +11458,8 @@ mod tests {
         let mut response = RegisterClientResponse {
             client,
             peer_map: PeerMap {
+                http_tunnel_protocol: None,
+                http_tunnel_urls: Default::default(),
                 cluster_id,
                 peers: vec![gateway],
                 bootstrap_endpoints: vec![BootstrapEndpoint {
@@ -12061,6 +12063,8 @@ mod tests {
             &RegisterNodeResponse {
                 node: node.clone(),
                 peer_map: PeerMap {
+                    http_tunnel_protocol: None,
+                    http_tunnel_urls: Default::default(),
                     cluster_id: node.cluster_id.clone(),
                     peers: Vec::new(),
                     bootstrap_endpoints: Vec::new(),
@@ -12140,6 +12144,8 @@ mod tests {
             &RegisterNodeResponse {
                 node: node.clone(),
                 peer_map: PeerMap {
+                    http_tunnel_protocol: None,
+                    http_tunnel_urls: Default::default(),
                     cluster_id: node.cluster_id.clone(),
                     peers: Vec::new(),
                     bootstrap_endpoints: active.clone(),
@@ -14673,6 +14679,8 @@ fi
         };
         let generated_at = Utc::now();
         let peer_map = PeerMap {
+            http_tunnel_protocol: None,
+            http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
             bootstrap_endpoints: Vec::new(),
             peers: vec![ipars_types::NodeRecord {

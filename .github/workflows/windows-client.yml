@@ -6,6 +6,7 @@ on:
     branches:
       - master
     paths:
+      - "clients/transport/**"
       - "clients/windows/**"
       - "install-client.sh"
       - ".github/workflows/windows-client.yml"
@@ -14,6 +15,7 @@ on:
       - ".github/workflows/ci.yml"
   pull_request:
     paths:
+      - "clients/transport/**"
       - "clients/windows/**"
       - "install-client.sh"
       - ".github/workflows/windows-client.yml"

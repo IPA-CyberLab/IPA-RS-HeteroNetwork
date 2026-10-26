@@ -123,6 +123,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "The embedded WireGuard runtime bootstrap failed."
 }
 
+$transportSource = Join-Path $clientRoot "../transport"
+$transportBinary = Join-Path $clientRoot ".build/native/win-x64/HeteroNetwork.TransportProxy.exe"
+Push-Location $transportSource
+try {
+    & go test ./...
+    if ($LASTEXITCODE -ne 0) { throw "HTTP transport tests failed." }
+    & go build -trimpath -ldflags="-s -w" -o $transportBinary ./cmd/proxy
+    if ($LASTEXITCODE -ne 0) { throw "HTTP transport build failed." }
+} finally { Pop-Location }
+
 Invoke-DotNet @("restore", $solution, $releaseProperty)
 Invoke-DotNet @(
     "build",

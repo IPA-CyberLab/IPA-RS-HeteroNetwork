@@ -13,11 +13,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	transport "github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/clients/transport"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -42,6 +44,7 @@ type activeTunnel struct {
 	interfaceName string
 	addedRoutes   map[string]struct{}
 	dns           *splitDNSSession
+	transport     *transport.Proxy
 }
 
 type splitDNSSession struct {
@@ -241,7 +244,12 @@ func createActiveTunnel(configuration tunnelConfiguration) (*activeTunnel, error
 		tunnel.close()
 		return nil, setupErr
 	}
-	if err := wireGuardDevice.IpcSet(configuration.uapiConfiguration()); err != nil {
+	proxy, err := transport.Start(transportConfiguration(configuration))
+	if err != nil {
+		return fail(err)
+	}
+	tunnel.transport = proxy
+	if err := wireGuardDevice.IpcSet(tunnel.uapiConfiguration(configuration, proxy)); err != nil {
 		return fail(fmt.Errorf("configure WireGuard: %w", err))
 	}
 	if err := tunnel.configureInterface(); err != nil {
@@ -324,6 +332,21 @@ func (tunnel *activeTunnel) deleteRoute(route string) {
 	delete(tunnel.addedRoutes, route)
 }
 
+func transportConfiguration(configuration tunnelConfiguration) transport.Configuration {
+	return transport.Configuration{
+		ClientNodeID: configuration.ClientNodeID, GatewayNodeID: configuration.GatewayNodeID,
+		PrivateKey: configuration.PrivateKey, GatewayWireGuardPublicKey: configuration.GatewayWireGuardPublicKey,
+		GatewayEndpoint: configuration.GatewayEndpoint, GatewayHTTPTunnelURLs: configuration.GatewayHTTPTunnelURLs,
+	}
+}
+
+func (tunnel *activeTunnel) uapiConfiguration(configuration tunnelConfiguration, proxy *transport.Proxy) string {
+	if proxy != nil {
+		configuration.GatewayEndpoint = proxy.Endpoint()
+	}
+	return configuration.uapiConfiguration()
+}
+
 func (tunnel *activeTunnel) update(configuration tunnelConfiguration) error {
 	if configuration.OwnerUID != tunnel.configuration.OwnerUID {
 		return errors.New("configuration owner cannot change while connected")
@@ -352,7 +375,29 @@ func (tunnel *activeTunnel) update(configuration tunnelConfiguration) error {
 		}
 		added = append(added, route)
 	}
-	if err := tunnel.device.IpcSet(configuration.uapiConfiguration()); err != nil {
+	proxy := tunnel.transport
+	changedTransport := configuration.PrivateKey != tunnel.configuration.PrivateKey ||
+		configuration.GatewayWireGuardPublicKey != tunnel.configuration.GatewayWireGuardPublicKey ||
+		configuration.GatewayEndpoint != tunnel.configuration.GatewayEndpoint ||
+		configuration.GatewayNodeID != tunnel.configuration.GatewayNodeID ||
+		!slices.Equal(configuration.GatewayHTTPTunnelURLs, tunnel.configuration.GatewayHTTPTunnelURLs)
+	if changedTransport {
+		var err error
+		proxy, err = transport.Start(transportConfiguration(configuration))
+		if err != nil {
+			for _, route := range added {
+				tunnel.deleteRoute(route)
+			}
+			return err
+		}
+	}
+	committedTransport := false
+	defer func() {
+		if changedTransport && !committedTransport && proxy != nil {
+			proxy.Close()
+		}
+	}()
+	if err := tunnel.device.IpcSet(tunnel.uapiConfiguration(configuration, proxy)); err != nil {
 		for _, rollbackRoute := range added {
 			tunnel.deleteRoute(rollbackRoute)
 		}
@@ -362,10 +407,14 @@ func (tunnel *activeTunnel) update(configuration tunnelConfiguration) error {
 		configuration.DNSDomain != tunnel.configuration.DNSDomain
 	if dnsChanged {
 		if tunnel.dns == nil {
+			_ = tunnel.device.IpcSet(tunnel.uapiConfiguration(tunnel.configuration, tunnel.transport))
+			for _, rollbackRoute := range added {
+				tunnel.deleteRoute(rollbackRoute)
+			}
 			return errors.New("split DNS session is unavailable")
 		}
 		if err := tunnel.dns.update(configuration.DNSServer, configuration.DNSDomain); err != nil {
-			_ = tunnel.device.IpcSet(tunnel.configuration.uapiConfiguration())
+			_ = tunnel.device.IpcSet(tunnel.uapiConfiguration(tunnel.configuration, tunnel.transport))
 			_ = tunnel.dns.update(
 				tunnel.configuration.DNSServer,
 				tunnel.configuration.DNSDomain,
@@ -382,10 +431,22 @@ func (tunnel *activeTunnel) update(configuration tunnelConfiguration) error {
 		}
 	}
 	tunnel.configuration = configuration
+	if changedTransport {
+		old := tunnel.transport
+		tunnel.transport = proxy
+		if old != nil {
+			old.Close()
+		}
+	}
+	committedTransport = true
 	return nil
 }
 
 func (tunnel *activeTunnel) close() {
+	if tunnel.transport != nil {
+		tunnel.transport.Close()
+		tunnel.transport = nil
+	}
 	if tunnel.dns != nil {
 		tunnel.dns.close()
 		tunnel.dns = nil
@@ -437,6 +498,10 @@ func (tunnel *activeTunnel) handleControlConnection(connection net.Conn) bool {
 		Interface: tunnel.interfaceName,
 		Gateway:   tunnel.configuration.GatewayNodeID,
 		PID:       os.Getpid(),
+	}
+	if tunnel.transport != nil {
+		status := tunnel.transport.Snapshot()
+		response.Transport = &status
 	}
 	stop := false
 	if err != nil {

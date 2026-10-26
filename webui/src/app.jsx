@@ -21,6 +21,7 @@ import { AclPage } from "./pages/acl-page.jsx";
 import { EnrollmentPage } from "./pages/enrollment-page.jsx";
 import { NodeDetailModal, NodesPage } from "./pages/nodes-page.jsx";
 import { OverviewPage } from "./pages/overview-page.jsx";
+import { TransportsPage } from "./pages/transports-page.jsx";
 import { PathsPage } from "./pages/paths-page.jsx";
 import { RoutesPage } from "./pages/routes-page.jsx";
 import { TopologyPage } from "./pages/topology-page.jsx";
@@ -28,6 +29,7 @@ import { TopologyPage } from "./pages/topology-page.jsx";
 const pageMetadata = {
   overview: ["概要", "ネットワーク全体の状態を確認します。"],
   nodes: ["ノード", "参加している実マシンと稼働サービスを確認します。"],
+  transports: ["通信方式", "UDP・HTTPS・HTTPの接続状態と切り替え履歴です。"],
   paths: ["接続", "選択されたピア経路とオペレーター制御です。"],
   topology: ["オーバーレイトポロジー", "再帰グループと転送リンクを確認します。"],
   routes: ["ネットワークルート", "広報されたネットワークと所有ノードです。"],
@@ -432,6 +434,7 @@ export function App() {
         ...(config.node_enrollment_enabled || config.client_enrollment_enabled
           ? [{ type: "link", text: "ノードを追加", href: "#/enrollment" }]
           : []),
+        { type: "link", text: "通信方式", href: "#/transports" },
         { type: "link", text: "接続", href: "#/paths", info: String(metrics.path_count ?? "-") },
         {
           type: "link",
@@ -478,6 +481,8 @@ export function App() {
     switch (activeView) {
       case "nodes":
         return <NodesPage overview={overview} onOpenNode={setSelectedNode} />;
+      case "transports":
+        return <TransportsPage overview={overview} />;
       case "paths":
         return (
           <PathsPage

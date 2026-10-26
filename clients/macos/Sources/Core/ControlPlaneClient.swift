@@ -98,7 +98,7 @@ public final class ControlPlaneClient {
             throw ControlPlaneAPIError.invalidResponse
         }
         var updated = storedSession
-        updated.peerMap = response.peerMap
+        updated.peerMap = response.peerMap.preserveLegacyTransport(storedSession.peerMap)
         updated.selectedGatewayNodeID = response.peerMap.peers.first?.nodeID
         let liveManagementURLs = EnrollmentParser.managementURLs(
             from: response.peerMap.bootstrapEndpoints

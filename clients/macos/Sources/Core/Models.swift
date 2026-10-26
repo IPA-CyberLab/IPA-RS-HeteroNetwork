@@ -282,17 +282,44 @@ public struct PeerMap: Codable, Equatable, Sendable {
     public let peers: [NodeRecord]
     public let bootstrapEndpoints: [BootstrapEndpoint]
     public let generatedAt: Date
+    public let httpTunnelURLs: [String: [String]]
+    public let httpTunnelProtocol: Int?
 
     public init(
         clusterID: String,
         peers: [NodeRecord],
         bootstrapEndpoints: [BootstrapEndpoint],
-        generatedAt: Date
+        generatedAt: Date,
+        httpTunnelURLs: [String: [String]] = [:],
+        httpTunnelProtocol: Int? = nil
     ) {
         self.clusterID = clusterID
         self.peers = peers
         self.bootstrapEndpoints = bootstrapEndpoints
         self.generatedAt = generatedAt
+        self.httpTunnelURLs = httpTunnelURLs
+        self.httpTunnelProtocol = httpTunnelProtocol
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        clusterID = try container.decode(String.self, forKey: .clusterID)
+        peers = try container.decode([NodeRecord].self, forKey: .peers)
+        bootstrapEndpoints = try container.decode([BootstrapEndpoint].self, forKey: .bootstrapEndpoints)
+        generatedAt = try container.decode(Date.self, forKey: .generatedAt)
+        httpTunnelURLs = try container.decodeIfPresent([String: [String]].self, forKey: .httpTunnelURLs) ?? [:]
+        httpTunnelProtocol = try container.decodeIfPresent(Int.self, forKey: .httpTunnelProtocol)
+    }
+
+    public func preserveLegacyTransport(_ previous: PeerMap) -> PeerMap {
+        guard httpTunnelProtocol == nil else { return self }
+        let retained = previous.httpTunnelURLs.filter { entry in
+            peers.contains { node in node.nodeID == entry.key && previous.peers.contains {
+                $0.nodeID == node.nodeID && $0.wireGuardPublicKey == node.wireGuardPublicKey
+            } }
+        }
+        return PeerMap(clusterID: clusterID, peers: peers, bootstrapEndpoints: bootstrapEndpoints,
+                       generatedAt: generatedAt, httpTunnelURLs: retained, httpTunnelProtocol: previous.httpTunnelProtocol)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -300,6 +327,8 @@ public struct PeerMap: Codable, Equatable, Sendable {
         case peers
         case bootstrapEndpoints = "bootstrap_endpoints"
         case generatedAt = "generated_at"
+        case httpTunnelURLs = "http_tunnel_urls"
+        case httpTunnelProtocol = "http_tunnel_protocol"
     }
 }
 

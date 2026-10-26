@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::io::{Read, Seek, SeekFrom};
@@ -634,6 +635,16 @@ where
 {
     let protocol = Router::new()
         .route("/healthz", get(healthz))
+        .route(
+            "/v1/transport-capabilities",
+            get(|| async {
+                Json(serde_json::json!({"http_tunnel_protocol":1,"transport_observations":true}))
+            }),
+        )
+        .route(
+            "/v1/nodes/http-transport/peer",
+            post(http_transport_peer::<S, L>),
+        )
         .route("/v1/join", post(join::<S, L>))
         .route("/v1/clients/join", post(join_client::<S, L>))
         .route(
@@ -720,6 +731,7 @@ where
     });
     let admin = Router::new()
         .route("/v1/admin/overview", get(admin_overview::<S, L>))
+        .route("/v1/admin/transports", get(admin_transports::<S, L>))
         .route("/v1/admin/topology", get(admin_topology::<S, L>))
         .route("/v1/admin/services", get(admin_services::<S, L>))
         .route(
@@ -6510,6 +6522,73 @@ where
     Ok(snapshot)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransportListQuery {
+    node_id: Option<String>,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn http_transport_peer<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<ipars_types::api::HttpTransportPeerRequest>,
+) -> Result<Json<ipars_types::api::HttpTransportPeerResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(state.plane.http_transport_peer(request).await?))
+}
+
+async fn admin_transports<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Query(query): Query<TransportListQuery>,
+) -> Result<Json<Value>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let limit = query.limit.unwrap_or(10);
+    if !(1..=50).contains(&limit)
+        || query.node_id.as_ref().is_some_and(|v| v.len() > 128)
+        || query.after.as_ref().is_some_and(|v| v.len() > 128)
+    {
+        return Err(ApiError(ControlPlaneError::InvalidTransportQuery(
+            "invalid transport page parameters".to_string(),
+        )));
+    }
+    let mut nodes = state
+        .plane
+        .list_nodes()
+        .await?
+        .into_iter()
+        .filter(|node| !node.role.is_client())
+        .map(|node| node.node_id)
+        .collect::<Vec<_>>();
+    nodes.sort();
+    if let Some(node) = &query.node_id {
+        nodes.retain(|id| id.as_str() == node);
+    }
+    if let Some(after) = &query.after {
+        nodes.retain(|id| id.as_str() > after.as_str());
+    }
+    let more = nodes.len() > limit;
+    nodes.truncate(limit);
+    let after = more
+        .then(|| nodes.last().map(|id| id.to_string()))
+        .flatten();
+    let ids: BTreeSet<NodeId> = nodes.into_iter().collect();
+    let items = state.plane.transport_snapshots_for(&ids).await?;
+    let unreported = ids
+        .iter()
+        .filter(|id| !items.iter().any(|item| &item.node_id == *id))
+        .collect::<Vec<_>>();
+    Ok(Json(
+        serde_json::json!({"items":items,"unreported":unreported,"next_cursor":after,"generated_at":Utc::now()}),
+    ))
+}
+
 async fn admin_overview<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
 ) -> Result<Json<ControlPlaneOverviewResponse>, ApiError>
@@ -6883,12 +6962,17 @@ where
     L: TokenLedger,
 {
     let metrics = control_plane_metrics(&state).await?;
+    let mut body = render_prometheus_metrics(&metrics);
+    body.push_str(&render_transport_metrics(
+        &state.plane.transport_snapshots().await?,
+        Utc::now(),
+    ));
     Ok((
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_prometheus_metrics(&metrics),
+        body,
     ))
 }
 
@@ -7550,6 +7634,116 @@ struct HealthResponse {
     status: &'static str,
 }
 
+fn render_transport_metrics(
+    snapshots: &[ipars_types::api::TransportNodeSnapshot],
+    now: chrono::DateTime<Utc>,
+) -> String {
+    use ipars_types::api::{DataPlaneTransport, TransportPhase};
+    let mut body = String::new();
+    for (name, description) in [
+        (
+            "report_timestamp_seconds",
+            "Last signed transport report timestamp.",
+        ),
+        (
+            "connections",
+            "Reported connections by transport and phase; stale reports are labelled stale.",
+        ),
+        (
+            "tx_bytes",
+            "Reported transmitted bytes since transport process start.",
+        ),
+        (
+            "rx_bytes",
+            "Reported received bytes since transport process start.",
+        ),
+        (
+            "switches",
+            "Reported transport switches since process start.",
+        ),
+        (
+            "reconnects",
+            "Reported reconnect attempts since process start.",
+        ),
+        (
+            "failures",
+            "Reported failures by bounded reason code since process start.",
+        ),
+    ] {
+        prometheus_line!(&mut body, "# HELP ipars_transport_{name} {description}");
+        prometheus_line!(&mut body, "# TYPE ipars_transport_{name} gauge");
+    }
+    for snapshot in snapshots {
+        let node = prometheus_label(snapshot.node_id.as_str());
+        prometheus_line!(
+            &mut body,
+            "ipars_transport_report_timestamp_seconds{{node_id=\"{node}\"}} {}",
+            snapshot.observed_at.timestamp()
+        );
+        let mut counts = BTreeMap::<(&str, &str), u64>::new();
+        let mut totals = [0_u64; 4];
+        let mut failures = BTreeMap::<&str, u64>::new();
+        for connection in &snapshot.snapshot.connections {
+            let protocol = match connection.transport {
+                DataPlaneTransport::Udp => "udp",
+                DataPlaneTransport::Http => "http",
+                DataPlaneTransport::Https => "https",
+            };
+            let phase = if now
+                .signed_duration_since(snapshot.observed_at)
+                .num_seconds()
+                > 90
+                || now
+                    .signed_duration_since(connection.updated_at)
+                    .num_seconds()
+                    > 90
+            {
+                "stale"
+            } else {
+                match connection.phase {
+                    TransportPhase::Probing => "probing",
+                    TransportPhase::Connected => "connected",
+                    TransportPhase::Reconnecting => "reconnecting",
+                    TransportPhase::Failed => "failed",
+                }
+            };
+            *counts.entry((protocol, phase)).or_default() += 1;
+            for (total, value) in totals.iter_mut().zip([
+                connection.tx_bytes,
+                connection.rx_bytes,
+                connection.switches,
+                connection.reconnects,
+            ]) {
+                *total = total.saturating_add(value);
+            }
+            for (reason, count) in &connection.failures {
+                let total = failures.entry(reason).or_default();
+                *total = total.saturating_add(*count);
+            }
+        }
+        for ((protocol, phase), count) in counts {
+            prometheus_line!(&mut body,"ipars_transport_connections{{node_id=\"{node}\",transport=\"{protocol}\",phase=\"{phase}\"}} {count}");
+        }
+        for (metric, value) in ["tx_bytes", "rx_bytes", "switches", "reconnects"]
+            .into_iter()
+            .zip(totals)
+        {
+            prometheus_line!(
+                &mut body,
+                "ipars_transport_{metric}{{node_id=\"{node}\"}} {value}"
+            );
+        }
+        for (reason, count) in failures {
+            let reason = prometheus_label(reason);
+            prometheus_line!(
+                &mut body,
+                "ipars_transport_failures{{node_id=\"{node}\",reason=\"{reason}\"}} {count}"
+            );
+        }
+    }
+    body
+}
+
 fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     let cluster_id = prometheus_label(metrics.cluster_id.as_str());
     let mut body = String::new();
@@ -7994,7 +8188,8 @@ impl IntoResponse for ApiError {
             | ControlPlaneError::OverlayDestinationNotFound(_)
             | ControlPlaneError::OverlayPathUnavailable { .. } => StatusCode::NOT_FOUND,
             ControlPlaneError::InvalidClusterPolicy(_) => StatusCode::BAD_REQUEST,
-            ControlPlaneError::InvalidNodeDisplayName(_) => StatusCode::BAD_REQUEST,
+            ControlPlaneError::InvalidNodeDisplayName(_)
+            | ControlPlaneError::InvalidTransportQuery(_) => StatusCode::BAD_REQUEST,
             ControlPlaneError::VpnPoolExhausted
             | ControlPlaneError::BoundedTopology(_)
             | ControlPlaneError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -13100,6 +13295,7 @@ exit 47
                 relay_capability: None,
                 routes: None,
                 service_advertisement: Some(ipars_types::api::NodeServiceAdvertisement {
+                    transport: None,
                     hostname: Some("uc-k8sp3".to_string()),
                     endpoints: Vec::new(),
                     agent_build: None,

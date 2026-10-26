@@ -89,6 +89,7 @@ The current implementation and known gaps are tracked in
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Operations](docs/OPERATIONS.md)
+- [UDP / HTTPS / HTTP fallback](docs/networking/http-transport.md)
 - [Security](docs/SECURITY.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md)

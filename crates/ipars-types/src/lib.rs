@@ -2941,6 +2941,10 @@ pub mod api {
         pub peers: Vec<NodeRecord>,
         #[serde(default)]
         pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub http_tunnel_urls: BTreeMap<NodeId, Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub http_tunnel_protocol: Option<u16>,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -2969,6 +2973,7 @@ pub mod api {
         PeerMap,
         NeighborMap,
         Paths,
+        HttpTransport,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2976,6 +2981,27 @@ pub mod api {
         pub node_id: NodeId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request_signature: Option<NodeApiRequestSignature>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HttpTransportPeerRequest {
+        pub query: ControlPlaneNodeQueryRequest,
+        pub peer: NodeId,
+        #[serde(default)]
+        pub admission: Option<RelayAdmissionRequest>,
+    }
+
+    impl HttpTransportPeerRequest {
+        pub fn binding_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+            serde_json::to_vec(&("http-transport-peer-v1", &self.peer, &self.admission))
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct HttpTransportPeerResponse {
+        pub peer: NodeRecord,
+        pub http_tunnel_urls: Vec<String>,
     }
 
     impl ControlPlaneNodeQueryRequest {
@@ -3062,6 +3088,98 @@ pub mod api {
         pub endpoints: Vec<BootstrapEndpoint>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent_build: Option<AgentBuildInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub transport: Option<NodeTransportSnapshot>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum DataPlaneTransport {
+        #[default]
+        Udp,
+        Http,
+        Https,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TransportPhase {
+        #[default]
+        Probing,
+        Connected,
+        Reconnecting,
+        Failed,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TransportDirection {
+        #[default]
+        Outgoing,
+        Incoming,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct TransportObservation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub connection_id: Option<String>,
+        pub peer: NodeId,
+        pub transport: DataPlaneTransport,
+        pub phase: TransportPhase,
+        #[serde(default)]
+        pub direction: TransportDirection,
+        #[serde(default)]
+        pub failures: BTreeMap<String, u64>,
+        pub endpoint: String,
+        pub fallback_reason: Option<String>,
+        pub last_error: Option<String>,
+        pub tx_packets: u64,
+        pub rx_packets: u64,
+        pub tx_bytes: u64,
+        pub rx_bytes: u64,
+        pub switches: u64,
+        pub reconnects: u64,
+        pub updated_at: DateTime<Utc>,
+        pub last_received_at: Option<DateTime<Utc>>,
+    }
+
+    impl TransportObservation {
+        pub fn new(peer: NodeId, endpoint: String) -> Self {
+            Self {
+                connection_id: None,
+                peer,
+                endpoint,
+                transport: DataPlaneTransport::Udp,
+                direction: TransportDirection::Outgoing,
+                failures: BTreeMap::new(),
+                phase: TransportPhase::Probing,
+                fallback_reason: None,
+                last_error: None,
+                tx_packets: 0,
+                rx_packets: 0,
+                tx_bytes: 0,
+                rx_bytes: 0,
+                switches: 0,
+                reconnects: 0,
+                updated_at: Utc::now(),
+                last_received_at: None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct NodeTransportSnapshot {
+        #[serde(default)]
+        pub http_tunnel_urls: Vec<String>,
+        #[serde(default)]
+        pub connections: Vec<TransportObservation>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct TransportNodeSnapshot {
+        pub node_id: NodeId,
+        pub observed_at: DateTime<Utc>,
+        pub snapshot: NodeTransportSnapshot,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3794,6 +3912,8 @@ pub mod api {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RelayStatusResponse {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub http_transports: Vec<TransportObservation>,
         pub relay_node: NodeId,
         pub capability: RelayCapability,
         pub health: HealthState,

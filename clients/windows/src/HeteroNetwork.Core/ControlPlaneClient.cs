@@ -96,7 +96,7 @@ public sealed class ControlPlaneClient : IDisposable
             throw new ControlPlaneException("The control plane returned an invalid response.");
         }
 
-        storedSession.PeerMap = response.PeerMap;
+        storedSession.PeerMap = response.PeerMap.PreserveLegacyTransport(storedSession.PeerMap);
         storedSession.SelectedGatewayNodeId = response.PeerMap.Peers.FirstOrDefault()?.NodeId;
         var liveManagementUrls =
             EnrollmentParser.ManagementUrls(response.PeerMap.BootstrapEndpoints);

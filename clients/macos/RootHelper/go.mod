@@ -12,3 +12,7 @@ require (
 	golang.org/x/net v0.61.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 )
+
+require github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/clients/transport v0.0.0
+
+replace github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/clients/transport => ../../transport

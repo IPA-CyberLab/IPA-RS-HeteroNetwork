@@ -11,6 +11,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	transport "github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/clients/transport"
 )
 
 const controlSocketPath = "/var/run/heteronetwork-client/control.sock"
@@ -21,12 +23,13 @@ type controlRequest struct {
 }
 
 type controlResponse struct {
-	OK        bool   `json:"ok"`
-	Status    string `json:"status"`
-	Interface string `json:"interface,omitempty"`
-	Gateway   string `json:"gateway,omitempty"`
-	PID       int    `json:"pid,omitempty"`
-	Error     string `json:"error,omitempty"`
+	OK        bool              `json:"ok"`
+	Status    string            `json:"status"`
+	Interface string            `json:"interface,omitempty"`
+	Gateway   string            `json:"gateway,omitempty"`
+	PID       int               `json:"pid,omitempty"`
+	Error     string            `json:"error,omitempty"`
+	Transport *transport.Status `json:"transport,omitempty"`
 }
 
 func requestControl(request controlRequest) (controlResponse, error) {

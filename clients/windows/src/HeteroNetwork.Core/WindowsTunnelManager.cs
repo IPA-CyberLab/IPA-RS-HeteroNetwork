@@ -294,7 +294,7 @@ public sealed class WindowsTunnelManager
         ClientKeyMaterial keys,
         TunnelProfile profile)
     {
-        return string.Join(
+        var configuration = string.Join(
             "\r\n",
             "[Interface]",
             $"PrivateKey = {keys.WireGuardPrivateKeyBase64}",
@@ -307,6 +307,22 @@ public sealed class WindowsTunnelManager
             $"AllowedIPs = {string.Join(", ", profile.AllowedIps)}",
             "PersistentKeepalive = 25",
             string.Empty);
+        if (profile.HttpTunnelUrls.Count > 0)
+        {
+            var metadata = new TunnelTransportConfiguration
+            {
+                ClientNodeId = keys.ClientId,
+                GatewayNodeId = profile.GatewayNodeId,
+                GatewayEndpoint = profile.GatewayEndpoint,
+                GatewayWireGuardPublicKey = Convert.ToHexStringLower(Convert.FromBase64String(profile.GatewayWireGuardPublicKey)),
+                GatewayHttpTunnelUrls = profile.HttpTunnelUrls,
+            };
+            var target = new Uri(profile.HttpTunnelUrls[0]);
+            var proxy = HttpClient.DefaultProxy.GetProxy(target);
+            if (proxy is not null && proxy != target) metadata.ProxyUrl = proxy.AbsoluteUri;
+            configuration += "# HeteroNetworkTransport = " + Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(metadata)) + "\r\n";
+        }
+        return configuration;
     }
 
     private static async Task<string> WriteMachineProtectedConfigurationAsync(

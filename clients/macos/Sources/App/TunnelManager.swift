@@ -308,6 +308,8 @@ private struct RootTunnelConfiguration: Encodable {
     let gatewayVPNIP: String
     let gatewayWireGuardPublicKey: String
     let gatewayEndpoint: String
+    let clientNodeID: String
+    let gatewayHTTPTunnelURLs: [String]
     let allowedIPs: [String]
     let dnsServer: String
     let dnsDomain: String
@@ -329,6 +331,8 @@ private struct RootTunnelConfiguration: Encodable {
         gatewayVPNIP = profile.gatewayVPNIP
         gatewayWireGuardPublicKey = gatewayKey.hexadecimalString
         gatewayEndpoint = profile.gatewayEndpoint
+        clientNodeID = session.client.nodeID
+        gatewayHTTPTunnelURLs = session.peerMap.httpTunnelURLs[profile.gatewayNodeID] ?? []
         allowedIPs = profile.allowedIPs
         dnsServer = profile.gatewayVPNIP
         dnsDomain = HeteroNetworkConstants.overlayDNSZone
@@ -353,6 +357,8 @@ private struct RootTunnelConfiguration: Encodable {
         case gatewayVPNIP = "gateway_vpn_ip"
         case gatewayWireGuardPublicKey = "gateway_wireguard_public_key"
         case gatewayEndpoint = "gateway_endpoint"
+        case clientNodeID = "client_node_id"
+        case gatewayHTTPTunnelURLs = "gateway_http_tunnel_urls"
         case allowedIPs = "allowed_ips"
         case dnsServer = "dns_server"
         case dnsDomain = "dns_domain"

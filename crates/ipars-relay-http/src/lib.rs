@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::sync::Arc;
+pub mod transport;
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -26,6 +27,7 @@ pub struct RelayHttpState {
     relay: Arc<RelayService>,
     admission_bearer_token: Option<Arc<str>>,
     operator_api_bearer_token: Option<Arc<str>>,
+    http_transport: Option<Arc<ipars_http_tunnel::TunnelHub>>,
 }
 
 impl RelayHttpState {
@@ -34,11 +36,18 @@ impl RelayHttpState {
             relay,
             admission_bearer_token: None,
             operator_api_bearer_token: None,
+            http_transport: None,
         }
     }
 
     pub fn require_admission_bearer_token(mut self, token: String) -> Self {
         self.admission_bearer_token = Some(Arc::from(token));
+        self
+    }
+    pub fn with_http_transport(mut self, backend: std::net::SocketAddr, maximum: usize) -> Self {
+        self.http_transport = Some(Arc::new(ipars_http_tunnel::TunnelHub::new(
+            backend, maximum,
+        )));
         self
     }
 
@@ -82,7 +91,7 @@ pub fn router(state: RelayHttpState) -> Router {
     } else {
         protocol
     };
-    app.with_state(state)
+    app.merge(transport::routes()).with_state(state)
 }
 
 async fn require_relay_operator_api_bearer(
@@ -109,7 +118,11 @@ async fn healthz() -> Json<HealthResponse> {
 }
 
 async fn status(State(state): State<RelayHttpState>) -> Json<RelayStatusResponse> {
-    Json(state.relay.status().await)
+    let mut status = state.relay.status().await;
+    if let Some(hub) = &state.http_transport {
+        status.http_transports = hub.observations();
+    }
+    Json(status)
 }
 
 async fn prometheus_metrics(State(state): State<RelayHttpState>) -> impl IntoResponse {
@@ -1026,6 +1039,204 @@ mod tests {
                 .get(&RelayAdmissionFailureReason::RateLimited),
             Some(&1)
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn http_transport_interoperates_with_udp_and_http_relay_peers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use ipars_http_tunnel::{
+            append_packet, decode_batch, OpenResponse, NODE_HEADER, TOKEN_SCHEME,
+        };
+        use ipars_relay::{
+            encode_relay_datagram_with_route, encode_relay_endpoint_announcement,
+            encode_relay_endpoint_probe, UdpRelay,
+        };
+        let service = test_relay();
+        let udp = UdpRelay::bind("127.0.0.1:0".parse()?).await?;
+        let backend = udp.local_addr()?;
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(udp.serve(service.table(), receiver));
+        let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let admitted = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("left"),
+                right: NodeId::from_string("right"),
+                left_addr: left.local_addr()?,
+                right_addr: right.local_addr()?,
+            })
+            .await?;
+        let app = router(RelayHttpState::new(service).with_http_transport(backend, 16));
+        let announcement = |node: &str, other: &str| {
+            encode_relay_endpoint_probe(
+                &admitted.session_id,
+                &admitted.session_token,
+                &NodeId::from_string(node),
+                &NodeId::from_string(other),
+            )
+        };
+        let request =
+            |method: &str, path: &str, token: Option<&str>, node: Option<&str>, body: Vec<u8>| {
+                let mut request = Request::builder().method(method).uri(path);
+                if let Some(token) = token {
+                    request = request.header("authorization", format!("{TOKEN_SCHEME}{token}"));
+                }
+                if let Some(node) = node {
+                    request = request.header(NODE_HEADER, node);
+                }
+                request.body(Body::from(body))
+            };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/tunnels/relay/open",
+                None,
+                Some("left"),
+                announcement("left", "right")?,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let left_http: OpenResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        right
+            .send_to(
+                &encode_relay_endpoint_announcement(
+                    &admitted.session_id,
+                    &admitted.session_token,
+                    &NodeId::from_string("right"),
+                    &NodeId::from_string("left"),
+                )?,
+                backend,
+            )
+            .await?;
+        let mut packet = vec![0_u8; 148];
+        packet[0] = 1;
+        packet[4] = 7;
+        let frame = encode_relay_datagram_with_route(
+            &admitted.session_id,
+            &admitted.session_token,
+            &NodeId::from_string("left"),
+            &NodeId::from_string("right"),
+            &packet,
+        )?;
+        let mut batch = Vec::new();
+        append_packet(&mut batch, &frame)?;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "POST",
+                    "/v1/tunnels/relay/packets",
+                    Some(&left_http.token),
+                    None,
+                    batch.clone()
+                )?)
+                .await?
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let mut buffer = vec![0_u8; 65535];
+        let len = tokio::time::timeout(std::time::Duration::from_secs(2), right.recv(&mut buffer))
+            .await??;
+        assert_eq!(&buffer[..len], &packet);
+        let mut response_packet = vec![0_u8; 92];
+        response_packet[0] = 2;
+        response_packet[4] = 8;
+        response_packet[8] = 7;
+        right
+            .send_to(
+                &encode_relay_datagram_with_route(
+                    &admitted.session_id,
+                    &admitted.session_token,
+                    &NodeId::from_string("right"),
+                    &NodeId::from_string("left"),
+                    &response_packet,
+                )?,
+                backend,
+            )
+            .await?;
+        let collect = |token: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri("/v1/tunnels/relay/packets")
+                            .header("authorization", format!("{TOKEN_SCHEME}{token}"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024).await?;
+                Ok::<_, Box<dyn std::error::Error>>(
+                    decode_batch(&bytes)?
+                        .into_iter()
+                        .map(|p| p.to_vec())
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        let mut found = false;
+        for _ in 0..3 {
+            if collect(left_http.token.clone())
+                .await?
+                .contains(&response_packet)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/tunnels/relay/open",
+                None,
+                Some("right"),
+                announcement("right", "left")?,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let right_http: OpenResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "POST",
+                    "/v1/tunnels/relay/packets",
+                    Some(&left_http.token),
+                    None,
+                    batch
+                )?)
+                .await?
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let mut found = false;
+        for _ in 0..3 {
+            if collect(right_http.token.clone()).await?.contains(&packet) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+        let mut forged = announcement("left", "right")?;
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert_eq!(
+            app.oneshot(request(
+                "POST",
+                "/v1/tunnels/relay/open",
+                None,
+                Some("left"),
+                forged
+            )?)
+            .await?
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        shutdown.send(true)?;
+        serving.await??;
         Ok(())
     }
 }

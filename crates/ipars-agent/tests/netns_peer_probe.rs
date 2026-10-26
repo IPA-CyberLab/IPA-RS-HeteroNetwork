@@ -44,6 +44,8 @@ async fn udp_peer_probe_crosses_linux_network_namespaces() -> Result<(), Box<dyn
     ));
     runtime_a
         .record_peer_map_snapshot(PeerMap {
+            http_tunnel_protocol: None,
+            http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-netns-probe"),
             peers: vec![peer_b],
             bootstrap_endpoints: Vec::new(),

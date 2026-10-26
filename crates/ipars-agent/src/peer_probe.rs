@@ -675,6 +675,8 @@ mod tests {
         let peer = peer_record(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
         runtime
             .record_peer_map_snapshot(PeerMap {
+                http_tunnel_protocol: None,
+                http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::new(),
                 peers: vec![peer.clone()],
                 bootstrap_endpoints: Vec::new(),
@@ -717,6 +719,8 @@ mod tests {
         let runtime = AgentRuntime::new(state, ipars_types::ClusterPolicy::default());
         let peer = peer_record(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)));
         let peer_map = PeerMap {
+            http_tunnel_protocol: None,
+            http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::new(),
             peers: vec![peer.clone()],
             bootstrap_endpoints: Vec::new(),

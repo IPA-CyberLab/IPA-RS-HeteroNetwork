@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+pub mod transport;
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -4576,6 +4577,8 @@ mod tests {
         Json(RotateWireGuardKeyResponse {
             node,
             peer_map: PeerMap {
+                http_tunnel_protocol: None,
+                http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: Vec::new(),
                 bootstrap_endpoints: Vec::new(),
@@ -6983,6 +6986,8 @@ mod tests {
             Vec::new(),
         );
         let peer_map = PeerMap {
+            http_tunnel_protocol: None,
+            http_tunnel_urls: Default::default(),
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer],
             bootstrap_endpoints: Vec::new(),
@@ -7224,6 +7229,8 @@ mod tests {
         };
         runtime
             .record_peer_map_snapshot(PeerMap {
+                http_tunnel_protocol: None,
+                http_tunnel_urls: Default::default(),
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer_record(
                     NodeId::from_string("peer-a"),
@@ -8262,6 +8269,91 @@ mod tests {
         assert_eq!(metrics.packet_flow_match_count, 0);
         assert_eq!(metrics.packet_flow_unmatched_count, 1);
         assert_eq!(metrics.packet_flow_filtered_count, 1);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn http_transport_authenticates_registered_key_and_rejects_replay_and_tampering(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine as _;
+        use ipars_http_tunnel::{
+            OpenResponse, TunnelAuth, NODE_HEADER, NONCE_HEADER, PROOF_HEADER, TIME_HEADER,
+        };
+        let gateway = AgentNodeState::generate(Utc::now());
+        let client = AgentNodeState::generate(Utc::now());
+        let auth = TunnelAuth::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(&client.wireguard_private_key_b64)?
+                .try_into()
+                .unwrap_or_else(|_| panic!("invalid key in test fixture")),
+            base64::engine::general_purpose::STANDARD
+                .decode(&gateway.wireguard_public_key_b64)?
+                .try_into()
+                .unwrap_or_else(|_| panic!("invalid key in test fixture")),
+            gateway.node_id.clone(),
+        )?;
+        let runtime = Arc::new(AgentRuntime::new(gateway, ClusterPolicy::default()));
+        let mut peer = peer_record(client.node_id.clone(), "10.250.0.10".parse()?, Vec::new());
+        peer.wireguard_public_key = client.wireguard_public_key_b64;
+        runtime
+            .record_peer_map_snapshot(PeerMap {
+                http_tunnel_protocol: Some(1),
+                http_tunnel_urls: Default::default(),
+                cluster_id: ClusterId::new(),
+                peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await;
+        let backend = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let app = crate::transport::router(runtime.clone(), backend.local_addr()?, None);
+        let mut first = vec![0; 148];
+        first[0] = 1;
+        let body = ipars_http_tunnel::encode_open(&first, &Default::default())?;
+        let timestamp = Utc::now().timestamp();
+        let nonce = "00112233445566778899aabbccddeeff";
+        let proof = auth.proof(&client.node_id, timestamp, nonce, &body)?;
+        let request = |packet: Vec<u8>, proof: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tunnels/wireguard/open")
+                .header(NODE_HEADER, client.node_id.as_str())
+                .header(TIME_HEADER, timestamp.to_string())
+                .header(NONCE_HEADER, nonce)
+                .header(PROOF_HEADER, proof)
+                .body(Body::from(packet))
+        };
+        let mut altered = body.clone();
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(altered, &proof)?)
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app.clone().oneshot(request(body.clone(), &proof)?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let opened: OpenResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(opened.token.len(), 64);
+        assert_eq!(
+            app.clone().oneshot(request(body, &proof)?).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let observed = runtime.transport_snapshot().await;
+        assert_eq!(observed.connections.len(), 1);
+        assert_eq!(observed.connections[0].peer, client.node_id);
+        assert_eq!(
+            app.oneshot(
+                Request::builder()
+                    .uri("/v1/tunnels/wireguard/packets")
+                    .body(Body::empty())?
+            )
+            .await?
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
         Ok(())
     }
 }

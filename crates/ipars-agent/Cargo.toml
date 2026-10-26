@@ -15,6 +15,8 @@ genetlink.workspace = true
 hex.workspace = true
 ipnet.workspace = true
 ipars-crypto = { path = "../ipars-crypto" }
+ipars-http-tunnel = { path = "../ipars-http-tunnel" }
+reqwest.workspace = true
 ipars-relay = { path = "../ipars-relay" }
 ipars-route-manager = { path = "../ipars-route-manager" }
 ipars-stun = { path = "../ipars-stun" }

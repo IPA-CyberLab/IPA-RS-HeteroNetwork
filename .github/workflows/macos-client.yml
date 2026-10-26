@@ -6,6 +6,7 @@ on:
     branches:
       - master
     paths:
+      - "clients/transport/**"
       - "clients/macos/**"
       - "install-client.sh"
       - ".github/workflows/macos-client.yml"
@@ -13,6 +14,7 @@ on:
       - ".github/workflows/ci.yml"
   pull_request:
     paths:
+      - "clients/transport/**"
       - "clients/macos/**"
       - "install-client.sh"
       - ".github/workflows/macos-client.yml"

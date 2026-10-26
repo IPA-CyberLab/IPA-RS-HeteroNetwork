@@ -135,7 +135,24 @@ public sealed record PeerMap(
     [property: JsonPropertyName("cluster_id")] string ClusterId,
     [property: JsonPropertyName("peers")] IReadOnlyList<NodeRecord> Peers,
     [property: JsonPropertyName("bootstrap_endpoints")] IReadOnlyList<BootstrapEndpoint> BootstrapEndpoints,
-    [property: JsonPropertyName("generated_at")] DateTimeOffset GeneratedAt);
+    [property: JsonPropertyName("generated_at")] DateTimeOffset GeneratedAt)
+{
+    [JsonPropertyName("http_tunnel_urls")]
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> HttpTunnelUrls { get; init; }
+        = new Dictionary<string, IReadOnlyList<string>>();
+    [JsonPropertyName("http_tunnel_protocol")]
+    public int? HttpTunnelProtocol { get; init; }
+
+    public PeerMap PreserveLegacyTransport(PeerMap previous)
+    {
+        if (HttpTunnelProtocol is not null) return this;
+        var retained = previous.HttpTunnelUrls.Where(entry => Peers.Any(node =>
+            node.NodeId == entry.Key && previous.Peers.Any(old =>
+                old.NodeId == node.NodeId && old.WireGuardPublicKey == node.WireGuardPublicKey)))
+            .ToDictionary(entry => entry.Key, entry => entry.Value);
+        return this with { HttpTunnelUrls = retained, HttpTunnelProtocol = previous.HttpTunnelProtocol };
+    }
+}
 
 public sealed record RegisterClientRequest(
     [property: JsonPropertyName("client_id")] string ClientId,

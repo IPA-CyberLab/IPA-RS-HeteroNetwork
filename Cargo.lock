@@ -1574,6 +1574,7 @@ dependencies = [
  "genetlink",
  "hex",
  "ipars-crypto",
+ "ipars-http-tunnel",
  "ipars-relay",
  "ipars-route-manager",
  "ipars-signal",
@@ -1585,6 +1586,7 @@ dependencies = [
  "netlink-packet-wireguard",
  "nix 0.30.1",
  "rand_core 0.6.4",
+ "reqwest 0.12.28",
  "rtnetlink",
  "serde",
  "serde_json",
@@ -1601,6 +1603,7 @@ dependencies = [
  "base64",
  "chrono",
  "ipars-agent",
+ "ipars-http-tunnel",
  "ipars-types",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
@@ -1658,6 +1661,8 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1719,6 +1724,7 @@ dependencies = [
  "ipars-control-plane",
  "ipars-control-plane-http",
  "ipars-crypto",
+ "ipars-http-tunnel",
  "ipars-quorum",
  "ipars-relay",
  "ipars-relay-http",
@@ -1744,7 +1750,28 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "ipars-http-tunnel"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "boringtun",
+ "chrono",
+ "hex",
+ "hmac",
+ "ipars-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1833,6 +1860,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "ipars-http-tunnel",
  "ipars-relay",
  "ipars-types",
  "serde",

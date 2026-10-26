@@ -176,6 +176,23 @@ impl IdentityKeyPair {
         Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
     }
 
+    pub fn sign_bound_control_plane_node_query_request(
+        &self,
+        request: &ControlPlaneNodeQueryRequest,
+        kind: ControlPlaneNodeQueryKind,
+        signed_at: DateTime<Utc>,
+        binding: &[u8],
+    ) -> Result<NodeApiRequestSignature, CryptoError> {
+        let mut nonce = Sha256::digest(binding).to_vec();
+        let mut random = [0_u8; 16];
+        OsRng.fill_bytes(&mut random);
+        nonce.extend_from_slice(&random);
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        let payload =
+            serde_json::to_vec(&request.signature_payload(kind, signed_at, nonce.clone()))?;
+        Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
     pub fn sign_client_registration_bundle(&self, bundle: &ClientRegistrationBundle) -> String {
         let signature = self.signing_key.sign(&bundle.signature_payload());
         encode_bytes(&signature.to_bytes())
@@ -431,7 +448,23 @@ pub fn verify_control_plane_node_query_signature(
         request_signature.signed_at,
         request_signature.nonce.clone(),
     ))?;
-    verify_node_api_payload(&payload, request_signature, node_public_key_b64)
+    if kind == ControlPlaneNodeQueryKind::HttpTransport {
+        // This operation includes a full SHA-256 body commitment and a fresh
+        // 128-bit nonce. Other operations retain their existing wire format.
+        let nonce = URL_SAFE_NO_PAD
+            .decode(&request_signature.nonce)
+            .map_err(|_| CryptoError::InvalidRequestNonce)?;
+        if nonce.len() != 48 || URL_SAFE_NO_PAD.encode(nonce) != request_signature.nonce {
+            return Err(CryptoError::InvalidRequestNonce);
+        }
+        verify_ed25519_payload(
+            &payload,
+            request_signature.signature_bytes()?,
+            node_public_key_b64,
+        )
+    } else {
+        verify_node_api_payload(&payload, request_signature, node_public_key_b64)
+    }
 }
 
 pub fn verify_client_registration_bundle_signature(
@@ -614,6 +647,15 @@ fn decode_canonical_key_material(value: &str) -> Result<[u8; KEY_MATERIAL_BYTES]
         return Err("is not canonical standard base64");
     }
     Ok(key)
+}
+
+/// Node API operation signatures can commit an additional bounded request body
+/// without changing signatures used by existing read-only query protocols.
+pub fn node_query_nonce_matches_binding(nonce: &str, binding: &[u8]) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(nonce)
+        .ok()
+        .is_some_and(|value| value.len() == 48 && value[..32] == Sha256::digest(binding)[..])
 }
 
 #[cfg(test)]
@@ -968,6 +1010,7 @@ mod tests {
             relay_capability: None,
             routes: None,
             service_advertisement: Some(NodeServiceAdvertisement {
+                transport: None,
                 hostname: None,
                 endpoints: vec![BootstrapEndpoint {
                     kind: BootstrapEndpointKind::Stun,

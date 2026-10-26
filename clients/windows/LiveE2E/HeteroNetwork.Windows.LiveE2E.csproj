@@ -9,6 +9,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Content Include="..\.build\native\win-x64\HeteroNetwork.TransportProxy.exe"
+             Link="HeteroNetwork.TransportProxy.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <ProjectReference Include="..\src\HeteroNetwork.Core\HeteroNetwork.Core.csproj" />
   </ItemGroup>
 </Project>

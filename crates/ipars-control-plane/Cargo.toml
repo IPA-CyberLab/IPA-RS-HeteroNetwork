@@ -7,6 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+url.workspace = true
+tracing.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 ipnet.workspace = true

@@ -402,6 +402,24 @@ test("Cloudscape console renders overview and hierarchical topology", async ({ p
   expect(pageErrors).toEqual([]);
 });
 
+test("transport panel shows HTTP fallback, failures and stale reports", async ({ page }) => {
+  await installMockBackend(page);
+  await page.route("**/v1/admin/transports?*", async (route) => {
+    await route.fulfill({ json: { items: [{ node_id: nodes[0].node.node_id, observed_at: new Date().toISOString(), snapshot: { connections: [{
+      peer: nodes[1].node.node_id, direction: "outgoing", transport: "https", phase: "connected", endpoint: "https://8.8.8.8/v1/tunnels/wireguard/open",
+      tx_bytes: 1048576, rx_bytes: 2097152, switches: 2, reconnects: 1, fallback_reason: "udp_probe_timeout", failures: { https_unavailable: 1 }, updated_at: new Date().toISOString(),
+    }] } }], unreported: [nodes[2].node.node_id], next_cursor: null } });
+  });
+  await page.goto("/ui/#/transports");
+  await expect(page.getByRole("heading", { name: "通信方式", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "HTTPS / TCP", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "1 MiB / 2 MiB", exact: true })).toBeVisible();
+  await expect(page.getByText("UDP応答なし", { exact: true })).toBeVisible();
+  await expect(page.getByText("HTTPS接続失敗: 1", { exact: true })).toBeVisible();
+  await expect(page.getByText("未報告・更新停止", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "次のノード" })).toBeDisabled();
+});
+
 test("Cloudscape console remains operable on a mobile viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await installMockBackend(page);

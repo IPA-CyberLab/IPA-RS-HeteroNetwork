@@ -23,6 +23,7 @@ hickory-proto.workspace = true
 ipnet.workspace = true
 ipars-agent = { path = "../ipars-agent" }
 ipars-agent-http = { path = "../ipars-agent-http" }
+ipars-http-tunnel = { path = "../ipars-http-tunnel" }
 ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-control-plane-http = { path = "../ipars-control-plane-http" }
 ipars-crypto = { path = "../ipars-crypto" }
@@ -51,6 +52,7 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 zeroize = "1.8"
+uuid.workspace = true
 
 [lints]
 workspace = true

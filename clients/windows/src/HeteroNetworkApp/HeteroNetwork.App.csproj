@@ -19,6 +19,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Content Include="..\..\.build\native\win-x64\HeteroNetwork.TransportProxy.exe"
+             Link="HeteroNetwork.TransportProxy.exe" CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
     <AssemblyMetadata Include="HeteroNetworkReleaseTag"
                       Value="$(HeteroNetworkReleaseTag)" />
   </ItemGroup>
@@ -47,6 +50,8 @@
   </ItemGroup>
 
   <Target Name="RequireEmbeddedWireGuard" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('..\..\.build\native\win-x64\HeteroNetwork.TransportProxy.exe')"
+           Text="The HTTP transport runtime is missing. Run clients/windows/build.ps1." />
     <Error Condition="!Exists('..\..\.build\native\win-x64\tunnel.dll')"
            Text="The embedded WireGuard runtime is missing. Run clients/windows/bootstrap-wireguard.ps1." />
     <Error Condition="!Exists('..\..\.build\native\win-x64\wireguard.dll')"

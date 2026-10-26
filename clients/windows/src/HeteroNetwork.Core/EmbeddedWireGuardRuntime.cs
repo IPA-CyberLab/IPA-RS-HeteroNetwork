@@ -46,7 +46,8 @@ public static class EmbeddedWireGuardRuntime
             "WireGuardTunnelService");
         var run = Marshal.GetDelegateForFunctionPointer<TunnelServiceEntryPoint>(
             entryPoint);
-        return run(configurationPath) ? 0 : 1;
+        using var transport = TunnelTransportService.Start(configurationPath);
+        return run(transport?.RuntimeConfigurationPath ?? configurationPath) ? 0 : 1;
     }
 
     public static void AssertAvailable()

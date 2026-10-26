@@ -137,6 +137,8 @@ fn client_claims_are_control_only(claims: &JoinTokenClaims) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
+    #[error("invalid transport query: {0}")]
+    InvalidTransportQuery(String),
     #[error("join token does not allow node registration")]
     JoinDenied,
     #[error("node {0} already exists")]
@@ -363,6 +365,20 @@ impl AdminCapabilityRevocation {
 
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
+    async fn upsert_transport_snapshot(
+        &self,
+        _record: ipars_types::api::TransportNodeSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        Err(ControlPlaneError::Store(
+            "transport snapshot persistence unsupported".to_string(),
+        ))
+    }
+    async fn list_transport_snapshots(
+        &self,
+        _nodes: Option<&BTreeSet<NodeId>>,
+    ) -> Result<Vec<ipars_types::api::TransportNodeSnapshot>, ControlPlaneError> {
+        Ok(Vec::new())
+    }
     /// Initial voter validation is external. Atomically installs both anchor and public config;
     /// never replaces an existing incompatible anchor or retained history.
     async fn initialize_admin_quorum_manifest(
@@ -667,6 +683,15 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn list_client_gateway_selections(
         &self,
     ) -> Result<BTreeMap<NodeId, ClientGatewaySelection>, ControlPlaneError>;
+    async fn get_client_gateway_selection(
+        &self,
+        client_id: &NodeId,
+    ) -> Result<Option<ClientGatewaySelection>, ControlPlaneError> {
+        Ok(self
+            .list_client_gateway_selections()
+            .await?
+            .remove(client_id))
+    }
     async fn latest_client_gateway_selection_at(
         &self,
     ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError>;
@@ -757,6 +782,7 @@ pub trait TokenLedger: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
+    transport_snapshots: RwLock<BTreeMap<NodeId, ipars_types::api::TransportNodeSnapshot>>,
     admin_capabilities: Mutex<AdminCapabilityLedgerState>,
     cluster_policies: RwLock<BTreeMap<ClusterId, ClusterPolicy>>,
     overlay_routing_epochs: RwLock<BTreeMap<ClusterId, u64>>,
@@ -830,6 +856,47 @@ fn advance_in_memory_overlay_routing_epoch(
 
 #[async_trait]
 impl ControlPlaneStore for InMemoryStore {
+    async fn get_client_gateway_selection(
+        &self,
+        client_id: &NodeId,
+    ) -> Result<Option<ClientGatewaySelection>, ControlPlaneError> {
+        Ok(self
+            .client_gateway_selections
+            .read()
+            .await
+            .get(client_id)
+            .cloned())
+    }
+    async fn upsert_transport_snapshot(
+        &self,
+        record: ipars_types::api::TransportNodeSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        let mut snapshots = self.transport_snapshots.write().await;
+        if snapshots
+            .get(&record.node_id)
+            .is_none_or(|old| old.observed_at <= record.observed_at)
+        {
+            snapshots.insert(record.node_id.clone(), record);
+        }
+        Ok(())
+    }
+    async fn list_transport_snapshots(
+        &self,
+        nodes: Option<&BTreeSet<NodeId>>,
+    ) -> Result<Vec<ipars_types::api::TransportNodeSnapshot>, ControlPlaneError> {
+        let existing = self.nodes.read().await;
+        Ok(self
+            .transport_snapshots
+            .read()
+            .await
+            .values()
+            .filter(|r| {
+                existing.contains_key(&r.node_id)
+                    && nodes.is_none_or(|ids| ids.contains(&r.node_id))
+            })
+            .cloned()
+            .collect())
+    }
     async fn initialize_admin_quorum_manifest(
         &self,
         cluster: &ClusterId,
@@ -1198,6 +1265,7 @@ impl ControlPlaneStore for InMemoryStore {
         advance_in_memory_overlay_routing_epoch(&mut epochs, &node.cluster_id)?;
 
         nodes.remove(node_id);
+        self.transport_snapshots.write().await.remove(node_id);
         let removed_health = health.remove(node_id).is_some();
         heartbeat_signature_timestamps.remove(node_id);
         nat_classifications.remove(node_id);
@@ -3041,6 +3109,125 @@ where
         })
     }
 
+    pub async fn http_transport_peer(
+        &self,
+        request: ipars_types::api::HttpTransportPeerRequest,
+    ) -> Result<ipars_types::api::HttpTransportPeerResponse, ControlPlaneError> {
+        let binding = request
+            .binding_bytes()
+            .map_err(|e| ControlPlaneError::Store(e.to_string()))?;
+        if !request
+            .query
+            .request_signature
+            .as_ref()
+            .is_some_and(|signature| {
+                ipars_crypto::node_query_nonce_matches_binding(&signature.nonce, &binding)
+            })
+        {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.query.node_id,
+                reason: "transport request binding is invalid".to_string(),
+            });
+        }
+        let source = self
+            .authenticate_node_query(
+                &request.query,
+                ControlPlaneNodeQueryKind::HttpTransport,
+                Utc::now(),
+            )
+            .await?;
+        let peer = self
+            .store
+            .get_node(&request.peer)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.peer.clone()))?;
+        let policy = self.current_cluster_policy().await?;
+        if peer.cluster_id != source.cluster_id
+            || (!policy.acl_rules.is_empty()
+                && (!acl_allows_peer(&source, &peer, &policy)
+                    || !acl_allows_peer(&peer, &source, &policy)))
+        {
+            return Err(ControlPlaneError::RelayDenied);
+        }
+        if let Some(admission) = &request.admission {
+            if peer.role.is_client()
+                || !peer.token_policy.allow_relay
+                || !source
+                    .relay_capability
+                    .as_ref()
+                    .is_some_and(RelayCapability::is_eligible_relay)
+            {
+                return Err(ControlPlaneError::RelayDenied);
+            }
+            let other_id = if admission.left == peer.node_id {
+                &admission.right
+            } else if admission.right == peer.node_id {
+                &admission.left
+            } else {
+                return Err(ControlPlaneError::RelayDenied);
+            };
+            let other = self
+                .store
+                .get_node(other_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(other_id.clone()))?;
+            if other.cluster_id != source.cluster_id
+                || other.node_id == source.node_id
+                || peer.node_id == source.node_id
+                || other.role.is_client()
+                || !other.token_policy.allow_relay
+                || (!policy.acl_rules.is_empty()
+                    && (!acl_allows_peer(&peer, &other, &policy)
+                        || !acl_allows_peer(&other, &peer, &policy)))
+            {
+                return Err(ControlPlaneError::RelayDenied);
+            }
+            let (local, remote) = if admission.left == peer.node_id {
+                (admission.left_addr, admission.right_addr)
+            } else {
+                (admission.right_addr, admission.left_addr)
+            };
+            if !peer.endpoint_candidates.iter().any(|c| c.addr == local)
+                || !other.endpoint_candidates.iter().any(|c| c.addr == remote)
+            {
+                return Err(ControlPlaneError::RelayDenied);
+            }
+        } else if peer.role.is_client()
+            && self
+                .store
+                .get_client_gateway_selection(&peer.node_id)
+                .await?
+                .is_some_and(|selection| selection.gateway_node_id != source.node_id)
+        {
+            return Err(ControlPlaneError::RelayDenied);
+        }
+        let ids = BTreeSet::from([peer.node_id.clone()]);
+        let http_tunnel_urls = self
+            .store
+            .list_transport_snapshots(Some(&ids))
+            .await?
+            .into_iter()
+            .find(|record| (Utc::now() - record.observed_at).num_seconds() < 90)
+            .map(|record| record.snapshot.http_tunnel_urls)
+            .unwrap_or_default();
+        Ok(ipars_types::api::HttpTransportPeerResponse {
+            peer,
+            http_tunnel_urls,
+        })
+    }
+
+    pub async fn transport_snapshots(
+        &self,
+    ) -> Result<Vec<ipars_types::api::TransportNodeSnapshot>, ControlPlaneError> {
+        self.store.list_transport_snapshots(None).await
+    }
+    pub async fn transport_snapshots_for(
+        &self,
+        nodes: &BTreeSet<NodeId>,
+    ) -> Result<Vec<ipars_types::api::TransportNodeSnapshot>, ControlPlaneError> {
+        self.store.list_transport_snapshots(Some(nodes)).await
+    }
+
     pub async fn list_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
         let mut paths = self.store.list_all_paths().await?;
         paths.sort_by(|left, right| {
@@ -3402,17 +3589,19 @@ where
         let client_gateway_selections = self.store.list_client_gateway_selections().await?;
         let policy = self.current_cluster_policy().await?;
         let directory = self.service_directory_at(now).await?;
-        let peer_map = self.filtered_peer_map_for_node(
-            &node,
-            &peers,
-            ClientGatewayRoutingState {
-                health_by_node: &health_by_node,
-                selections: &client_gateway_selections,
-            },
-            &policy,
-            directory.bootstrap_endpoints,
-            now,
-        );
+        let peer_map = self
+            .filtered_peer_map_for_node(
+                &node,
+                &peers,
+                ClientGatewayRoutingState {
+                    health_by_node: &health_by_node,
+                    selections: &client_gateway_selections,
+                },
+                &policy,
+                directory.bootstrap_endpoints,
+                now,
+            )
+            .await?;
         let relay_map =
             self.filtered_relay_map_for_node(&node, &peers, &health_by_node, &policy, now);
 
@@ -3770,7 +3959,7 @@ where
         let health_by_node = self.health_by_node(&peers).await?;
         let client_gateway_selections = self.store.list_client_gateway_selections().await?;
         let directory = self.service_directory_at(now).await?;
-        Ok(self.filtered_peer_map_for_node(
+        self.filtered_peer_map_for_node(
             &source,
             &peers,
             ClientGatewayRoutingState {
@@ -3780,7 +3969,8 @@ where
             &policy,
             directory.bootstrap_endpoints,
             now,
-        ))
+        )
+        .await
     }
 
     pub async fn neighbor_map_for(
@@ -4639,6 +4829,10 @@ where
             .service_advertisement
             .as_ref()
             .and_then(|advertisement| advertisement.agent_build.clone());
+        let transport = request
+            .service_advertisement
+            .as_ref()
+            .and_then(|ad| ad.transport.clone());
         self.validate_heartbeat_request(&request, &node, &policy, previous_signature_at, now)?;
         let heartbeat_service_instance =
             heartbeat_service_instance(&request, &node, &self.config.cluster_id, now)?;
@@ -4772,6 +4966,19 @@ where
                 .write()
                 .await
                 .insert(request_node_id.clone(), agent_build);
+        }
+        if let Some(snapshot) = transport {
+            if let Err(error) = self
+                .store
+                .upsert_transport_snapshot(ipars_types::api::TransportNodeSnapshot {
+                    node_id: request_node_id.clone(),
+                    observed_at: accepted_signature_at.unwrap_or(now),
+                    snapshot,
+                })
+                .await
+            {
+                tracing::error!(%error, node_id = %request_node_id, "transport snapshot persistence failed");
+            }
         }
         if let Some(instance) = heartbeat_service_instance {
             self.advertise_service_instance(instance).await?;
@@ -4991,17 +5198,19 @@ where
         let client_gateway_selections = self.store.list_client_gateway_selections().await?;
         let policy = self.current_cluster_policy().await?;
         let directory = self.service_directory_at(rotated_at).await?;
-        let peer_map = self.filtered_peer_map_for_node(
-            &updated_node,
-            &peers,
-            ClientGatewayRoutingState {
-                health_by_node: &health_by_node,
-                selections: &client_gateway_selections,
-            },
-            &policy,
-            directory.bootstrap_endpoints,
-            rotated_at,
-        );
+        let peer_map = self
+            .filtered_peer_map_for_node(
+                &updated_node,
+                &peers,
+                ClientGatewayRoutingState {
+                    health_by_node: &health_by_node,
+                    selections: &client_gateway_selections,
+                },
+                &policy,
+                directory.bootstrap_endpoints,
+                rotated_at,
+            )
+            .await?;
         let relay_map = self.filtered_relay_map_for_node(
             &updated_node,
             &peers,
@@ -5085,6 +5294,18 @@ where
         previous_signature_at: Option<chrono::DateTime<Utc>>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), ControlPlaneError> {
+        if let Some(snapshot) = request
+            .service_advertisement
+            .as_ref()
+            .and_then(|ad| ad.transport.as_ref())
+        {
+            validate_transport_snapshot(snapshot, request.nat_classification.as_ref()).map_err(
+                |reason| ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason,
+                },
+            )?;
+        }
         validate_node_health_shape(
             &request.health,
             now,
@@ -5728,7 +5949,7 @@ where
         self.store.get_health_by_node_ids(&node_ids).await
     }
 
-    fn filtered_peer_map_for_node(
+    async fn filtered_peer_map_for_node(
         &self,
         source: &NodeRecord,
         peers: &[NodeRecord],
@@ -5736,7 +5957,7 @@ where
         policy: &ClusterPolicy,
         bootstrap_endpoints: Vec<BootstrapEndpoint>,
         generated_at: chrono::DateTime<Utc>,
-    ) -> PeerMap {
+    ) -> Result<PeerMap, ControlPlaneError> {
         let visible_peers = if source.role.is_client() {
             client_gateway_peer_map(
                 source,
@@ -5756,12 +5977,29 @@ where
                 generated_at,
             )
         };
-        PeerMap {
+        let peer_ids = visible_peers
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let http_tunnel_urls = self
+            .store
+            .list_transport_snapshots(Some(&peer_ids))
+            .await?
+            .into_iter()
+            .filter(|record| {
+                (generated_at - record.observed_at).num_seconds() < 90
+                    && !record.snapshot.http_tunnel_urls.is_empty()
+            })
+            .map(|record| (record.node_id, record.snapshot.http_tunnel_urls))
+            .collect();
+        Ok(PeerMap {
+            http_tunnel_protocol: Some(1),
+            http_tunnel_urls,
             cluster_id: self.config.cluster_id.clone(),
             peers: visible_peers,
             bootstrap_endpoints,
             generated_at,
-        }
+        })
     }
 
     fn filtered_relay_map_for_node(
@@ -6186,6 +6424,86 @@ fn insert_preferred_gateway_route(routes: &mut BTreeMap<IpNet, Route>, route: Ro
     if replace {
         routes.insert(route.cidr, route);
     }
+}
+
+fn validate_transport_snapshot(
+    snapshot: &ipars_types::api::NodeTransportSnapshot,
+    nat: Option<&NatClassification>,
+) -> Result<(), String> {
+    if snapshot.connections.len() > 4096 || snapshot.http_tunnel_urls.len() > 8 {
+        return Err("transport snapshot exceeds its bounds".to_string());
+    }
+    for endpoint in &snapshot.http_tunnel_urls {
+        let url = url::Url::parse(endpoint).map_err(|_| "invalid HTTP tunnel endpoint")?;
+        let ip = url
+            .host_str()
+            .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok());
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.port() == Some(0)
+            || url.path() != "/v1/tunnels/wireguard/open"
+            || ip.is_none()
+            || ip != nat.and_then(NatClassification::publicly_reachable_ip)
+        {
+            return Err("HTTP tunnel endpoint does not match the observed public node".to_string());
+        }
+    }
+    for connection in &snapshot.connections {
+        if connection
+            .connection_id
+            .as_ref()
+            .is_some_and(|id| id.len() > 512 || id.chars().any(char::is_control))
+        {
+            return Err("invalid transport connection ID".to_string());
+        }
+        if connection.peer.as_str().is_empty()
+            || connection.peer.as_str().len() > 128
+            || connection.peer.as_str().chars().any(char::is_control)
+            || connection.endpoint.len() > 2048
+            || connection.endpoint.chars().any(char::is_control)
+            || connection.updated_at > Utc::now() + chrono::Duration::seconds(60)
+        {
+            return Err("invalid transport observation".to_string());
+        }
+        for code in [&connection.fallback_reason, &connection.last_error]
+            .into_iter()
+            .flatten()
+        {
+            if code.len() > 96
+                || !code
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err("transport diagnostics must use bounded reason codes".to_string());
+            }
+        }
+        if connection.failures.len() > 16
+            || connection.failures.keys().any(|key| {
+                key.len() > 64
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+        {
+            return Err("invalid transport failure counters".to_string());
+        }
+        if connection.endpoint.parse::<std::net::SocketAddr>().is_err() {
+            let url = url::Url::parse(&connection.endpoint)
+                .map_err(|_| "invalid transport observation endpoint")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err("invalid transport observation endpoint".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn heartbeat_service_instance_id(node_id: &NodeId) -> String {
@@ -13733,6 +14051,7 @@ mod tests {
                     relay_capability: Some(relay.clone()),
                     routes: None,
                     service_advertisement: Some(NodeServiceAdvertisement {
+                        transport: None,
                         hostname: Some("service-host".to_string()),
                         endpoints: vec![
                             BootstrapEndpoint {
@@ -13795,6 +14114,7 @@ mod tests {
                     relay_capability: Some(relay),
                     routes: None,
                     service_advertisement: Some(NodeServiceAdvertisement {
+                        transport: None,
                         hostname: None,
                         endpoints: vec![BootstrapEndpoint {
                             kind: BootstrapEndpointKind::Signal,
@@ -13825,6 +14145,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     service_advertisement: Some(NodeServiceAdvertisement {
+                        transport: None,
                         hostname: None,
                         endpoints: vec![BootstrapEndpoint {
                             kind: BootstrapEndpointKind::Stun,
@@ -16566,5 +16887,84 @@ mod tests {
             })
         ));
         Ok(())
+    }
+    #[tokio::test]
+    async fn transport_metadata_lookup_binds_target_and_admission_to_the_signature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use ipars_types::api::{
+            HttpTransportPeerRequest, NodeTransportSnapshot, TransportNodeSnapshot,
+        };
+        let cluster = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster.clone(), "10.250.0.0/24".parse()?),
+            store.clone(),
+        );
+        let source = plane
+            .register_with_claims(
+                claims(cluster.clone()),
+                registration_request("transport-source"),
+            )
+            .await?
+            .node;
+        let peer = plane
+            .register_with_claims(claims(cluster), registration_request("transport-peer"))
+            .await?
+            .node;
+        let urls = vec!["https://8.8.8.8/v1/tunnels/wireguard/open".to_string()];
+        store
+            .upsert_transport_snapshot(TransportNodeSnapshot {
+                node_id: peer.node_id.clone(),
+                observed_at: Utc::now(),
+                snapshot: NodeTransportSnapshot {
+                    http_tunnel_urls: urls.clone(),
+                    connections: Vec::new(),
+                },
+            })
+            .await?;
+        let mut request = HttpTransportPeerRequest {
+            query: ControlPlaneNodeQueryRequest {
+                node_id: source.node_id.clone(),
+                request_signature: None,
+            },
+            peer: peer.node_id.clone(),
+            admission: None,
+        };
+        request.query.request_signature = Some(
+            identity_for_node("transport-source").sign_bound_control_plane_node_query_request(
+                &request.query,
+                ControlPlaneNodeQueryKind::HttpTransport,
+                Utc::now(),
+                &request.binding_bytes()?,
+            )?,
+        );
+        let mut tampered = request.clone();
+        tampered.peer = source.node_id.clone();
+        assert!(plane.http_transport_peer(tampered).await.is_err());
+        let response = plane.http_transport_peer(request.clone()).await?;
+        assert_eq!(response.peer.node_id, peer.node_id);
+        assert_eq!(response.http_tunnel_urls, urls);
+        assert!(plane.http_transport_peer(request).await.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn transport_observations_reject_credentials_and_unbounded_diagnostics() {
+        use ipars_types::api::{NodeTransportSnapshot, TransportObservation};
+        let mut snapshot = NodeTransportSnapshot::default();
+        let mut connection = TransportObservation::new(
+            node_id("peer"),
+            "http://8.8.8.8/v1/tunnels/wireguard/open?token=secret".to_string(),
+        );
+        snapshot.connections.push(connection.clone());
+        assert!(validate_transport_snapshot(&snapshot, None).is_err());
+        connection.endpoint = "8.8.8.8:51820".to_string();
+        snapshot.connections[0] = connection;
+        assert!(validate_transport_snapshot(&snapshot, None).is_ok());
+        snapshot.connections[0].last_error = Some("leaked token".to_string());
+        assert!(validate_transport_snapshot(&snapshot, None).is_err());
+        snapshot.connections[0].last_error = None;
+        snapshot.http_tunnel_urls = vec!["http://127.0.0.1/v1/tunnels/wireguard/open".to_string()];
+        assert!(validate_transport_snapshot(&snapshot, None).is_err());
     }
 }

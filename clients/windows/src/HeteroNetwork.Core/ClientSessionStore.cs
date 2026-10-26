@@ -132,6 +132,7 @@ internal static class WindowsDataProtection
 
     public static byte[] UnprotectCurrentUser(byte[] encrypted, byte[] entropy) =>
         Unprotect(encrypted, entropy);
+    public static byte[] UnprotectLocalMachine(byte[] encrypted) => Unprotect(encrypted, null);
 
     private static byte[] Protect(byte[] plaintext, byte[]? entropy, bool localMachine)
     {

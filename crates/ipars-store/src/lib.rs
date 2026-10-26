@@ -332,6 +332,7 @@ impl SqliteControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        self.pool.execute("CREATE TABLE IF NOT EXISTS node_transport_snapshots (node_id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE, observed_at BIGINT NOT NULL, record_json TEXT NOT NULL)").await.map_err(sql_error)?;
         Ok(())
     }
 }
@@ -406,6 +407,71 @@ impl SqliteControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for SqliteControlPlaneStore {
+    async fn get_client_gateway_selection(
+        &self,
+        client: &NodeId,
+    ) -> Result<Option<ClientGatewaySelection>, ControlPlaneError> {
+        let row=sqlx::query("SELECT client_id, gateway_node_id, selected_at_millis FROM client_gateway_selections WHERE client_id = ?")
+            .bind(client.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
+        row.map(|row| -> Result<ClientGatewaySelection, ControlPlaneError> {
+            Ok(ClientGatewaySelection {
+                client_id: NodeId::from_string(
+                    row.try_get::<String, _>("client_id").map_err(sql_error)?,
+                ),
+                gateway_node_id: NodeId::from_string(
+                    row.try_get::<String, _>("gateway_node_id")
+                        .map_err(sql_error)?,
+                ),
+                selected_at: DateTime::from_timestamp_millis(
+                    row.try_get("selected_at_millis").map_err(sql_error)?,
+                )
+                .ok_or_else(|| {
+                    ControlPlaneError::Store("invalid gateway selection timestamp".to_string())
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn upsert_transport_snapshot(
+        &self,
+        record: ipars_types::api::TransportNodeSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query("INSERT INTO node_transport_snapshots(node_id, observed_at, record_json) VALUES (?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET observed_at = excluded.observed_at, record_json = excluded.record_json WHERE excluded.observed_at >= node_transport_snapshots.observed_at")
+            .bind(record.node_id.as_str()).bind(record.observed_at.timestamp_millis())
+            .bind(serde_json::to_string(&record).map_err(json_error)?)
+            .execute(&self.pool).await.map_err(sql_error)?;
+        Ok(())
+    }
+    async fn list_transport_snapshots(
+        &self,
+        nodes: Option<&BTreeSet<NodeId>>,
+    ) -> Result<Vec<ipars_types::api::TransportNodeSnapshot>, ControlPlaneError> {
+        if nodes.is_some_and(BTreeSet::is_empty) {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT t.record_json FROM node_transport_snapshots t JOIN nodes n ON n.node_id = t.node_id");
+        if let Some(nodes) = nodes {
+            query.push(" WHERE t.node_id IN (");
+            let mut values = query.separated(", ");
+            for node in nodes {
+                values.push_bind(node.as_str());
+            }
+            values.push_unseparated(")");
+        }
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let record: String = row.try_get("record_json").map_err(sql_error)?;
+                serde_json::from_str(&record).map_err(json_error)
+            })
+            .collect()
+    }
+
     async fn initialize_admin_quorum_manifest(
         &self,
         cluster: &ClusterId,
@@ -2216,6 +2282,7 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        transaction.execute("CREATE TABLE IF NOT EXISTS node_transport_snapshots (node_id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE, observed_at BIGINT NOT NULL, record_json TEXT NOT NULL)").await.map_err(sql_error)?;
         transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
@@ -2292,6 +2359,71 @@ impl PostgresControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for PostgresControlPlaneStore {
+    async fn get_client_gateway_selection(
+        &self,
+        client: &NodeId,
+    ) -> Result<Option<ClientGatewaySelection>, ControlPlaneError> {
+        let row=sqlx::query("SELECT client_id, gateway_node_id, selected_at_millis FROM client_gateway_selections WHERE client_id = $1")
+            .bind(client.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
+        row.map(|row| -> Result<ClientGatewaySelection, ControlPlaneError> {
+            Ok(ClientGatewaySelection {
+                client_id: NodeId::from_string(
+                    row.try_get::<String, _>("client_id").map_err(sql_error)?,
+                ),
+                gateway_node_id: NodeId::from_string(
+                    row.try_get::<String, _>("gateway_node_id")
+                        .map_err(sql_error)?,
+                ),
+                selected_at: DateTime::from_timestamp_millis(
+                    row.try_get("selected_at_millis").map_err(sql_error)?,
+                )
+                .ok_or_else(|| {
+                    ControlPlaneError::Store("invalid gateway selection timestamp".to_string())
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn upsert_transport_snapshot(
+        &self,
+        record: ipars_types::api::TransportNodeSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query("INSERT INTO node_transport_snapshots(node_id, observed_at, record_json) VALUES ($1, $2, $3) ON CONFLICT(node_id) DO UPDATE SET observed_at = excluded.observed_at, record_json = excluded.record_json WHERE excluded.observed_at >= node_transport_snapshots.observed_at")
+            .bind(record.node_id.as_str()).bind(record.observed_at.timestamp_millis())
+            .bind(serde_json::to_string(&record).map_err(json_error)?)
+            .execute(&self.pool).await.map_err(sql_error)?;
+        Ok(())
+    }
+    async fn list_transport_snapshots(
+        &self,
+        nodes: Option<&BTreeSet<NodeId>>,
+    ) -> Result<Vec<ipars_types::api::TransportNodeSnapshot>, ControlPlaneError> {
+        if nodes.is_some_and(BTreeSet::is_empty) {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Postgres>::new("SELECT t.record_json FROM node_transport_snapshots t JOIN nodes n ON n.node_id = t.node_id");
+        if let Some(nodes) = nodes {
+            query.push(" WHERE t.node_id IN (");
+            let mut values = query.separated(", ");
+            for node in nodes {
+                values.push_bind(node.as_str());
+            }
+            values.push_unseparated(")");
+        }
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let record: String = row.try_get("record_json").map_err(sql_error)?;
+                serde_json::from_str(&record).map_err(json_error)
+            })
+            .collect()
+    }
+
     async fn initialize_admin_quorum_manifest(
         &self,
         cluster: &ClusterId,
@@ -6736,6 +6868,37 @@ mod tests {
         drop(admission);
         drop(store);
         let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sqlite_transport_snapshots_are_shared_monotonic_and_removed_with_the_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use ipars_types::api::{NodeTransportSnapshot, TransportNodeSnapshot};
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let first = SqliteControlPlaneStore::from_pool(pool.clone()).await?;
+        let second = SqliteControlPlaneStore::from_pool(pool).await?;
+        let node = node("transport-node", Ipv4Addr::new(10, 250, 0, 1));
+        first.insert_node(node.clone()).await?;
+        let now = Utc::now();
+        let record = TransportNodeSnapshot {
+            node_id: node.node_id.clone(),
+            observed_at: now,
+            snapshot: NodeTransportSnapshot::default(),
+        };
+        first.upsert_transport_snapshot(record.clone()).await?;
+        let mut stale = record.clone();
+        stale.observed_at = now - Duration::seconds(1);
+        first.upsert_transport_snapshot(stale).await?;
+        assert_eq!(second.list_transport_snapshots(None).await?, vec![record]);
+        assert!(second
+            .list_transport_snapshots(Some(&BTreeSet::new()))
+            .await?
+            .is_empty());
+        second.remove_node(&node.node_id).await?;
+        assert!(first.list_transport_snapshots(None).await?.is_empty());
+        // Reusing an identity must not resurrect observations from its old registration.
+        first.insert_node(node).await?;
+        assert!(second.list_transport_snapshots(None).await?.is_empty());
         Ok(())
     }
 }

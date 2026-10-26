@@ -10,6 +10,7 @@ rust-version.workspace = true
 axum.workspace = true
 chrono.workspace = true
 ipars-relay = { path = "../ipars-relay" }
+ipars-http-tunnel = { path = "../ipars-http-tunnel" }
 ipars-types = { path = "../ipars-types" }
 serde.workspace = true
 tokio.workspace = true

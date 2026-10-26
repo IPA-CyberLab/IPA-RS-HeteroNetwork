@@ -124,6 +124,7 @@ struct RelayDatagram {
 const RELAY_FRAME_MAGIC: &[u8] = b"IPARS-RLY1";
 const RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
 const RELAY_FRAME_MAGIC_V3: &[u8] = b"IPARS-RLY3";
+const RELAY_FRAME_MAGIC_V4: &[u8] = b"IPARS-RLY4";
 const MAX_RELAY_SESSION_ID_BYTES: usize = 4096;
 const MAX_RELAY_SESSION_TOKEN_BYTES: usize = 256;
 const MAX_RELAY_NODE_ID_BYTES: usize = 128;
@@ -210,6 +211,18 @@ pub fn encode_relay_datagram_with_route(
 /// Relay forwarders bind an ephemeral UDP port, which may differ from the
 /// endpoint advertised during registration. The relay learns that port from
 /// the source address of this frame before normal WireGuard traffic starts.
+pub fn encode_relay_endpoint_probe(
+    session_id: &str,
+    session_token: &str,
+    source: &NodeId,
+    destination: &NodeId,
+) -> Result<Vec<u8>, RelayError> {
+    let mut packet =
+        encode_relay_endpoint_announcement(session_id, session_token, source, destination)?;
+    packet[..RELAY_FRAME_MAGIC_V4.len()].copy_from_slice(RELAY_FRAME_MAGIC_V4);
+    Ok(packet)
+}
+
 pub fn encode_relay_endpoint_announcement(
     session_id: &str,
     session_token: &str,
@@ -255,6 +268,30 @@ pub struct RelayTable {
 }
 
 impl RelayTable {
+    pub fn authorize_http_announcement(
+        &mut self,
+        node: &NodeId,
+        packet: &[u8],
+    ) -> Result<(String, DateTime<Utc>), RelayError> {
+        let frame = decode_relay_datagram(packet)?;
+        if !frame.endpoint_announcement || frame.source.as_ref() != Some(node) {
+            return Err(RelayError::InvalidSessionCredential);
+        }
+        self.remove_expired_session(&frame.session_id, Utc::now())?;
+        let session = self
+            .sessions
+            .get(&frame.session_id)
+            .ok_or(RelayError::UnknownSession)?;
+        session.verify_token(&frame.session_token)?;
+        if !((frame.source.as_ref() == Some(&session.left)
+            && frame.destination.as_ref() == Some(&session.right))
+            || (frame.source.as_ref() == Some(&session.right)
+                && frame.destination.as_ref() == Some(&session.left)))
+        {
+            return Err(RelayError::InvalidSessionCredential);
+        }
+        Ok((session.id.as_str().to_string(), session.expires_at))
+    }
     pub fn admit(
         &mut self,
         capability: &RelayCapability,
@@ -1020,6 +1057,12 @@ fn relay_session_token_matches(expected: &str, provided: &str) -> bool {
 }
 
 fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
+    if datagram.starts_with(RELAY_FRAME_MAGIC_V4) {
+        let mut probe = datagram.to_vec();
+        probe[..RELAY_FRAME_MAGIC_V3.len()].copy_from_slice(RELAY_FRAME_MAGIC_V3);
+        return decode_relay_datagram(&probe);
+    }
+
     if datagram.starts_with(RELAY_FRAME_MAGIC_V3) {
         return decode_relay_datagram_v3(datagram);
     }
@@ -1362,6 +1405,7 @@ impl RelayService {
         table.purge_expired(generated_at);
         capability.active_sessions = table.session_count() as u32;
         RelayStatusResponse {
+            http_transports: Vec::new(),
             relay_node: self.relay_node.clone(),
             capability: capability.clone(),
             health: HealthState::Healthy,
@@ -1418,6 +1462,11 @@ impl UdpRelay {
                     if let Ok((target, payload)) = target {
                         if !payload.is_empty() {
                             self.socket.send_to(&payload, target).await?;
+                        } else if buffer[..len].starts_with(RELAY_FRAME_MAGIC_V4) {
+                            // Only an authenticated endpoint announcement can
+                            // reach this branch. Its echo proves UDP Relay
+                            // reachability independently of the remote peer.
+                            self.socket.send_to(&buffer[..len], peer).await?;
                         }
                     }
                 }

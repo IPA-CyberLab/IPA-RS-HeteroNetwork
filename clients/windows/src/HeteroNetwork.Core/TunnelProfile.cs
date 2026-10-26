@@ -13,6 +13,7 @@ public sealed record TunnelProfile(
     string GatewayEndpoint,
     IReadOnlyList<string> AllowedIps)
 {
+    public IReadOnlyList<string> HttpTunnelUrls { get; init; } = [];
     public static TunnelProfile FromSession(ClientSession session, int gatewayIndex = 0)
     {
         if (!IPAddress.TryParse(session.Client.VpnIp, out var clientIp))
@@ -75,7 +76,10 @@ public sealed record TunnelProfile(
             gateway.VpnIp,
             gateway.WireGuardPublicKey,
             endpoint.Address,
-            allowedIps);
+            allowedIps)
+        {
+            HttpTunnelUrls = session.PeerMap.HttpTunnelUrls.TryGetValue(gateway.NodeId, out var urls) ? urls : [],
+        };
     }
 
     public static EndpointCandidate? PreferredEndpoint(

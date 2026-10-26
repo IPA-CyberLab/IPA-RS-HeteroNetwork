@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+
+	transport "github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/clients/transport"
 )
 
 const (
@@ -27,6 +29,8 @@ type tunnelConfiguration struct {
 	GatewayVPNIP              string   `json:"gateway_vpn_ip"`
 	GatewayWireGuardPublicKey string   `json:"gateway_wireguard_public_key"`
 	GatewayEndpoint           string   `json:"gateway_endpoint"`
+	ClientNodeID              string   `json:"client_node_id,omitempty"`
+	GatewayHTTPTunnelURLs     []string `json:"gateway_http_tunnel_urls,omitempty"`
 	AllowedIPs                []string `json:"allowed_ips"`
 	DNSServer                 string   `json:"dns_server"`
 	DNSDomain                 string   `json:"dns_domain"`
@@ -34,6 +38,14 @@ type tunnelConfiguration struct {
 }
 
 func (configuration *tunnelConfiguration) validateAndNormalize() error {
+	if err := transport.ValidateURLs(configuration.GatewayHTTPTunnelURLs); err != nil {
+		return err
+	}
+	if len(configuration.GatewayHTTPTunnelURLs) > 0 {
+		if err := validateGatewayNodeID(configuration.ClientNodeID); err != nil {
+			return err
+		}
+	}
 	if configuration.SchemaVersion != configurationSchemaVersion {
 		return fmt.Errorf("unsupported configuration schema %d", configuration.SchemaVersion)
 	}
