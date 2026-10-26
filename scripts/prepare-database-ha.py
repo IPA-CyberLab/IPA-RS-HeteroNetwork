@@ -9,6 +9,8 @@ from pathlib import Path
 import stat
 import sys
 
+from node_lifecycle import ROSTER, stopped_hosts
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "scripts/prepare-console-release.py"
@@ -28,9 +30,18 @@ def prepare(work_dir, ssh_key):
     groups = rendered["all"]["children"]
     members = groups["postgres_members"]["hosts"]
     voters = groups["postgres_dcs_only"]["hosts"]
+    declared_members = {
+        "uc-k8sp5": ("db-b", "100.96.127.54"),
+        "uc-k8sp4": ("db-e", "100.111.33.52"),
+        "ichikawap1": ("db-h", "100.65.54.75"),
+    }
+    stopped = stopped_hosts(json.loads(ROSTER.read_text()))
+    expected = {name: identity for name, identity in declared_members.items() if name not in stopped}
+    CONSOLE.require(len(expected) >= 2, "Database HA requires at least two active declared members")
     CONSOLE.require(
+        set(members) == set(expected) and
         {(value["postgres_name"], value["tailscale_ip"]) for value in members.values()}
-        == {("db-b", "100.96.127.54"), ("db-e", "100.111.33.52"), ("db-h", "100.65.54.75")},
+        == set(expected.values()),
         "Database member inventory does not match the recovered topology",
     )
     CONSOLE.require(

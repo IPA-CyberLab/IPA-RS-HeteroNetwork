@@ -30,14 +30,14 @@ class DatabaseHaPreparationTests(unittest.TestCase):
         result = PREPARE.prepare(self.work, self.key)
         self.assertEqual(result, {
             "result": "prepared",
-            "postgres_members": ["ichikawap1", "uc-k8sp4", "uc-k8sp5"],
+            "postgres_members": ["ichikawap1", "uc-k8sp5"],
             "postgres_dcs_only": [],
         })
         inventory = json.loads((self.work / "inventory.json").read_text())
         groups = inventory["all"]["children"]
         self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp5"]["postgres_name"], "db-b")
         self.assertNotIn("name", groups["postgres_members"]["hosts"]["uc-k8sp5"])
-        self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp4"]["postgres_name"], "db-e")
+        self.assertNotIn("uc-k8sp4", groups["postgres_members"]["hosts"])
         self.assertEqual(groups["postgres_members"]["hosts"]["ichikawap1"]["postgres_name"], "db-h")
         self.assertEqual(groups["enrollment_issuer"]["hosts"]["ichikawap1"]["vpn_ip"],
                          "10.250.0.10")
