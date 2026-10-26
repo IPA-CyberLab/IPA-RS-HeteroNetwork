@@ -17,6 +17,7 @@ def files():
            'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py',
            'scripts/verify-storage-redundancy.py','scripts/test_verify_storage_redundancy.py',
            'scripts/reconcile-overlay-boot.py','scripts/test_reconcile_overlay_boot.py','scripts/overlay_power_recovery_e2e.py',
+           'scripts/node_lifecycle.py','scripts/test_node_lifecycle.py','scripts/reconcile-node-lifecycle.py',
            'scripts/promote-database-sync-replica.py','scripts/test_promote_database_sync_replica.py',
            'scripts/start-declared-sync-replica.py','scripts/prepare-database-ha.py',
            'scripts/test_prepare_database_ha.py','scripts/prepare-console-release.py','scripts/test_prepare_console_release.py',

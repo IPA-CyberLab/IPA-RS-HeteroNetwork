@@ -1,8 +1,12 @@
 locals {
-  repo_root      = abspath("${path.module}/../../..")
-  nodes          = jsondecode(file("${path.module}/nodes.json"))
-  standard_nodes = jsondecode(file("${path.module}/standard-nodes.json"))
-  edge_nodes     = jsondecode(file("${path.module}/edge-nodes.json"))
+  repo_root     = abspath("${path.module}/../../..")
+  node_states   = try(jsondecode(file("${path.module}/overlay-boot-peers.json")).node_states, {})
+  stopped_hosts = toset([for name, value in local.node_states : name if value.state == "stopped"])
+  nodes = { for name, node in jsondecode(file("${path.module}/nodes.json")) : name => node
+  if !contains(local.stopped_hosts, name) }
+  standard_nodes = { for name, node in jsondecode(file("${path.module}/standard-nodes.json")) : name => node
+  if !contains(local.stopped_hosts, name) }
+  edge_nodes = jsondecode(file("${path.module}/edge-nodes.json"))
   gpu_expected_nodes = {
     uc-k8sp5 = {
       count      = 2

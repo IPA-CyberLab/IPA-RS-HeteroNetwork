@@ -1,5 +1,23 @@
 # HeteroNetwork host infrastructure
 
+`overlay-boot-peers.json` also declares operator lifecycle flags in `node_states`.
+`uc-k8sp4` is currently `stopped`: Terraform and native release deployment skip
+that host, cold VPN recovery excludes it, and live E2E derives its expected
+gateways from the same roster. An unflagged unreachable gateway still fails E2E.
+The `standard-nodes` manifest keeps the Kubernetes Node cordoned with
+`heteronetwork.io/lifecycle=stopped`, disables ingress/discovery/runtime labels,
+and disables new Longhorn placements. Registration, VPN IP and existing storage
+are retained. This flag does not power off a host or evict its existing volumes.
+
+The bootstrap host runs `reconcile-node-lifecycle.py` with its private systemd
+database credential to apply `heteronetwork-stopped` and deny ACLs in one shared
+database transaction. This also works during a rolling control-plane upgrade;
+the credential never enters command arguments or logs. Rejoining a registered
+node preserves its administrative tags. New control planes additionally exclude
+stopped nodes from gateways, relays and service-owner selection, and the console
+labels them `停止中`. To resume, change the roster state to `active`, restore the
+Node/Longhorn scheduling declarations, and apply the reviewed IaC changes.
+
 `terraform_data.gvisor_configuration` installs the checksum-pinned Flash runtime
 installer and gVisor package on `uc-k8sp4` and `uc-k8sp5`. These hosts can run CPU
 Flash services independently of the enrollment issuer. Configuration changes

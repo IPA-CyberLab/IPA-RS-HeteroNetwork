@@ -22,6 +22,8 @@ import time
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
+from node_lifecycle import gateway_ips
+
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -745,11 +747,15 @@ def write_report(path, report):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work-dir", required=True)
-    parser.add_argument("--gateways", required=True)
+    gateways = parser.add_mutually_exclusive_group(required=True)
+    gateways.add_argument("--gateways")
+    gateways.add_argument("--gateway-roster", type=Path)
     parser.add_argument("--credential-file", type=Path)
     parser.add_argument("--require-authenticated-console", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.gateway_roster is not None:
+        args.gateways = gateway_ips(args.gateway_roster)
     work_root = Path(args.work_dir).expanduser().resolve()
     work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     work = Path(tempfile.mkdtemp(prefix="overlay-client-", dir=work_root))

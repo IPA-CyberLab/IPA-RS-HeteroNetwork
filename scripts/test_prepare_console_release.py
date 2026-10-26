@@ -81,12 +81,12 @@ class ConsoleReleasePreparationTests(unittest.TestCase):
                 Path(root, name).chmod(0o600)
         shutil.rmtree(self.temp)
 
-    def test_verified_release_renders_private_six_host_inputs(self):
+    def test_verified_release_renders_private_active_host_inputs(self):
         result = PREPARE.prepare(
             self.manifest, self.archive, self.work, self.key, "v1.2.3", self.commit)
         self.assertEqual(result["result"], "prepared")
         self.assertEqual(result["targets"], [
-            "ichikawap1", "uc-k8s3p", "uc-k8sp1", "uc-k8sp2", "uc-k8sp4", "uc-k8sp5"])
+            "ichikawap1", "uc-k8s3p", "uc-k8sp1", "uc-k8sp2", "uc-k8sp5"])
         with tarfile.open(self.work / "native-bin.tar.gz", "r:gz") as archive:
             self.assertEqual(archive.getnames(), ["ipars", "iparsd"])
             for name in PREPARE.TARGET_BINARIES:
@@ -97,8 +97,8 @@ class ConsoleReleasePreparationTests(unittest.TestCase):
         groups = rendered["all"]["children"]
         self.assertEqual({
             name for group in groups.values() for name in group["hosts"]
-        }, {"ichikawap1", "uc-k8s3p", "uc-k8sp1", "uc-k8sp2", "uc-k8sp4", "uc-k8sp5"})
-        self.assertEqual(set(groups["postgres_members"]["hosts"]), {"uc-k8sp4", "uc-k8sp5", "ichikawap1"})
+        }, {"ichikawap1", "uc-k8s3p", "uc-k8sp1", "uc-k8sp2", "uc-k8sp5"})
+        self.assertEqual(set(groups["postgres_members"]["hosts"]), {"uc-k8sp5", "ichikawap1"})
         self.assertEqual(set(groups["postgres_dcs_only"]["hosts"]), set())
         self.assertEqual(groups["postgres_members"]["hosts"]["uc-k8sp5"]["postgres_name"], "db-b")
         self.assertIn("ProxyCommand=ssh", groups["enrollment_issuer"]["hosts"]

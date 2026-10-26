@@ -6360,6 +6360,9 @@ fn client_gateway_candidate_score(
     now: chrono::DateTime<Utc>,
     policy: &ClusterPolicy,
 ) -> Option<(u8, u32, u16, String)> {
+    if node.is_administratively_stopped() {
+        return None;
+    }
     node.endpoint_candidates
         .iter()
         .filter(|candidate| {
@@ -6857,6 +6860,9 @@ fn service_owner_is_publicly_reachable(
     now: chrono::DateTime<Utc>,
     policy: &ClusterPolicy,
 ) -> bool {
+    if node.is_administratively_stopped() {
+        return false;
+    }
     classification
         .publicly_reachable_ip()
         .is_some_and(|public_ip| {
@@ -7366,6 +7372,9 @@ fn relay_candidate_allowed(
     now: chrono::DateTime<Utc>,
     policy: &ClusterPolicy,
 ) -> bool {
+    if node.is_administratively_stopped() {
+        return false;
+    }
     node.relay_capability
         .as_ref()
         .is_some_and(|capability| capability.is_eligible_relay())
@@ -7548,6 +7557,9 @@ fn acl_filter_peer(
     target: &NodeRecord,
     policy: &ClusterPolicy,
 ) -> Option<NodeRecord> {
+    if source.is_administratively_stopped() || target.is_administratively_stopped() {
+        return None;
+    }
     if policy.acl_rules.is_empty() {
         return Some(target.clone());
     }
@@ -7570,6 +7582,9 @@ fn acl_filter_peer(
 }
 
 fn acl_allows_peer(source: &NodeRecord, target: &NodeRecord, policy: &ClusterPolicy) -> bool {
+    if source.is_administratively_stopped() || target.is_administratively_stopped() {
+        return false;
+    }
     acl_decision(source, target, None, policy).unwrap_or(false)
 }
 
@@ -12503,6 +12518,29 @@ mod tests {
             plane.register_sponsored_client(tampered, Utc::now()).await,
             Err(ControlPlaneError::NodeRegistrationRejected { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_node_cannot_be_a_gateway_or_visible_peer_until_resumed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let policy = ClusterPolicy::default();
+        let source = node_record("active-source");
+        let mut target = node_record("stopped-target");
+        target.endpoint_candidates = vec![EndpointCandidate {
+            kind: EndpointCandidateKind::PublicUdp,
+            ..candidate_at("stopped-target", "8.8.4.4:51820".parse()?)
+        }];
+        assert!(client_gateway_candidate_score(&target, now, &policy).is_some());
+        assert!(acl_filter_peer(&source, &target, &policy).is_some());
+        let marker = Tag::from_string("heteronetwork-stopped");
+        target.tags.insert(marker.clone());
+        assert!(client_gateway_candidate_score(&target, now, &policy).is_none());
+        assert!(acl_filter_peer(&source, &target, &policy).is_none());
+        assert!(acl_filter_peer(&target, &source, &policy).is_none());
+        target.tags.remove(&marker);
+        assert!(client_gateway_candidate_score(&target, now, &policy).is_some());
         Ok(())
     }
 

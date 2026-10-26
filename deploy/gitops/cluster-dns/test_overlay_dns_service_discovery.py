@@ -125,6 +125,11 @@ class OverlayDnsServiceDiscoveryTests(unittest.TestCase):
         )
         self.assertNotIn("secrets.heteronetwork.internal", effective["records"])
 
+    def test_administratively_stopped_ready_node_is_not_discovered(self):
+        stopped = node("node-stopped", "10.250.0.11")
+        stopped["metadata"]["labels"] = {"heteronetwork.io/lifecycle": "stopped"}
+        self.assertFalse(discovery.node_is_ready(stopped))
+
     def test_missing_service_removes_managed_record(self):
         effective, status = discovery.build_effective_zone(
             self.base, [], [], self.nodes, self.rules

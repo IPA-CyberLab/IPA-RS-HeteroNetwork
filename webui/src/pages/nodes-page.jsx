@@ -119,8 +119,8 @@ export function NodesPage({ overview, onOpenNode }) {
         id: "health",
         header: "エージェント",
         cell: (entry) => (
-          <Status value={entry.health?.state || "unknown"}>
-            {entry.health?.state === "healthy" ? "正常" : pretty(entry.health?.state)}
+          <Status value={entry.node?.tags?.includes("heteronetwork-stopped") ? "inactive" : entry.health?.state || "unknown"}>
+            {entry.node?.tags?.includes("heteronetwork-stopped") ? "停止中" : entry.health?.state === "healthy" ? "正常" : pretty(entry.health?.state)}
           </Status>
         ),
       },

@@ -45122,7 +45122,10 @@ exec sleep 60
             };
             validate_relay_config(&args)?;
             assert_eq!(
-                relay_tcp_public_endpoint(&args, args.public_endpoint.unwrap()),
+                relay_tcp_public_endpoint(
+                    &args,
+                    args.public_endpoint.context("public endpoint missing")?
+                ),
                 expected.parse::<SocketAddr>()?
             );
         }

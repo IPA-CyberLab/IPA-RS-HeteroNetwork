@@ -164,7 +164,8 @@ def object_name(value):
 
 def node_is_ready(node):
     metadata = node.get("metadata") or {}
-    if metadata.get("deletionTimestamp"):
+    if (metadata.get("deletionTimestamp")
+            or (metadata.get("labels") or {}).get("heteronetwork.io/lifecycle") == "stopped"):
         return False
     return any(
         condition.get("type") == "Ready" and condition.get("status") == "True"

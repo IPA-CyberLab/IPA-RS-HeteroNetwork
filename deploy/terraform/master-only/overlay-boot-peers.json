@@ -313,5 +313,11 @@
       "routes": [],
       "registered_at": "2026-09-14T13:27:36.840373723Z"
     }
-  ]
+  ],
+  "node_states": {
+    "uc-k8sp4": {
+      "state": "stopped",
+      "reason": "Operator excluded unreachable host on 2026-10-26"
+    }
+  }
 }

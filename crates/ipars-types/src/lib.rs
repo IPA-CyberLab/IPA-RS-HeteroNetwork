@@ -1586,6 +1586,14 @@ pub struct NodeRecord {
 
 pub const MAX_NODE_HOSTNAME_BYTES: usize = 253;
 
+impl NodeRecord {
+    pub fn is_administratively_stopped(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|tag| tag.as_str() == "heteronetwork-stopped")
+    }
+}
+
 pub fn node_hostname_is_valid(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_NODE_HOSTNAME_BYTES

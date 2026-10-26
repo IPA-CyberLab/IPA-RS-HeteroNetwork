@@ -14,6 +14,8 @@ import stat
 import sys
 import tarfile
 
+from node_lifecycle import stopped_hosts
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / "deploy/terraform/master-only"
@@ -99,8 +101,14 @@ def inventory(repo_root, work_dir, ssh_key, checksums):
     nodes, _ = read_json(MODULE / "nodes.json")
     standard_nodes, _ = read_json(MODULE / "standard-nodes.json")
     edge_nodes, _ = read_json(MODULE / "edge-nodes.json")
+    roster, _ = read_json(MODULE / "overlay-boot-peers.json")
+    stopped = stopped_hosts(roster)
+    nodes = {name: node for name, node in nodes.items() if name not in stopped}
+    standard_nodes = {name: node for name, node in standard_nodes.items() if name not in stopped}
     bootstrap = edge_nodes["bootstrap"]
     issuer = edge_nodes["enrollment_issuer"]
+    require(bootstrap["name"] not in stopped and issuer["name"] not in stopped,
+            "Bootstrap and enrollment issuer must be active for a console deployment")
     for path in (repo_root, work_dir, ssh_key):
         require(SAFE_PATH.fullmatch(str(path)), "Deployment paths must use safe absolute characters")
     common = (f"-o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes "

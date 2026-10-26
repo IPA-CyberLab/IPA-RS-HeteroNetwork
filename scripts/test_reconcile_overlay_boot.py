@@ -39,10 +39,10 @@ class OverlayBootRecoveryTest(unittest.TestCase):
         self.assertFalse(preview['changed'])
         self.assertEqual(json.loads(self.state_path.read_text()),self.state)
         result=BOOT.reconcile(self.state_path,self.roster_path,'uc-k8sp5')
-        self.assertEqual(result['approved_bootstrap_peers'],5)
+        self.assertEqual(result['approved_bootstrap_peers'],4)
         after=json.loads(self.state_path.read_text())
         self.assertEqual({p['vpn_ip'] for p in after['bootstrap_peer_cache']['peers']},
-                         {'10.250.0.4','10.250.0.5','10.250.0.6','10.250.0.10','10.250.0.11'})
+                         {'10.250.0.4','10.250.0.5','10.250.0.6','10.250.0.10'})
         self.assertTrue(all(not p['routes'] for p in after['bootstrap_peer_cache']['peers']))
         for key in self.state:
             if key not in ['updated_at','bootstrap_peer_cache']:self.assertEqual(after[key],self.state[key])

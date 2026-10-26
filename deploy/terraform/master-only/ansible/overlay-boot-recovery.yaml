@@ -6,6 +6,22 @@
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
   tasks:
+    - name: Install the shared operator lifecycle policy reader
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/node_lifecycle.py"
+        dest: /opt/heteronetwork/libexec/node_lifecycle.py
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Install the shared database lifecycle reconciler
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/reconcile-node-lifecycle.py"
+        dest: /opt/heteronetwork/libexec/reconcile-node-lifecycle.py
+        owner: root
+        group: root
+        mode: '0755'
+
     - name: Install the bounded recovery state reconciler
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/scripts/reconcile-overlay-boot.py"
@@ -25,6 +41,18 @@
     - name: Validate local identity and the proposed bootstrap map without changing the live agent
       ansible.builtin.command:
         argv: [python3, /opt/heteronetwork/libexec/reconcile-overlay-boot.py, --state, /var/lib/heteronetwork/agent.json, --roster, /etc/heteronetwork/overlay-boot-peers.json, --node, "{{ inventory_hostname }}", --check]
+      changed_when: false
+
+    - name: Apply operator stops to VPN visibility while retaining registrations
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /opt/heteronetwork/libexec/reconcile-node-lifecycle.py
+          - --roster
+          - /etc/heteronetwork/overlay-boot-peers.json
+          - --database-url-file
+          - /run/credentials/heteronetwork-control-plane.service/database-url
+      when: inventory_hostname == 'uc-k8sp5'
       changed_when: false
 
     - name: Create the agent dependency directory

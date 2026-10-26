@@ -28,7 +28,7 @@ resource "terraform_data" "database_sync_replica" {
 
 # Per-host recovery remains deployable when another physical member is offline.
 resource "terraform_data" "database_recovery_proxy" {
-  for_each = toset(["uc-k8sp5", "ichikawap1", "uc-k8sp4"])
+  for_each = setsubtract(toset(["uc-k8sp5", "ichikawap1", "uc-k8sp4"]), local.stopped_hosts)
   triggers_replace = [
     filesha256("${path.module}/ansible/database-proxy.yaml"),
     filesha256("${local.repo_root}/scripts/postgres-ha-node.sh"),

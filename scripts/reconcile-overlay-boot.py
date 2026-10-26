@@ -16,6 +16,8 @@ from pathlib import Path
 import stat
 import tempfile
 
+from node_lifecycle import active_peers, stopped_hosts
+
 
 def require(condition, reason):
     if not condition:
@@ -44,6 +46,7 @@ def recovery_map(state, roster, node):
     require(set(roster['hosts'].values()) == {peer['node_id'] for peer in peers}
             and len(roster['hosts']) == len(peers), 'roster_host_bindings_invalid')
     require(node in roster['hosts'], 'host_not_in_approved_recovery_roster')
+    require(node not in stopped_hosts(roster), 'local_host_is_administratively_stopped')
     seen = {key: set() for key in ['hostname', 'node_id', 'vpn_ip', 'wireguard_public_key', 'identity_public_key']}
     local = None
     for peer in peers:
@@ -71,7 +74,7 @@ def recovery_map(state, roster, node):
                 'local_recovery_identity_mismatch')
     current = state.get('bootstrap_peer_cache') or {}
     return {'cluster_id': roster['cluster_id'],
-            'peers': [copy.deepcopy(peer) for peer in peers if peer['node_id'] != local['node_id']],
+            'peers': [copy.deepcopy(peer) for peer in active_peers(roster) if peer['node_id'] != local['node_id']],
             'bootstrap_endpoints': current.get('bootstrap_endpoints', state.get('bootstrap_endpoints', [])),
             'generated_at': state['updated_at']}
 
