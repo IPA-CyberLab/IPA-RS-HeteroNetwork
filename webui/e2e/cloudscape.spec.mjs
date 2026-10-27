@@ -410,7 +410,7 @@ test("transport panel shows HTTP fallback, failures and stale reports", async ({
     await route.fulfill({ json: { items: [{ node_id: nodes[0].node.node_id, observed_at: new Date().toISOString(), snapshot: { connections: [{
       peer: nodes[1].node.node_id, direction: "outgoing", transport: "https", phase: "connected", endpoint: "https://vpn.example.test/v1/tunnels/wireguard/open", resolved_endpoint: "8.8.8.8:443",
       tx_bytes: 1048576, rx_bytes: 2097152, switches: 2, reconnects: 1, fallback_reason: "udp_probe_timeout", failures: { https_unavailable: 1 }, updated_at: new Date().toISOString(),
-    }, { peer: nodes[3].node.node_id, direction:"outgoing",transport:"tcp",phase:"connected",endpoint:"tcp://8.8.8.8:51820",tx_bytes:4096,rx_bytes:8192,switches:1,reconnects:0,updated_at:new Date().toISOString() }] } }], unreported: [nodes[2].node.node_id], next_cursor: null } });
+    }, { peer: nodes[3].node.node_id, direction:"outgoing",transport:"tcp",phase:"connected",endpoint:"tcp://8.8.8.8:51820",tx_bytes:4096,rx_bytes:8192,switches:1,reconnects:0,updated_at:new Date().toISOString() }] } }], unreported: [nodes[2].node.node_id], http_mesh: [{ node_id:nodes[0].node.node_id, sent_bytes:3145728, received_bytes:4194304, pending_bytes:1024, pending_batches:2, last_poll_at:new Date().toISOString() }], next_cursor: null } });
   });
   await page.goto("/ui/#/transports");
   await expect(page.getByRole("heading", { name: "通信方式", exact: true })).toBeVisible();
@@ -419,6 +419,9 @@ test("transport panel shows HTTP fallback, failures and stale reports", async ({
   await expect(page.getByRole("cell", { name: "8.8.8.8:443", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "TCP", exact:true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "1 MiB / 2 MiB", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /^HTTPメッシュ/ })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "3 MiB / 4 MiB", exact:true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "0 MiB / 2 バッチ", exact:true })).toBeVisible();
   await expect(page.getByText("UDP応答なし", { exact: true })).toBeVisible();
   await expect(page.getByText("HTTPS接続失敗: 1", { exact: true })).toBeVisible();
   await expect(page.getByText("未報告・更新停止", { exact: true })).toBeVisible();

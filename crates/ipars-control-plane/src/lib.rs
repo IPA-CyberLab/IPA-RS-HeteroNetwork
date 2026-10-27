@@ -1,4 +1,5 @@
 pub mod bounded_topology;
+pub mod http_mesh;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -137,6 +138,8 @@ fn client_claims_are_control_only(claims: &JoinTokenClaims) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
+    #[error("HTTP mesh recipient queue is full")]
+    HttpMeshCapacity,
     #[error("invalid transport query: {0}")]
     InvalidTransportQuery(String),
     #[error("join token does not allow node registration")]
@@ -365,6 +368,26 @@ impl AdminCapabilityRevocation {
 
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
+    async fn reap_expired_http_members(
+        &self,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<usize, ControlPlaneError> {
+        Ok(0)
+    }
+    fn http_mesh(&self) -> Option<&dyn http_mesh::HttpMeshStore> {
+        None
+    }
+
+    async fn find_node_by_vpn_ip(
+        &self,
+        address: IpAddr,
+    ) -> Result<Option<NodeRecord>, ControlPlaneError> {
+        Ok(self
+            .list_nodes()
+            .await?
+            .into_iter()
+            .find(|node| node.vpn_ip.0 == address))
+    }
     async fn upsert_transport_snapshot(
         &self,
         _record: ipars_types::api::TransportNodeSnapshot,
@@ -782,6 +805,7 @@ pub trait TokenLedger: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
+    http_mesh: http_mesh::MemoryMeshStore,
     transport_snapshots: RwLock<BTreeMap<NodeId, ipars_types::api::TransportNodeSnapshot>>,
     admin_capabilities: Mutex<AdminCapabilityLedgerState>,
     cluster_policies: RwLock<BTreeMap<ClusterId, ClusterPolicy>>,
@@ -856,6 +880,9 @@ fn advance_in_memory_overlay_routing_epoch(
 
 #[async_trait]
 impl ControlPlaneStore for InMemoryStore {
+    fn http_mesh(&self) -> Option<&dyn http_mesh::HttpMeshStore> {
+        Some(&self.http_mesh)
+    }
     async fn get_client_gateway_selection(
         &self,
         client_id: &NodeId,
@@ -2148,6 +2175,27 @@ where
         self.plane.register_with_claims(token.claims, request).await
     }
 
+    pub async fn join_http_node(
+        &self,
+        token: SignedJoinToken,
+        request: RegisterNodeRequest,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        self.validate_join_token(&token, now)?;
+        if token.claims.role.is_client()
+            || !request.candidates.is_empty()
+            || request.nat_classification.is_some()
+            || request.relay_capability.is_some()
+            || !request.requested_routes.is_empty()
+        {
+            return Err(ControlPlaneError::JoinDenied);
+        }
+        self.admission.admit_join(&token.claims, now).await?;
+        self.plane
+            .register_http_node_with_claims(token.claims, request)
+            .await
+    }
+
     pub async fn join_client(
         &self,
         token: SignedJoinToken,
@@ -2230,6 +2278,7 @@ type OverlayTopologyCache = BTreeMap<OverlayTopologyCacheKey, OverlayTopologyCac
 
 #[derive(Debug)]
 struct OverlayNodeSnapshot {
+    backbone_nodes: Vec<NodeRecord>,
     loaded_at: Instant,
     generated_at: chrono::DateTime<Utc>,
     nodes: Vec<NodeRecord>,
@@ -2255,7 +2304,7 @@ enum OverlayTopologyNodeSource {
 impl OverlayTopologyNodeSource {
     fn nodes(&self) -> &[NodeRecord] {
         match self {
-            Self::Snapshot(snapshot) => &snapshot.nodes,
+            Self::Snapshot(snapshot) => &snapshot.backbone_nodes,
             #[cfg(test)]
             Self::Owned(nodes) => nodes,
         }
@@ -3248,6 +3297,14 @@ where
         &self,
         node_id: &NodeId,
     ) -> Result<RemoveNodeResponse, ControlPlaneError> {
+        self.remove_verified_node(node_id, true).await
+    }
+
+    async fn remove_verified_node(
+        &self,
+        node_id: &NodeId,
+        admin: bool,
+    ) -> Result<RemoveNodeResponse, ControlPlaneError> {
         let result = self.store.remove_node(node_id).await?;
         self.agent_builds.write().await.remove(node_id);
         self.invalidate_overlay_node_snapshot().await;
@@ -3256,7 +3313,7 @@ where
             .await
             .retain(|(local, remote), _| local != node_id && remote != node_id);
         *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
-        self.operation_metrics.record_node_removal(true);
+        self.operation_metrics.record_node_removal(admin);
         Ok(RemoveNodeResponse {
             node: result.node,
             removed_path_count: result.removed_path_count,
@@ -3491,6 +3548,39 @@ where
         claims: JoinTokenClaims,
         request: RegisterNodeRequest,
     ) -> Result<RegisterNodeResponse, ControlPlaneError> {
+        let (node, now) = self
+            .register_participant_record_with_claims(claims, request, false)
+            .await?;
+        self.registration_response_for_node(node, now).await
+    }
+
+    pub async fn register_http_node_with_claims(
+        &self,
+        mut claims: JoinTokenClaims,
+        request: RegisterNodeRequest,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        if claims.role.is_client()
+            || !request.candidates.is_empty()
+            || request.nat_classification.is_some()
+            || request.relay_capability.is_some()
+            || !request.requested_routes.is_empty()
+        {
+            return Err(ControlPlaneError::JoinDenied);
+        }
+        claims
+            .tags
+            .insert(ipars_types::Tag::from_string("heteronetwork-http-only"));
+        self.register_participant_record_with_claims(claims, request, true)
+            .await
+            .map(|(node, _)| node)
+    }
+
+    async fn register_participant_record_with_claims(
+        &self,
+        claims: JoinTokenClaims,
+        request: RegisterNodeRequest,
+        sparse_allocation: bool,
+    ) -> Result<(NodeRecord, chrono::DateTime<Utc>), ControlPlaneError> {
         if !claims.policy.allow_join {
             return Err(ControlPlaneError::JoinDenied);
         }
@@ -3539,9 +3629,12 @@ where
                     claims.clone(),
                     request.clone(),
                     relay_capability.clone(),
-                    now,
-                    persisted_cluster_policy.clone(),
-                    expected_route_catalog_epoch,
+                    NodeRegistrationAllocation {
+                        registered_at: now,
+                        expected_cluster_policy: persisted_cluster_policy.clone(),
+                        expected_route_catalog_epoch,
+                        sparse: sparse_allocation,
+                    },
                 )
                 .await
             {
@@ -3580,7 +3673,7 @@ where
                 .await?;
         }
         self.invalidate_overlay_node_snapshot().await;
-        self.registration_response_for_node(node, now).await
+        Ok((node, now))
     }
 
     async fn registration_response_for_node(
@@ -3657,18 +3750,36 @@ where
         claims: JoinTokenClaims,
         request: RegisterNodeRequest,
         relay_capability: Option<RelayCapability>,
-        registered_at: chrono::DateTime<Utc>,
-        expected_cluster_policy: Option<ClusterPolicy>,
-        expected_route_catalog_epoch: Option<u64>,
+        allocation: NodeRegistrationAllocation,
     ) -> Result<NodeRecord, ControlPlaneError> {
+        let NodeRegistrationAllocation {
+            registered_at,
+            expected_cluster_policy,
+            expected_route_catalog_epoch,
+            sparse: sparse_allocation,
+        } = allocation;
+        let mut attempts = 0;
         loop {
-            let existing_nodes = self.store.list_nodes().await?;
-            let reserved_vpn_ips = assigned_ipv4_vpn_ips(&existing_nodes);
-            let vpn_ip = self
-                .allocator
-                .write()
-                .await
-                .allocate_next(&reserved_vpn_ips)?;
+            attempts += 1;
+            // HTTP-only registrations use indexed uniqueness, not a complete
+            // cluster inventory or full peer map on every new instance.
+            let vpn_ip = if sparse_allocation && attempts <= 64 {
+                let size = 1_u64 << (32 - self.config.vpn_pool.prefix_len());
+                if size <= 2 {
+                    return Err(ControlPlaneError::VpnPoolExhausted);
+                }
+                let host = 1 + (uuid::Uuid::new_v4().as_u128() as u64 % (size - 2));
+                VpnIp(
+                    Ipv4Addr::from(u32::from(self.config.vpn_pool.network()) + host as u32).into(),
+                )
+            } else {
+                let existing_nodes = self.store.list_nodes().await?;
+                let reserved_vpn_ips = assigned_ipv4_vpn_ips(&existing_nodes);
+                self.allocator
+                    .write()
+                    .await
+                    .allocate_next(&reserved_vpn_ips)?
+            };
             let node = NodeRecord {
                 node_id: request.node_id.clone(),
                 display_name: None,
@@ -3717,7 +3828,7 @@ where
             .get_node(&request.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
-        if node.role.is_client() {
+        if node.role.is_client() && kind != ControlPlaneNodeQueryKind::HttpMesh {
             return Err(ControlPlaneError::NodeSignatureRejected {
                 node_id: request.node_id.clone(),
                 reason: "client identities must use the client control API".to_string(),
@@ -3743,8 +3854,35 @@ where
             });
         }
 
-        self.accept_node_query_nonce(&request.node_id, signature.signed_at, &signature.nonce, now)
+        if kind == ControlPlaneNodeQueryKind::HttpMesh {
+            if node.is_administratively_stopped() {
+                return Err(ControlPlaneError::RelayDenied);
+            }
+            let store = self.store.http_mesh().ok_or_else(|| {
+                ControlPlaneError::Store("shared HTTP mesh store unavailable".into())
+            })?;
+            let age = chrono::Duration::from_std(self.config.heartbeat_signature_max_age)
+                .map_err(|_| ControlPlaneError::Store("invalid signature age".into()))?;
+            if !store
+                .consume_nonce(
+                    &node.node_id,
+                    &signature.nonce,
+                    signature.signed_at + age + chrono::Duration::seconds(1),
+                    now,
+                )
+                .await?
+            {
+                return Err(ControlPlaneError::NodeRequestReplay(node.node_id));
+            }
+        } else {
+            self.accept_node_query_nonce(
+                &request.node_id,
+                signature.signed_at,
+                &signature.nonce,
+                now,
+            )
             .await?;
+        }
         Ok(node)
     }
 
@@ -4475,10 +4613,18 @@ where
             .enumerate()
             .map(|(index, node)| (node.node_id.clone(), index))
             .collect::<BTreeMap<_, _>>();
-        let membership_epoch = overlay_membership_epoch(nodes_by_id.keys().map(NodeId::as_str));
+        // HTTP application nodes do not forward the native UDP backbone. They
+        // have dedicated bridge routes and must never replace its neighbors.
+        let backbone_nodes = nodes
+            .iter()
+            .filter(|node| !node.is_http_only())
+            .cloned()
+            .collect::<Vec<_>>();
+        let membership_epoch =
+            overlay_membership_epoch(backbone_nodes.iter().map(|node| node.node_id.as_str()));
         let topology_cache_key = Arc::new(OverlayTopologyCacheKey {
             membership_epoch,
-            node_count: nodes.len(),
+            node_count: backbone_nodes.len(),
             block_size: policy.overlay_block_size,
             max_degree: policy.overlay_max_degree,
             permutation_seed: self.config.cluster_id.as_str().to_string(),
@@ -4494,6 +4640,7 @@ where
             return Err(ControlPlaneError::OverlayRouteCatalogChanged);
         }
         let snapshot = Arc::new(OverlayNodeSnapshot {
+            backbone_nodes,
             loaded_at,
             generated_at,
             nodes,
@@ -6071,6 +6218,14 @@ where
             generated_at,
         }
     }
+}
+
+#[derive(Clone)]
+struct NodeRegistrationAllocation {
+    registered_at: chrono::DateTime<Utc>,
+    expected_cluster_policy: Option<ClusterPolicy>,
+    expected_route_catalog_epoch: Option<u64>,
+    sparse: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -17088,6 +17243,181 @@ mod tests {
             .await?
             .transport_urls
             .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_mesh_survives_replica_changes_retries_and_lost_poll_responses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::http_mesh::{MeshAck, MeshAction, MeshRequest};
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let cluster = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let config = ControlPlaneConfig::new(cluster.clone(), "10.254.0.0/24".parse()?);
+        let a = ControlPlane::new(config.clone(), store.clone());
+        let b = ControlPlane::new(config, store.clone());
+        for name in ["mesh-a", "mesh-b", "mesh-other"] {
+            let mut registration = registration_request(name);
+            registration.candidates.clear();
+            registration.nat_classification = None;
+            registration.relay_capability = None;
+            a.register_with_claims(claims(cluster.clone()), registration)
+                .await?;
+        }
+        let signed =
+            |name: &str, action: MeshAction| -> Result<MeshRequest, Box<dyn std::error::Error>> {
+                let mut request = MeshRequest {
+                    query: ControlPlaneNodeQueryRequest {
+                        node_id: node_id(name),
+                        request_signature: None,
+                    },
+                    action,
+                };
+                request.query.request_signature = Some(
+                    identity_for_node(name).sign_bound_control_plane_node_query_request(
+                        &request.query,
+                        ControlPlaneNodeQueryKind::HttpMesh,
+                        Utc::now(),
+                        &request.binding_bytes()?,
+                    )?,
+                );
+                Ok(request)
+            };
+        let target = store
+            .get_node(&node_id("mesh-b"))
+            .await?
+            .ok_or("target missing")?;
+        let response = a
+            .http_mesh_request(signed(
+                "mesh-a",
+                MeshAction::Peer {
+                    address: target.vpn_ip.to_string(),
+                },
+            )?)
+            .await?;
+        assert_eq!(response.node.ok_or("peer missing")?.node_id, target.node_id);
+        let mut packet = vec![0; 32];
+        packet[0] = 4;
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let action = MeshAction::Send {
+            target: target.node_id.clone(),
+            batch_id: batch_id.clone(),
+            packets: vec![STANDARD.encode(&packet)],
+        };
+        let request = signed("mesh-a", action.clone())?;
+        let mut tampered = request.clone();
+        if let MeshAction::Send { target, .. } = &mut tampered.action {
+            *target = node_id("mesh-other");
+        }
+        assert!(b.http_mesh_request(tampered).await.is_err());
+        assert_eq!(
+            a.http_mesh_request(request.clone()).await?.accepted,
+            Some(true)
+        );
+        assert!(
+            b.http_mesh_request(request).await.is_err(),
+            "replay accepted by another replica"
+        );
+        assert_eq!(
+            b.http_mesh_request(signed("mesh-a", action.clone())?)
+                .await?
+                .accepted,
+            Some(false)
+        );
+        let poll = || MeshAction::Poll {
+            acknowledgements: Vec::new(),
+            wait_ms: 0,
+        };
+        assert_eq!(
+            b.http_mesh_request(signed("mesh-b", poll())?)
+                .await?
+                .envelopes
+                .len(),
+            1
+        );
+        assert_eq!(
+            a.http_mesh_request(signed("mesh-b", poll())?)
+                .await?
+                .envelopes
+                .len(),
+            1,
+            "a lost response consumed the packet"
+        );
+        let ack = MeshAck {
+            source: node_id("mesh-a"),
+            batch_id,
+        };
+        assert!(a
+            .http_mesh_request(signed(
+                "mesh-other",
+                MeshAction::Poll {
+                    acknowledgements: vec![ack.clone()],
+                    wait_ms: 0
+                }
+            )?)
+            .await?
+            .envelopes
+            .is_empty());
+        assert_eq!(
+            a.http_mesh_request(signed("mesh-b", poll())?)
+                .await?
+                .envelopes
+                .len(),
+            1,
+            "another node acknowledged somebody else's packet"
+        );
+        assert!(b
+            .http_mesh_request(signed(
+                "mesh-b",
+                MeshAction::Poll {
+                    acknowledgements: vec![ack],
+                    wait_ms: 0
+                }
+            )?)
+            .await?
+            .envelopes
+            .is_empty());
+        assert_eq!(
+            a.http_mesh_request(signed("mesh-a", action)?)
+                .await?
+                .accepted,
+            Some(false),
+            "retry after ACK re-enqueued a packet"
+        );
+        let stats = b.http_mesh_stats(&BTreeSet::from([target.node_id])).await?;
+        assert_eq!(stats[0].received_bytes, 32);
+        assert_eq!(stats[0].pending_batches, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_application_nodes_do_not_replace_native_backbone_neighbors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster.clone(), "10.254.0.0/24".parse()?),
+            store,
+        );
+        for name in ["native-a", "native-b"] {
+            plane
+                .register_with_claims(claims(cluster.clone()), registration_request(name))
+                .await?;
+        }
+        let before = plane.neighbor_map_for(&node_id("native-a")).await?;
+        for name in ["cloud-a", "cloud-b", "cloud-c"] {
+            let mut request = registration_request(name);
+            request.candidates.clear();
+            request.nat_classification = None;
+            request.relay_capability = None;
+            plane
+                .register_http_node_with_claims(claims(cluster.clone()), request)
+                .await?;
+        }
+        let after = plane.neighbor_map_for(&node_id("native-a")).await?;
+        assert_eq!(before.topology_epoch, after.topology_epoch);
+        assert_eq!(before.neighbors, after.neighbors);
+        assert_eq!(plane.list_nodes().await?.len(), 5);
         Ok(())
     }
 

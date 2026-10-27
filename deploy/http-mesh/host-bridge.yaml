@@ -1,0 +1,100 @@
+- name: Connect existing Linux VPN hosts to HTTP-only cloud members
+  hosts: master_only:bootstrap:enrollment_issuer:standard
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    mesh_roster: "{{ lookup('file', hnn_repo_root + '/deploy/terraform/master-only/overlay-boot-peers.json') | from_json }}"
+  tasks:
+    - name: Skip hosts explicitly stopped by the operator
+      ansible.builtin.meta: end_host
+      when: mesh_roster.node_states[inventory_hostname].state | default('active') == 'stopped'
+
+    - name: Require a tested local artifact and a trusted control-plane origin
+      ansible.builtin.assert:
+        that:
+          - hnn_http_mesh_endpoint is match('^https://[A-Za-z0-9.:-]+$')
+          - hnn_http_mesh_binary_sha256 is match('^[a-f0-9]{64}$')
+
+    - name: Install the headless bridge binary
+      ansible.builtin.copy:
+        src: '{{ hnn_http_mesh_binary }}'
+        dest: /opt/heteronetwork/bin/heteronet-headless
+        owner: root
+        group: root
+        mode: '0755'
+      register: mesh_binary
+
+    - name: Verify the deployed binary
+      ansible.builtin.stat:
+        path: /opt/heteronetwork/bin/heteronet-headless
+        checksum_algorithm: sha256
+      register: mesh_verified
+
+    - name: Enforce artifact provenance
+      ansible.builtin.assert:
+        that: mesh_verified.stat.checksum == hnn_http_mesh_binary_sha256
+
+    - name: Install the local identity loader
+      ansible.builtin.copy:
+        src: '{{ hnn_repo_root }}/scripts/http_mesh_host_bridge.py'
+        dest: /opt/heteronetwork/libexec/http_mesh_host_bridge.py
+        owner: root
+        group: root
+        mode: '0755'
+      register: mesh_loader
+
+    - name: Install the isolated host bridge unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-http-mesh.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=HeteroNetwork HTTP-only cloud node bridge
+          Wants=network-online.target
+          After=network-online.target heteronetwork-agent.service
+          [Service]
+          Type=simple
+          Environment=HETERONETWORK_ENDPOINT={{ hnn_http_mesh_endpoint }}
+          ExecStart=/usr/bin/python3 /opt/heteronetwork/libexec/http_mesh_host_bridge.py
+          Restart=on-failure
+          RestartSec=5s
+          TimeoutStopSec=30s
+          User=root
+          AmbientCapabilities=CAP_NET_ADMIN
+          CapabilityBoundingSet=CAP_NET_ADMIN
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          ProtectKernelTunables=true
+          ProtectKernelModules=true
+          ProtectControlGroups=true
+          RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+          DevicePolicy=closed
+          DeviceAllow=/dev/net/tun rw
+          UMask=0077
+          [Install]
+          WantedBy=multi-user.target
+      register: mesh_unit
+
+    - name: Enable and reconcile the host bridge
+      ansible.builtin.systemd_service:
+        name: heteronetwork-http-mesh.service
+        enabled: true
+        daemon_reload: true
+        state: "{{ 'restarted' if mesh_binary.changed or mesh_loader.changed or mesh_unit.changed else 'started' }}"
+
+    - name: Require a ready HTTP bridge before proceeding to the next host
+      ansible.builtin.uri:
+        url: http://127.0.0.1:19881/readyz
+        status_code: 204
+        use_proxy: false
+      register: mesh_ready
+      retries: 12
+      delay: 5
+      until: mesh_ready.status | default(0) == 204
+      changed_when: false

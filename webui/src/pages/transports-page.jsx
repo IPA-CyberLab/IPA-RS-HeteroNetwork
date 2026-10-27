@@ -78,6 +78,14 @@ export function TransportsPage({ overview }) {
   ];
   return <SpaceBetween size="l">
     {error ? <ErrorAlert error={error} onRetry={() => load()} /> : null}
+    {data?.http_mesh?.length ? <ResourceTable header="HTTPメッシュ" description="HTTPだけで接続するノードの通信量と待機中データです。最終接続が45秒以上更新されない場合は更新停止として表示します。"
+      items={data.http_mesh} trackBy="node_id" pageSize={20} columns={[
+        { id: "node", header: "ノード", cell: (row) => name(row.node_id) },
+        { id: "state", header: "状態", cell: (row) => { const active = row.last_poll_at && Date.now() - Date.parse(row.last_poll_at) < 45000; return <StatusIndicator type={active ? "success" : "warning"}>{active ? "接続中" : "更新停止"}</StatusIndicator>; } },
+        { id: "usage", header: "送信 / 受信", cell: (row) => `${bytes(row.sent_bytes)} / ${bytes(row.received_bytes)}` },
+        { id: "queue", header: "待機中", cell: (row) => `${bytes(row.pending_bytes)} / ${row.pending_batches} バッチ` },
+        { id: "last", header: "最終接続", cell: (row) => age(row.last_poll_at) },
+      ]} emptyTitle="HTTPメッシュの報告がありません" /> : null}
     <ResourceTable header="通信方式" description="UDPからTCP・HTTPS・HTTPへの切り替えを5秒ごとに確認します。通信量はこのプロセスの起動以降の値で、報告停止を通信量0として扱いません。"
       items={rows} columns={columns} trackBy="id" pageSize={20}
       actions={<SpaceBetween size="s" direction="horizontal"><Select selectedOption={source} options={options} ariaLabel="報告ノード" onChange={({ detail }) => { setSource(detail.selectedOption); setCursors([""]); }} /><Button loading={busy} onClick={() => load()}>更新</Button></SpaceBetween>}

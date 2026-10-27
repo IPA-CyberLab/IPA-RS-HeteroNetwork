@@ -37,3 +37,6 @@ clients/windows/.build/
 *.auto.tfvars
 *.auto.tfvars.json
 !*.auto.tfvars.example
+
+/deploy/http-mesh/cloudflare/node_modules/
+/deploy/http-mesh/cloudflare/.wrangler/

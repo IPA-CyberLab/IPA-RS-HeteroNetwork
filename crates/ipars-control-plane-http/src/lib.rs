@@ -638,7 +638,7 @@ where
         .route(
             "/v1/transport-capabilities",
             get(|| async {
-                Json(serde_json::json!({"http_tunnel_protocol":1,"transport_observations":true,"tcp_tunnel_protocol":1,"transport_url_protocol":1}))
+                Json(serde_json::json!({"http_tunnel_protocol":1,"transport_observations":true,"tcp_tunnel_protocol":1,"transport_url_protocol":1,"http_mesh_protocol":1}))
             }),
         )
         .route(
@@ -646,6 +646,8 @@ where
             post(http_transport_peer::<S, L>),
         )
         .route("/v1/join", post(join::<S, L>))
+        .route("/v1/http-mesh/join",post(http_mesh_join::<S,L>))
+        .route("/v1/http-mesh", post(http_mesh::<S,L>).layer(DefaultBodyLimit::max(128 * 1024)))
         .route("/v1/clients/join", post(join_client::<S, L>))
         .route(
             "/v1/clients/sponsored-enrollment",
@@ -6585,6 +6587,32 @@ struct TransportListQuery {
     limit: Option<usize>,
 }
 
+async fn http_mesh_join<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<ipars_types::api::JoinNodeRequest>,
+) -> Result<Json<Value>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let node = state
+        .join_service
+        .join_http_node(request.token, request.registration, Utc::now())
+        .await?;
+    Ok(Json(serde_json::json!({"node":node})))
+}
+
+async fn http_mesh<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<ipars_control_plane::http_mesh::MeshRequest>,
+) -> Result<Json<ipars_control_plane::http_mesh::MeshResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(state.plane.http_mesh_request(request).await?))
+}
+
 async fn http_transport_peer<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Json(request): Json<ipars_types::api::HttpTransportPeerRequest>,
@@ -6635,12 +6663,13 @@ where
         .flatten();
     let ids: BTreeSet<NodeId> = nodes.into_iter().collect();
     let items = state.plane.transport_snapshots_for(&ids).await?;
+    let http_mesh = state.plane.http_mesh_stats(&ids).await?;
     let unreported = ids
         .iter()
         .filter(|id| !items.iter().any(|item| &item.node_id == *id))
         .collect::<Vec<_>>();
     Ok(Json(
-        serde_json::json!({"items":items,"unreported":unreported,"next_cursor":after,"generated_at":Utc::now()}),
+        serde_json::json!({"items":items,"unreported":unreported,"http_mesh":http_mesh,"next_cursor":after,"generated_at":Utc::now()}),
     ))
 }
 
@@ -8234,6 +8263,7 @@ impl IntoResponse for ApiError {
             | ControlPlaneError::NodeStateChanged(_)
             | ControlPlaneError::KeycloakCandidateGenerationConflict { .. } => StatusCode::CONFLICT,
             ControlPlaneError::NodeRequestAuthenticationCapacity => StatusCode::SERVICE_UNAVAILABLE,
+            ControlPlaneError::HttpMeshCapacity => StatusCode::TOO_MANY_REQUESTS,
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
             ControlPlaneError::NodeAlreadyExists(_)
             | ControlPlaneError::VpnIpAlreadyAllocated(_) => StatusCode::CONFLICT,

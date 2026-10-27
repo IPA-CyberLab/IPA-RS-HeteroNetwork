@@ -1,0 +1,8 @@
+.git
+.env*
+.key
+*.key
+*.pem
+*.test
+*_test.go
+heteronet-headless

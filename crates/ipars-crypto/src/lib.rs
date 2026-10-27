@@ -448,7 +448,10 @@ pub fn verify_control_plane_node_query_signature(
         request_signature.signed_at,
         request_signature.nonce.clone(),
     ))?;
-    if kind == ControlPlaneNodeQueryKind::HttpTransport {
+    if matches!(
+        kind,
+        ControlPlaneNodeQueryKind::HttpTransport | ControlPlaneNodeQueryKind::HttpMesh
+    ) {
         // This operation includes a full SHA-256 body commitment and a fresh
         // 128-bit nonce. Other operations retain their existing wire format.
         let nonce = URL_SAFE_NO_PAD

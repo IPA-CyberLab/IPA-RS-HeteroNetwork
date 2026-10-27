@@ -1,0 +1,8 @@
+{
+  "name": "heteronet-cloudflare-http-members",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test src/router.test.mjs", "check": "wrangler deploy --dry-run" },
+  "dependencies": { "@cloudflare/containers": "0.3.7" },
+  "devDependencies": { "wrangler": "4.153.0" }
+}

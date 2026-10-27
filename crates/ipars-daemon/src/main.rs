@@ -14711,7 +14711,7 @@ fn public_web_gateway_caddyfile(
         if let Some(control_plane_upstream) = config.control_plane_upstream {
             let _ = writeln!(
                 caddyfile,
-                "\t@control_plane_bootstrap path /v1/join /v1/transport-capabilities /v1/nodes/http-transport/peer /v1/heartbeat /v1/nodes/authenticate-signal-upsert /v1/nodes/public-services/bootstrap /v1/peers/query /v1/neighbors/query /v1/paths/query /v1/overlay-paths/query /v1/install/*\n\thandle @control_plane_bootstrap {{\n\t\treverse_proxy http://{control_plane_upstream}\n\t}}"
+                "\t@control_plane_bootstrap path /v1/join /v1/http-mesh /v1/http-mesh/join /v1/transport-capabilities /v1/nodes/http-transport/peer /v1/heartbeat /v1/nodes/authenticate-signal-upsert /v1/nodes/public-services/bootstrap /v1/peers/query /v1/neighbors/query /v1/paths/query /v1/overlay-paths/query /v1/install/*\n\thandle @control_plane_bootstrap {{\n\t\treverse_proxy http://{control_plane_upstream}\n\t}}"
             );
         }
         if let Some(signal_upstream) = config.signal_upstream {
@@ -14736,6 +14736,9 @@ fn public_web_gateway_caddyfile(
             // HTTP carries authenticated WireGuard ciphertext only. Enrollment
             // credentials and management APIs remain behind TLS or the VPN.
             let _ = writeln!(caddyfile, "{host} {{\n\tbind {}\n\t@wireguard_tunnel path /v1/tunnels/wireguard/open /v1/tunnels/wireguard/packets /v1/tunnels/relay/admit\n\thandle @wireguard_tunnel {{\n\t\treverse_proxy http://{upstream}\n\t}}", target.bind_ip);
+            if let Some(control_plane) = config.control_plane_upstream {
+                let _=writeln!(caddyfile,"\t@http_mesh path /v1/http-mesh\n\thandle @http_mesh {{\n\t\treverse_proxy http://{control_plane}\n\t}}");
+            }
             if let Some(relay) = config.relay_admission_upstream {
                 let _ = writeln!(caddyfile, "\t@relay_transport path /v1/tunnels/relay/open /v1/tunnels/relay/packets\n\thandle @relay_transport {{\n\t\treverse_proxy http://{relay}\n\t}}");
             }
@@ -23709,7 +23712,7 @@ mod tests {
         )));
         assert!(public.contains("@health path /healthz"));
         assert!(public.contains("respond 204"));
-        assert!(public.contains("@control_plane_bootstrap path /v1/join /v1/transport-capabilities /v1/nodes/http-transport/peer /v1/heartbeat"));
+        assert!(public.contains("@control_plane_bootstrap path /v1/join /v1/http-mesh /v1/http-mesh/join /v1/transport-capabilities /v1/nodes/http-transport/peer /v1/heartbeat"));
         assert!(public.contains("/v1/nodes/authenticate-signal-upsert"));
         assert!(public.contains("/v1/neighbors/query"));
         assert!(public.contains("/v1/overlay-paths/query"));

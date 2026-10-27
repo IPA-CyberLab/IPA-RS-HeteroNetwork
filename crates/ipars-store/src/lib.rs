@@ -17,6 +17,7 @@ use ipars_types::{
     TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
+mod http_mesh;
 
 const PATH_PAIR_QUERY_CHUNK_SIZE: usize = 200;
 const MAX_KEYCLOAK_CANDIDATE_QUERY_LIMIT: usize = 64;
@@ -84,19 +85,28 @@ fn admin_anchor(
 #[derive(Debug, Clone)]
 pub struct SqliteControlPlaneStore {
     pool: SqlitePool,
+    mesh_wakeups: std::sync::Arc<ipars_control_plane::http_mesh::MeshWakeups>,
 }
 
 impl SqliteControlPlaneStore {
     pub async fn connect(database_url: &str) -> Result<Self, ControlPlaneError> {
         let pool = SqlitePool::connect(database_url).await.map_err(sql_error)?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            mesh_wakeups: Default::default(),
+        };
         store.migrate().await?;
+        http_mesh::sqlite_reaper(&store.pool, &store.mesh_wakeups);
         Ok(store)
     }
 
     pub async fn from_pool(pool: SqlitePool) -> Result<Self, ControlPlaneError> {
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            mesh_wakeups: Default::default(),
+        };
         store.migrate().await?;
+        http_mesh::sqlite_reaper(&store.pool, &store.mesh_wakeups);
         Ok(store)
     }
 
@@ -333,6 +343,9 @@ impl SqliteControlPlaneStore {
             .await
             .map_err(sql_error)?;
         self.pool.execute("CREATE TABLE IF NOT EXISTS node_transport_snapshots (node_id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE, observed_at BIGINT NOT NULL, record_json TEXT NOT NULL)").await.map_err(sql_error)?;
+        for statement in http_mesh::SCHEMA {
+            self.pool.execute(*statement).await.map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -407,6 +420,32 @@ impl SqliteControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for SqliteControlPlaneStore {
+    async fn reap_expired_http_members(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<usize, ControlPlaneError> {
+        self.reap_expired_mesh_members(now).await
+    }
+    fn http_mesh(&self) -> Option<&dyn ipars_control_plane::http_mesh::HttpMeshStore> {
+        Some(self)
+    }
+    async fn find_node_by_vpn_ip(
+        &self,
+        address: std::net::IpAddr,
+    ) -> Result<Option<NodeRecord>, ControlPlaneError> {
+        let row = sqlx::query(
+            "SELECT record_json FROM nodes WHERE json_extract(record_json,'$.vpn_ip')=?",
+        )
+        .bind(address.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        row.map(|row| {
+            let body: String = row.try_get("record_json").map_err(sql_error)?;
+            serde_json::from_str(&body).map_err(json_error)
+        })
+        .transpose()
+    }
     async fn get_client_gateway_selection(
         &self,
         client: &NodeId,
@@ -955,60 +994,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 
     async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
-        let mut transaction = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(sql_error)?;
-        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
-            .bind(node_id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        let node = row
-            .map(row_to_node)
-            .transpose()?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        let health_result = sqlx::query("DELETE FROM health WHERE node_id = ?1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = ?1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        sqlx::query("DELETE FROM nat_classifications WHERE node_id = ?1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        sqlx::query(
-            "DELETE FROM client_gateway_selections WHERE client_id = ?1 OR gateway_node_id = ?1",
-        )
-        .bind(node_id.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(sql_error)?;
-        let path_result =
-            sqlx::query("DELETE FROM paths WHERE local_node_id = ?1 OR remote_node_id = ?1")
-                .bind(node_id.as_str())
-                .execute(&mut *transaction)
-                .await
-                .map_err(sql_error)?;
-        sqlx::query("DELETE FROM nodes WHERE node_id = ?1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        bump_sqlite_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
-        transaction.commit().await.map_err(sql_error)?;
-        Ok(RemovedNode {
-            node,
-            removed_path_count: path_result.rows_affected() as usize,
-            removed_health: health_result.rows_affected() > 0,
-        })
+        self.remove_node_checked(node_id, None).await
     }
 
     async fn update_node_candidates(
@@ -1828,6 +1814,88 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 }
 
+impl SqliteControlPlaneStore {
+    async fn remove_node_checked(
+        &self,
+        node_id: &NodeId,
+        expired_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<RemovedNode, ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let node = row
+            .map(row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if let Some(now) = expired_at {
+            let lease =
+                sqlx::query("SELECT ephemeral,expires_at FROM http_mesh_members WHERE node_id=?1")
+                    .bind(node_id.as_str())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(sql_error)?;
+            let expired = if let Some(lease) = lease {
+                lease.try_get::<bool, _>("ephemeral").map_err(sql_error)?
+                    && lease.try_get::<i64, _>("expires_at").map_err(sql_error)?
+                        <= now.timestamp_millis()
+            } else {
+                false
+            };
+            if !expired || node.is_administratively_stopped() {
+                return Err(ControlPlaneError::NodeStateChanged(node_id.clone()));
+            }
+        }
+
+        let health_result = sqlx::query("DELETE FROM health WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nat_classifications WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query(
+            "DELETE FROM client_gateway_selections WHERE client_id = ?1 OR gateway_node_id = ?1",
+        )
+        .bind(node_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let path_result =
+            sqlx::query("DELETE FROM paths WHERE local_node_id = ?1 OR remote_node_id = ?1")
+                .bind(node_id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(RemovedNode {
+            node,
+            removed_path_count: path_result.rows_affected() as usize,
+            removed_health: health_result.rows_affected() > 0,
+        })
+    }
+}
+
 #[async_trait]
 impl TokenLedger for SqliteControlPlaneStore {
     async fn insert_token_if_absent(
@@ -2038,6 +2106,7 @@ impl TokenLedger for SqliteControlPlaneStore {
 #[derive(Debug, Clone)]
 pub struct PostgresControlPlaneStore {
     pool: PgPool,
+    mesh_wakeups: std::sync::Arc<ipars_control_plane::http_mesh::MeshWakeups>,
 }
 
 // PostgreSQL can race internally even for concurrent `IF NOT EXISTS` DDL.
@@ -2046,14 +2115,22 @@ const POSTGRES_MIGRATION_ADVISORY_LOCK_ID: i64 = 0x4950_4152_534d_4947;
 impl PostgresControlPlaneStore {
     pub async fn connect(database_url: &str) -> Result<Self, ControlPlaneError> {
         let pool = PgPool::connect(database_url).await.map_err(sql_error)?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            mesh_wakeups: Default::default(),
+        };
         store.migrate().await?;
+        http_mesh::postgres_listener(&store.pool, &store.mesh_wakeups).await?;
         Ok(store)
     }
 
     pub async fn from_pool(pool: PgPool) -> Result<Self, ControlPlaneError> {
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            mesh_wakeups: Default::default(),
+        };
         store.migrate().await?;
+        http_mesh::postgres_listener(&store.pool, &store.mesh_wakeups).await?;
         Ok(store)
     }
 
@@ -2283,6 +2360,9 @@ impl PostgresControlPlaneStore {
             .await
             .map_err(sql_error)?;
         transaction.execute("CREATE TABLE IF NOT EXISTS node_transport_snapshots (node_id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE, observed_at BIGINT NOT NULL, record_json TEXT NOT NULL)").await.map_err(sql_error)?;
+        for statement in http_mesh::SCHEMA {
+            transaction.execute(*statement).await.map_err(sql_error)?;
+        }
         transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
@@ -2359,6 +2439,27 @@ impl PostgresControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for PostgresControlPlaneStore {
+    async fn reap_expired_http_members(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<usize, ControlPlaneError> {
+        self.reap_expired_mesh_members(now).await
+    }
+    fn http_mesh(&self) -> Option<&dyn ipars_control_plane::http_mesh::HttpMeshStore> {
+        Some(self)
+    }
+    async fn find_node_by_vpn_ip(
+        &self,
+        address: std::net::IpAddr,
+    ) -> Result<Option<NodeRecord>, ControlPlaneError> {
+        let row =
+            sqlx::query("SELECT record_json FROM nodes WHERE record_json::jsonb->>'vpn_ip'=$1")
+                .bind(address.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        row.map(pg_row_to_node).transpose()
+    }
     async fn get_client_gateway_selection(
         &self,
         client: &NodeId,
@@ -2898,61 +2999,7 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
     }
 
     async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
-        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
-        let cluster_id = postgres_node_cluster_id(&mut transaction, node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        lock_postgres_cluster(&mut transaction, &cluster_id).await?;
-        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
-            .bind(node_id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        let node = row
-            .map(pg_row_to_node)
-            .transpose()?
-            .filter(|node| node.cluster_id == cluster_id)
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = $1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        let health_result = sqlx::query("DELETE FROM health WHERE node_id = $1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        sqlx::query("DELETE FROM nat_classifications WHERE node_id = $1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        sqlx::query(
-            "DELETE FROM client_gateway_selections WHERE client_id = $1 OR gateway_node_id = $1",
-        )
-        .bind(node_id.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(sql_error)?;
-        let path_result =
-            sqlx::query("DELETE FROM paths WHERE local_node_id = $1 OR remote_node_id = $1")
-                .bind(node_id.as_str())
-                .execute(&mut *transaction)
-                .await
-                .map_err(sql_error)?;
-        sqlx::query("DELETE FROM nodes WHERE node_id = $1")
-            .bind(node_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
-        bump_postgres_overlay_routing_epoch(&mut transaction, &cluster_id).await?;
-        transaction.commit().await.map_err(sql_error)?;
-        Ok(RemovedNode {
-            node,
-            removed_path_count: path_result.rows_affected() as usize,
-            removed_health: health_result.rows_affected() > 0,
-        })
+        self.remove_node_checked(node_id, None).await
     }
 
     async fn update_node_candidates(
@@ -3766,6 +3813,90 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
                 .await
                 .map_err(sql_error)?;
         Ok(row.get("selected_at"))
+    }
+}
+
+impl PostgresControlPlaneStore {
+    async fn remove_node_checked(
+        &self,
+        node_id: &NodeId,
+        expired_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<RemovedNode, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let cluster_id = postgres_node_cluster_id(&mut transaction, node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        lock_postgres_cluster(&mut transaction, &cluster_id).await?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .filter(|node| node.cluster_id == cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if let Some(now) = expired_at {
+            let lease = sqlx::query(
+                "SELECT ephemeral,expires_at FROM http_mesh_members WHERE node_id=$1 FOR UPDATE",
+            )
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+            let expired = if let Some(lease) = lease {
+                lease.try_get::<bool, _>("ephemeral").map_err(sql_error)?
+                    && lease.try_get::<i64, _>("expires_at").map_err(sql_error)?
+                        <= now.timestamp_millis()
+            } else {
+                false
+            };
+            if !expired || node.is_administratively_stopped() {
+                return Err(ControlPlaneError::NodeStateChanged(node_id.clone()));
+            }
+        }
+
+        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let health_result = sqlx::query("DELETE FROM health WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nat_classifications WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query(
+            "DELETE FROM client_gateway_selections WHERE client_id = $1 OR gateway_node_id = $1",
+        )
+        .bind(node_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let path_result =
+            sqlx::query("DELETE FROM paths WHERE local_node_id = $1 OR remote_node_id = $1")
+                .bind(node_id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nodes WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, &cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(RemovedNode {
+            node,
+            removed_path_count: path_result.rows_affected() as usize,
+            removed_health: health_result.rows_affected() > 0,
+        })
     }
 }
 

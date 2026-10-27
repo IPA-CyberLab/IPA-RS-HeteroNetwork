@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "heteronet-http-members",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-10-27",
+  "workers_dev": false,
+  "containers": [{
+    "class_name": "HeteronetMember",
+    "image": "ghcr.io/ipa-cyberlab/heteronet-headless:sha-REPLACE_WITH_TESTED_COMMIT",
+    "max_instances": 10,
+    "instance_type": "basic"
+  }],
+  "durable_objects": { "bindings": [{ "name": "MEMBERS", "class_name": "HeteronetMember" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HeteronetMember"] }],
+  "vars": { "HETERONETWORK_ENDPOINT": "https://REPLACE_WITH_CONTROL_ORIGIN" }
+}
