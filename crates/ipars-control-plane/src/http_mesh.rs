@@ -181,6 +181,7 @@ pub trait HttpMeshStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct MeshWakeups {
     entries: SyncMutex<BTreeMap<NodeId, Weak<Notify>>>,
+    last_sweep: SyncMutex<Option<Instant>>,
     pub listener: SyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl MeshWakeups {
@@ -190,7 +191,16 @@ impl MeshWakeups {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if entries.len() >= 1024 {
-            entries.retain(|_, value| value.strong_count() != 0);
+            let mut last = self
+                .last_sweep
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // Sweep by elapsed time, not on every request above a size limit.
+            // Otherwise N waiting polls would each scan N live entries.
+            if last.is_none_or(|instant| instant.elapsed() >= Duration::from_secs(30)) {
+                entries.retain(|_, value| value.strong_count() != 0);
+                *last = Some(Instant::now());
+            }
         }
         if let Some(notifier) = entries.get(node).and_then(Weak::upgrade) {
             return notifier;

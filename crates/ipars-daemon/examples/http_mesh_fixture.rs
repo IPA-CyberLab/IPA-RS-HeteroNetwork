@@ -24,7 +24,7 @@ async fn serve<S: ControlPlaneStore + TokenLedger + 'static>(store: Arc<S>) -> a
             .http_mesh()
             .ok_or_else(|| anyhow::anyhow!("fixture store does not support HTTP mesh"))?;
         let mut records = Vec::new();
-        for index in 0..5 {
+        for index in 0..105 {
             let mut node = NodeRecord {
                 node_id: NodeId::from_string(format!("lease-{}-{index}", issuer.node_id())),
                 display_name: None,
@@ -41,13 +41,14 @@ async fn serve<S: ControlPlaneStore + TokenLedger + 'static>(store: Arc<S>) -> a
                 routes: vec![],
                 registered_at: now,
             };
-            if index == 2 {
+            if index == 2 || index >= 5 {
                 node.tags.insert(Tag::from_string("heteronetwork-stopped"));
             }
             store.insert_node(node.clone()).await?;
             let at = match index {
-                4 => now,
+                0 | 4 => now,
                 3 => now - chrono::Duration::minutes(2),
+                5.. => now - chrono::Duration::minutes(9),
                 _ => now - chrono::Duration::minutes(6),
             };
             mesh.lease(&node, index != 1, true, at).await?;
@@ -56,6 +57,10 @@ async fn serve<S: ControlPlaneStore + TokenLedger + 'static>(store: Arc<S>) -> a
             }
             records.push(node);
         }
+        // Put 100 older stopped leases before the expired active lease. They
+        // must not consume the candidate limit and starve active-node cleanup.
+        mesh.lease(&records[0], true, true, now - chrono::Duration::minutes(6))
+            .await?;
         // Another replica's background reaper may already have deleted node 0.
         // Verify the resulting records, not which concurrent worker deleted it.
         // Node 3 must survive beyond its original lease due to the renewal.

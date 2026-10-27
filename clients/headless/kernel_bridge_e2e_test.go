@@ -4,13 +4,13 @@ package headless
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 )
@@ -92,8 +92,19 @@ func TestHTTPMeshPhysicalBridgeRoutesPrivateCloudTraffic(t *testing.T) {
 	cloud.Close()
 	for {
 		output, err := exec.Command("/usr/sbin/ip", "-j", "route", "show", "table", "51989").Output()
-		if err == nil && !strings.Contains(string(output), cloud.Record.VPNIP) {
-			break
+		var routes []struct {
+			Destination string `json:"dst"`
+		}
+		present := false
+		if err == nil && json.Unmarshal(output, &routes) == nil {
+			for _, route := range routes {
+				if route.Destination == cloud.Record.VPNIP || route.Destination == cloud.Record.VPNIP+"/32" {
+					present = true
+				}
+			}
+			if !present {
+				break
+			}
 		}
 		select {
 		case <-ctx.Done():

@@ -14727,7 +14727,10 @@ fn public_web_gateway_caddyfile(
             );
         }
         let _ = writeln!(caddyfile, "\thandle {{\n\t\trespond 404\n\t}}\n}}");
-        if let Some(upstream) = config.wireguard_tunnel_upstream {
+        if config.wireguard_tunnel_upstream.is_some()
+            || config.control_plane_upstream.is_some()
+            || config.relay_admission_upstream.is_some()
+        {
             let host = http_hosts
                 .iter()
                 .map(|host| format!("http://{host}"))
@@ -14735,7 +14738,10 @@ fn public_web_gateway_caddyfile(
                 .join(", ");
             // HTTP carries authenticated WireGuard ciphertext only. Enrollment
             // credentials and management APIs remain behind TLS or the VPN.
-            let _ = writeln!(caddyfile, "{host} {{\n\tbind {}\n\t@wireguard_tunnel path /v1/tunnels/wireguard/open /v1/tunnels/wireguard/packets /v1/tunnels/relay/admit\n\thandle @wireguard_tunnel {{\n\t\treverse_proxy http://{upstream}\n\t}}", target.bind_ip);
+            let _ = writeln!(caddyfile, "{host} {{\n\tbind {}", target.bind_ip);
+            if let Some(upstream) = config.wireguard_tunnel_upstream {
+                let _ = writeln!(caddyfile, "\t@wireguard_tunnel path /v1/tunnels/wireguard/open /v1/tunnels/wireguard/packets /v1/tunnels/relay/admit\n\thandle @wireguard_tunnel {{\n\t\treverse_proxy http://{upstream}\n\t}}");
+            }
             if let Some(control_plane) = config.control_plane_upstream {
                 let _=writeln!(caddyfile,"\t@http_mesh path /v1/http-mesh\n\thandle @http_mesh {{\n\t\treverse_proxy http://{control_plane}\n\t}}");
             }
@@ -23718,6 +23724,9 @@ mod tests {
         assert!(public.contains("/v1/overlay-paths/query"));
         assert!(public.contains("/v1/install/*"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:19088"));
+        assert!(public.contains("http://203.0.113.10 {"));
+        assert!(public.contains("@http_mesh path /v1/http-mesh\n"));
+        assert!(!public.contains("@wireguard_tunnel"));
         assert!(public.contains("@signal path /v1/nodes/* /v1/paths/negotiate /v1/hole-punch"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:18443"));
         assert!(public.contains(

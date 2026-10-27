@@ -155,10 +155,10 @@ impl PostgresControlPlaneStore {
 }
 
 macro_rules! mesh_store {
-    ($store:ty,$database:ty) => {
+    ($store:ty,$database:ty,$active_node:literal) => {
         impl $store{
             pub(crate) async fn reap_expired_mesh_members(&self,now:chrono::DateTime<Utc>)->Result<usize,ControlPlaneError>{
-                let mut query=QueryBuilder::<$database>::new("SELECT node_id FROM http_mesh_members WHERE ephemeral=TRUE AND expires_at<=");query.push_bind(now.timestamp_millis()).push(" ORDER BY expires_at LIMIT 100");
+                let mut query=QueryBuilder::<$database>::new("SELECT m.node_id FROM http_mesh_members m JOIN nodes n ON n.node_id=m.node_id WHERE m.ephemeral=TRUE AND m.expires_at<=");query.push_bind(now.timestamp_millis()).push(" AND ").push($active_node).push(" ORDER BY m.expires_at LIMIT 100");
                 let rows=query.build().fetch_all(&self.pool).await.map_err(sql_error)?;
                 let mut removed=0;
                 for row in rows{
@@ -279,5 +279,9 @@ macro_rules! mesh_store {
         }
     };
 }
-mesh_store!(SqliteControlPlaneStore, Sqlite);
-mesh_store!(PostgresControlPlaneStore, Postgres);
+mesh_store!(SqliteControlPlaneStore, Sqlite, "NOT EXISTS (SELECT 1 FROM json_each(json_extract(n.record_json,'$.tags')) WHERE value='heteronetwork-stopped')");
+mesh_store!(
+    PostgresControlPlaneStore,
+    Postgres,
+    "NOT (n.record_json->'tags' ? 'heteronetwork-stopped')"
+);
