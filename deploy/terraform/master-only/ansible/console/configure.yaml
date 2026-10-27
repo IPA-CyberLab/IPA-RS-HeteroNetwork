@@ -8,6 +8,44 @@
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
     hnn_binary_archive: "{{ hnn_work_dir }}/native-bin.tar.gz"
   tasks:
+    - name: Validate declared public transport URLs
+      ansible.builtin.assert:
+        that:
+          - public_transport_urls is sequence and public_transport_urls is not string
+          - public_transport_urls | length <= 8
+          - public_transport_urls | select('string') | list | length == public_transport_urls | length
+          - public_transport_urls | select('match', '^(udp|tcp|https?)://[A-Za-z0-9:/._\[\]-]+$') | list | length == public_transport_urls | length
+        fail_msg: Public transport URLs must be a bounded list without credentials or query strings
+      when: public_transport_urls is defined
+
+    - name: Create the Agent configuration directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/heteronetwork-agent.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: public_transport_urls is defined
+
+    - name: Configure declared public transport URLs
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-agent.service.d/07-transport-urls.conf
+        content: |
+          [Service]
+          Environment="HETERONETWORK_AGENT_PUBLIC_TRANSPORT_URLS={{ public_transport_urls | join(',') }}"
+        owner: root
+        group: root
+        mode: '0644'
+      when: public_transport_urls is defined and public_transport_urls | length > 0
+      notify: Restart console Agent
+
+    - name: Remove public transport overrides when explicitly cleared
+      ansible.builtin.file:
+        path: /etc/systemd/system/heteronetwork-agent.service.d/07-transport-urls.conf
+        state: absent
+      when: public_transport_urls is defined and public_transport_urls | length == 0
+      notify: Restart console Agent
+
     - name: Create the native binary directory
       ansible.builtin.file:
         path: /opt/heteronetwork/bin

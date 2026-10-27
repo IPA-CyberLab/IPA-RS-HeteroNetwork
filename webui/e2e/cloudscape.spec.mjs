@@ -257,6 +257,7 @@ test("node enrollment submits distinct local and public ports", async ({ page })
     } });
   });
   await page.goto("/ui/#/enrollment");
+  await page.getByLabel("公開接続先URL（任意）", { exact: true }).fill("https://vpn.example.test\ntcp://vpn.example.test:51820");
   await page.getByRole("button", { name: "ポート設定", exact: true }).click();
   await page.getByLabel("WireGuard (UDP) 待ち受けポート", { exact: true }).fill("30100");
   await page.getByLabel("WireGuard (UDP) 公開ポート", { exact: true }).fill("40100");
@@ -269,6 +270,7 @@ test("node enrollment submits distinct local and public ports", async ({ page })
   await page.getByRole("button", { name: "インストールコマンドを生成", exact: true }).click();
   await expect(page.getByText("sudo sh install.sh --relay-listen-port 30101 --relay-public-port 40101")).toBeVisible();
   expect(submissions).toHaveLength(1);
+  expect(submissions[0].public_transport_urls).toEqual(["https://vpn.example.test", "tcp://vpn.example.test:51820"]);
   expect(submissions[0].ports).toEqual({
     wireguard_listen_port: 30100, wireguard_public_port: 40100,
     relay_listen_port: 30101, relay_public_port: 40101,
@@ -406,13 +408,15 @@ test("transport panel shows HTTP fallback, failures and stale reports", async ({
   await installMockBackend(page);
   await page.route("**/v1/admin/transports?*", async (route) => {
     await route.fulfill({ json: { items: [{ node_id: nodes[0].node.node_id, observed_at: new Date().toISOString(), snapshot: { connections: [{
-      peer: nodes[1].node.node_id, direction: "outgoing", transport: "https", phase: "connected", endpoint: "https://8.8.8.8/v1/tunnels/wireguard/open",
+      peer: nodes[1].node.node_id, direction: "outgoing", transport: "https", phase: "connected", endpoint: "https://vpn.example.test/v1/tunnels/wireguard/open", resolved_endpoint: "8.8.8.8:443",
       tx_bytes: 1048576, rx_bytes: 2097152, switches: 2, reconnects: 1, fallback_reason: "udp_probe_timeout", failures: { https_unavailable: 1 }, updated_at: new Date().toISOString(),
     }, { peer: nodes[3].node.node_id, direction:"outgoing",transport:"tcp",phase:"connected",endpoint:"tcp://8.8.8.8:51820",tx_bytes:4096,rx_bytes:8192,switches:1,reconnects:0,updated_at:new Date().toISOString() }] } }], unreported: [nodes[2].node.node_id], next_cursor: null } });
   });
   await page.goto("/ui/#/transports");
   await expect(page.getByRole("heading", { name: "通信方式", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "HTTPS / TCP", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "https://vpn.example.test/v1/tunnels/wireguard/open", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "8.8.8.8:443", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "TCP", exact:true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "1 MiB / 2 MiB", exact: true })).toBeVisible();
   await expect(page.getByText("UDP応答なし", { exact: true })).toBeVisible();

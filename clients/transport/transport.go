@@ -14,11 +14,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
@@ -28,6 +31,8 @@ const transportMaximumPacket = 65507
 const transportMaximumBatch = 256 * 1024
 
 type Configuration struct {
+	GatewayTransportURLs      []string `json:"gateway_transport_urls,omitempty"`
+	publicIngress             bool
 	GatewayTCPTunnelEndpoints []string `json:"gateway_tcp_tunnel_endpoints,omitempty"`
 	ClientNodeID              string   `json:"client_node_id"`
 	GatewayNodeID             string   `json:"gateway_node_id"`
@@ -39,30 +44,33 @@ type Configuration struct {
 }
 
 type Status struct {
-	Failures       map[string]uint64 `json:"failures"`
-	Transport      string            `json:"transport"`
-	Phase          string            `json:"phase"`
-	Endpoint       string            `json:"endpoint"`
-	FallbackReason string            `json:"fallback_reason,omitempty"`
-	LastError      string            `json:"last_error,omitempty"`
-	TXBytes        uint64            `json:"tx_bytes"`
-	RXBytes        uint64            `json:"rx_bytes"`
-	Switches       uint64            `json:"switches"`
-	Reconnects     uint64            `json:"reconnects"`
+	ResolvedEndpoint string            `json:"resolved_endpoint,omitempty"`
+	Failures         map[string]uint64 `json:"failures"`
+	Transport        string            `json:"transport"`
+	Phase            string            `json:"phase"`
+	Endpoint         string            `json:"endpoint"`
+	FallbackReason   string            `json:"fallback_reason,omitempty"`
+	LastError        string            `json:"last_error,omitempty"`
+	TXBytes          uint64            `json:"tx_bytes"`
+	RXBytes          uint64            `json:"rx_bytes"`
+	Switches         uint64            `json:"switches"`
+	Reconnects       uint64            `json:"reconnects"`
 }
 
 type Proxy struct {
-	local, network *net.UDPConn
-	remote         *net.UDPAddr
-	configuration  Configuration
-	authKey        []byte
-	client         *http.Client
-	cancel         context.CancelFunc
-	done           chan struct{}
-	mu             sync.Mutex
-	status         Status
-	lastUDP        time.Time
-	lastSender     *net.UDPAddr
+	endpointNetwork endpointNetwork
+	udpLabel        string
+	local, network  *net.UDPConn
+	remote          *net.UDPAddr
+	configuration   Configuration
+	authKey         []byte
+	client          *http.Client
+	cancel          context.CancelFunc
+	done            chan struct{}
+	mu              sync.Mutex
+	status          Status
+	lastUDP         time.Time
+	lastSender      *net.UDPAddr
 }
 
 func ValidateURLs(values []string) error {
@@ -116,13 +124,16 @@ func transportProof(key []byte, node, gateway string, timestamp int64, nonce str
 }
 
 func Start(configuration Configuration) (*Proxy, error) {
-	if len(configuration.GatewayHTTPTunnelURLs) == 0 && len(configuration.GatewayTCPTunnelEndpoints) == 0 {
+	if len(configuration.GatewayHTTPTunnelURLs) == 0 && len(configuration.GatewayTCPTunnelEndpoints) == 0 && len(configuration.GatewayTransportURLs) == 0 {
 		return nil, nil
 	}
 	if err := ValidateURLs(configuration.GatewayHTTPTunnelURLs); err != nil {
 		return nil, err
 	}
 	if err := ValidateTCPEndpoints(configuration.GatewayTCPTunnelEndpoints); err != nil {
+		return nil, err
+	}
+	if err := ValidateTransportURLs(configuration.GatewayTransportURLs); err != nil {
 		return nil, err
 	}
 	for _, node := range []string{configuration.ClientNodeID, configuration.GatewayNodeID} {
@@ -137,11 +148,44 @@ func Start(configuration Configuration) (*Proxy, error) {
 		return nil, errors.New("invalid public UDP gateway endpoint")
 	}
 
+	configuration.publicIngress = true
 	return start(configuration, nil)
 }
 
 // Exported Start always validates the public ingress catalog first.
 func start(configuration Configuration, suppliedClient *http.Client) (*Proxy, error) {
+	return startWithNetwork(configuration, suppliedClient, endpointNetwork{})
+}
+
+func startWithNetwork(configuration Configuration, suppliedClient *http.Client, endpoints endpointNetwork) (*Proxy, error) {
+	if endpoints.resolver == nil {
+		endpoints.resolver = net.DefaultResolver
+	}
+	if endpoints.dial == nil {
+		endpoints.dial = (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
+	var namedHTTP, namedTCP []string
+	namedUDP := false
+	for _, value := range configuration.GatewayTransportURLs {
+		parsed, err := normalizeTransportURL(value)
+		if err != nil {
+			return nil, err
+		}
+		switch parsed.Scheme {
+		case "http", "https":
+			namedHTTP = append(namedHTTP, parsed.String())
+		case "tcp":
+			namedTCP = append(namedTCP, parsed.Host)
+		case "udp":
+			namedUDP = true
+		}
+	}
+	configuration.GatewayHTTPTunnelURLs = append(namedHTTP, configuration.GatewayHTTPTunnelURLs...)
+	configuration.GatewayTCPTunnelEndpoints = append(namedTCP, configuration.GatewayTCPTunnelEndpoints...)
+	// Preserve protocol preference while preferring names within a protocol.
+	sort.SliceStable(configuration.GatewayHTTPTunnelURLs, func(i, j int) bool {
+		return strings.HasPrefix(configuration.GatewayHTTPTunnelURLs[i], "https:") && !strings.HasPrefix(configuration.GatewayHTTPTunnelURLs[j], "https:")
+	})
 	key, err := transportAuthenticationKey(configuration.PrivateKey, configuration.GatewayWireGuardPublicKey)
 	if err != nil {
 		return nil, errors.New("invalid HTTP tunnel key material")
@@ -159,6 +203,9 @@ func start(configuration Configuration, suppliedClient *http.Client) (*Proxy, er
 	if remote.IP.To4() == nil {
 		family = "udp6"
 	}
+	if namedUDP {
+		family = "udp"
+	}
 	network, err := net.ListenUDP(family, nil)
 	if err != nil && family == "udp6" {
 		network, err = net.ListenUDP("udp4", nil)
@@ -170,7 +217,13 @@ func start(configuration Configuration, suppliedClient *http.Client) (*Proxy, er
 	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
 	httpTransport.MaxConnsPerHost = 4
 	httpTransport.TLSHandshakeTimeout = 3 * time.Second
-	httpTransport.DialContext = (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	var proxy *Proxy
+	httpTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if !configuration.publicIngress || proxy.proxyAddress(address) {
+			return endpoints.dial(ctx, network, address)
+		}
+		return proxy.dialEndpoint(ctx, network, address)
+	}
 	if configuration.ProxyURL != "" {
 		proxyURL, parseErr := url.Parse(configuration.ProxyURL)
 		if parseErr != nil || proxyURL.Host == "" || (proxyURL.Scheme != "http" && proxyURL.Scheme != "https") {
@@ -181,13 +234,28 @@ func start(configuration Configuration, suppliedClient *http.Client) (*Proxy, er
 		httpTransport.Proxy = http.ProxyURL(proxyURL)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	proxy := &Proxy{local: local, network: network, remote: remote, configuration: configuration, authKey: key,
+	proxy = &Proxy{local: local, network: network, remote: remote, configuration: configuration, authKey: key, endpointNetwork: endpoints, udpLabel: configuration.GatewayEndpoint,
 		client: &http.Client{Transport: httpTransport, Timeout: 25 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		cancel: cancel, done: make(chan struct{}), status: Status{Transport: "udp", Phase: "probing", Endpoint: configuration.GatewayEndpoint, Failures: make(map[string]uint64)},
 		lastUDP: time.Now(),
 	}
 	if suppliedClient != nil {
 		proxy.client = suppliedClient
+	}
+	if namedUDP {
+		proxy.refreshUDP(ctx)
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					proxy.refreshUDP(ctx)
+				}
+			}
+		}()
 	}
 	go proxy.run(ctx)
 	return proxy, nil
@@ -246,6 +314,23 @@ func (p *Proxy) open(ctx context.Context, endpoint string, first []byte) (string
 	if err != nil {
 		return "", err
 	}
+	if p.configuration.publicIngress {
+		address := request.URL.Host
+		if request.URL.Port() == "" {
+			port := "80"
+			if request.URL.Scheme == "https" {
+				port = "443"
+			}
+			address = net.JoinHostPort(request.URL.Hostname(), port)
+		}
+		if _, err := p.resolveEndpoint(ctx, address); err != nil {
+			p.recordDNSError(err)
+			return "", err
+		}
+	}
+	var connected atomic.Value
+	connected.Store("")
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { connected.Store(info.Conn.RemoteAddr().String()) }}))
 	nonceBytes := make([]byte, 16)
 	if _, err = rand.Read(nonceBytes); err != nil {
 		return "", err
@@ -275,6 +360,9 @@ func (p *Proxy) open(ctx context.Context, endpoint string, first []byte) (string
 	if _, err = hex.DecodeString(opened.Token); err != nil {
 		return "", errors.New("invalid HTTP tunnel token")
 	}
+	p.mu.Lock()
+	p.status.ResolvedEndpoint = connected.Load().(string)
+	p.mu.Unlock()
 	return opened.Token, nil
 }
 
@@ -353,7 +441,10 @@ func (p *Proxy) run(ctx context.Context) {
 				time.Sleep(250 * time.Millisecond)
 				continue
 			}
-			if source.Port != p.remote.Port || !source.IP.Equal(p.remote.IP) {
+			p.mu.Lock()
+			remote := p.remote
+			p.mu.Unlock()
+			if source.Port != remote.Port || !source.IP.Equal(remote.IP) {
 				continue
 			}
 			if validTransportWireGuard(buffer[:n]) {
@@ -397,7 +488,7 @@ func (p *Proxy) run(ctx context.Context) {
 			if outgoing != nil {
 				probing := len(packet) > 32 && time.Now().After(nextUDP)
 				if probing {
-					_, _ = p.network.WriteToUDP(packet, p.remote)
+					p.sendUDP(packet)
 					nextUDP = time.Now().Add(time.Minute)
 					udpProbePending = packet
 					udpProbeDeadline = time.Now().Add(2 * time.Second)
@@ -411,7 +502,7 @@ func (p *Proxy) run(ctx context.Context) {
 					}
 				}
 			} else {
-				_, _ = p.network.WriteToUDP(packet, p.remote)
+				p.sendUDP(packet)
 				if (len(packet) > 32 && time.Since(lastUDP) > 20*time.Second) || p.Snapshot().Phase != "connected" {
 					if first == nil && len(packet) > 32 {
 						first = append([]byte(nil), packet...)
@@ -446,7 +537,8 @@ func (p *Proxy) run(ctx context.Context) {
 			}
 			p.status.Transport = "udp"
 			p.status.Phase = "connected"
-			p.status.Endpoint = p.configuration.GatewayEndpoint
+			p.status.Endpoint = p.udpLabel
+			p.status.ResolvedEndpoint = p.remote.String()
 			p.status.LastError = ""
 			p.lastUDP = time.Now()
 			p.mu.Unlock()

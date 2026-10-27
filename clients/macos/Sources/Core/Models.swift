@@ -286,6 +286,8 @@ public struct PeerMap: Codable, Equatable, Sendable {
     public let httpTunnelProtocol: Int?
     public let tcpTunnelEndpoints: [String: [String]]
     public let tcpTunnelProtocol: Int?
+    public let transportURLs: [String: [String]]
+    public let transportURLProtocol: Int?
 
     public init(
         clusterID: String,
@@ -295,7 +297,9 @@ public struct PeerMap: Codable, Equatable, Sendable {
         httpTunnelURLs: [String: [String]] = [:],
         httpTunnelProtocol: Int? = nil,
         tcpTunnelEndpoints: [String: [String]] = [:],
-        tcpTunnelProtocol: Int? = nil
+        tcpTunnelProtocol: Int? = nil,
+        transportURLs: [String: [String]] = [:],
+        transportURLProtocol: Int? = nil
     ) {
         self.clusterID = clusterID
         self.peers = peers
@@ -305,6 +309,8 @@ public struct PeerMap: Codable, Equatable, Sendable {
         self.httpTunnelProtocol = httpTunnelProtocol
         self.tcpTunnelEndpoints = tcpTunnelEndpoints
         self.tcpTunnelProtocol = tcpTunnelProtocol
+        self.transportURLs = transportURLs
+        self.transportURLProtocol = transportURLProtocol
     }
 
     public init(from decoder: Decoder) throws {
@@ -317,6 +323,8 @@ public struct PeerMap: Codable, Equatable, Sendable {
         httpTunnelProtocol = try container.decodeIfPresent(Int.self, forKey: .httpTunnelProtocol)
         tcpTunnelEndpoints = try container.decodeIfPresent([String: [String]].self, forKey: .tcpTunnelEndpoints) ?? [:]
         tcpTunnelProtocol = try container.decodeIfPresent(Int.self, forKey: .tcpTunnelProtocol)
+        transportURLs = try container.decodeIfPresent([String: [String]].self, forKey: .transportURLs) ?? [:]
+        transportURLProtocol = try container.decodeIfPresent(Int.self, forKey: .transportURLProtocol)
     }
 
     public func preserveLegacyTransport(_ previous: PeerMap) -> PeerMap {
@@ -334,7 +342,9 @@ public struct PeerMap: Codable, Equatable, Sendable {
             httpTunnelURLs: httpTunnelProtocol == nil ? retained(previous.httpTunnelURLs) : httpTunnelURLs,
             httpTunnelProtocol: httpTunnelProtocol ?? previous.httpTunnelProtocol,
             tcpTunnelEndpoints: tcpTunnelProtocol == nil ? retained(previous.tcpTunnelEndpoints) : tcpTunnelEndpoints,
-            tcpTunnelProtocol: tcpTunnelProtocol ?? previous.tcpTunnelProtocol
+            tcpTunnelProtocol: tcpTunnelProtocol ?? previous.tcpTunnelProtocol,
+            transportURLs: transportURLProtocol == nil ? retained(previous.transportURLs) : transportURLs,
+            transportURLProtocol: transportURLProtocol ?? previous.transportURLProtocol
         )
     }
 
@@ -347,6 +357,8 @@ public struct PeerMap: Codable, Equatable, Sendable {
         case httpTunnelProtocol = "http_tunnel_protocol"
         case tcpTunnelEndpoints = "tcp_tunnel_endpoints"
         case tcpTunnelProtocol = "tcp_tunnel_protocol"
+        case transportURLs = "transport_urls"
+        case transportURLProtocol = "transport_url_protocol"
     }
 }
 

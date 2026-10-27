@@ -638,7 +638,7 @@ where
         .route(
             "/v1/transport-capabilities",
             get(|| async {
-                Json(serde_json::json!({"http_tunnel_protocol":1,"transport_observations":true,"tcp_tunnel_protocol":1}))
+                Json(serde_json::json!({"http_tunnel_protocol":1,"transport_observations":true,"tcp_tunnel_protocol":1,"transport_url_protocol":1}))
             }),
         )
         .route(
@@ -2569,6 +2569,8 @@ struct AdminNodeDisplayNameRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdminNodeEnrollmentRequest {
+    #[serde(default)]
+    public_transport_urls: Vec<String>,
     expires_in_seconds: u64,
     #[serde(default = "default_node_enrollment_role")]
     role: String,
@@ -2704,6 +2706,7 @@ enum NodeEnrollmentSetup {
 
 #[derive(Debug, Serialize)]
 struct AdminNodeEnrollmentResponse {
+    public_transport_urls: Vec<String>,
     token: SignedJoinToken,
     expires_at: DateTime<Utc>,
     max_uses: u32,
@@ -2799,6 +2802,24 @@ where
         ));
     }
     let max_uses = node_enrollment_max_uses(&request)?;
+    if request.public_transport_urls.len() > 8 {
+        return Err(NodeEnrollmentApiError::bad_request(
+            "at most eight public transport URLs are allowed",
+        ));
+    }
+    let public_transport_urls = request
+        .public_transport_urls
+        .iter()
+        .map(|url| {
+            ipars_types::normalize_public_transport_url(url, false)
+                .map_err(NodeEnrollmentApiError::bad_request)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if public_transport_urls.iter().collect::<BTreeSet<_>>().len() != public_transport_urls.len() {
+        return Err(NodeEnrollmentApiError::bad_request(
+            "public transport URLs must be unique",
+        ));
+    }
     if let Some(ports) = request.ports {
         ports.validate()?;
     }
@@ -2920,13 +2941,18 @@ where
         &database_autopilot_bearer_token,
         &keycloak_autopilot_bearer_token,
         request.ports,
+        &public_transport_urls,
     );
     let mut install_command =
         node_enrollment_install_command(enrollment, &encoded_token, &bootstrap_endpoints);
     if let Some(ports) = request.ports {
         install_command.push_str(&ports.installer_arguments());
     }
+    for value in &public_transport_urls {
+        install_command.push_str(&format!(" --public-transport-url '{value}'"));
+    }
     let payload = AdminNodeEnrollmentResponse {
+        public_transport_urls,
         token,
         expires_at,
         max_uses,
@@ -3517,6 +3543,7 @@ fn node_enrollment_install_script(
         database_autopilot_bearer_token,
         keycloak_autopilot_bearer_token,
         None,
+        &[],
     )
 }
 
@@ -3530,6 +3557,7 @@ fn node_enrollment_install_script_with_ports(
     database_autopilot_bearer_token: &str,
     keycloak_autopilot_bearer_token: &str,
     ports: Option<NodeEnrollmentPorts>,
+    public_transport_urls: &[String],
 ) -> String {
     const TEMPLATE: &str = r#"#!/bin/sh
 # HETERONETWORK_PUBLIC_SERVICES_GENERATION=__PUBLIC_SERVICES_TARGET_GENERATION__
@@ -3544,8 +3572,21 @@ relay_enabled=1
 public_services_enabled=1
 promote_existing=0
 mapped_public_ip=
+public_transport_urls='__PUBLIC_TRANSPORT_URLS__'
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --public-transport-url|--public-transport-url=*)
+      case "$1" in
+        *=*) transport_url=${1#*=} ;;
+        *) shift; [ "$#" -gt 0 ] || { echo "--public-transport-url requires a URL" >&2; exit 2; }; transport_url=$1 ;;
+      esac
+      transport_clean=$(printf '%s' "$transport_url" | LC_ALL=C tr -cd 'A-Za-z0-9:/._[]-')
+      if [ "$transport_clean" != "$transport_url" ] || [ "${#transport_url}" -gt 2048 ]; then
+        echo "Invalid public transport URL" >&2; exit 2
+      fi
+      case "$transport_url" in udp://*|tcp://*|http://*|https://*) ;; *) echo "Unsupported public transport scheme" >&2; exit 2 ;; esac
+      case ",$public_transport_urls," in *",$transport_url,"*) ;; *) public_transport_urls=${public_transport_urls:+$public_transport_urls,}$transport_url ;; esac
+      ;;
     --wireguard-listen-port|--wireguard-public-port|--relay-listen-port|--relay-public-port|--stun-listen-port|--stun-public-port|--https-listen-port|--https-public-port|--wireguard-listen-port=*|--wireguard-public-port=*|--relay-listen-port=*|--relay-public-port=*|--stun-listen-port=*|--stun-public-port=*|--https-listen-port=*|--https-public-port=*)
       node_port_option=${1%%=*}
       case "$1" in
@@ -3717,6 +3758,7 @@ relay_snapshot_directory_manifest="$relay_snapshot_dir/directories"
 relay_transaction_paths='
 /etc/heteronetwork/node-ports.env
 /etc/systemd/system/heteronetwork-agent.service.d/06-node-ports.conf
+/etc/systemd/system/heteronetwork-agent.service.d/07-transport-urls.conf
 /opt/heteronetwork/libexec/node-ports.sh
 /etc/sysusers.d/heteronetwork-relay.conf
 /etc/heteronetwork/relay-admission.token
@@ -3735,6 +3777,7 @@ relay_transaction_paths='
 relay_transaction_temporary_paths='
 /etc/heteronetwork/.node-ports.env.new
 /etc/systemd/system/heteronetwork-agent.service.d/.06-node-ports.conf.new
+/etc/systemd/system/heteronetwork-agent.service.d/.07-transport-urls.conf.new
 /opt/heteronetwork/libexec/.node-ports.sh.new
 /etc/heteronetwork/.relay-admission.token.new
 /etc/heteronetwork/.relay-server-admission.token.new
@@ -4464,6 +4507,14 @@ else
 fi
 
 install -d -o root -g root -m 0755 /etc/heteronetwork
+if [ -n "$public_transport_urls" ]; then
+  install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
+  printf '[Service]\nEnvironment=HETERONETWORK_AGENT_PUBLIC_TRANSPORT_URLS=%s\n' "$public_transport_urls" \
+    >/etc/systemd/system/heteronetwork-agent.service.d/.07-transport-urls.conf.new
+  chmod 0644 /etc/systemd/system/heteronetwork-agent.service.d/.07-transport-urls.conf.new
+  mv -f /etc/systemd/system/heteronetwork-agent.service.d/.07-transport-urls.conf.new \
+    /etc/systemd/system/heteronetwork-agent.service.d/07-transport-urls.conf
+fi
 install -d -o root -g root -m 0755 /opt/heteronetwork/libexec /etc/systemd/system/heteronetwork-agent.service.d
 node_ports_write >/etc/heteronetwork/.node-ports.env.new
 chmod 0600 /etc/heteronetwork/.node-ports.env.new
@@ -4653,6 +4704,10 @@ fi
         String::new()
     };
     TEMPLATE
+        .replace(
+            "__PUBLIC_TRANSPORT_URLS__",
+            &public_transport_urls.join(","),
+        )
         .replace(
             "__NODE_PORTS_LIBRARY__",
             include_str!("../../../scripts/node-ports.sh"),
@@ -10531,6 +10586,33 @@ mod tests {
         });
         let mut custom_request = request_body.clone();
         custom_request["ports"] = custom_ports.clone();
+        custom_request["public_transport_urls"] = serde_json::json!(["https://vpn.example.test"]);
+        for invalid_urls in [
+            serde_json::json!(["https://169.254.169.254"]),
+            serde_json::json!(["https://user:secret@vpn.example.test"]),
+            serde_json::json!([
+                "https://vpn.example.test",
+                "https://vpn.example.test/v1/tunnels/wireguard/open"
+            ]),
+        ] {
+            let mut invalid_request = custom_request.clone();
+            invalid_request["public_transport_urls"] = invalid_urls;
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/admin/enrollment")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                        )
+                        .body(Body::from(serde_json::to_vec(&invalid_request)?))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
         let custom_response = app
             .clone()
             .oneshot(
@@ -10558,14 +10640,20 @@ mod tests {
             .ok_or("missing custom command")?;
         let port_arguments =
             serde_json::from_value::<NodeEnrollmentPorts>(custom_ports)?.installer_arguments();
-        assert!(custom_command.ends_with(&port_arguments));
+        assert!(custom_command.contains(&port_arguments));
+        assert!(custom_command.ends_with(
+            " --public-transport-url 'https://vpn.example.test/v1/tunnels/wireguard/open'"
+        ));
         let run_preamble =
             |script: &str, arguments: &[&str]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
                 let preamble = script
                     .split_once("if [ -n \"$mapped_public_ip\" ]; then")
                     .ok_or("installer omitted argument validation")?
                     .0;
-                let harness = format!("{preamble}\nnode_ports_write\n").replace(
+                let harness = format!(
+                    "{preamble}\nnode_ports_write\nprintf '%s\\n' \"$public_transport_urls\"\n"
+                )
+                .replace(
                     "node_ports_load /etc/heteronetwork/node-ports.env",
                     "# isolated installer preflight",
                 );
@@ -10590,7 +10678,11 @@ mod tests {
                 );
                 Ok(result.stdout)
             };
-        let flag_words = port_arguments.split_whitespace().collect::<Vec<_>>();
+        let mut flag_words = port_arguments.split_whitespace().collect::<Vec<_>>();
+        flag_words.extend([
+            "--public-transport-url",
+            "https://vpn.example.test/v1/tunnels/wireguard/open",
+        ]);
         let inline_ports = run_preamble(custom_script, &[])?;
         assert_eq!(inline_ports, run_preamble(generated_script, &flag_words)?);
         assert!(String::from_utf8(inline_ports)?.contains("RELAY_PUBLIC_PORT=40101\n"));
@@ -12986,6 +13078,7 @@ exit 47
         assert!(require_ha_client_enrollment_directory(&inactive_directory).is_err());
 
         let invalid = AdminNodeEnrollmentRequest {
+            public_transport_urls: Vec::new(),
             expires_in_seconds: 86_400,
             role: "edge".to_string(),
             tags: Vec::new(),

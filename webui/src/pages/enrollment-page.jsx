@@ -13,6 +13,7 @@ import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import Select from "@cloudscape-design/components/select";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Toggle from "@cloudscape-design/components/toggle";
+import Textarea from "@cloudscape-design/components/textarea";
 import { useEffect, useState } from "react";
 import { Empty, ErrorAlert } from "../components.jsx";
 import { copyText, csvValues, formatDateTime } from "../utils.js";
@@ -142,6 +143,7 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
   const [expirationDays, setExpirationDays] = useState("7");
   const [maxUses, setMaxUses] = useState("10");
   const [ports, setPorts] = useState(defaultPorts);
+  const [transportUrls, setTransportUrls] = useState("");
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
 
@@ -193,6 +195,7 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
               expires_in_seconds: days * 86400,
               role: role.value,
               tags: csvValues(tags),
+              public_transport_urls: transportUrls.trim() ? csvValues(transportUrls.replaceAll("\n", ",")) : undefined,
               reusable,
               max_uses: reusable ? uses : 1,
               ports: Object.keys(ports).some((key) => ports[key] !== defaultPorts[key])
@@ -291,6 +294,12 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
                   </SpaceBetween>
                 ) : null}
               </ColumnLayout>
+              {mode === "linux" ? (
+                <FormField label="公開接続先URL（任意）" description="1行に1件。ホスト名はA/AAAAでもCNAMEでも利用できます。空欄の場合は検出したIPアドレスを使います。">
+                  <Textarea value={transportUrls} rows={3} placeholder={"https://vpn.example.com\ntcp://vpn.example.com:51820\nudp://vpn.example.com:51820"}
+                    onChange={({ detail }) => setTransportUrls(detail.value)} />
+                </FormField>
+              ) : null}
               {mode === "linux" ? (
                 <ExpandableSection headerText="ポート設定">
                   <SpaceBetween size="m">

@@ -16,6 +16,70 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::{net::UdpSocket, sync::watch};
+
+#[test]
+fn public_transport_urls_accept_names_and_reject_credential_or_private_targets(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ipars_types::normalize_public_transport_url as normalize;
+    assert_eq!(
+        normalize("https://VPN.Example.TEST.:443", false)?,
+        "https://vpn.example.test/v1/tunnels/wireguard/open"
+    );
+    assert_eq!(
+        normalize("tcp://vpn.example.test:51820/", false)?,
+        "tcp://vpn.example.test:51820"
+    );
+    assert_eq!(
+        normalize("udp://[2606:4700:4700::1111]:51820", false)?,
+        "udp://[2606:4700:4700::1111]:51820"
+    );
+    assert_eq!(
+        normalize("https://relay.example.test", true)?,
+        "https://relay.example.test/v1/tunnels/relay/open"
+    );
+    for value in [
+        "http://127.0.0.1",
+        "http://169.254.169.254",
+        "tcp://100.96.127.54:443",
+        "https://user:secret@vpn.example.test",
+        "https://vpn.example.test?",
+        "https://vpn.example.test#",
+        "tcp://vpn.example.test",
+        "udp://vpn.example.test:0",
+        "tcp://vpn.example.test:443/path",
+        "https://vpn.example.test/not-transport",
+        "https://localhost",
+        "https://bad_host.example.test",
+        "file:///tmp/secret",
+    ] {
+        assert!(normalize(value, false).is_err(), "accepted {value}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_transport_dns_rejects_special_addresses_before_dial(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for value in [
+        "tcp://127.0.0.1:80",
+        "tcp://169.254.169.254:80",
+        "tcp://100.96.127.54:80",
+        "tcp://[::ffff:127.0.0.1]:80",
+        "tcp://[64:ff9b::7f00:1]:80",
+    ] {
+        let url = reqwest::Url::parse(value)?;
+        assert!(matches!(
+            ipars_http_tunnel::endpoint::resolve(&url).await,
+            Err(TunnelError::DnsRejected)
+        ));
+    }
+    let url = reqwest::Url::parse("tcp://[2606:4700:4700::1111]:443")?;
+    assert_eq!(
+        ipars_http_tunnel::endpoint::resolve(&url).await?,
+        vec!["[2606:4700:4700::1111]:443".parse::<SocketAddr>()?]
+    );
+    Ok(())
+}
 use x25519_dalek::{PublicKey, StaticSecret};
 
 fn id(value: &str) -> NodeId {

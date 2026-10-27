@@ -1,6 +1,7 @@
 //! Bounded datagram transport over ordinary HTTP requests. WireGuard remains
 //! responsible for end-to-end authentication and encryption. No Upgrade, UDP,
 //! HTTP/3, or incoming client port is required on the external network.
+pub mod endpoint;
 pub mod tcp;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -111,6 +112,10 @@ impl TunnelAuth {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TunnelError {
+    #[error("transport DNS resolution failed")]
+    DnsUnavailable,
+    #[error("transport DNS did not return a public address")]
+    DnsRejected,
     #[error("invalid transport packet")]
     InvalidPacket,
     #[error("transport capacity exceeded")]
@@ -551,6 +556,7 @@ pub struct HttpTunnel {
     packets_url: String,
     token: String,
     pub first_packet: Vec<u8>,
+    pub resolved_endpoint: Option<SocketAddr>,
 }
 
 impl HttpTunnel {
@@ -590,6 +596,7 @@ impl HttpTunnel {
                 .header(PROOF_HEADER, auth.proof(node, timestamp, &nonce, &first)?);
         }
         let response = request.body(first).send().await?;
+        let resolved_endpoint = response.remote_addr();
         if !response.status().is_success() {
             return Err(TunnelError::Status(response.status().as_u16()));
         }
@@ -624,6 +631,7 @@ impl HttpTunnel {
             packets_url,
             token: opened.token,
             first_packet: opened.first_packet,
+            resolved_endpoint,
         })
     }
 
@@ -677,6 +685,12 @@ enum ReliableTunnel {
     Http(HttpTunnel),
 }
 impl ReliableTunnel {
+    fn resolved_endpoint(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Tcp(tunnel) => Some(tunnel.resolved_endpoint),
+            Self::Http(tunnel) => tunnel.resolved_endpoint,
+        }
+    }
     fn first_packet(&self) -> &[u8] {
         match self {
             Self::Tcp(_) => &[],
@@ -747,10 +761,37 @@ impl DatagramProxy {
         } else {
             "[::]:0"
         };
-        let network = match UdpSocket::bind(bind).await {
+        let mut network = match UdpSocket::bind(bind).await {
             Ok(socket) => socket,
             Err(_) if self.udp_endpoint.is_ipv6() => UdpSocket::bind("0.0.0.0:0").await?,
             Err(error) => return Err(error.into()),
+        };
+        let mut udp_endpoint = self.udp_endpoint;
+        let mut udp_label = udp_endpoint.to_string();
+        let udp_urls = self
+            .open_urls
+            .iter()
+            .filter(|value| value.starts_with("udp://"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (dns_sender, mut dns_receiver) = mpsc::channel(1);
+        let dns_task = if udp_urls.is_empty() {
+            None
+        } else {
+            Some(AbortTask(tokio::spawn(async move {
+                loop {
+                    let resolved = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        endpoint::udp_addresses(&udp_urls),
+                    )
+                    .await
+                    .unwrap_or(Err(TunnelError::DnsUnavailable));
+                    if dns_sender.send(resolved).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            })))
         };
         let client = http_client()?;
         let mut local_buffer = vec![0; MAX_PACKET_BYTES];
@@ -781,6 +822,25 @@ impl DatagramProxy {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() { break; }
                 }
+                resolved = dns_receiver.recv(), if dns_task.is_some() => {
+                    match resolved {
+                        Some(Ok((label, addresses))) => {
+                            let address = if addresses.contains(&udp_endpoint) { udp_endpoint } else {
+                                addresses.iter().copied().find(|address| address.is_ipv4() == udp_endpoint.is_ipv4()).unwrap_or(addresses[0])
+                            };
+                            if address.is_ipv4() != udp_endpoint.is_ipv4() {
+                                let bind = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                                match UdpSocket::bind(bind).await {Ok(socket)=>network=socket,Err(_)=>continue}
+                            }
+                            if address != udp_endpoint {received_udp=false;}
+                            udp_endpoint=address;udp_label=label;
+                            if let Some(relay)=&self.relay {let _=network.send_to(&relay.announcement,udp_endpoint).await;}
+                            update(&self.status,|s|{if s.transport==DataPlaneTransport::Udp {s.endpoint=udp_label.clone();s.resolved_endpoint=Some(udp_endpoint);}});
+                        }
+                        Some(Err(error)) => update(&self.status,|s|{let reason=if matches!(error,TunnelError::DnsRejected){"dns_nonpublic"}else{"dns_unavailable"};*s.failures.entry(reason.to_string()).or_default()+=1;}),
+                        None => {}
+                    }
+                }
                 packet = local.recv_from(&mut local_buffer) => {
                     let (len, source) = packet?;
                     if source != self.wireguard_endpoint || !wireguard_packet(&local_buffer[..len]) { continue; }
@@ -795,7 +855,7 @@ impl DatagramProxy {
                         let probing = packet.len() > 32 && Instant::now() >= next_udp_probe;
                         if probing {
                             let probe = self.relay.as_ref().map(|r| r.announcement.clone()).unwrap_or_else(|| packet.clone());
-                            let _ = network.send_to(&probe, self.udp_endpoint).await;
+                            let _ = network.send_to(&probe, udp_endpoint).await;
                             next_udp_probe = Instant::now() + Duration::from_secs(60);
                         }
                         if probing && self.relay.is_none() {
@@ -806,14 +866,14 @@ impl DatagramProxy {
                             update(&self.status, |s| s.last_error = Some("send_queue_full".to_string()));
                         }
                     } else {
-                        let _ = network.send_to(&self.encoded(&packet), self.udp_endpoint).await;
+                        let _ = network.send_to(&self.encoded(&packet), udp_endpoint).await;
                         if !received_udp && pending.len() < MAX_BATCH_PACKETS { pending.push_back(packet); }
                     }
                     update(&self.status, |s| { s.tx_packets += 1; s.tx_bytes += len as u64; });
                 }
                 packet = network.recv_from(&mut network_buffer) => {
                     let (len, source) = match packet { Ok(packet) => packet, Err(_) => continue };
-                    if source != self.udp_endpoint { continue; }
+                    if source != udp_endpoint { continue; }
                     let announcement_ack = self.relay.as_ref().is_some_and(|r| network_buffer[..len] == r.announcement);
                     if !announcement_ack && !wireguard_packet(&network_buffer[..len]) { continue; }
                     last_udp_received = Instant::now();
@@ -829,7 +889,7 @@ impl DatagramProxy {
                     update(&self.status, |s| {
                         if s.transport != DataPlaneTransport::Udp { s.switches += 1; }
                         s.transport = DataPlaneTransport::Udp; s.phase = TransportPhase::Connected;
-                        s.endpoint = self.udp_endpoint.to_string(); s.last_error = None;
+                        s.endpoint = udp_label.clone(); s.resolved_endpoint=Some(udp_endpoint); s.last_error = None;
                         s.last_received_at = Some(Utc::now());
                     });
                     if !announcement_ack {
@@ -888,21 +948,31 @@ impl DatagramProxy {
                     });
                     http_task = Some(AbortTask(tokio::spawn(async move {
                         let mut opened = None;
-                        let candidates=tcp_endpoints.into_iter().map(|endpoint|format!("tcp://{endpoint}")).chain(urls);
+                        let mut candidates=urls.into_iter().filter(|url|!url.starts_with("udp://")).collect::<Vec<_>>();
+                        candidates.extend(tcp_endpoints.into_iter().map(|endpoint|format!("tcp://{endpoint}")));
+                        candidates.sort_by_key(|url| if url.starts_with("tcp:"){0}else if url.starts_with("https:"){1}else{2});
                         for url in candidates {
                             let failures = status.lock().unwrap_or_else(|e| e.into_inner()).failures.clone();
                             let result=if let Some(endpoint)=url.strip_prefix("tcp://") {
                                 match endpoint.parse::<SocketAddr>() {
                                     Ok(endpoint)=>tcp::TcpTunnel::open(endpoint,&node,initial.clone(),auth.as_ref(),&failures).await.map(ReliableTunnel::Tcp),
-                                    Err(_)=>Err(TunnelError::InvalidPacket),
+                                    Err(_)=>tcp::TcpTunnel::open_url(&url,&node,initial.clone(),auth.as_ref(),&failures).await.map(ReliableTunnel::Tcp),
                                 }
-                            }else{HttpTunnel::open(client.clone(), &url, &node, initial.clone(), auth.as_ref(), &failures).await.map(ReliableTunnel::Http)};
+                            }else{
+                                let parsed=reqwest::Url::parse(&url).map_err(|_|TunnelError::InvalidPacket);
+                                let public_client=match parsed {
+                                    Ok(parsed) if parsed.host_str().is_some_and(|host|host.trim_matches(['[',']']).parse::<IpAddr>().is_err())=>endpoint::http_client(&parsed).await,
+                                    Ok(_)=>Ok(client.clone()),Err(error)=>Err(error),
+                                };
+                                match public_client {Ok(client)=>HttpTunnel::open(client,&url,&node,initial.clone(),auth.as_ref(),&failures).await.map(ReliableTunnel::Http),Err(error)=>Err(error)}
+                            };
                             match result {
                                 Ok(tunnel) => {
                                     update(&status, |s| {
                                         let transport = if url.starts_with("tcp:"){DataPlaneTransport::Tcp}else if url.starts_with("https:") { DataPlaneTransport::Https } else { DataPlaneTransport::Http };
                                         if s.transport != transport { s.switches += 1; }
                                         s.transport = transport; s.endpoint = url; s.last_error = None;
+                                        s.resolved_endpoint=tunnel.resolved_endpoint();
                                         s.phase = TransportPhase::Connected;
                                     });
                                     opened = Some(tunnel); break;
@@ -910,12 +980,14 @@ impl DatagramProxy {
                                 Err(error) => {
                                     let protocol = if url.starts_with("tcp:"){"tcp"}else if url.starts_with("https:") { "https" } else { "http" };
                                     let reason = match error {
+                                        TunnelError::DnsUnavailable => "dns_unavailable",
+                                        TunnelError::DnsRejected => "dns_nonpublic",
                                         TunnelError::Status(407) => "proxy_authentication_required",
                                         TunnelError::Status(401 | 403) => "authentication_failed",
                                         TunnelError::Status(429) => "capacity_exceeded",
                                         _ => "unavailable",
                                     };
-                                    update(&status, |s| { *s.failures.entry(format!("{protocol}_{reason}")).or_default() += 1; });
+                                    update(&status, |s| { *s.failures.entry(if reason.starts_with("dns_"){reason.to_string()}else{format!("{protocol}_{reason}")}).or_default() += 1; });
                                     continue;
                                 },
                             }

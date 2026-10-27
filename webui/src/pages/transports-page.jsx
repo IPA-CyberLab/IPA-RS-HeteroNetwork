@@ -11,6 +11,7 @@ import { age, nodeDisplayName } from "../utils.js";
 const reasons = {
   udp_probe_timeout: "UDP応答なし", remote_http_tunnel: "接続元がHTTPトンネルを選択",
   tcp_unavailable: "TCP接続失敗", tcp_tunnel_unavailable:"TCPトンネル切断",
+  dns_unavailable: "名前解決失敗", dns_nonpublic: "公開アドレスなし",
   https_unavailable: "HTTPS接続失敗", http_unavailable: "HTTP接続失敗",
   http_tunnel_unavailable: "HTTPトンネル切断", authentication_failed: "認証失敗",
   tunnel_idle_or_closed: "通信停止・セッション終了", tunnel_stopped: "接続終了",
@@ -68,6 +69,7 @@ export function TransportsPage({ overview }) {
     } },
     { id: "connection", header: "接続ID", cell: (r) => r.connection_id || "—" },
     { id: "endpoint", header: "接続先アドレス", cell: (r) => <Box variant="code">{r.endpoint || "未取得"}</Box> },
+    { id: "resolved", header: "接続先IP", cell: (r) => <Box variant="code">{r.resolved_endpoint || "未取得"}</Box> },
     { id: "traffic", header: "送信 / 受信", cell: (r) => `${bytes(r.tx_bytes)} / ${bytes(r.rx_bytes)}` },
     { id: "switches", header: "切替 / 再接続", cell: (r) => `${r.switches ?? "未取得"} / ${r.reconnects ?? "未取得"}` },
     { id: "reason", header: "切替理由・最終エラー", cell: (r) => [r.fallback_reason, r.last_error].filter(Boolean).map((reason) => reasons[reason] || reason).join(" / ") || "—" },

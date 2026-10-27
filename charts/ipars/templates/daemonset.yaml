@@ -72,6 +72,13 @@
 {{- $agentPeerProbeResponderMaxRequestsPerSecond := printf "%v" .Values.agent.peerProbe.responderMaxRequestsPerSecond -}}
 {{- $agentPeerProbeObservationMaxAgeSeconds := printf "%v" .Values.agent.peerProbe.observationMaxAgeSeconds -}}
 {{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
+{{- range $entry := list (dict "path" "agent.publicTransportUrls" "values" .Values.agent.publicTransportUrls) (dict "path" "agent.relayService.publicTransportUrls" "values" .Values.agent.relayService.publicTransportUrls) -}}
+{{- if not (kindIs "slice" $entry.values) -}}{{- fail (printf "%s must be a list" $entry.path) -}}{{- end -}}
+{{- if gt (len $entry.values) 8 -}}{{- fail (printf "%s must contain at most eight URLs" $entry.path) -}}{{- end -}}
+{{- range $url := $entry.values -}}
+{{- if not (kindIs "string" $url) -}}{{- fail (printf "%s must contain URL strings" $entry.path) -}}{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- $agentOverlayTransitPortValue := printf "%v" .Values.agent.overlayTransitPort -}}
 {{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
 {{- $agentNatDiscoveryIntervalSeconds := printf "%v" .Values.agent.natDiscovery.intervalSeconds -}}
@@ -1328,6 +1335,10 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.agent.joinTokenSecretName | quote }}
                   key: {{ .Values.agent.apiBearerTokenSecretKey | quote }}
+            {{- if .Values.agent.publicTransportUrls }}
+            - name: HETERONETWORK_AGENT_PUBLIC_TRANSPORT_URLS
+              value: {{ join "," .Values.agent.publicTransportUrls | quote }}
+            {{- end }}
             - name: HETERONETWORK_KUBERNETES_NODE_NAME
               valueFrom:
                 fieldRef:
@@ -1629,6 +1640,10 @@ spec:
           env:
             - name: HETERONETWORK_RELAY_UDP_LISTEN
               value: {{ printf "0.0.0.0:%d" (int .Values.agent.relayService.udpTargetPort) | quote }}
+            {{- if .Values.agent.relayService.publicTransportUrls }}
+            - name: HETERONETWORK_RELAY_PUBLIC_TRANSPORT_URLS
+              value: {{ join "," .Values.agent.relayService.publicTransportUrls | quote }}
+            {{- end }}
             - name: HETERONETWORK_RELAY_HTTP_LISTEN
               value: {{ printf "0.0.0.0:%d" (int .Values.agent.relayService.httpTargetPort) | quote }}
             - name: HETERONETWORK_RELAY_PUBLIC_ENDPOINT

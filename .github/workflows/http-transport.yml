@@ -24,6 +24,24 @@ jobs:
         with: {persist-credentials: false}
       - name: Install pinned Rust
         run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+      - name: Install the pinned gateway parser for configuration tests
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, os, pathlib, re, tarfile, urllib.request
+          source = pathlib.Path('crates/ipars-control-plane-http/src/lib.rs').read_text()
+          version = re.search(r'const NODE_ENROLLMENT_CADDY_VERSION: &str = "([^"]+)"', source).group(1)
+          expected = re.search(r'const NODE_ENROLLMENT_CADDY_SHA256: &str =\s*"([a-f0-9]{64})"', source).group(1)
+          url = f'https://github.com/caddyserver/caddy/releases/download/v{version}/caddy_{version}_linux_amd64.tar.gz'
+          with urllib.request.urlopen(url, timeout=60) as response:
+              archive = response.read(100 * 1024 * 1024)
+          assert hashlib.sha256(archive).hexdigest() == expected, 'gateway archive checksum mismatch'
+          destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'heteronet-test-caddy'
+          with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as bundle:
+              destination.write_bytes(bundle.extractfile('caddy').read())
+          destination.chmod(0o755)
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write(f'HETERONETWORK_TEST_CADDY={destination}\n')
+          PY
       - name: Format and lint
         run: |
           cargo +1.96.1 fmt --all -- --check

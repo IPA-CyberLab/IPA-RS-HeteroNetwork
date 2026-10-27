@@ -562,6 +562,74 @@ pub fn socket_addr_is_globally_routable(addr: SocketAddr) -> bool {
     addr.port() != 0 && ip_addr_is_globally_routable(addr.ip())
 }
 
+/// Normalize a public data-plane URL without resolving it on the control plane.
+/// The connecting client validates and pins DNS results before opening a socket.
+pub fn normalize_public_transport_url(value: &str, relay: bool) -> Result<String, String> {
+    if value.len() > 2048 || value.chars().any(char::is_control) {
+        return Err("invalid public transport URL".to_string());
+    }
+    let mut url = url::Url::parse(value).map_err(|_| "invalid public transport URL")?;
+    if !matches!(url.scheme(), "udp" | "tcp" | "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port_or_known_default().is_none_or(|port| port == 0)
+    {
+        return Err(
+            "public transport URL requires a supported scheme and port without credentials"
+                .to_string(),
+        );
+    }
+    let host = url
+        .host_str()
+        .ok_or("public transport URL requires a host")?
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_string();
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !ip_addr_is_globally_routable(ip) {
+            return Err(
+                "public transport URL requires a globally routable destination".to_string(),
+            );
+        }
+    } else {
+        if host.len() > 253
+            || !host.contains('.')
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err("public transport URL requires a valid DNS hostname".to_string());
+        }
+        url.set_host(Some(&host))
+            .map_err(|_| "invalid public transport hostname")?;
+    }
+    if matches!(url.scheme(), "http" | "https") {
+        let path = if relay {
+            "/v1/tunnels/relay/open"
+        } else {
+            "/v1/tunnels/wireguard/open"
+        };
+        if !matches!(url.path(), "" | "/") && url.path() != path {
+            return Err("public transport URL has an unsupported path".to_string());
+        }
+        url.set_path(path);
+    } else {
+        if !matches!(url.path(), "" | "/") {
+            return Err("UDP and TCP transport URLs cannot have paths".to_string());
+        }
+        url.set_path("");
+    }
+    Ok(url.into())
+}
+
 /// Returns whether two private addresses are likely reachable on the same LAN.
 ///
 /// Endpoint candidates do not carry interface prefix lengths, so discovery uses
@@ -2946,6 +3014,10 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PeerMap {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub transport_url_protocol: Option<u16>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub transport_urls: BTreeMap<NodeId, Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tcp_tunnel_protocol: Option<u16>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub tcp_tunnel_endpoints: BTreeMap<NodeId, Vec<std::net::SocketAddr>>,
@@ -3012,6 +3084,10 @@ pub mod api {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct HttpTransportPeerResponse {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub transport_urls: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub relay_transport_urls: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub tcp_tunnel_endpoints: Vec<std::net::SocketAddr>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3139,6 +3215,8 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct TransportObservation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub resolved_endpoint: Option<SocketAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub connection_id: Option<String>,
         pub peer: NodeId,
         pub transport: DataPlaneTransport,
@@ -3163,6 +3241,7 @@ pub mod api {
     impl TransportObservation {
         pub fn new(peer: NodeId, endpoint: String) -> Self {
             Self {
+                resolved_endpoint: None,
                 connection_id: None,
                 peer,
                 endpoint,
@@ -3186,6 +3265,10 @@ pub mod api {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct NodeTransportSnapshot {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub public_transport_urls: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub relay_transport_urls: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub tcp_tunnel_endpoints: Vec<std::net::SocketAddr>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3933,6 +4016,8 @@ pub mod api {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RelayStatusResponse {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub transport_urls: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tcp_endpoint: Option<std::net::SocketAddr>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

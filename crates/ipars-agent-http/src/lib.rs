@@ -4577,6 +4577,8 @@ mod tests {
         Json(RotateWireGuardKeyResponse {
             node,
             peer_map: PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -6988,6 +6990,8 @@ mod tests {
             Vec::new(),
         );
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -7233,6 +7237,8 @@ mod tests {
         };
         runtime
             .record_peer_map_snapshot(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -8302,6 +8308,8 @@ mod tests {
         peer.wireguard_public_key = client.wireguard_public_key_b64;
         runtime
             .record_peer_map_snapshot(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: Some(1),

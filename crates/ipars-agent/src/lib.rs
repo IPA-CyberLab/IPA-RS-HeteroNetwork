@@ -1082,6 +1082,8 @@ pub struct AgentRuntime {
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
     http_gateway: std::sync::RwLock<Option<Arc<ipars_http_tunnel::TunnelHub>>>,
     http_gateway_urls: std::sync::RwLock<Vec<String>>,
+    public_transport_urls: std::sync::RwLock<Vec<String>>,
+    relay_transport_urls: tokio::sync::RwLock<Vec<String>>,
     tcp_gateway_port: std::sync::RwLock<Option<u16>>,
     tcp_relay_endpoints: tokio::sync::RwLock<Vec<SocketAddr>>,
     relay_http_status: tokio::sync::RwLock<Vec<ipars_types::api::TransportObservation>>,
@@ -1930,6 +1932,8 @@ impl AgentRuntime {
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
             http_gateway: std::sync::RwLock::new(None),
             http_gateway_urls: std::sync::RwLock::new(Vec::new()),
+            public_transport_urls: std::sync::RwLock::new(Vec::new()),
+            relay_transport_urls: tokio::sync::RwLock::new(Vec::new()),
             tcp_gateway_port: std::sync::RwLock::new(None),
             tcp_relay_endpoints: tokio::sync::RwLock::new(Vec::new()),
             relay_http_status: tokio::sync::RwLock::new(Vec::new()),
@@ -2281,6 +2285,15 @@ impl AgentRuntime {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(port);
     }
+    pub fn set_public_transport_urls(&self, urls: Vec<String>) {
+        *self
+            .public_transport_urls
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = urls;
+    }
+    pub async fn set_relay_transport_urls(&self, urls: Vec<String>) {
+        *self.relay_transport_urls.write().await = urls;
+    }
     pub async fn set_tcp_relay_endpoints(&self, endpoints: Vec<SocketAddr>) {
         *self.tcp_relay_endpoints.write().await = endpoints;
     }
@@ -2329,7 +2342,14 @@ impl AgentRuntime {
             )
             .map(|(ip, port)| vec![SocketAddr::new(ip, port)])
             .unwrap_or_default();
+        let public_transport_urls = self
+            .public_transport_urls
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         ipars_types::api::NodeTransportSnapshot {
+            public_transport_urls,
+            relay_transport_urls: self.relay_transport_urls.read().await.clone(),
             tcp_tunnel_endpoints,
             tcp_relay_endpoints: self.tcp_relay_endpoints.read().await.clone(),
             http_tunnel_urls: self
@@ -2347,7 +2367,7 @@ impl AgentRuntime {
         endpoint: SocketAddr,
         wireguard_endpoint: SocketAddr,
     ) -> Result<Option<SocketAddr>, AgentError> {
-        let urls = self
+        let mut urls = self
             .latest_peer_map
             .read()
             .await
@@ -2355,6 +2375,15 @@ impl AgentRuntime {
             .and_then(|map| map.http_tunnel_urls.get(&peer.node_id))
             .cloned()
             .unwrap_or_default();
+        if let Some(named) = self
+            .latest_peer_map
+            .read()
+            .await
+            .as_ref()
+            .and_then(|map| map.transport_urls.get(&peer.node_id))
+        {
+            urls.splice(0..0, named.iter().cloned());
+        }
         let tcp_endpoints = self
             .latest_peer_map
             .read()
@@ -4991,6 +5020,25 @@ impl AgentRuntime {
                 peer_map.tcp_tunnel_protocol = previous.tcp_tunnel_protocol;
             }
         }
+        if peer_map.transport_url_protocol.is_none() {
+            if let Some(previous) = self.latest_peer_map.read().await.as_ref() {
+                peer_map.transport_urls = previous
+                    .transport_urls
+                    .iter()
+                    .filter(|(id, _)| {
+                        peer_map.peers.iter().any(|node| {
+                            &node.node_id == *id
+                                && previous.peers.iter().any(|old| {
+                                    old.node_id == node.node_id
+                                        && old.wireguard_public_key == node.wireguard_public_key
+                                })
+                        })
+                    })
+                    .map(|(id, endpoints)| (id.clone(), endpoints.clone()))
+                    .collect();
+                peer_map.transport_url_protocol = previous.transport_url_protocol;
+            }
+        }
         *self.http_peer_keys.write().await = peer_map
             .peers
             .iter()
@@ -4999,10 +5047,12 @@ impl AgentRuntime {
         self.http_transport_tasks.lock().await.retain(|peer, _| {
             peer_map.http_tunnel_urls.contains_key(peer)
                 || peer_map.tcp_tunnel_endpoints.contains_key(peer)
+                || peer_map.transport_urls.contains_key(peer)
         });
         self.http_transport_status.write().await.retain(|peer, _| {
             peer_map.http_tunnel_urls.contains_key(peer)
                 || peer_map.tcp_tunnel_endpoints.contains_key(peer)
+                || peer_map.transport_urls.contains_key(peer)
         });
         let current_peers = peer_map
             .peers
@@ -9009,6 +9059,13 @@ pub fn bootstrap_peer_map_cache(
     }
 
     let cache = PeerMap {
+        transport_url_protocol: peer_map.transport_url_protocol,
+        transport_urls: peer_map
+            .transport_urls
+            .iter()
+            .filter(|(id, _)| peers.iter().any(|peer| &peer.node_id == *id))
+            .map(|(id, urls)| (id.clone(), urls.clone()))
+            .collect(),
         tcp_tunnel_protocol: peer_map.tcp_tunnel_protocol,
         tcp_tunnel_endpoints: peer_map
             .tcp_tunnel_endpoints
@@ -9036,6 +9093,7 @@ fn bootstrap_peer_cache_recovery_eq(left: &PeerMap, right: &PeerMap) -> bool {
     left.cluster_id == right.cluster_id
         && left.http_tunnel_urls == right.http_tunnel_urls
         && left.tcp_tunnel_endpoints == right.tcp_tunnel_endpoints
+        && left.transport_urls == right.transport_urls
         && left.bootstrap_endpoints == right.bootstrap_endpoints
         && left.peers.len() == right.peers.len()
         && left.peers.iter().zip(&right.peers).all(|(left, right)| {
@@ -10673,6 +10731,8 @@ mod tests {
             peers.push(peer);
         }
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -12615,6 +12675,8 @@ mod tests {
         )
         .with_lazy_connect_runtime(runtime.clone());
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -12664,6 +12726,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -12950,6 +13014,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -12995,6 +13061,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13058,6 +13126,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13110,6 +13180,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13154,6 +13226,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13218,6 +13292,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13276,6 +13352,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13322,6 +13400,8 @@ mod tests {
 
         let result = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13386,6 +13466,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13483,6 +13565,8 @@ mod tests {
 
         let summary = applier
             .apply_bootstrap_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13543,6 +13627,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13567,6 +13653,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13631,6 +13719,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13693,6 +13783,8 @@ mod tests {
 
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13749,6 +13841,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13761,6 +13855,8 @@ mod tests {
             .await?;
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13827,6 +13923,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13839,6 +13937,8 @@ mod tests {
             .await?;
         let summary = applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -13932,6 +14032,8 @@ mod tests {
 
         applier
             .apply_peer_map(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -14029,6 +14131,8 @@ mod tests {
             Vec::new(),
         );
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -14386,6 +14490,8 @@ mod tests {
         );
         pinned_peer.role = Role::control_plane();
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -14481,6 +14587,8 @@ mod tests {
             Vec::new(),
         );
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -14541,6 +14649,8 @@ mod tests {
         );
         client.role = Role::client();
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -15354,6 +15464,8 @@ mod tests {
         let mut peers = backbone.clone();
         peers.push(route_owner.clone());
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -15468,6 +15580,8 @@ mod tests {
         runtime.record_neighbor_map_snapshot(neighbor_map).await?;
         runtime
             .record_peer_map_snapshot(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -15957,6 +16071,8 @@ mod tests {
         }];
         runtime.record_neighbor_map_snapshot(neighbor_map).await?;
         let empty_peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -16182,6 +16298,8 @@ mod tests {
 
         runtime
             .record_peer_map_snapshot(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -18088,6 +18206,8 @@ mod tests {
     async fn peer_map_sync_fetches_and_applies_once() -> Result<(), AgentError> {
         let node_id = NodeId::from_string("local");
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,

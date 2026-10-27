@@ -52,8 +52,9 @@ func (p *Proxy) openingBody(first []byte) ([]byte, error) {
 func (p *Proxy) openTCP(ctx context.Context, endpoint string, first []byte) (*tcpSession, error) {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	connection, err := (&net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", endpoint)
+	connection, err := p.dialEndpoint(ctx, "tcp", endpoint)
 	if err != nil {
+		p.recordDNSError(err)
 		return nil, errors.New("TCP tunnel connection failed")
 	}
 	stop := context.AfterFunc(ctx, func() { connection.Close() })
@@ -93,6 +94,9 @@ func (p *Proxy) openTCP(ctx context.Context, endpoint string, first []byte) (*tc
 	}
 	connection.SetDeadline(time.Time{})
 	committed = true
+	p.mu.Lock()
+	p.status.ResolvedEndpoint = connection.RemoteAddr().String()
+	p.mu.Unlock()
 	return &tcpSession{connection: connection}, nil
 }
 func (session *tcpSession) send(body []byte) error {

@@ -3211,6 +3211,8 @@ where
             .map(|record| record.snapshot)
             .unwrap_or_default();
         Ok(ipars_types::api::HttpTransportPeerResponse {
+            transport_urls: snapshot.public_transport_urls,
+            relay_transport_urls: snapshot.relay_transport_urls,
             peer,
             http_tunnel_urls: snapshot.http_tunnel_urls,
             tcp_tunnel_endpoints: snapshot.tcp_tunnel_endpoints,
@@ -6013,7 +6015,19 @@ where
                 )
             })
             .collect();
+        let transport_urls = snapshots
+            .iter()
+            .filter(|record| !record.snapshot.public_transport_urls.is_empty())
+            .map(|record| {
+                (
+                    record.node_id.clone(),
+                    record.snapshot.public_transport_urls.clone(),
+                )
+            })
+            .collect();
         Ok(PeerMap {
+            transport_url_protocol: Some(1),
+            transport_urls,
             tcp_tunnel_protocol: Some(1),
             tcp_tunnel_endpoints,
             http_tunnel_protocol: Some(1),
@@ -6458,11 +6472,25 @@ fn validate_transport_snapshot(
     relay: Option<&RelayCapability>,
 ) -> Result<(), String> {
     if snapshot.connections.len() > 4096
+        || snapshot.public_transport_urls.len() > 8
+        || snapshot.relay_transport_urls.len() > 8
         || snapshot.http_tunnel_urls.len() > 8
         || snapshot.tcp_tunnel_endpoints.len() > 8
         || snapshot.tcp_relay_endpoints.len() > 8
     {
         return Err("transport snapshot exceeds its bounds".to_string());
+    }
+    for (urls, relay) in [
+        (&snapshot.public_transport_urls, false),
+        (&snapshot.relay_transport_urls, true),
+    ] {
+        let mut unique = BTreeSet::new();
+        for value in urls {
+            let normalized = ipars_types::normalize_public_transport_url(value, relay)?;
+            if &normalized != value || !unique.insert(value) {
+                return Err("transport URLs must be canonical and unique".to_string());
+            }
+        }
     }
     for (endpoints, expected_ip) in [
         (
@@ -6545,7 +6573,7 @@ fn validate_transport_snapshot(
         if connection.endpoint.parse::<std::net::SocketAddr>().is_err() {
             let url = url::Url::parse(&connection.endpoint)
                 .map_err(|_| "invalid transport observation endpoint")?;
-            if !matches!(url.scheme(), "http" | "https" | "tcp")
+            if !matches!(url.scheme(), "http" | "https" | "tcp" | "udp")
                 || !url.username().is_empty()
                 || url.password().is_some()
                 || url.query().is_some()
@@ -16999,11 +17027,15 @@ mod tests {
             .await?
             .node;
         let urls = vec!["https://8.8.8.8/v1/tunnels/wireguard/open".to_string()];
+        let named_urls = vec!["https://vpn.example.test/v1/tunnels/wireguard/open".to_string()];
+        let relay_urls = vec!["tcp://relay.example.test:51820".to_string()];
         store
             .upsert_transport_snapshot(TransportNodeSnapshot {
                 node_id: peer.node_id.clone(),
                 observed_at: Utc::now(),
                 snapshot: NodeTransportSnapshot {
+                    public_transport_urls: named_urls.clone(),
+                    relay_transport_urls: relay_urls.clone(),
                     tcp_tunnel_endpoints: Vec::new(),
                     tcp_relay_endpoints: Vec::new(),
                     http_tunnel_urls: urls.clone(),
@@ -17033,7 +17065,29 @@ mod tests {
         let response = plane.http_transport_peer(request.clone()).await?;
         assert_eq!(response.peer.node_id, peer.node_id);
         assert_eq!(response.http_tunnel_urls, urls);
+        assert_eq!(response.transport_urls, named_urls);
+        assert_eq!(response.relay_transport_urls, relay_urls);
         assert!(plane.http_transport_peer(request).await.is_err());
+        let peer_map = plane.peer_map_for(&source.node_id).await?;
+        assert_eq!(peer_map.transport_url_protocol, Some(1));
+        assert_eq!(
+            peer_map.transport_urls.get(&peer.node_id),
+            Some(&named_urls)
+        );
+        // Simulate the age of the last accepted report. The store intentionally
+        // ignores an older heartbeat arriving after a newer one.
+        {
+            let mut snapshots = store.transport_snapshots.write().await;
+            snapshots
+                .get_mut(&peer.node_id)
+                .ok_or("transport fixture missing")?
+                .observed_at = Utc::now() - Duration::seconds(91);
+        }
+        assert!(plane
+            .peer_map_for(&source.node_id)
+            .await?
+            .transport_urls
+            .is_empty());
         Ok(())
     }
 
@@ -17054,6 +17108,15 @@ mod tests {
         assert!(validate_transport_snapshot(&snapshot, None, None).is_err());
         snapshot.connections[0].last_error = None;
         snapshot.http_tunnel_urls = vec!["http://127.0.0.1/v1/tunnels/wireguard/open".to_string()];
+        assert!(validate_transport_snapshot(&snapshot, None, None).is_err());
+        snapshot.http_tunnel_urls.clear();
+        snapshot.public_transport_urls =
+            vec!["https://vpn.example.test/v1/tunnels/wireguard/open".to_string()];
+        assert!(validate_transport_snapshot(&snapshot, None, None).is_ok());
+        snapshot.public_transport_urls =
+            vec!["https://169.254.169.254/v1/tunnels/wireguard/open".to_string()];
+        assert!(validate_transport_snapshot(&snapshot, None, None).is_err());
+        snapshot.public_transport_urls = vec!["tcp://vpn.example.test:51820".to_string(); 9];
         assert!(validate_transport_snapshot(&snapshot, None, None).is_err());
     }
 }

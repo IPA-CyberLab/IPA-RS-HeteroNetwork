@@ -29,6 +29,7 @@ pub struct RelayHttpState {
     operator_api_bearer_token: Option<Arc<str>>,
     http_transport: Option<Arc<ipars_http_tunnel::TunnelHub>>,
     tcp_endpoint: Option<std::net::SocketAddr>,
+    transport_urls: Vec<String>,
 }
 
 impl RelayHttpState {
@@ -39,6 +40,7 @@ impl RelayHttpState {
             operator_api_bearer_token: None,
             http_transport: None,
             tcp_endpoint: None,
+            transport_urls: Vec::new(),
         }
     }
 
@@ -55,6 +57,10 @@ impl RelayHttpState {
 
     pub fn with_tcp_endpoint(mut self, endpoint: std::net::SocketAddr) -> Self {
         self.tcp_endpoint = Some(endpoint);
+        self
+    }
+    pub fn with_transport_urls(mut self, urls: Vec<String>) -> Self {
+        self.transport_urls = urls;
         self
     }
     pub fn tcp_authorizer(&self) -> ipars_http_tunnel::tcp::Authorizer {
@@ -163,6 +169,7 @@ async fn healthz() -> Json<HealthResponse> {
 async fn status(State(state): State<RelayHttpState>) -> Json<RelayStatusResponse> {
     let mut status = state.relay.status().await;
     status.tcp_endpoint = state.tcp_endpoint;
+    status.transport_urls = state.transport_urls.clone();
     if let Some(hub) = &state.http_transport {
         status.http_transports = hub.observations();
     }

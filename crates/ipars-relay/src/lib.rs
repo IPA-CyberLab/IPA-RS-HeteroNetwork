@@ -1405,6 +1405,7 @@ impl RelayService {
         table.purge_expired(generated_at);
         capability.active_sessions = table.session_count() as u32;
         RelayStatusResponse {
+            transport_urls: Vec::new(),
             tcp_endpoint: None,
             http_transports: Vec::new(),
             relay_node: self.relay_node.clone(),

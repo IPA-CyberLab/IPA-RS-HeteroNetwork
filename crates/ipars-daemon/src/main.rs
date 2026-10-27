@@ -855,6 +855,12 @@ struct RelayArgs {
     #[arg(long, env = "HETERONETWORK_RELAY_DISABLE_TCP_TUNNEL")]
     disable_tcp_tunnel: bool,
     #[arg(
+        long = "public-transport-url",
+        env = "HETERONETWORK_RELAY_PUBLIC_TRANSPORT_URLS",
+        value_delimiter = ','
+    )]
+    public_transport_urls: Vec<String>,
+    #[arg(
         long,
         env = "HETERONETWORK_RELAY_HTTP_LISTEN",
         default_value = "0.0.0.0:9580"
@@ -1085,6 +1091,12 @@ struct AgentArgs {
     wireguard_tcp_public_port: Option<u16>,
     #[arg(long, env = "HETERONETWORK_AGENT_DISABLE_TCP_TUNNEL")]
     disable_tcp_tunnel: bool,
+    #[arg(
+        long = "public-transport-url",
+        env = "HETERONETWORK_AGENT_PUBLIC_TRANSPORT_URLS",
+        value_delimiter = ','
+    )]
+    public_transport_urls: Vec<String>,
     #[arg(long, env = "HETERONETWORK_AGENT_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_AGENT_SIGNAL_URL")]
@@ -2154,6 +2166,7 @@ fn preflight_agent_runtime_with_path_and_checks(
 }
 
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
+    normalized_transport_urls(&args.public_transport_urls, false)?;
     let packet_flow_detector = effective_packet_flow_detector(args);
     validate_agent_api_auth_config(args)?;
     anyhow::ensure!(
@@ -9026,7 +9039,11 @@ async fn run_relay(
         udp_addr.port(),
     );
     let mut http_state = RelayHttpState::new(service)
-        .with_http_transport(backend, args.max_sessions.saturating_mul(2) as usize);
+        .with_http_transport(backend, args.max_sessions.saturating_mul(2) as usize)
+        .with_transport_urls(normalized_transport_urls(
+            &args.public_transport_urls,
+            true,
+        )?);
     if let Some(token) = admission_bearer_token {
         http_state = http_state.require_admission_bearer_token(token);
     }
@@ -9078,6 +9095,7 @@ fn relay_tcp_public_endpoint(args: &RelayArgs, public_endpoint: SocketAddr) -> S
 }
 
 fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
+    normalized_transport_urls(&args.public_transport_urls, true)?;
     match (&args.relay_node_id, &args.relay_node_id_path) {
         (Some(node_id), None) => validate_daemon_identifier(node_id, "--relay-node-id")?,
         (None, Some(path)) if path.as_os_str().is_empty() => {
@@ -9191,6 +9209,22 @@ fn chrono_duration_seconds(value: u64, name: &str) -> anyhow::Result<chrono::Dur
     Ok(chrono::Duration::seconds(seconds))
 }
 
+fn normalized_transport_urls(values: &[String], relay: bool) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        values.len() <= 8,
+        "at most eight public transport URLs are allowed"
+    );
+    let mut seen = BTreeSet::new();
+    let mut urls = Vec::new();
+    for value in values {
+        let url = ipars_types::normalize_public_transport_url(value, relay)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(seen.insert(url.clone()), "duplicate public transport URL");
+        urls.push(url);
+    }
+    Ok(urls)
+}
+
 fn agent_http_connect_timeout(args: &AgentArgs) -> Duration {
     Duration::from_secs(args.http_connect_timeout_seconds)
 }
@@ -9241,6 +9275,10 @@ async fn run_agent(
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+    runtime.set_public_transport_urls(normalized_transport_urls(
+        &args.public_transport_urls,
+        false,
+    )?);
     let mut internal_packet_flow_udp_ports = BTreeSet::from([args.overlay_transit_port]);
     if !args.disable_peer_probe {
         internal_packet_flow_udp_ports.insert(args.peer_probe_port);
@@ -9410,6 +9448,7 @@ async fn run_agent(
                 runtime.clone(),
                 status.clone(),
                 PublicWebGatewayConfig {
+                    transport_urls: args.public_transport_urls.clone(),
                     listen_port: args.public_web_gateway_listen_port,
                     public_port: args.public_web_gateway_public_port,
                     wireguard_tunnel_upstream: Some(args.listen),
@@ -14445,6 +14484,7 @@ struct AgentApiErrorResponse {
 
 #[derive(Clone)]
 struct PublicWebGatewayConfig {
+    transport_urls: Vec<String>,
     listen_port: u16,
     public_port: u16,
     wireguard_tunnel_upstream: Option<SocketAddr>,
@@ -14626,7 +14666,32 @@ fn public_web_gateway_caddyfile(
         // https_port selects the local listener; the advertised port can be
         // different when the router forwards a public port to this listener.
         let site = public_web_gateway_url(target.public_ip, 443);
-        let site = site.trim_end_matches('/');
+        let mut sites = vec![site.trim_end_matches('/').to_string()];
+        let mut http_hosts = vec![match target.public_ip {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        }];
+        for value in &config.transport_urls {
+            if let Ok(url) = reqwest::Url::parse(value) {
+                if let Some(host) = url
+                    .host_str()
+                    .filter(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().is_err())
+                {
+                    if url.scheme() == "https" {
+                        let site = format!("https://{host}");
+                        if !sites.contains(&site) {
+                            sites.push(site);
+                        }
+                    }
+                    if matches!(url.scheme(), "http" | "https")
+                        && !http_hosts.contains(&host.to_string())
+                    {
+                        http_hosts.push(host.to_string());
+                    }
+                }
+            }
+        }
+        let site = sites.join(", ");
         let _ = writeln!(
             caddyfile,
             "{site} {{\n\tbind {}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}",
@@ -14663,13 +14728,14 @@ fn public_web_gateway_caddyfile(
         }
         let _ = writeln!(caddyfile, "\thandle {{\n\t\trespond 404\n\t}}\n}}");
         if let Some(upstream) = config.wireguard_tunnel_upstream {
-            let host = match target.public_ip {
-                IpAddr::V4(ip) => ip.to_string(),
-                IpAddr::V6(ip) => format!("[{ip}]"),
-            };
+            let host = http_hosts
+                .iter()
+                .map(|host| format!("http://{host}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             // HTTP carries authenticated WireGuard ciphertext only. Enrollment
             // credentials and management APIs remain behind TLS or the VPN.
-            let _ = writeln!(caddyfile, "http://{host} {{\n\tbind {}\n\t@wireguard_tunnel path /v1/tunnels/wireguard/open /v1/tunnels/wireguard/packets /v1/tunnels/relay/admit\n\thandle @wireguard_tunnel {{\n\t\treverse_proxy http://{upstream}\n\t}}", target.bind_ip);
+            let _ = writeln!(caddyfile, "{host} {{\n\tbind {}\n\t@wireguard_tunnel path /v1/tunnels/wireguard/open /v1/tunnels/wireguard/packets /v1/tunnels/relay/admit\n\thandle @wireguard_tunnel {{\n\t\treverse_proxy http://{upstream}\n\t}}", target.bind_ip);
             if let Some(relay) = config.relay_admission_upstream {
                 let _ = writeln!(caddyfile, "\t@relay_transport path /v1/tunnels/relay/open /v1/tunnels/relay/packets\n\thandle @relay_transport {{\n\t\treverse_proxy http://{relay}\n\t}}");
             }
@@ -15678,10 +15744,14 @@ async fn send_heartbeat_to_control_planes(
                             .ok()
                             .map(|value| {
                                 if value["transport_observations"] == true {
-                                    if value["tcp_tunnel_protocol"] == 1 {
+                                    (if value["tcp_tunnel_protocol"] == 1 {
                                         3
                                     } else {
                                         1
+                                    }) | if value["transport_url_protocol"] == 1 {
+                                        4
+                                    } else {
+                                        0
                                     }
                                 } else {
                                     0
@@ -15707,6 +15777,21 @@ async fn send_heartbeat_to_control_planes(
                     }
                 });
                 let mut snapshot = report.snapshot.clone();
+                if supported & 4 == 0 {
+                    snapshot.public_transport_urls.clear();
+                    snapshot.relay_transport_urls.clear();
+                    for connection in &mut snapshot.connections {
+                        if connection.endpoint.starts_with("udp://") {
+                            if let Some(address) = connection.resolved_endpoint {
+                                connection.endpoint = address.to_string();
+                            }
+                        }
+                        connection.resolved_endpoint = None;
+                    }
+                    snapshot
+                        .connections
+                        .retain(|connection| !connection.endpoint.starts_with("udp://"));
+                }
                 if supported & 2 == 0 {
                     snapshot.tcp_tunnel_endpoints.clear();
                     snapshot.tcp_relay_endpoints.clear();
@@ -18437,6 +18522,9 @@ async fn heartbeat_relay_capability(
                     .set_relay_http_status(status.http_transports.clone())
                     .await;
                 runtime
+                    .set_relay_transport_urls(status.transport_urls.clone())
+                    .await;
+                runtime
                     .set_tcp_relay_endpoints(status.tcp_endpoint.into_iter().collect())
                     .await;
             }
@@ -18445,6 +18533,7 @@ async fn heartbeat_relay_capability(
         Ok(status) => {
             if let Some(runtime) = runtime {
                 runtime.set_tcp_relay_endpoints(Vec::new()).await;
+                runtime.set_relay_transport_urls(Vec::new()).await;
             }
             tracing::warn!(
                 status_url,
@@ -18456,6 +18545,7 @@ async fn heartbeat_relay_capability(
         Err(error) => {
             if let Some(runtime) = runtime {
                 runtime.set_tcp_relay_endpoints(Vec::new()).await;
+                runtime.set_relay_transport_urls(Vec::new()).await;
             }
             tracing::warn!(
                 %error,
@@ -18848,6 +18938,9 @@ async fn admit_relay_session_from_candidates(
                     {
                         Ok(mut session) => {
                             session.relay_tcp_endpoints = metadata.tcp_relay_endpoints.clone();
+                            session
+                                .relay_http_urls
+                                .splice(0..0, metadata.relay_transport_urls.clone());
                             runtime.record_relay_admission_success();
                             return Ok(session);
                         }
@@ -18961,6 +19054,9 @@ async fn admit_relay_session_from_candidates(
                         .await
                     {
                         session.relay_tcp_endpoints = metadata.tcp_relay_endpoints;
+                        session
+                            .relay_http_urls
+                            .splice(0..0, metadata.relay_transport_urls);
                     }
                     runtime.record_relay_admission_success();
                     return Ok(session);
@@ -21969,6 +22065,8 @@ impl PeerMapSource for HttpPeerMapSource {
             merge_resolved_overlay_peer(&mut peers, peer);
         }
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -23523,6 +23621,7 @@ mod tests {
     fn public_web_gateway_custom_ports_keep_local_and_public_addresses_separate(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let config = PublicWebGatewayConfig {
+            transport_urls: Vec::new(),
             wireguard_tunnel_upstream: None,
             listen_port: 8443,
             public_port: 9443,
@@ -23564,6 +23663,7 @@ mod tests {
     fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let mut config = PublicWebGatewayConfig {
+            transport_urls: Vec::new(),
             wireguard_tunnel_upstream: None,
             listen_port: 443,
             public_port: 443,
@@ -23650,6 +23750,40 @@ mod tests {
         assert!(mapped.contains("default_bind 10.10.10.103"));
         assert!(mapped.contains("bind 10.10.10.103"));
         assert!(!mapped.contains("bind 203.0.113.10"));
+        config.transport_urls =
+            vec!["https://vpn.example.test/v1/tunnels/wireguard/open".to_string()];
+        config.wireguard_tunnel_upstream = Some(SocketAddr::from(([127, 0, 0, 1], 9780)));
+        let named = public_web_gateway_caddyfile(
+            &config,
+            Some(PublicWebGatewayTarget {
+                public_ip,
+                bind_ip: public_ip,
+            }),
+            &extra,
+        );
+        assert!(named.contains("https://203.0.113.10, https://vpn.example.test {"));
+        assert!(named.contains("http://203.0.113.10, http://vpn.example.test {"));
+        assert!(!named.contains("/v1/admin/"));
+        if let Ok(caddy) = std::env::var("HETERONETWORK_TEST_CADDY") {
+            let directory = unique_test_dir("named-gateway-caddy")
+                .unwrap_or_else(|e| panic!("fixture directory: {e}"));
+            let path = directory.join("Caddyfile");
+            std::fs::write(&path, &named).unwrap_or_else(|e| panic!("fixture config: {e}"));
+            let result = std::process::Command::new(caddy)
+                .args(["adapt", "--adapter", "caddyfile", "--config"])
+                .arg(&path)
+                .output()
+                .unwrap_or_else(|e| panic!("pinned Caddy: {e}"));
+            let _ = std::fs::remove_dir_all(directory);
+            assert!(
+                result.status.success(),
+                "Caddy rejected the named public gateway: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let parsed: serde_json::Value = serde_json::from_slice(&result.stdout)
+                .unwrap_or_else(|e| panic!("Caddy JSON: {e}"));
+            assert!(parsed["apps"]["http"].is_object());
+        }
     }
 
     #[test]
@@ -24072,6 +24206,8 @@ mod tests {
         let applier = PeerMapApplier::new("ipars0", wireguard, DryRunLinuxRouteManager);
         let applier = configure_peer_map_endpoint_resolver(&args, runtime.clone(), applier)?;
         let peer_map = || PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -24240,6 +24376,7 @@ mod tests {
         active_sessions: u32,
     ) -> RelayStatusResponse {
         RelayStatusResponse {
+            transport_urls: Vec::new(),
             tcp_endpoint: None,
             http_transports: Vec::new(),
             relay_node: NodeId::from_string("relay-a"),
@@ -24887,7 +25024,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_transport_heartbeat_keeps_legacy_signatures_and_negotiates_new_reports(
     ) -> anyhow::Result<()> {
-        for tcp_supported in [false, true] {
+        for (tcp_supported, named_supported) in [(false, false), (true, false), (true, true)] {
             let state = AgentNodeState::generate(Utc::now());
             let identity = state.identity_key_pair()?;
             let public_key = identity.public_key_b64();
@@ -24895,12 +25032,17 @@ mod tests {
             let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let received = seen.clone();
             let app=Router::new().route("/v1/transport-capabilities",axum::routing::get(move||async move{
-                axum::Json(serde_json::json!({"transport_observations":true,"tcp_tunnel_protocol":if tcp_supported {Some(1)}else{None}}))
+                axum::Json(serde_json::json!({"transport_observations":true,"tcp_tunnel_protocol":if tcp_supported {Some(1)}else{None},"transport_url_protocol":if named_supported{Some(1)}else{None}}))
             })).route("/v1/heartbeat",axum::routing::post(move|axum::Json(value):axum::Json<serde_json::Value>|{
                 let public_key=public_key.clone();let received=received.clone();async move{
                     let snapshot=&value["service_advertisement"]["transport"];
                     assert_eq!(snapshot.get("tcp_tunnel_endpoints").is_some(),tcp_supported);
-                    assert_eq!(snapshot["connections"].as_array().map_or(0,Vec::len),usize::from(tcp_supported));
+                    assert_eq!(snapshot.get("public_transport_urls").is_some(),named_supported);
+                    assert_eq!(snapshot.get("relay_transport_urls").is_some(),named_supported);
+                    assert_eq!(snapshot["connections"].as_array().map_or(0,Vec::len),usize::from(tcp_supported)+1);
+                    let udp=snapshot["connections"].as_array().and_then(|connections|connections.iter().find(|connection|connection["transport"]=="udp")).unwrap_or_else(||panic!("UDP observation missing"));
+                    assert_eq!(udp["endpoint"],if named_supported{"udp://vpn.example.test:51820"}else{"8.8.8.8:51820"});
+                    assert_eq!(udp.get("resolved_endpoint").is_some(),named_supported);
                     let request:HeartbeatRequest=serde_json::from_value(value).unwrap_or_else(|e|panic!("heartbeat wire format: {e}"));
                     ipars_crypto::verify_heartbeat_request_signature(&request,&public_key).unwrap_or_else(|e|panic!("heartbeat signature changed: {e}"));
                     received.store(true,Ordering::Relaxed);axum::Json(heartbeat_response(false))
@@ -24909,6 +25051,10 @@ mod tests {
             let (url, server) = spawn_test_http_service(app).await?;
             let request = heartbeat_request(&runtime, &identity, None, None, None, None).await?;
             let mut snapshot = ipars_types::api::NodeTransportSnapshot {
+                public_transport_urls: vec![
+                    "https://vpn.example.test/v1/tunnels/wireguard/open".to_string()
+                ],
+                relay_transport_urls: vec!["tcp://relay.example.test:51820".to_string()],
                 tcp_tunnel_endpoints: vec!["8.8.8.8:51820".parse()?],
                 ..Default::default()
             };
@@ -24918,6 +25064,12 @@ mod tests {
             );
             observation.transport = ipars_types::api::DataPlaneTransport::Tcp;
             snapshot.connections.push(observation);
+            let mut udp = ipars_types::api::TransportObservation::new(
+                NodeId::from_string("peer"),
+                "udp://vpn.example.test:51820".to_string(),
+            );
+            udp.resolved_endpoint = Some("8.8.8.8:51820".parse()?);
+            snapshot.connections.push(udp);
             let mut features = BTreeMap::new();
             let response = send_heartbeat_to_control_planes(
                 &reqwest::Client::new(),
@@ -25041,6 +25193,8 @@ mod tests {
         async fn fetch_peer_map(&self, _node_id: &NodeId) -> Result<PeerMap, AgentError> {
             let _ = self.fetches.send(());
             Ok(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -25105,6 +25259,8 @@ mod tests {
             10,
         )];
         let source = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -25309,6 +25465,8 @@ mod tests {
         peer.endpoint_candidates = vec![current_candidate.clone()];
         runtime
             .record_peer_map_snapshot(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -28448,6 +28606,7 @@ mod tests {
             e2e_only: true,
         };
         let status = RelayStatusResponse {
+            transport_urls: Vec::new(),
             tcp_endpoint: None,
             http_transports: Vec::new(),
             relay_node: NodeId::from_string("relay-a"),
@@ -41288,6 +41447,8 @@ exec sleep 60
         }
 
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -41457,6 +41618,8 @@ exec sleep 60
         });
 
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -41578,6 +41741,8 @@ exec sleep 60
         });
 
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -41734,6 +41899,8 @@ exec sleep 60
         });
 
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -41883,6 +42050,8 @@ exec sleep 60
             e2e_only: true,
         });
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -42079,6 +42248,8 @@ exec sleep 60
         });
 
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -42185,6 +42356,8 @@ exec sleep 60
             .await;
 
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,
@@ -42555,6 +42728,8 @@ exec sleep 60
             .await?;
         runtime
             .record_peer_map_snapshot(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -42791,6 +42966,8 @@ exec sleep 60
         let peers = signal_negotiation_peer_set(
             &runtime,
             PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -42838,6 +43015,8 @@ exec sleep 60
         let peers = signal_negotiation_peer_set(
             &runtime,
             PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -43183,6 +43362,8 @@ exec sleep 60
         peer.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
         runtime
             .record_peer_map_snapshot(PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,

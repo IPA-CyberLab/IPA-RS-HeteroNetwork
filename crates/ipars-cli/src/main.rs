@@ -11458,6 +11458,8 @@ mod tests {
         let mut response = RegisterClientResponse {
             client,
             peer_map: PeerMap {
+                transport_url_protocol: None,
+                transport_urls: Default::default(),
                 tcp_tunnel_protocol: None,
                 tcp_tunnel_endpoints: Default::default(),
                 http_tunnel_protocol: None,
@@ -12065,6 +12067,8 @@ mod tests {
             &RegisterNodeResponse {
                 node: node.clone(),
                 peer_map: PeerMap {
+                    transport_url_protocol: None,
+                    transport_urls: Default::default(),
                     tcp_tunnel_protocol: None,
                     tcp_tunnel_endpoints: Default::default(),
                     http_tunnel_protocol: None,
@@ -12148,6 +12152,8 @@ mod tests {
             &RegisterNodeResponse {
                 node: node.clone(),
                 peer_map: PeerMap {
+                    transport_url_protocol: None,
+                    transport_urls: Default::default(),
                     tcp_tunnel_protocol: None,
                     tcp_tunnel_endpoints: Default::default(),
                     http_tunnel_protocol: None,
@@ -14685,6 +14691,8 @@ fi
         };
         let generated_at = Utc::now();
         let peer_map = PeerMap {
+            transport_url_protocol: None,
+            transport_urls: Default::default(),
             tcp_tunnel_protocol: None,
             tcp_tunnel_endpoints: Default::default(),
             http_tunnel_protocol: None,

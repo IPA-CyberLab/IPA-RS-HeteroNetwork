@@ -307,7 +307,7 @@ public sealed class WindowsTunnelManager
             $"AllowedIPs = {string.Join(", ", profile.AllowedIps)}",
             "PersistentKeepalive = 25",
             string.Empty);
-        if (profile.HttpTunnelUrls.Count > 0 || profile.TcpTunnelEndpoints.Count > 0)
+        if (profile.HttpTunnelUrls.Count > 0 || profile.TcpTunnelEndpoints.Count > 0 || profile.TransportUrls.Count > 0)
         {
             var metadata = new TunnelTransportConfiguration
             {
@@ -317,10 +317,14 @@ public sealed class WindowsTunnelManager
                 GatewayWireGuardPublicKey = Convert.ToHexStringLower(Convert.FromBase64String(profile.GatewayWireGuardPublicKey)),
                 GatewayHttpTunnelUrls = profile.HttpTunnelUrls,
                 GatewayTcpTunnelEndpoints = profile.TcpTunnelEndpoints,
+                GatewayTransportUrls = profile.TransportUrls,
             };
-            if (profile.HttpTunnelUrls.Count > 0)
+            var httpTarget = profile.TransportUrls.FirstOrDefault(value =>
+                Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
+                ?? profile.HttpTunnelUrls.FirstOrDefault();
+            if (httpTarget is not null)
             {
-                var target = new Uri(profile.HttpTunnelUrls[0]);
+                var target = new Uri(httpTarget);
                 var proxy = HttpClient.DefaultProxy.GetProxy(target);
                 if (proxy is not null && proxy != target) metadata.ProxyUrl = proxy.AbsoluteUri;
             }

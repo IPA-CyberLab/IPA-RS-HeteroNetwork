@@ -89,6 +89,7 @@ agent:
     gatewayRecords: {}
   interfaceName: heteronetwork0
   wireguardListenPort: 51820
+  publicTransportUrls: []
   overlayTransitPort: 51822
   stunBind: "0.0.0.0:51820"
   natDiscovery:
@@ -253,6 +254,7 @@ agent:
     maxSessions: 10000
     maxMbps: 1000
   relayService:
+    publicTransportUrls: []
     enabled: false
     exposureAcknowledged: false
     allowUnrestrictedLoadBalancer: false

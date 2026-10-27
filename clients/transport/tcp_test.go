@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +18,13 @@ import (
 )
 
 func TestNativeTCPFallbackDoesNotIssueHTTPRequests(t *testing.T) {
+	for _, named := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cname=%v", named), func(t *testing.T) { nativeTCPFallback(t, named) })
+	}
+}
+
+func nativeTCPFallback(t *testing.T, named bool) {
+	t.Helper()
 	private, public := keys()
 	key, _ := transportAuthenticationKey(private, public)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -117,7 +126,23 @@ func TestNativeTCPFallbackDoesNotIssueHTTPRequests(t *testing.T) {
 	}()
 	blackhole, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	defer blackhole.Close()
-	p, err := start(Configuration{ClientNodeID: "client", GatewayNodeID: "gateway", PrivateKey: private, GatewayWireGuardPublicKey: public, GatewayEndpoint: blackhole.LocalAddr().String(), GatewayTCPTunnelEndpoints: []string{listener.Addr().String()}, GatewayHTTPTunnelURLs: []string{unusedHTTP.URL + "/v1/tunnels/wireguard/open"}}, nil)
+	configuration := Configuration{ClientNodeID: "client", GatewayNodeID: "gateway", PrivateKey: private, GatewayWireGuardPublicKey: public, GatewayEndpoint: blackhole.LocalAddr().String(), GatewayTCPTunnelEndpoints: []string{listener.Addr().String()}, GatewayHTTPTunnelURLs: []string{unusedHTTP.URL + "/v1/tunnels/wireguard/open"}}
+	endpoints := endpointNetwork{}
+	var cnames *atomic.Int32
+	if named {
+		configuration.publicIngress = true
+		configuration.GatewayTCPTunnelEndpoints = nil
+		port := listener.Addr().(*net.TCPAddr).Port
+		configuration.GatewayTransportURLs = []string{fmt.Sprintf("tcp://vpn.alias.test:%d", port)}
+		endpoints.resolver, cnames = cnameResolver(t, func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("8.8.8.8")} })
+		endpoints.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if address != fmt.Sprintf("8.8.8.8:%d", port) {
+				return nil, fmt.Errorf("unexpected DNS destination")
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, listener.Addr().String())
+		}
+	}
+	p, err := startWithNetwork(configuration, nil, endpoints)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +177,9 @@ func TestNativeTCPFallbackDoesNotIssueHTTPRequests(t *testing.T) {
 	}
 	if httpRequests.Load() != 0 {
 		t.Fatal("native TCP used HTTP")
+	}
+	if named && (cnames.Load() == 0 || !strings.Contains(p.Snapshot().Endpoint, "vpn.alias.test")) {
+		t.Fatal("CNAME path or hostname telemetry was not exercised")
 	}
 	if err := <-serverResult; err != nil {
 		t.Fatal(err)

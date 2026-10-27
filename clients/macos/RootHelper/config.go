@@ -21,6 +21,7 @@ const (
 )
 
 type tunnelConfiguration struct {
+	GatewayTransportURLs      []string `json:"gateway_transport_urls,omitempty"`
 	GatewayTCPTunnelEndpoints []string `json:"gateway_tcp_tunnel_endpoints,omitempty"`
 	SchemaVersion             int      `json:"schema_version"`
 	OwnerUID                  int      `json:"owner_uid"`
@@ -45,7 +46,10 @@ func (configuration *tunnelConfiguration) validateAndNormalize() error {
 	if err := transport.ValidateTCPEndpoints(configuration.GatewayTCPTunnelEndpoints); err != nil {
 		return err
 	}
-	if len(configuration.GatewayHTTPTunnelURLs) > 0 || len(configuration.GatewayTCPTunnelEndpoints) > 0 {
+	if err := transport.ValidateTransportURLs(configuration.GatewayTransportURLs); err != nil {
+		return err
+	}
+	if len(configuration.GatewayHTTPTunnelURLs) > 0 || len(configuration.GatewayTCPTunnelEndpoints) > 0 || len(configuration.GatewayTransportURLs) > 0 {
 		if err := validateGatewayNodeID(configuration.ClientNodeID); err != nil {
 			return err
 		}

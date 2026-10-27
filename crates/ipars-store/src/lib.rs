@@ -6963,6 +6963,8 @@ mod tests {
                 let mut udp = connection.clone();
                 udp.transport = ipars_types::api::DataPlaneTransport::Udp;
                 NodeTransportSnapshot {
+                    public_transport_urls: Vec::new(),
+                    relay_transport_urls: Vec::new(),
                     connections: vec![connection, udp],
                     ..Default::default()
                 }

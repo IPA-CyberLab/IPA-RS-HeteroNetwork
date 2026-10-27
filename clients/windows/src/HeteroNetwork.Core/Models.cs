@@ -149,6 +149,12 @@ public sealed record PeerMap(
     [JsonPropertyName("tcp_tunnel_protocol")]
     public int? TcpTunnelProtocol { get; init; }
 
+    [JsonPropertyName("transport_urls")]
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> TransportUrls { get; init; }
+        = new Dictionary<string, IReadOnlyList<string>>();
+    [JsonPropertyName("transport_url_protocol")]
+    public int? TransportUrlProtocol { get; init; }
+
     public PeerMap PreserveLegacyTransport(PeerMap previous)
     {
         IReadOnlyDictionary<string, IReadOnlyList<string>> Retained(
@@ -163,6 +169,8 @@ public sealed record PeerMap(
             HttpTunnelProtocol = HttpTunnelProtocol ?? previous.HttpTunnelProtocol,
             TcpTunnelEndpoints = TcpTunnelProtocol is null ? Retained(previous.TcpTunnelEndpoints) : TcpTunnelEndpoints,
             TcpTunnelProtocol = TcpTunnelProtocol ?? previous.TcpTunnelProtocol,
+            TransportUrls = TransportUrlProtocol is null ? Retained(previous.TransportUrls) : TransportUrls,
+            TransportUrlProtocol = TransportUrlProtocol ?? previous.TransportUrlProtocol,
         };
     }
 }

@@ -82,6 +82,11 @@ helm_cmd lint /work/charts/ipars >/tmp/heteronetwork-helm-lint.txt
 
 template_ok default
 
+template_ok named-transports --set-string 'agent.publicTransportUrls[0]=https://vpn.example.test' --set-string 'agent.publicTransportUrls[1]=tcp://vpn.example.test:51820'
+assert_rendered_contains named-transports 'name: HETERONETWORK_AGENT_PUBLIC_TRANSPORT_URLS'
+assert_rendered_contains named-transports 'https://vpn.example.test,tcp://vpn.example.test:51820'
+template_fails invalid-transport-url-list 'agent.publicTransportUrls must be a list' --set-string agent.publicTransportUrls=bad
+
 assert_rendered_absent default "mountPath: /dev/net/tun"
 assert_rendered_absent default "name: dev-net-tun"
 assert_rendered_absent default "name: HETERONETWORK_ROUTE_PROVIDER"
