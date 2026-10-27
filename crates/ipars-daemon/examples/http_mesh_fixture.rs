@@ -45,10 +45,10 @@ async fn serve<S: ControlPlaneStore + TokenLedger + 'static>(store: Arc<S>) -> a
                 node.tags.insert(Tag::from_string("heteronetwork-stopped"));
             }
             store.insert_node(node.clone()).await?;
-            let at = if index == 4 {
-                now
-            } else {
-                now - chrono::Duration::minutes(6)
+            let at = match index {
+                4 => now,
+                3 => now - chrono::Duration::minutes(2),
+                _ => now - chrono::Duration::minutes(6),
             };
             mesh.lease(&node, index != 1, true, at).await?;
             if index == 3 {
@@ -56,7 +56,12 @@ async fn serve<S: ControlPlaneStore + TokenLedger + 'static>(store: Arc<S>) -> a
             }
             records.push(node);
         }
-        assert_eq!(store.reap_expired_http_members(now).await?, 1);
+        // Another replica's background reaper may already have deleted node 0.
+        // Verify the resulting records, not which concurrent worker deleted it.
+        // Node 3 must survive beyond its original lease due to the renewal.
+        store
+            .reap_expired_http_members(now + chrono::Duration::minutes(4))
+            .await?;
         for (index, record) in records.iter().enumerate() {
             assert_eq!(store.get_node(&record.node_id).await?.is_some(), index != 0);
             if index != 0 {
