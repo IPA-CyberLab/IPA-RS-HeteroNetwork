@@ -121,7 +121,7 @@ jobs:
         image: postgres:16
         env: {POSTGRES_USER: ipars, POSTGRES_PASSWORD: disposable-mesh-test, POSTGRES_DB: http_mesh_e2e}
         ports: ['5432:5432']
-        options: --health-cmd 'pg_isready -U ipars -d http_mesh_e2e' --health-interval 5s --health-timeout 5s --health-retries 20
+        options: --health-cmd=pg_isready --health-interval=5s --health-timeout=5s --health-retries=20
     env:
       HTTP_MESH_TEST_DATABASE: postgresql://ipars:disposable-mesh-test@127.0.0.1:5432/http_mesh_e2e
       HTTP_MESH_SCALE_TEST: '1'

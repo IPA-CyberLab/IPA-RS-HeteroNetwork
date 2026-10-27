@@ -1,0 +1,94 @@
+- name: Roll the verified native HTTP mesh server through active VPN hosts
+  hosts: master_only:bootstrap:enrollment_issuer:standard
+  gather_facts: false
+  become: true
+  serial: 1
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    mesh_roster: "{{ lookup('file', hnn_repo_root + '/deploy/terraform/master-only/overlay-boot-peers.json') | from_json }}"
+  tasks:
+    - name: Preserve explicitly stopped hosts
+      ansible.builtin.meta: end_host
+      when: mesh_roster.node_states.get(inventory_hostname, {}).get('state', 'active') == 'stopped'
+
+    - name: Inspect the immutable local server artifact
+      ansible.builtin.stat:
+        path: '{{ hnn_http_mesh_native_binary }}'
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      register: mesh_local_native
+
+    - name: Require verified artifact provenance before changing the host
+      ansible.builtin.assert:
+        that:
+          - hnn_http_mesh_native_sha256 is match('^[a-f0-9]{64}$')
+          - mesh_local_native.stat.checksum == hnn_http_mesh_native_sha256
+
+    - name: Record running native services
+      ansible.builtin.service_facts:
+
+    - name: Install the tested server and retain the previous binary
+      ansible.builtin.copy:
+        src: '{{ hnn_http_mesh_native_binary }}'
+        dest: /opt/heteronetwork/bin/iparsd
+        owner: root
+        group: root
+        mode: '0755'
+        backup: true
+      register: mesh_native_install
+
+    - name: Reconcile the active services and restore the previous binary on failure
+      when: mesh_native_install.changed
+      block:
+        - name: Restart an already running control plane
+          ansible.builtin.systemd_service:
+            name: heteronetwork-control-plane.service
+            state: restarted
+          when: ansible_facts.services.get('heteronetwork-control-plane.service', {}).get('state') == 'running'
+
+        - name: Require the local control plane to start before refreshing the gateway
+          ansible.builtin.uri:
+            url: "http://{{ (mesh_roster.peers | selectattr('node_id', 'equalto', mesh_roster.hosts[inventory_hostname]) | first).vpn_ip }}:19088/healthz"
+            use_proxy: false
+            status_code: 200
+          register: mesh_control_ready
+          retries: 12
+          delay: 3
+          until: mesh_control_ready.status | default(0) == 200
+          when: ansible_facts.services.get('heteronetwork-control-plane.service', {}).get('state') == 'running'
+
+        - name: Refresh the running agent and its public HTTP routes
+          ansible.builtin.systemd_service:
+            name: heteronetwork-agent.service
+            state: restarted
+          when: ansible_facts.services.get('heteronetwork-agent.service', {}).get('state') == 'running'
+
+        - name: Require the active agent to remain running
+          ansible.builtin.command: systemctl is-active --quiet heteronetwork-agent.service
+          changed_when: false
+          register: mesh_agent_ready
+          retries: 12
+          delay: 3
+          until: mesh_agent_ready.rc == 0
+          when: ansible_facts.services.get('heteronetwork-agent.service', {}).get('state') == 'running'
+      rescue:
+        - name: Restore the retained native binary
+          ansible.builtin.copy:
+            src: '{{ mesh_native_install.backup_file }}'
+            remote_src: true
+            dest: /opt/heteronetwork/bin/iparsd
+            owner: root
+            group: root
+            mode: '0755'
+          when: mesh_native_install.backup_file is defined
+        - name: Restart the previously active services
+          ansible.builtin.systemd_service:
+            name: '{{ item }}'
+            state: restarted
+          loop: [heteronetwork-control-plane.service, heteronetwork-agent.service]
+          when: ansible_facts.services.get(item, {}).get('state') == 'running'
+        - name: Reject the unsuccessful rollout
+          ansible.builtin.fail:
+            msg: HTTP mesh native rollout failed; the previous binary was restored

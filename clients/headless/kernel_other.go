@@ -16,3 +16,5 @@ func prepareKernel(Config, netip.Addr) (tun.Device, *kernelState, error) {
 }
 func (*kernelState) routes(*Node) {}
 func (*kernelState) cleanup()     {}
+
+func filterKernelTraffic(local tun.Device, _ *Node) tun.Device { return local }

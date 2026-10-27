@@ -133,6 +133,7 @@ func Start(ctx context.Context, config Config) (*Node, error) {
 	node := &Node{kernel: kernel, Record: record, network: network, api: api, ctx: child, cancel: cancel, peers: make(map[string]cachedPeer), ephemeral: ephemeral, errors: make(chan error, 1)}
 	bind := &meshBind{api: api, base: child, ensurePeer: node.ensurePeer, fatal: node.errors}
 	node.bind = bind
+	local = filterKernelTraffic(local, node)
 	wireguard := device.NewDevice(local, bind, device.NewLogger(device.LogLevelSilent, ""))
 	node.device = wireguard
 	if err = wireguard.IpcSet("private_key=" + hex.EncodeToString(private) + "\n"); err != nil {

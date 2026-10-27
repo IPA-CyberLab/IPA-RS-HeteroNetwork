@@ -7247,9 +7247,31 @@ fn peer_map_visibility_metrics(
     nodes: &[NodeRecord],
     policy: &ClusterPolicy,
 ) -> PeerMapVisibilityMetrics {
+    // HTTP application participants have no native full-mesh peer map. Their
+    // usage is reported separately; scaling them must not create an N² audit.
+    let nodes = nodes
+        .iter()
+        .filter(|node| !node.is_http_only())
+        .collect::<Vec<_>>();
+    if policy.acl_rules.is_empty() {
+        let destinations = nodes.len().saturating_sub(1);
+        let pairs = nodes.len().saturating_mul(destinations);
+        let routes = nodes
+            .iter()
+            .map(|node| node.routes.len())
+            .sum::<usize>()
+            .saturating_mul(destinations);
+        return PeerMapVisibilityMetrics {
+            peer_candidates: pairs,
+            visible_peers: pairs,
+            route_candidates: routes,
+            visible_routes: routes,
+            ..Default::default()
+        };
+    }
     let mut metrics = PeerMapVisibilityMetrics::default();
-    for source in nodes {
-        for target in nodes {
+    for source in &nodes {
+        for target in &nodes {
             if source.node_id == target.node_id {
                 continue;
             }
@@ -17384,6 +17406,110 @@ mod tests {
             Some(false),
             "retry after ACK re-enqueued a packet"
         );
+        // The host bridge authorizes the inner address pair as well as its
+        // encrypted outer peer: no underlay access or wrong client gateway.
+        store
+            .nodes
+            .write()
+            .await
+            .get_mut(&node_id("mesh-b"))
+            .ok_or("missing cloud")?
+            .tags
+            .insert(ipars_types::Tag::from_string("heteronetwork-http-only"));
+        let other = store
+            .get_node(&node_id("mesh-other"))
+            .await?
+            .ok_or("missing destination")?;
+        let forwarding = || MeshAction::Forward {
+            source: target.vpn_ip.0,
+            destination: other.vpn_ip.0,
+        };
+        assert_eq!(
+            a.http_mesh_request(signed("mesh-a", forwarding())?)
+                .await?
+                .accepted,
+            Some(true)
+        );
+        assert!(
+            a.http_mesh_request(signed("mesh-b", forwarding())?)
+                .await
+                .is_err(),
+            "cloud caller was allowed to authorize forwarding"
+        );
+        assert!(
+            a.http_mesh_request(signed(
+                "mesh-a",
+                MeshAction::Forward {
+                    source: target.vpn_ip.0,
+                    destination: "192.0.2.1".parse()?
+                }
+            )?)
+            .await
+            .is_err(),
+            "underlay forwarding was authorized"
+        );
+        store
+            .nodes
+            .write()
+            .await
+            .get_mut(&other.node_id)
+            .ok_or("missing client")?
+            .role = Role::from_string("client");
+        assert!(
+            a.http_mesh_request(signed("mesh-a", forwarding())?)
+                .await
+                .is_err(),
+            "client without a gateway was reachable"
+        );
+        store.client_gateway_selections.write().await.insert(
+            other.node_id.clone(),
+            ClientGatewaySelection {
+                client_id: other.node_id.clone(),
+                gateway_node_id: node_id("mesh-a"),
+                selected_at: Utc::now(),
+            },
+        );
+        assert_eq!(
+            a.http_mesh_request(signed("mesh-a", forwarding())?)
+                .await?
+                .accepted,
+            Some(true)
+        );
+        let mut denied = ClusterPolicy::default();
+        denied.acl_rules.push(AclRule {
+            id: "deny-cloud-client".into(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::from([ipars_types::Tag::from_string("heteronetwork-http-only")]),
+            to_roles: BTreeSet::from([Role::from_string("client")]),
+            to_tags: BTreeSet::new(),
+            routes: vec![],
+            protocol: TransportProtocol::Any,
+            action: AclAction::Deny,
+        });
+        denied.acl_rules.push(AclRule {
+            id: "allow-other-pairs".into(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: vec![],
+            protocol: TransportProtocol::Any,
+            action: AclAction::Allow,
+        });
+        store.upsert_cluster_policy(&cluster, denied).await?;
+        a.http_mesh_request(signed(
+            "mesh-a",
+            MeshAction::Peer {
+                address: target.vpn_ip.to_string(),
+            },
+        )?)
+        .await?;
+        assert!(
+            a.http_mesh_request(signed("mesh-a", forwarding())?)
+                .await
+                .is_err(),
+            "inner client ACL was bypassed by a gateway tunnel"
+        );
         let stats = b.http_mesh_stats(&BTreeSet::from([target.node_id])).await?;
         assert_eq!(stats[0].received_bytes, 32);
         assert_eq!(stats[0].pending_batches, 0);
@@ -17418,6 +17544,11 @@ mod tests {
         assert_eq!(before.topology_epoch, after.topology_epoch);
         assert_eq!(before.neighbors, after.neighbors);
         assert_eq!(plane.list_nodes().await?.len(), 5);
+        assert_eq!(
+            peer_map_visibility_metrics(&plane.list_nodes().await?, &ClusterPolicy::default())
+                .peer_candidates,
+            2
+        );
         Ok(())
     }
 

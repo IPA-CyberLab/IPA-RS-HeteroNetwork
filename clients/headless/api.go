@@ -52,6 +52,8 @@ type action struct {
 	HTTPOnly         *bool    `json:"http_only,omitempty"`
 	After            *string  `json:"after,omitempty"`
 	Limit            *uint16  `json:"limit,omitempty"`
+	Source           string   `json:"source,omitempty"`
+	Destination      string   `json:"destination,omitempty"`
 }
 type ack struct {
 	Source  string `json:"source"`
@@ -187,7 +189,7 @@ func (api *API) meshRequest(ctx context.Context, value action) (meshResponse, er
 		return meshResponse{}, err
 	}
 	endpoint := api.mesh
-	if value.Operation == "peer" || value.Operation == "lease" || value.Operation == "leave" || value.Operation == "routes" {
+	if value.Operation == "peer" || value.Operation == "lease" || value.Operation == "leave" || value.Operation == "routes" || value.Operation == "forward" {
 		endpoint = api.control
 	}
 	var result meshResponse

@@ -37,6 +37,10 @@ pub enum MeshAction {
         limit: u16,
     },
     Leave,
+    Forward {
+        source: IpAddr,
+        destination: IpAddr,
+    },
     Peer {
         address: String,
     },
@@ -648,6 +652,61 @@ impl<S: ControlPlaneStore> ControlPlane<S> {
             }
             MeshAction::Leave => {
                 self.remove_verified_node(&source.node_id, false).await?;
+                Ok(MeshResponse {
+                    accepted: Some(true),
+                    ..Default::default()
+                })
+            }
+            MeshAction::Forward {
+                source: origin,
+                destination,
+            } => {
+                if source.role.is_client() || source.is_http_only() {
+                    return Err(ControlPlaneError::RelayDenied);
+                }
+                let origin = self
+                    .store
+                    .find_node_by_vpn_ip(origin)
+                    .await?
+                    .ok_or(ControlPlaneError::RelayDenied)?;
+                let destination = self
+                    .store
+                    .find_node_by_vpn_ip(destination)
+                    .await?
+                    .ok_or(ControlPlaneError::RelayDenied)?;
+                // Authorize the inner IP pair, not just the outer gateway tunnel.
+                // A cloud participant must not use the bridge to reach underlay
+                // addresses or bypass another client's ACL/gateway assignment.
+                let cloud = match (origin.is_http_only(), destination.is_http_only()) {
+                    (true, false) => &origin,
+                    (false, true) => &destination,
+                    _ => return Err(ControlPlaneError::RelayDenied),
+                };
+                self.authorize_mesh_pair(&source, cloud).await?;
+                let policy = self.current_cluster_policy().await?;
+                if origin.cluster_id != source.cluster_id
+                    || destination.cluster_id != source.cluster_id
+                    || origin.is_administratively_stopped()
+                    || destination.is_administratively_stopped()
+                    || (!policy.acl_rules.is_empty()
+                        && (!acl_allows_peer(&origin, &destination, &policy)
+                            || !acl_allows_peer(&destination, &origin, &policy)))
+                {
+                    return Err(ControlPlaneError::RelayDenied);
+                }
+                for client in [&origin, &destination]
+                    .into_iter()
+                    .filter(|node| node.role.is_client())
+                {
+                    if self
+                        .store
+                        .get_client_gateway_selection(&client.node_id)
+                        .await?
+                        .is_none_or(|selection| selection.gateway_node_id != source.node_id)
+                    {
+                        return Err(ControlPlaneError::RelayDenied);
+                    }
+                }
                 Ok(MeshResponse {
                     accepted: Some(true),
                     ..Default::default()

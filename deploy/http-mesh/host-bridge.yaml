@@ -10,7 +10,7 @@
   tasks:
     - name: Skip hosts explicitly stopped by the operator
       ansible.builtin.meta: end_host
-      when: mesh_roster.node_states[inventory_hostname].state | default('active') == 'stopped'
+      when: mesh_roster.node_states.get(inventory_hostname, {}).get('state', 'active') == 'stopped'
 
     - name: Require a tested local artifact and a trusted control-plane origin
       ansible.builtin.assert:
