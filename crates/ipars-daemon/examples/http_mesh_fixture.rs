@@ -57,6 +57,24 @@ async fn serve<S: ControlPlaneStore + TokenLedger + 'static>(store: Arc<S>) -> a
             }
             records.push(node);
         }
+        // Exercise the real SQL-backed client lookup. PostgreSQL stores a
+        // timestamptz; SQLite stores milliseconds, and both must round-trip.
+        let selected_at = chrono::DateTime::from_timestamp_millis(now.timestamp_millis())
+            .ok_or_else(|| anyhow::anyhow!("invalid fixture timestamp"))?;
+        let selection = ipars_types::api::ClientGatewaySelection {
+            client_id: records[4].node_id.clone(),
+            gateway_node_id: records[1].node_id.clone(),
+            selected_at,
+        };
+        store
+            .upsert_client_gateway_selection(selection.clone())
+            .await?;
+        assert_eq!(
+            store
+                .get_client_gateway_selection(&selection.client_id)
+                .await?,
+            Some(selection)
+        );
         // Put 100 older stopped leases before the expired active lease. They
         // must not consume the candidate limit and starve active-node cleanup.
         mesh.lease(&records[0], true, true, now - chrono::Duration::minutes(6))

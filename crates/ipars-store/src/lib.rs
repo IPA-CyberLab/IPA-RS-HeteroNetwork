@@ -2464,7 +2464,7 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         &self,
         client: &NodeId,
     ) -> Result<Option<ClientGatewaySelection>, ControlPlaneError> {
-        let row=sqlx::query("SELECT client_id, gateway_node_id, selected_at_millis FROM client_gateway_selections WHERE client_id = $1")
+        let row=sqlx::query("SELECT client_id, gateway_node_id, selected_at FROM client_gateway_selections WHERE client_id = $1")
             .bind(client.as_str()).fetch_optional(&self.pool).await.map_err(sql_error)?;
         row.map(|row| -> Result<ClientGatewaySelection, ControlPlaneError> {
             Ok(ClientGatewaySelection {
@@ -2475,12 +2475,9 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
                     row.try_get::<String, _>("gateway_node_id")
                         .map_err(sql_error)?,
                 ),
-                selected_at: DateTime::from_timestamp_millis(
-                    row.try_get("selected_at_millis").map_err(sql_error)?,
-                )
-                .ok_or_else(|| {
-                    ControlPlaneError::Store("invalid gateway selection timestamp".to_string())
-                })?,
+                selected_at: row
+                    .try_get::<DateTime<Utc>, _>("selected_at")
+                    .map_err(sql_error)?,
             })
         })
         .transpose()
