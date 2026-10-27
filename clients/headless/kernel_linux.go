@@ -191,13 +191,8 @@ func (state *kernelState) routes(node *Node) {
 					failure = errors.New("invalid HTTP peer route")
 					break
 				}
-				node.lookupMu.Lock()
-				_, err = node.configurePeer(record, id)
-				node.lookupMu.Unlock()
-				if err != nil {
-					failure = err
-					break
-				}
+				// Route inventory is O(members); WireGuard peers are created
+				// only when lazyTUN or an incoming envelope actually needs one.
 				if err = state.ip(ctx, "route", "replace", address.String()+"/32", "dev", state.name, "src", state.source, "table", strconv.Itoa(state.table)); err != nil {
 					failure = err
 					break
@@ -209,7 +204,17 @@ func (state *kernelState) routes(node *Node) {
 					if _, ok := desired[id]; ok {
 						continue
 					}
-					state.ip(ctx, "route", "delete", previous.VPNIP+"/32", "dev", state.name, "table", strconv.Itoa(state.table))
+					if err := state.ip(ctx, "route", "delete", previous.VPNIP+"/32", "dev", state.name, "table", strconv.Itoa(state.table)); err != nil {
+						failure = err
+						break
+					}
+					node.lookupMu.Lock()
+					err := node.dropPeerLocked(id)
+					node.lookupMu.Unlock()
+					if err != nil {
+						failure = err
+						break
+					}
 					delete(state.installed, id)
 				}
 			}

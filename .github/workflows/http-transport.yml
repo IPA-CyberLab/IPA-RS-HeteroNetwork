@@ -141,8 +141,15 @@ jobs:
       - name: Verify with no root, no Linux capabilities, no TUN and no OS UDP
         run: |
           go -C clients/headless test -mod=readonly -c -o "$RUNNER_TEMP/mesh-e2e.test"
-          sudo --preserve-env=HETERONETWORK_HTTP_MESH_FIXTURE,HTTP_MESH_TEST_DATABASE \
-            python3 scripts/http_mesh_restricted_e2e.py "$RUNNER_TEMP/mesh-e2e.test" \
+          restricted_root="$(mktemp -d /tmp/heteronet-restricted.XXXXXX)"
+          trap 'sudo python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1])" "$restricted_root"' EXIT
+          chmod 755 "$restricted_root"
+          install -m 755 "$HETERONETWORK_HTTP_MESH_FIXTURE" "$restricted_root/http_mesh_fixture"
+          install -m 755 "$RUNNER_TEMP/mesh-e2e.test" "$restricted_root/mesh-e2e.test"
+          install -d -m 1777 "$restricted_root/tmp"
+          sudo --preserve-env=HTTP_MESH_TEST_DATABASE \
+            env HETERONETWORK_HTTP_MESH_FIXTURE="$restricted_root/http_mesh_fixture" TMPDIR="$restricted_root/tmp" \
+            python3 scripts/http_mesh_restricted_e2e.py "$restricted_root/mesh-e2e.test" \
             -test.run 'TestRestrictedEnvironment|TestHTTPMeshRealWireGuardAcrossScaleAndRestart' -test.v -test.timeout=3m
       - name: Connect the physical VPN host to unprivileged HTTP cloud nodes
         run: |

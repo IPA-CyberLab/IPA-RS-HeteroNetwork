@@ -332,6 +332,26 @@ func TestHTTPMeshRealWireGuardAcrossScaleAndRestart(t *testing.T) {
 	if err != nil || response.StatusCode != 200 || len(stats.Mesh) != 1 || stats.Mesh[0].ReceivedBytes == 0 || stats.Mesh[0].LastPoll == nil {
 		t.Fatal("shared transport usage or liveness was missing")
 	}
+	// An idle peer releases real WireGuard state as well as lookup aliases.
+	// The existing private application remains reachable after lazy reattachment.
+	nodes[0].lookupMu.Lock()
+	nodes[0].peersMu.Lock()
+	for key, cached := range nodes[0].peers {
+		if cached.endpoint.node == nodes[1].Record.NodeID {
+			cached.at = time.Now().Add(-3 * time.Minute)
+			nodes[0].peers[key] = cached
+		}
+	}
+	nodes[0].peersMu.Unlock()
+	pruneErr := nodes[0].pruneIdlePeersLocked(time.Now())
+	nodes[0].peersMu.Lock()
+	remaining := len(nodes[0].peers)
+	nodes[0].peersMu.Unlock()
+	nodes[0].lookupMu.Unlock()
+	if pruneErr != nil || remaining != 0 {
+		t.Fatal("idle peer state/aliases were retained")
+	}
+	read()
 	t.Log("PASS: TUN-free real WireGuard TCP/UDP; HTTP replicas 3 -> 5 -> 2 -> 3; committed-response loss; cross-replica usage")
 }
 

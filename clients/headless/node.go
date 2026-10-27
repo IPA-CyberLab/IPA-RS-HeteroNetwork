@@ -133,7 +133,7 @@ func Start(ctx context.Context, config Config) (*Node, error) {
 	node := &Node{kernel: kernel, Record: record, network: network, api: api, ctx: child, cancel: cancel, peers: make(map[string]cachedPeer), ephemeral: ephemeral, errors: make(chan error, 1)}
 	bind := &meshBind{api: api, base: child, ensurePeer: node.ensurePeer, fatal: node.errors}
 	node.bind = bind
-	local = filterKernelTraffic(local, node)
+	local = &lazyTUN{Device: filterKernelTraffic(local, node), node: node}
 	wireguard := device.NewDevice(local, bind, device.NewLogger(device.LogLevelSilent, ""))
 	node.device = wireguard
 	if err = wireguard.IpcSet("private_key=" + hex.EncodeToString(private) + "\n"); err != nil {
@@ -170,6 +170,14 @@ func (node *Node) ensurePeer(ctx context.Context, address string) (meshEndpoint,
 	full := len(node.peers) >= 4096
 	node.peersMu.Unlock()
 	if full {
+		if err := node.pruneIdlePeersLocked(time.Now()); err != nil {
+			return meshEndpoint{}, err
+		}
+		node.peersMu.Lock()
+		full = len(node.peers) >= 4096
+		node.peersMu.Unlock()
+	}
+	if full {
 		return meshEndpoint{}, errors.New("active HTTP mesh peer cache full")
 	}
 	call, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -179,6 +187,51 @@ func (node *Node) ensurePeer(ctx context.Context, address string) (meshEndpoint,
 		return meshEndpoint{}, err
 	}
 	return node.configurePeer(record, address)
+}
+
+// Caller holds lookupMu. Departed/idle peers must release both WireGuard
+// state and every discovery alias, so autoscaling churn cannot fill the cache.
+func (node *Node) dropPeerLocked(id string) error {
+	node.peersMu.Lock()
+	peer, exists := node.peers[id]
+	node.peersMu.Unlock()
+	if !exists {
+		return nil
+	}
+	if err := node.device.IpcSet("public_key=" + peer.publicKey + "\nremove=true\n"); err != nil {
+		return errors.New("idle WireGuard peer could not be removed")
+	}
+	node.peersMu.Lock()
+	defer node.peersMu.Unlock()
+	for key, value := range node.peers {
+		if value.endpoint.node == id {
+			delete(node.peers, key)
+		}
+	}
+	return nil
+}
+func (node *Node) pruneIdlePeersLocked(now time.Time) error {
+	node.peersMu.Lock()
+	var idle []string
+	for key, peer := range node.peers {
+		if key == peer.endpoint.node && now.Sub(peer.at) > 2*time.Minute {
+			idle = append(idle, key)
+		}
+	}
+	node.peersMu.Unlock()
+	for _, id := range idle {
+		if err := node.dropPeerLocked(id); err != nil {
+			return err
+		}
+	}
+	node.peersMu.Lock()
+	defer node.peersMu.Unlock()
+	for key, peer := range node.peers {
+		if key != peer.endpoint.node && now.Sub(peer.at) > 2*time.Minute {
+			delete(node.peers, key)
+		}
+	}
+	return nil
 }
 
 // Caller holds lookupMu. Records come from authenticated HTTPS discovery.
