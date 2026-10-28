@@ -1,0 +1,29 @@
+# Replacement for the registry data lost in the 2026-10-25 outage. User-approved
+# reset on 2026-10-28; no user workspace PVC is selected by this declaration.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: registry-replicated
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "2"
+  fsType: ext4
+  dataEngine: v1
+  staleReplicaTimeout: "30"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: harbor-registry-replicated
+  namespace: heterocloud-registry
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: registry-replicated
+  resources:
+    requests:
+      storage: 32Gi

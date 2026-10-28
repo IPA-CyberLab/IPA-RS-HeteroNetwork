@@ -5,10 +5,11 @@ namespaceOverride: longhorn-system
 persistence:
   createStorageClass: false
   defaultClass: false
-  defaultClassReplicaCount: 3
+  defaultClassReplicaCount: 2
 defaultSettings:
   createDefaultDiskLabeledNodes: true
-  defaultReplicaCount: '{"v1":"3","v2":"3"}'
+  defaultReplicaCount: '{"v1":"2","v2":"2"}'
+  allowVolumeCreationWithDegradedAvailability: false
   replicaSoftAntiAffinity: false
   v1DataEngine: true
   v2DataEngine: false
@@ -60,7 +61,7 @@ extraObjects:
     reclaimPolicy: Retain
     volumeBindingMode: Immediate
     parameters:
-      numberOfReplicas: "3"
+      numberOfReplicas: "2"
       fsType: ext4
       migratable: "false"
       dataEngine: v1

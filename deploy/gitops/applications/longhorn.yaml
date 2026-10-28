@@ -18,11 +18,13 @@ spec:
           jobEnabled: false
         persistence:
           defaultClass: true
-          defaultClassReplicaCount: 3
+          defaultClassReplicaCount: 2
           defaultDataLocality: disabled
           reclaimPolicy: Retain
         defaultSettings:
-          defaultReplicaCount: "3"
+          defaultReplicaCount: '{"v1":"2","v2":"2"}'
+          allowVolumeCreationWithDegradedAvailability: false
+          replicaSoftAntiAffinity: false
           replicaAutoBalance: best-effort
           storageMinimalAvailablePercentage: "15"
           storageReservedPercentageForDefaultDisk: "20"

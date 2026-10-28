@@ -24,3 +24,21 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
 value: "false"
+---
+apiVersion: longhorn.io/v1beta2
+kind: Setting
+metadata:
+  name: default-replica-count
+  namespace: longhorn-system
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+value: '{"v1":"2","v2":"2"}'
+---
+apiVersion: longhorn.io/v1beta2
+kind: Setting
+metadata:
+  name: allow-volume-creation-with-degraded-availability
+  namespace: longhorn-system
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+value: "false"
