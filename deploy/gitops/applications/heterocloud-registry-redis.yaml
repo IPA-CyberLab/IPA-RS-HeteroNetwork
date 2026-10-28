@@ -32,7 +32,7 @@ spec:
           automateClusterRecovery: true
         replica:
           replicaCount: 3
-          podAntiAffinityPreset: hard
+          podAntiAffinityPreset: soft
           persistence:
             enabled: true
             storageClass: longhorn

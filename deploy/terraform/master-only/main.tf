@@ -25,15 +25,16 @@ locals {
     heterocloud-edge       = "deploy/gitops/envoy-gateway"
   }
   managed_external_application_files = {
-    longhorn               = "deploy/gitops/applications/longhorn.yaml"
-    heterocloud-registry   = "deploy/gitops/applications/heterocloud-registry.yaml"
-    envoy-gateway          = "deploy/gitops/applications/envoy-gateway.yaml"
-    heterocloud            = "deploy/gitops/applications/heterocloud.yaml"
-    heterocloud-flash      = "deploy/gitops/applications/heterocloud-flash.yaml"
-    heterocloud-flow       = "deploy/gitops/applications/heterocloud-flow.yaml"
-    heterocloud-syouyu     = "deploy/gitops/applications/heterocloud-syouyu.yaml"
-    heterocloud-vpc        = "deploy/gitops/applications/heterocloud-vpc.yaml"
-    heterocloud-vpc-egress = "deploy/gitops/applications/heterocloud-vpc-egress.yaml"
+    longhorn                   = "deploy/gitops/applications/longhorn.yaml"
+    heterocloud-registry       = "deploy/gitops/applications/heterocloud-registry.yaml"
+    heterocloud-registry-redis = "deploy/gitops/applications/heterocloud-registry-redis.yaml"
+    envoy-gateway              = "deploy/gitops/applications/envoy-gateway.yaml"
+    heterocloud                = "deploy/gitops/applications/heterocloud.yaml"
+    heterocloud-flash          = "deploy/gitops/applications/heterocloud-flash.yaml"
+    heterocloud-flow           = "deploy/gitops/applications/heterocloud-flow.yaml"
+    heterocloud-syouyu         = "deploy/gitops/applications/heterocloud-syouyu.yaml"
+    heterocloud-vpc            = "deploy/gitops/applications/heterocloud-vpc.yaml"
+    heterocloud-vpc-egress     = "deploy/gitops/applications/heterocloud-vpc-egress.yaml"
   }
   external_application_manifests = {
     for key, path in local.managed_external_application_files :

@@ -39,7 +39,7 @@ spec:
         existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD
         existingSecretSecretKey: harbor-core-runtime
         core:
-          replicas: 3
+          replicas: 2
           nodeSelector:
             node-role.kubernetes.io/control-plane: ""
           existingSecret: harbor-core-runtime
@@ -48,22 +48,26 @@ spec:
           secretName: harbor-token
           podDisruptionBudget:
             enabled: true
-            minAvailable: 2
+            minAvailable: 1
           topologySpreadConstraints:
             - maxSkew: 1
               topologyKey: kubernetes.io/hostname
               whenUnsatisfiable: DoNotSchedule
+              nodeTaintsPolicy: Honor
+              matchLabelKeys: [pod-template-hash]
         portal:
-          replicas: 3
+          replicas: 2
           podDisruptionBudget:
             enabled: true
-            minAvailable: 2
+            minAvailable: 1
           topologySpreadConstraints:
             - maxSkew: 1
               topologyKey: kubernetes.io/hostname
               whenUnsatisfiable: DoNotSchedule
+              nodeTaintsPolicy: Honor
+              matchLabelKeys: [pod-template-hash]
         jobservice:
-          replicas: 3
+          replicas: 2
           nodeSelector:
             node-role.kubernetes.io/control-plane: ""
           existingSecret: harbor-jobservice-runtime
@@ -72,11 +76,13 @@ spec:
             - database
           podDisruptionBudget:
             enabled: true
-            minAvailable: 2
+            minAvailable: 1
           topologySpreadConstraints:
             - maxSkew: 1
               topologyKey: kubernetes.io/hostname
               whenUnsatisfiable: DoNotSchedule
+              nodeTaintsPolicy: Honor
+              matchLabelKeys: [pod-template-hash]
         registry:
           replicas: 2
           existingSecret: harbor-registry-runtime
@@ -94,14 +100,16 @@ spec:
               nodeTaintsPolicy: Honor
               matchLabelKeys: [pod-template-hash]
         nginx:
-          replicas: 3
+          replicas: 2
           podDisruptionBudget:
             enabled: true
-            minAvailable: 2
+            minAvailable: 1
           topologySpreadConstraints:
             - maxSkew: 1
               topologyKey: kubernetes.io/hostname
               whenUnsatisfiable: DoNotSchedule
+              nodeTaintsPolicy: Honor
+              matchLabelKeys: [pod-template-hash]
         exporter:
           replicas: 2
           nodeSelector:

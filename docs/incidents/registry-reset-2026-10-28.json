@@ -1,0 +1,147 @@
+{
+  "observed_at": "2026-10-28T09:36:47.625400+00:00",
+  "default_storage_replicas": 2,
+  "initial_degraded_creation_allowed": false,
+  "registry": {
+    "volume": "pvc-682f4543-8b4f-482d-80fb-43961c8ace3d",
+    "size_gib": 32,
+    "healthy_independent_hosts": [
+      "ichikawap1",
+      "uc-k8sp5"
+    ],
+    "reset_lost_artifact_records": 6,
+    "reset_stale_blob_descriptor_cache_entries": 257,
+    "all_republished_coder_blobs_read_back_and_digest_verified": true
+  },
+  "cache_recovery": {
+    "result": "passed",
+    "recreated_failed_cache_volumes": [
+      {
+        "ordinal": 1,
+        "volume": "pvc-721742d4-1e7b-4f67-9ef5-c14ad29edc03",
+        "copies": 2,
+        "health": "healthy"
+      },
+      {
+        "ordinal": 2,
+        "volume": "pvc-0b719e3b-0923-45b1-a8c2-b6d49fc869d7",
+        "copies": 2,
+        "health": "healthy"
+      }
+    ],
+    "active_cache_data_preserved": true
+  },
+  "old_volume_cleanup": {
+    "result": "passed",
+    "removed_registry_volume": "pvc-d5e6cff1-8fd6-4073-b27e-47ae17a339f9",
+    "removed_stale_registry_pods": [
+      "harbor-registry-567c4d997b-2px52",
+      "harbor-registry-567c4d997b-ffn27",
+      "harbor-registry-567c4d997b-m66q4"
+    ],
+    "replacement_volume": "pvc-682f4543-8b4f-482d-80fb-43961c8ace3d"
+  },
+  "reclaimed_orphan_bytes": 21497114624,
+  "workspace_e2e": {
+    "run_id": "77512a27f78047ffbd4309613f0c4e4d",
+    "result": "passed",
+    "checks": {
+      "automatic_image_inspection_and_replicated_home": true,
+      "agent_connected_and_ready": true,
+      "chromium_file_websocket_and_reload": true
+    },
+    "cleanup": {
+      "all_new_resources_removed": true,
+      "pods_deployment_and_network_policy_absence_verified": true
+    },
+    "workspace_id": "b40eba97-da17-408a-954d-7857386de503",
+    "service_id": "01a181c9-2424-7e03-b49b-958612259055"
+  },
+  "browser_e2e": {
+    "schema_version": 1,
+    "observed_at": "2026-10-28T09:14:50.906Z",
+    "passed": true,
+    "checks": [
+      {
+        "name": "folder_and_file",
+        "passed": true,
+        "status": 200,
+        "folder_loaded": true,
+        "file_opened": true,
+        "editor_rendered": true,
+        "websocket_bidirectional": true,
+        "stable_connection_ms": 5000,
+        "elapsed_ms": 12327
+      },
+      {
+        "name": "reload_existing_folder",
+        "passed": true,
+        "status": 200,
+        "folder_loaded": true,
+        "file_opened": true,
+        "editor_rendered": true,
+        "websocket_bidirectional": true,
+        "stable_connection_ms": 5000,
+        "elapsed_ms": 9306
+      }
+    ],
+    "server_errors": []
+  },
+  "existing_workspaces": [
+    {
+      "workspace": "ramen",
+      "agent_connected": true,
+      "agent_ready": true,
+      "code_server_healthy": true,
+      "persistent_home_retained": true,
+      "persistent_home_created_at": "2026-10-28T07:37:17Z"
+    },
+    {
+      "workspace": "immunefi",
+      "agent_connected": true,
+      "agent_ready": true,
+      "code_server_healthy": true,
+      "persistent_home_retained": true,
+      "persistent_home_created_at": "2026-10-27T14:59:32Z"
+    },
+    {
+      "workspace": "dYdx",
+      "agent_connected": true,
+      "agent_ready": true,
+      "code_server_healthy": true,
+      "persistent_home_retained": true,
+      "persistent_home_created_at": "2026-10-27T15:58:33Z"
+    }
+  ],
+  "additional_resource_limit_events": [
+    {
+      "workspace": "dYdx",
+      "configured_limit": "8Gi memory",
+      "reason": "CONSTRAINT_MEMCG / OOMKilled",
+      "automatic_container_restart": true,
+      "agent_reconnected": true
+    },
+    {
+      "workspace": "immunefi",
+      "configured_limit": "10Gi ephemeral storage",
+      "reason": "Evicted: ephemeral local storage usage exceeds 10737418240 bytes",
+      "replacement_pod_created": true,
+      "same_deployment_revision": true,
+      "persistent_home_retained": true,
+      "agent_reconnected": true
+    }
+  ],
+  "planned_cache_failover": {
+    "result": "passed",
+    "sentinel_master_changed": true,
+    "public_manifest_digest_verified": true,
+    "public_config_blob_digest_verified": true,
+    "registry_health": "healthy"
+  },
+  "flash_runtime_commit": "d153cc012235afda0d679bae650f436f16e6dd71",
+  "flash_chart_commit": "52b46b3ab0b43df06ce5717390a94590ea3bda90",
+  "ci": {
+    "release": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/40652978738",
+    "operations": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/40658922912"
+  }
+}

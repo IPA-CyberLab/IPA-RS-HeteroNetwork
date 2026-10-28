@@ -233,3 +233,27 @@ References: [Terraform provisioners](https://developer.hashicorp.com/terraform/l
 [Kubernetes state backend](https://developer.hashicorp.com/terraform/language/backend/kubernetes),
 [Argo CD server-side apply](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/),
 [Kubernetes admission mutation](https://kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/).
+
+## Registry and Coder workspace images
+
+New Longhorn volumes default to two replicas on independent workers. Initial
+creation requires every requested replica. The registry uses the separately
+declared `harbor-registry-replicated` claim. Changing defaults does not shrink
+existing user disks or delete their data.
+
+`deploy/coder/workspace-image.json` declares the image for future Standard
+Develop/Big builds. `terraform_data.coder_workspace_image` validates a new Coder
+template version before activation, preserving template files and resource
+overrides. Supply a short-lived `CODER_SESSION_TOKEN` in the operator's process
+environment when applying that resource; it never enters Terraform state.
+Running workspaces are retained.
+
+`scripts/coder_workspace_bootstrap_live_e2e.py` accepts explicit endpoint,
+template, pinned image, kubectl/kubeconfig, browser script and report paths.
+Use `IPA-RS-HeteroCloud/scripts/e2e/coder_ide_browser.mjs` with its installed
+Playwright/Chromium dependencies. The probe creates its own workspace, checks
+automatic provisioning, opens a file in the IDE, checks bidirectional WebSocket
+traffic and reloads. It removes only its newly created workspace and fenced
+storage resources, and fails when cleanup cannot be verified. A temporary
+`CODER_SESSION_TOKEN` is supplied through the environment and revoked afterward
+by the operator's credential issuer.
