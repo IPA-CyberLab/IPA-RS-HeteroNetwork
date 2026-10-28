@@ -6,9 +6,13 @@
   "workers_dev": false,
   "containers": [{
     "class_name": "HeteronetMember",
-    "image": "ghcr.io/ipa-cyberlab/heteronet-headless:sha-REPLACE_WITH_TESTED_COMMIT",
-    "max_instances": 10,
-    "instance_type": "basic"
+    "scheduling_policy": "durable_object",
+    "images": {
+      "base": {
+        "dockerfile": "../../../docker/http-mesh/Dockerfile",
+        "build_context": "../../../clients/headless"
+      }
+    }
   }],
   "durable_objects": { "bindings": [{ "name": "MEMBERS", "class_name": "HeteronetMember" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HeteronetMember"] }],

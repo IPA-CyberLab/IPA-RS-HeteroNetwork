@@ -188,7 +188,7 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm test
-          npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/cloudflare-mesh"
+          npm run check -- --outdir "$RUNNER_TEMP/cloudflare-mesh"
 
   publish-headless:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'

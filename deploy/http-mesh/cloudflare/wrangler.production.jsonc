@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "heteronet-http-members",
+  "account_id": "bcfa6be997048e886f5b7cddff7b723d",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-10-27",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "containers": [{
+    "class_name": "HeteronetMember",
+    "scheduling_policy": "durable_object",
+    "images": { "base": { "image": "registry.cloudflare.com/bcfa6be997048e886f5b7cddff7b723d/heteronet-headless@sha256:992b4b888782c041c9050ee3b5e6373f2c0838ffc1e0ade108300e758c7801ac" } }
+  }],
+  "durable_objects": { "bindings": [{ "name": "MEMBERS", "class_name": "HeteronetMember" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HeteronetMember"] }],
+  "vars": {
+    "HETERONETWORK_ENDPOINT": "https://163.220.236.61",
+    "HETERONETWORK_ARGS": ["--publish", "18081=127.0.0.1:8080"]
+  }
+}

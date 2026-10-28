@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-28T05:23:50.667124+00:00",
+  "result": "passed",
+  "provider": "Cloudflare Containers",
+  "account_id": "bcfa6be997048e886f5b7cddff7b723d",
+  "worker_url": "https://heteronet-http-members.fasutotesuto.workers.dev",
+  "durable_object_namespace": "a3b41cac28d64260a0fbe12b37c74880",
+  "scheduling_policy": "durable_object",
+  "instance_type": "lite",
+  "steady_instance_name": "cloudflare-1",
+  "steady_node": {
+    "node_id": "node-350e2bb11ebef83507591bf0fe6d1ba4",
+    "vpn_ip": "10.250.218.34"
+  },
+  "image": {
+    "source_commit": "687750881a3eff2955bbb62b0be8dd64e98b7ca4",
+    "published_source": "ghcr.io/ipa-cyberlab/heteronet-headless@sha256:9b98d650504aca9d0595d2ff0f6008fbeb392f50ac3af35cb3fd36d06d9b9b43",
+    "cloudflare_amd64": "registry.cloudflare.com/bcfa6be997048e886f5b7cddff7b723d/heteronet-headless@sha256:992b4b888782c041c9050ee3b5e6373f2c0838ffc1e0ade108300e758c7801ac"
+  },
+  "checks": {
+    "anonymous_management_status": 401,
+    "authenticated_management_status": 204,
+    "native_vpn_source": "uc-k8sp5",
+    "vpn_target_port": 18081,
+    "outer_transport": "HTTPS HTTP mesh; encrypted WireGuard packets",
+    "scale_sequence": [
+      {
+        "members": 1,
+        "observed_at": "2026-10-28T05:13:53.063557+00:00",
+        "tcp_checks": [
+          {
+            "node_id": "node-350e2bb11ebef83507591bf0fe6d1ba4",
+            "vpn_ip": "10.250.218.34",
+            "status": 204,
+            "elapsed_seconds": 0.713,
+            "empty_response": true
+          }
+        ]
+      },
+      {
+        "members": 3,
+        "observed_at": "2026-10-28T05:14:00.388124+00:00",
+        "tcp_checks": [
+          {
+            "node_id": "node-2010b116c93fd7f5e22e28bff406c8a2",
+            "vpn_ip": "10.250.238.92",
+            "status": 204,
+            "elapsed_seconds": 0.87,
+            "empty_response": true
+          },
+          {
+            "node_id": "node-350e2bb11ebef83507591bf0fe6d1ba4",
+            "vpn_ip": "10.250.218.34",
+            "status": 204,
+            "elapsed_seconds": 0.852,
+            "empty_response": true
+          },
+          {
+            "node_id": "node-a86464c5688bfc4593325f26b47c2174",
+            "vpn_ip": "10.250.94.163",
+            "status": 204,
+            "elapsed_seconds": 0.996,
+            "empty_response": true
+          }
+        ]
+      },
+      {
+        "members": 1,
+        "observed_at": "2026-10-28T05:14:03.308515+00:00",
+        "tcp_checks": [
+          {
+            "node_id": "node-350e2bb11ebef83507591bf0fe6d1ba4",
+            "vpn_ip": "10.250.218.34",
+            "status": 204,
+            "elapsed_seconds": 0.658,
+            "empty_response": true
+          }
+        ]
+      }
+    ],
+    "stopped_members_removed_from_vpn": true,
+    "survivor_identity_preserved": true,
+    "idle_without_management_requests": {
+      "seconds": 522,
+      "same_identity": true,
+      "native_tcp_status": 204
+    },
+    "after_worker_redeploy": {
+      "same_identity": true,
+      "vpn_ip": "10.250.218.34",
+      "native_tcp_status": 204
+    },
+    "local_unit_tests_passed": 6,
+    "worker_bundle_dry_run_passed": true
+  },
+  "credential_handling": {
+    "worker_secrets": [
+      "HETERONETWORK_JOIN_TOKEN",
+      "MANAGEMENT_TOKEN"
+    ],
+    "credentials_in_git": false,
+    "issuer_policy_max_ttl_seconds": 604800,
+    "issuer_policy_max_uses": 1000,
+    "automatic_enrollment_secret_rotation": false,
+    "enrollment_secret_expires_at": "2026-11-04T05:09:23.004261885Z"
+  },
+  "limitations": [
+    "Cloud Run and ECS account deployments were not tested by this run.",
+    "Cloudflare CLI dashboard reports inactive rows for these Durable Objects while the direct Container API and native VPN TCP checks succeed; native VPN probes are the running-state evidence.",
+    "The enrollment secret must be refreshed before expiry to admit new identities. Existing registered members continue polling independently of enrollment-token expiry."
+  ],
+  "final_worker_version_id": "d8462186-1b61-40e3-8b52-41f41133c99e"
+}

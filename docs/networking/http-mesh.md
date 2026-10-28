@@ -65,17 +65,17 @@ Linuxの物理VPNホストでのみ、CLIの`--kernel-interface hnhttp0`を使�
 
 ## クラウドへの配置
 
-配置例は`deploy/http-mesh/`にあります。アカウント・課金対象リソースを自動作成した実績を表すものではありません。接続先、既存ネットワーク、シークレット参照、テスト済みイメージを指定して適用します。アプリを一緒に動かす場合は、このCLIを組み込んだイメージかサイドカーを使用してください。
+配置設定は`deploy/http-mesh/`にあります。Cloudflare Containersは実アカウントへ配置し、既存VPNからの通信と1→3→1台の増減を検証しています。[実配置の設定と操作](../../deploy/http-mesh/cloudflare/README.md)、[検証記録](../verification/cloudflare-http-mesh-2026-10-28.json)を参照してください。Cloud RunとECSは配置例です。接続先、既存ネットワーク、シークレット参照、テスト済みイメージを指定して適用します。アプリを一緒に動かす場合は、このCLIを組み込んだイメージかサイドカーを使用してください。
 
 | 環境 | 配置設定 | 継続接続の設定 |
 |---|---|---|
 | Cloud Run | `cloud-run/main.tf` | CPU常時割当、min=1、内部入口、Secret Manager参照 |
 | ECS Fargate | `ecs/main.tf` | 非特権、全capability削除、タスクを1〜10にスケール、Secrets Manager/SSM参照 |
-| Cloudflare Containers | `cloudflare/` | 名前ごとに別コンテナ、休止タイマー延長、管理操作は認証後に実行 |
+| Cloudflare Containers | `cloudflare/wrangler.production.jsonc` | 名前ごとに別コンテナ、永続アラームで継続接続、管理操作は認証後に実行 |
 
 Cloud Runでは、VPNへの着信だけではスケールゼロからアプリを起動できません。継続して受信するアプリはmin=1以上・CPU常時割当が必要です。水平スケールで生まれた個々のノードは別IPになるため、アプリの負荷分散にはサービス側のディスカバリー/LBを使います。1個のVPN IPに複数のWireGuard状態を重ねる方式ではありません。
 
-Cloudflareの設定では`HETERONETWORK_ENDPOINT`とイメージを変更し、`HETERONETWORK_JOIN_TOKEN`、32文字以上の`MANAGEMENT_TOKEN`をWranglerのsecretとして保存します。設定ファイルの`vars`やTerraformの変数には秘密の値を入れません。管理用のWorkerルートを割り当て、`PUT /nodes/INSTANCE_NAME`で開始、`GET`でready確認、`DELETE`で停止します。名前を変えると別ノードです。管理トークンがない公開アクセスではコンテナを起動しません。最大インスタンス数はWranglerの`max_instances`で制限します。
+Cloudflareの設定では`HETERONETWORK_ENDPOINT`とイメージを変更し、`HETERONETWORK_JOIN_TOKEN`、32文字以上の`MANAGEMENT_TOKEN`をWranglerのsecretとして保存します。設定ファイルの`vars`やTerraformの変数には秘密の値を入れません。管理用のWorkerルートを割り当て、`PUT /nodes/INSTANCE_NAME`で開始、`GET`でready確認、`DELETE`で停止します。名前を変えると別ノードです。管理トークンがない公開アクセスではコンテナを起動しません。`durable_object`方式は`max_instances`に対応していないため、アカウントの上限と認証済み管理操作で制御します。実行サイズの既定は`lite`です。
 
 ECSのサブネットにはHTTPSへの外向き経路が必要です。実行ロールに指定のシークレット取得とイメージ取得・ログ書き込みだけを許可し、ノード用のWAN受信ルールは不要です。Cloud Runのサービスアカウントは指定の参加トークンのみを取得できます。
 
@@ -92,4 +92,4 @@ Actionsの`HTTP transport fallback`は、実際のRust制御プレーンを共�
 5. 1000個の異なるノードIDでの登録・署名付きポーリング。1000台分の同時通信帯域測定ではありません。
 6. 期限切れの一時ノードのみ削除し、固定・停止指定・更新済みノードを保持。
 
-このE2Eは上記の制約とプロトコルの検証です。各クラウドアカウントでの本番配置検証とは区別します。
+このActions E2Eは上記の制約とプロトコルの検証です。Cloudflareの実アカウントで行った配置検証は別の検証記録に保存しています。Cloud RunとECSの実アカウント配置は未検証です。
