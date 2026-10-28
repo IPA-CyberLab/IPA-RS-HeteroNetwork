@@ -1,0 +1,8 @@
+{
+  "endpoint": "https://coder.mizuame.app",
+  "image": "registry.heterocloud.mizuame.app/hc-019fbda8eff37610bdd58fe89e746c14/coder-standard-develop@sha256:c92ad25e123792881019b2b0b527d193bbcf19288a9c45a0605b98a27a7647b4",
+  "templates": [
+    "14e0910e-b43c-43a8-be19-99a2ece2bb29",
+    "7a6c19c0-025f-4139-8ea4-7fc4a4bf12fb"
+  ]
+}
