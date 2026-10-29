@@ -34,12 +34,12 @@ def dns_response(query, address, *, flags=0x8180, response_id=None):
 
 
 class OverlayConsoleConvergenceTests(unittest.TestCase):
-    def test_authenticated_browser_requires_acl_editor_evidence(self):
+    def test_authenticated_browser_requires_acl_and_monochrome_evidence(self):
         checks = [{"check": name, "status": 200} for name in (
             "Authenticated overview", "Overview after reload",
             "Refresh cookie in new tab", "Authenticated overview in new tab")]
-        for acl_verified in (False, True):
-            with self.subTest(acl_verified=acl_verified), tempfile.TemporaryDirectory() as tmp:
+        for acl_verified, monochrome_verified in ((False, True), (True, False), (True, True)):
+            with self.subTest(acl_verified=acl_verified, monochrome_verified=monochrome_verified), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)
                 credential = work / "credentials.json"
                 credential.write_text("{}\n")
@@ -50,14 +50,15 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
                     directory.mkdir()
                     report = {"result": "passed", "checks": checks, "authenticated": True,
                               "sessionRestored": True, "httpOnlyRefreshCookie": True,
-                              "aclEditorVerified": acl_verified}
+                              "aclEditorVerified": acl_verified, "monochromeVerified": monochrome_verified}
                     (directory / "report.json").write_text(json.dumps(report))
                     return subprocess.CompletedProcess([], 0, "", "")
 
                 with patch.object(verify.subprocess, "run", side_effect=browser):
-                    if acl_verified:
+                    if acl_verified and monochrome_verified:
                         result = verify.authenticated_browser_check(work, "10.250.0.2", credential)
                         self.assertTrue(result["acl_editor_verified"])
+                        self.assertTrue(result["monochrome_verified"])
                     else:
                         with self.assertRaisesRegex(RuntimeError, "ACL editor"):
                             verify.authenticated_browser_check(work, "10.250.0.2", credential)

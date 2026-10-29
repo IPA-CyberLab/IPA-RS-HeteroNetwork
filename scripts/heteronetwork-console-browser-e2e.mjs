@@ -109,6 +109,25 @@ try {
   report.sessionRestored = true;
   await restoredPage.screenshot({ path: path.join(runDirectory, "restored.png"), fullPage: true });
 
+  const palette = await restoredPage.evaluate(() => {
+    const probe = document.createElement("span");
+    document.body.append(probe);
+    const colors = ["primary", "primary-content", "secondary", "accent", "neutral", "info", "success", "warning", "error", "base-100", "base-200", "base-content"].map((name) => {
+      probe.style.color = `var(--color-${name})`;
+      return getComputedStyle(probe).color;
+    });
+    probe.remove();
+    const sidebar = document.querySelector(".ui-layout__sidebar");
+    const brand = document.querySelector(".ui-brand__mark span");
+    if (!sidebar || !brand) throw new Error("Console theme elements are missing");
+    return [...colors, getComputedStyle(sidebar).backgroundColor, getComputedStyle(brand).backgroundColor];
+  });
+  if (palette.some((color) => {
+    const match = /^rgb\((\d+), (\d+), (\d+)\)$/.exec(color);
+    return !match || match[1] !== match[2] || match[2] !== match[3];
+  })) throw new Error("The live console palette is not monochrome");
+  report.monochromeVerified = true;
+
   // Exercise the new ACL editor against the live read-only policy without
   // persisting the temporary rule or allowing a policy write from the browser.
   let blockedPolicyWrites = 0;
