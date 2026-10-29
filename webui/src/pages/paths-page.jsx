@@ -1,6 +1,6 @@
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import Select from "@cloudscape-design/components/select";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { Select } from "../ui.jsx";
 import { useMemo, useState } from "react";
 import { ResourceTable, Status } from "../components.jsx";
 import { age, nodeDisplayName, pathLabels, pathState } from "../utils.js";

@@ -1,11 +1,11 @@
-import BarChart from "@cloudscape-design/components/bar-chart";
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import ColumnLayout from "@cloudscape-design/components/column-layout";
-import Container from "@cloudscape-design/components/container";
-import Header from "@cloudscape-design/components/header";
-import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
-import SpaceBetween from "@cloudscape-design/components/space-between";
+import { BarChart } from "../ui.jsx";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { ColumnLayout } from "../ui.jsx";
+import { Container } from "../ui.jsx";
+import { Header } from "../ui.jsx";
+import { KeyValuePairs } from "../ui.jsx";
+import { SpaceBetween } from "../ui.jsx";
 import { ResourceTable, Status } from "../components.jsx";
 import {
   age,

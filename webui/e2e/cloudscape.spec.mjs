@@ -257,8 +257,12 @@ test("node enrollment submits distinct local and public ports", async ({ page })
     } });
   });
   await page.goto("/ui/#/enrollment");
-  await page.getByLabel("公開接続先URL（任意）", { exact: true }).fill("https://vpn.example.test\ntcp://vpn.example.test:51820");
-  await page.getByRole("button", { name: "ポート設定", exact: true }).click();
+  const url = page.getByLabel("公開接続先URLを追加", { exact: true });
+  await url.fill("https://vpn.example.test");
+  await url.press("Enter");
+  await url.fill("tcp://vpn.example.test:51820");
+  await url.press("Enter");
+  await page.getByText("ポート設定", { exact: true }).click();
   await page.getByLabel("WireGuard (UDP) 待ち受けポート", { exact: true }).fill("30100");
   await page.getByLabel("WireGuard (UDP) 公開ポート", { exact: true }).fill("40100");
   await page.getByLabel("Relay (UDP) 待ち受けポート", { exact: true }).fill("30101");
@@ -283,7 +287,7 @@ test("node enrollment submits distinct local and public ports", async ({ page })
   expect(submissions).toHaveLength(1);
 });
 
-test("login action works before the full Cloudscape bundle is available", async ({ page }) => {
+test("login action works before the full application bundle is available", async ({ page }) => {
   const appGate = { started: deferred(), release: deferred() };
   const deviceStarted = deferred();
   await installDelayedLoginBackend(page, { appGate, deviceStarted, deviceDelayMs: 0 });
@@ -366,7 +370,7 @@ test("device login shows a local waiting page before Keycloak responds", async (
   await popup.close();
 });
 
-test("Cloudscape console renders overview and hierarchical topology", async ({ page }) => {
+test("HeteroNetwork console renders overview and hierarchical topology", async ({ page }) => {
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await installMockBackend(page);
@@ -428,7 +432,7 @@ test("transport panel shows HTTP fallback, failures and stale reports", async ({
   await expect(page.getByRole("button", { name: "次のノード" })).toBeDisabled();
 });
 
-test("Cloudscape console remains operable on a mobile viewport", async ({ page }) => {
+test("HeteroNetwork console remains operable on a mobile viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await installMockBackend(page);
   await page.goto("/ui/#/topology");
@@ -455,4 +459,40 @@ test("node display names can be changed without replacing the OS hostname", asyn
 
   await expect(dialog.getByText("uc-k8sv1", { exact: true })).toBeVisible();
   await expect(dialog.getByText("uc-k8sp1", { exact: true })).toBeVisible();
+});
+
+test("ACL rules can be edited as individual values and saved", async ({ page }) => {
+  await installMockBackend(page);
+  let saved;
+  await page.route("**/v1/admin/policy", async route => {
+    if (route.request().method() === "PUT") {
+      saved = route.request().postDataJSON().cluster_policy;
+      await route.fulfill({ json: { cluster_policy: saved } });
+    } else await route.fulfill({ json: { cluster_policy: policy } });
+  });
+  await page.goto("/ui/#/acl");
+  await page.getByRole("button", { name: "ルールを追加" }).click();
+  await page.getByLabel("送信元タグを追加").fill("trusted");
+  await page.getByLabel("送信元タグを追加").press("Enter");
+  await page.getByLabel("宛先タグを追加").fill("database");
+  await page.getByLabel("宛先タグを追加").press("Enter");
+  await page.getByLabel("ルート (CIDR)を追加").fill("10.1.0.0/16");
+  await page.getByLabel("ルート (CIDR)を追加").press("Enter");
+  await page.getByRole("combobox", { name: "プロトコル" }).selectOption("tcp");
+  await page.getByRole("button", { name: "ポリシーを保存" }).click();
+  await expect.poll(() => saved?.acl_rules?.length).toBe(1);
+  expect(saved.acl_rules[0]).toMatchObject({id:"rule-1",action:"allow",protocol:"tcp",from_tags:["trusted"],to_tags:["database"],routes:["10.1.0.0/16"]});
+  await expect(page.getByText("ポリシーを保存しました。")).toBeVisible();
+});
+
+test("theme changes persist without hiding navigation", async ({ page }) => {
+  await installMockBackend(page);
+  await page.addInitScript(() => { if (!localStorage.getItem("heteronetwork_theme")) localStorage.setItem("heteronetwork_theme", "light"); });
+  await page.goto("/ui/#/nodes");
+  await page.getByRole("button", {name:"ダークモードに切り替え"}).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(page.getByRole("heading", {name:"ノード",exact:true})).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem("heteronetwork_theme"))).toBe("dark");
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 });

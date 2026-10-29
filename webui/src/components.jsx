@@ -1,14 +1,14 @@
-import Alert from "@cloudscape-design/components/alert";
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import Header from "@cloudscape-design/components/header";
-import Pagination from "@cloudscape-design/components/pagination";
-import SpaceBetween from "@cloudscape-design/components/space-between";
-import Spinner from "@cloudscape-design/components/spinner";
-import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import Table from "@cloudscape-design/components/table";
-import TextFilter from "@cloudscape-design/components/text-filter";
-import { useCollection } from "@cloudscape-design/collection-hooks";
+import { Alert } from "./ui.jsx";
+import { Box } from "./ui.jsx";
+import { Button } from "./ui.jsx";
+import { Header } from "./ui.jsx";
+import { Pagination } from "./ui.jsx";
+import { SpaceBetween } from "./ui.jsx";
+import { Spinner } from "./ui.jsx";
+import { StatusIndicator } from "./ui.jsx";
+import { Table } from "./ui.jsx";
+import { TextFilter } from "./ui.jsx";
+import { useCollection } from "./ui.jsx";
 import { useEffect, useId, useMemo, useState } from "react";
 import { statusType } from "./utils.js";
 
@@ -198,7 +198,7 @@ export function MermaidDiagram({ source }) {
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
-          theme: document.documentElement.classList.contains("awsui-dark-mode")
+          theme: document.documentElement.dataset.theme === "dark"
             ? "dark"
             : "default",
           flowchart: { htmlLabels: true, curve: "basis" },

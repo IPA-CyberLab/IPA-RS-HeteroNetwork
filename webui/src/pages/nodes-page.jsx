@@ -1,12 +1,12 @@
-import Badge from "@cloudscape-design/components/badge";
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import FormField from "@cloudscape-design/components/form-field";
-import Input from "@cloudscape-design/components/input";
-import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
-import Modal from "@cloudscape-design/components/modal";
-import SpaceBetween from "@cloudscape-design/components/space-between";
-import Table from "@cloudscape-design/components/table";
+import { Badge } from "../ui.jsx";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { FormField } from "../ui.jsx";
+import { Input } from "../ui.jsx";
+import { KeyValuePairs } from "../ui.jsx";
+import { Modal } from "../ui.jsx";
+import { SpaceBetween } from "../ui.jsx";
+import { Table } from "../ui.jsx";
 import { useEffect, useMemo, useState } from "react";
 import { ResourceTable, Status } from "../components.jsx";
 import {

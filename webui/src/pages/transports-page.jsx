@@ -1,8 +1,8 @@
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import Select from "@cloudscape-design/components/select";
-import SpaceBetween from "@cloudscape-design/components/space-between";
-import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { Select } from "../ui.jsx";
+import { SpaceBetween } from "../ui.jsx";
+import { StatusIndicator } from "../ui.jsx";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api.js";
 import { ErrorAlert, ResourceTable } from "../components.jsx";

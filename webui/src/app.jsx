@@ -1,19 +1,19 @@
-import AppLayout from "@cloudscape-design/components/app-layout";
-import Box from "@cloudscape-design/components/box";
-import BreadcrumbGroup from "@cloudscape-design/components/breadcrumb-group";
-import Button from "@cloudscape-design/components/button";
-import Container from "@cloudscape-design/components/container";
-import ContentLayout from "@cloudscape-design/components/content-layout";
-import Flashbar from "@cloudscape-design/components/flashbar";
-import Form from "@cloudscape-design/components/form";
-import FormField from "@cloudscape-design/components/form-field";
-import Header from "@cloudscape-design/components/header";
-import Input from "@cloudscape-design/components/input";
-import SideNavigation from "@cloudscape-design/components/side-navigation";
-import SpaceBetween from "@cloudscape-design/components/space-between";
-import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import TopNavigation from "@cloudscape-design/components/top-navigation";
-import { applyMode, Mode } from "@cloudscape-design/global-styles";
+import { AppLayout } from "./ui.jsx";
+import { Box } from "./ui.jsx";
+import { BreadcrumbGroup } from "./ui.jsx";
+import { Button } from "./ui.jsx";
+import { Container } from "./ui.jsx";
+import { ContentLayout } from "./ui.jsx";
+import { Flashbar } from "./ui.jsx";
+import { Form } from "./ui.jsx";
+import { FormField } from "./ui.jsx";
+import { Header } from "./ui.jsx";
+import { Input } from "./ui.jsx";
+import { SideNavigation } from "./ui.jsx";
+import { SpaceBetween } from "./ui.jsx";
+import { StatusIndicator } from "./ui.jsx";
+import { TopNavigation } from "./ui.jsx";
+
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { api } from "./api.js";
 import { ErrorAlert, Loading } from "./components.jsx";
@@ -138,7 +138,7 @@ export function App() {
   const [renamingNode, setRenamingNode] = useState(false);
   const [error, setError] = useState(null);
   const [topologyError, setTopologyError] = useState(null);
-  const [navigationOpen, setNavigationOpen] = useState(true);
+  const [navigationOpen, setNavigationOpen] = useState(() => window.matchMedia("(min-width: 1024px)").matches);
   const [directory, setDirectory] = useState(null);
   const [flashItems, setFlashItems] = useState([]);
   const [theme, setTheme] = useState(
@@ -242,7 +242,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    applyMode(theme === "dark" ? Mode.Dark : Mode.Light);
+    document.documentElement.dataset.theme = theme;
     localStorage.setItem("heteronetwork_theme", theme);
   }, [theme]);
 

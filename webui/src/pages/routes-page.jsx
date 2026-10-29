@@ -1,7 +1,7 @@
-import Badge from "@cloudscape-design/components/badge";
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import SpaceBetween from "@cloudscape-design/components/space-between";
+import { Badge } from "../ui.jsx";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { SpaceBetween } from "../ui.jsx";
 import { ResourceTable, Status } from "../components.jsx";
 import { nodeDisplayName, pretty } from "../utils.js";
 

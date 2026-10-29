@@ -14,7 +14,7 @@
   document.documentElement.lang = locale;
 
   // Start the small, same-origin configuration request while the browser is
-  // still parsing the document. The full Cloudscape bundle is intentionally
+  // still parsing the document. The full application bundle is intentionally
   // not on the critical path for showing a usable login action.
   var configPromise = fetch("/ui/config", {
     headers: { Accept: "application/json" },
@@ -48,7 +48,7 @@
   }
 
   // Render the small disabled login shell as soon as HTML and CSS are ready.
-  // Configuration enables the button; the full Cloudscape bundle can continue
+  // Configuration enables the button; the full application bundle can continue
   // downloading without consuming the three-second first-render budget.
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", showPendingLogin, { once: true });

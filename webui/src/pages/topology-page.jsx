@@ -1,14 +1,14 @@
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import ColumnLayout from "@cloudscape-design/components/column-layout";
-import Container from "@cloudscape-design/components/container";
-import FormField from "@cloudscape-design/components/form-field";
-import Header from "@cloudscape-design/components/header";
-import Input from "@cloudscape-design/components/input";
-import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
-import Select from "@cloudscape-design/components/select";
-import SpaceBetween from "@cloudscape-design/components/space-between";
-import Tabs from "@cloudscape-design/components/tabs";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { ColumnLayout } from "../ui.jsx";
+import { Container } from "../ui.jsx";
+import { FormField } from "../ui.jsx";
+import { Header } from "../ui.jsx";
+import { Input } from "../ui.jsx";
+import { KeyValuePairs } from "../ui.jsx";
+import { Select } from "../ui.jsx";
+import { SpaceBetween } from "../ui.jsx";
+import { Tabs } from "../ui.jsx";
 import { useEffect, useMemo, useState } from "react";
 import {
   ErrorAlert,

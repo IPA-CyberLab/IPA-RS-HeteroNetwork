@@ -1,18 +1,17 @@
-import AttributeEditor from "@cloudscape-design/components/attribute-editor";
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import ColumnLayout from "@cloudscape-design/components/column-layout";
-import Container from "@cloudscape-design/components/container";
-import Form from "@cloudscape-design/components/form";
-import FormField from "@cloudscape-design/components/form-field";
-import Header from "@cloudscape-design/components/header";
-import Input from "@cloudscape-design/components/input";
-import Select from "@cloudscape-design/components/select";
-import SpaceBetween from "@cloudscape-design/components/space-between";
-import Toggle from "@cloudscape-design/components/toggle";
+import { AttributeEditor } from "../ui.jsx";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { ColumnLayout } from "../ui.jsx";
+import { Container } from "../ui.jsx";
+import { Form } from "../ui.jsx";
+import { FormField } from "../ui.jsx";
+import { Header } from "../ui.jsx";
+import { Input } from "../ui.jsx";
+import { Select } from "../ui.jsx";
+import { SpaceBetween } from "../ui.jsx";
+import { Toggle, TagInput } from "../ui.jsx";
 import { useEffect, useMemo, useState } from "react";
 import { ErrorAlert } from "../components.jsx";
-import { csvValues } from "../utils.js";
 
 const protocolOptions = [
   "any",
@@ -101,17 +100,17 @@ export function AclPage({ overview, onSave, saving }) {
       ].map(([field, label]) => ({
         label,
         control: (rule, index) => (
-          <Input
-            value={(rule[field] || []).join(", ")}
-            placeholder="カンマ区切り"
-            onChange={({ detail }) =>
-              updateRule(index, field, csvValues(detail.value))
-            }
+          <TagInput
+            values={rule[field] || []}
+            ariaLabel={`${label}を追加`}
+            placeholder={field === "routes" ? "例: 10.0.0.0/8" : "値を入力"}
+            disabled={saving}
+            onChange={(values) => updateRule(index, field, values)}
           />
         ),
       })),
     ],
-    [],
+    [saving],
   );
 
   const submit = async (event) => {

@@ -1,19 +1,19 @@
-import Alert from "@cloudscape-design/components/alert";
-import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
-import ColumnLayout from "@cloudscape-design/components/column-layout";
-import Container from "@cloudscape-design/components/container";
-import ExpandableSection from "@cloudscape-design/components/expandable-section";
-import Form from "@cloudscape-design/components/form";
-import FormField from "@cloudscape-design/components/form-field";
-import Header from "@cloudscape-design/components/header";
-import Input from "@cloudscape-design/components/input";
-import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
-import SegmentedControl from "@cloudscape-design/components/segmented-control";
-import Select from "@cloudscape-design/components/select";
-import SpaceBetween from "@cloudscape-design/components/space-between";
-import Toggle from "@cloudscape-design/components/toggle";
-import Textarea from "@cloudscape-design/components/textarea";
+import { Alert } from "../ui.jsx";
+import { Box } from "../ui.jsx";
+import { Button } from "../ui.jsx";
+import { ColumnLayout } from "../ui.jsx";
+import { Container } from "../ui.jsx";
+import { ExpandableSection } from "../ui.jsx";
+import { Form } from "../ui.jsx";
+import { FormField } from "../ui.jsx";
+import { Header } from "../ui.jsx";
+import { Input } from "../ui.jsx";
+import { KeyValuePairs } from "../ui.jsx";
+import { SegmentedControl } from "../ui.jsx";
+import { Select } from "../ui.jsx";
+import { SpaceBetween } from "../ui.jsx";
+import { Toggle } from "../ui.jsx";
+import { TagInput } from "../ui.jsx";
 import { useEffect, useState } from "react";
 import { Empty, ErrorAlert } from "../components.jsx";
 import { copyText, csvValues, formatDateTime } from "../utils.js";
@@ -295,9 +295,8 @@ export function EnrollmentPage({ config, onIssue, issuing, onNotify }) {
                 ) : null}
               </ColumnLayout>
               {mode === "linux" ? (
-                <FormField label="公開接続先URL（任意）" description="1行に1件。ホスト名はA/AAAAでもCNAMEでも利用できます。空欄の場合は検出したIPアドレスを使います。">
-                  <Textarea value={transportUrls} rows={3} placeholder={"https://vpn.example.com\ntcp://vpn.example.com:51820\nudp://vpn.example.com:51820"}
-                    onChange={({ detail }) => setTransportUrls(detail.value)} />
+                <FormField label="公開接続先URL（任意）" description="HTTPS、TCP、UDPの接続先を追加できます。空欄の場合は検出したIPアドレスを使います。">
+                  <TagInput values={transportUrls.split(/\n/).map(value => value.trim()).filter(Boolean)} onChange={(values) => setTransportUrls(values.join("\n"))} ariaLabel="公開接続先URLを追加" placeholder="例: https://vpn.example.com" />
                 </FormField>
               ) : null}
               {mode === "linux" ? (
