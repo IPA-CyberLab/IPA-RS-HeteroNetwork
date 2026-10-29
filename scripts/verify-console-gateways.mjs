@@ -156,6 +156,16 @@ try {
           if (configuration.status !== 200 || config.auth_enabled !== true || config.provider !== 'keycloak' ||
               config.issuer_url !== 'https://heterocloud.mizuame.app/id/realms/heterocloud' ||
               config.device_verification_origin !== 'https://heterocloud.mizuame.app') {
+            let issuerIsHttps = false;
+            try { issuerIsHttps = new URL(config.issuer_url).protocol === 'https:'; } catch { /* invalid URL */ }
+            report.configuration_failure = {
+              gateway, port, http: configuration.status,
+              auth_enabled: config.auth_enabled === true,
+              provider: config.provider === 'keycloak' ? 'keycloak' : 'other',
+              issuer_is_https: issuerIsHttps,
+              issuer_matches_expected: config.issuer_url === 'https://heterocloud.mizuame.app/id/realms/heterocloud',
+              verification_origin_matches_expected: config.device_verification_origin === 'https://heterocloud.mizuame.app',
+            };
             throw new Error(`${gateway}:${port} console authentication configuration is invalid`);
           }
           const row = { gateway, port, ui_http: 200, config_http: 200,

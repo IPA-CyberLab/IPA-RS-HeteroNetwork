@@ -484,6 +484,7 @@ resource "terraform_data" "console_configuration" {
   triggers_replace = [
     sha256(join("", [for f in sort(tolist(fileset(path.module, "ansible/console/**"))) : filesha256("${path.module}/${f}") if endswith(f, ".yaml") || endswith(f, ".j2")])),
     filesha256("${local.repo_root}/deploy/systemd/heteronetwork-agent-overlay-proxy.conf"),
+    filesha256("${local.repo_root}/scripts/reconcile-console-issuer.py"),
     sha256(jsonencode(local.inventory)),
     sha256(jsonencode({ for name, host in terraform_data.host_configuration : name => host.id })),
     sha256(jsonencode({ for name, host in terraform_data.standard_host_configuration : name => host.id }))
@@ -503,7 +504,7 @@ resource "terraform_data" "console_configuration" {
 resource "terraform_data" "onboarding_acceptance" {
   input = { dedicated_masters = keys(local.nodes), standard_nodes = keys(local.standard_nodes), acceptance_requires = "live-e2e" }
   triggers_replace = [
-    sha256(join("", [for f in ["scripts/accept-registered-nodes.py", "scripts/verify-overlay-client-console.py", "scripts/verify-console-gateways.mjs", "scripts/heteronetwork-console-browser-e2e.mjs", "scripts/reconcile-console-e2e-user.py", "scripts/verify-master-only.py", "scripts/verify-standard-node.py"] : filesha256("${local.repo_root}/${f}")])),
+    sha256(join("", [for f in ["scripts/accept-registered-nodes.py", "scripts/verify-overlay-client-console.py", "scripts/verify-console-gateways.mjs", "scripts/reconcile-console-issuer.py", "scripts/heteronetwork-console-browser-e2e.mjs", "scripts/reconcile-console-e2e-user.py", "scripts/verify-master-only.py", "scripts/verify-standard-node.py"] : filesha256("${local.repo_root}/${f}")])),
     sha256(jsonencode({ for name, host in terraform_data.host_configuration : name => host.id })),
     sha256(jsonencode({ for name, host in terraform_data.standard_host_configuration : name => host.id })),
     terraform_data.console_configuration.id, terraform_data.git_source.id

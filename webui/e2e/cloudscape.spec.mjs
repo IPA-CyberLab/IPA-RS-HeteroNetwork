@@ -472,6 +472,7 @@ test("ACL rules can be edited as individual values and saved", async ({ page }) 
   });
   await page.goto("/ui/#/acl");
   await page.getByRole("button", { name: "ルールを追加" }).click();
+  await expect(page.getByRole("combobox", { name: "アクション" })).toHaveCSS("background-image", /linear-gradient/);
   await page.getByLabel("送信元タグを追加").fill("trusted");
   await page.getByLabel("送信元タグを追加").press("Enter");
   await page.getByLabel("宛先タグを追加").fill("database");

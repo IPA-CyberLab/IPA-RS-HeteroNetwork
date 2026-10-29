@@ -848,7 +848,7 @@ export function BreadcrumbGroup({
   const normalized = items.filter(
     (item, index) => index === items.length - 1 || item.href !== items[index + 1]?.href
   );
-  return <nav aria-label="パンくずリスト" className="breadcrumbs ui-breadcrumbs">
+  return <nav aria-label="パンくずリスト" className="ui-breadcrumbs">
       <ol>
         {normalized.map((item, index) => <li key={`${item.href}-${index}`}>
             {index === normalized.length - 1 ? <span aria-current="page">{item.text}</span> : <a

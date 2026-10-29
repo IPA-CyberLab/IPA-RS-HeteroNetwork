@@ -48,6 +48,8 @@ on:
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/test_verify_standard_node.py'
       - 'scripts/verify-console-gateways.mjs'
+      - 'scripts/reconcile-console-issuer.py'
+      - 'scripts/test_reconcile_console_issuer.py'
       - 'scripts/verify-overlay-client-console.py'
       - 'scripts/test_verify_overlay_client_console.py'
       - 'scripts/heteronetwork-console-browser-e2e.mjs'
@@ -111,6 +113,8 @@ on:
       - 'scripts/test_onboarding_acceptance.py'
       - 'scripts/test_verify_standard_node.py'
       - 'scripts/verify-console-gateways.mjs'
+      - 'scripts/reconcile-console-issuer.py'
+      - 'scripts/test_reconcile_console_issuer.py'
       - 'scripts/verify-overlay-client-console.py'
       - 'scripts/test_verify_overlay_client_console.py'
       - 'scripts/heteronetwork-console-browser-e2e.mjs'
@@ -153,6 +157,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_reconcile_overlay_boot.py -v
           python3 -B -m unittest discover -s scripts -p test_node_lifecycle.py -v
           python3 -B -m unittest discover -s scripts -p test_prepare_console_release.py -v
+          python3 -B -m unittest discover -s scripts -p test_reconcile_console_issuer.py -v
           python3 -B -m unittest discover -s scripts -p test_promote_database_sync_replica.py -v
           python3 -B -m unittest discover -s scripts -p test_prepare_database_ha.py -v
           python3 -B -m unittest discover -s scripts -p test_recover_database_authority.py -v

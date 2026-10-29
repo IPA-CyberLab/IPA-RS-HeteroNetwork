@@ -375,7 +375,7 @@ def browser_check(work, gateway, gateways, output):
                     for key in (
                         "failure", "canonical", "canonical_request_failure",
                         "canonical_diagnostic", "canonical_page",
-                        "no_proxy_diagnostic", "keycloak_failure", "gateways",
+                        "no_proxy_diagnostic", "keycloak_failure", "configuration_failure", "gateways",
                         "errors",
                     )
                     if key in browser_report

@@ -46,6 +46,29 @@
       when: public_transport_urls is defined and public_transport_urls | length == 0
       notify: Restart console Agent
 
+    - name: Ensure the console reconciliation helper directory exists
+      ansible.builtin.file:
+        path: /opt/heteronetwork/libexec
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Install the managed console issuer reconciler
+      ansible.builtin.copy:
+        src: '{{ hnn_repo_root }}/scripts/reconcile-console-issuer.py'
+        dest: /opt/heteronetwork/libexec/reconcile-console-issuer.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Repair the known legacy public issuer while preserving existing authentication settings
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /opt/heteronetwork/libexec/reconcile-console-issuer.py
+      register: hnn_console_issuer_reconcile
+      changed_when: hnn_console_issuer_reconcile.stdout | trim == 'updated'
+      when: not ansible_check_mode
+
     - name: Create the native binary directory
       ansible.builtin.file:
         path: /opt/heteronetwork/bin
