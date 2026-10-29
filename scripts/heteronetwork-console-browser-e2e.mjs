@@ -108,6 +108,24 @@ try {
   if (!report.httpOnlyRefreshCookie) throw new Error("Missing protected refresh cookie");
   report.sessionRestored = true;
   await restoredPage.screenshot({ path: path.join(runDirectory, "restored.png"), fullPage: true });
+
+  // Exercise the new ACL editor against the live read-only policy without
+  // persisting the temporary rule or allowing a policy write from the browser.
+  let blockedPolicyWrites = 0;
+  await restoredPage.route("**/v1/admin/policy", async (route) => {
+    if (["GET", "HEAD"].includes(route.request().method())) return route.continue();
+    blockedPolicyWrites += 1;
+    return route.abort("blockedbyclient");
+  });
+  await restoredPage.getByRole("link", { name: /アクセス制御/ }).click();
+  await restoredPage.getByRole("heading", { name: "アクセス制御", exact: true }).waitFor();
+  await restoredPage.getByRole("button", { name: "ルールを追加" }).click();
+  const roles = restoredPage.getByRole("textbox", { name: "送信元ロールを追加" }).last();
+  await roles.fill("ui-e2e-unsaved");
+  await roles.press("Enter");
+  await restoredPage.getByText("ui-e2e-unsaved", { exact: true }).waitFor();
+  if (blockedPolicyWrites) throw new Error("ACL editor attempted to persist an unsaved rule");
+  report.aclEditorVerified = true;
   if (report.errors.length) throw new Error("Browser JavaScript errors detected");
   report.result = "passed";
 } catch (error) {

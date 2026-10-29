@@ -3,10 +3,12 @@
 
 import importlib.util
 import ipaddress
+import json
 from pathlib import Path
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -32,6 +34,34 @@ def dns_response(query, address, *, flags=0x8180, response_id=None):
 
 
 class OverlayConsoleConvergenceTests(unittest.TestCase):
+    def test_authenticated_browser_requires_acl_editor_evidence(self):
+        checks = [{"check": name, "status": 200} for name in (
+            "Authenticated overview", "Overview after reload",
+            "Refresh cookie in new tab", "Authenticated overview in new tab")]
+        for acl_verified in (False, True):
+            with self.subTest(acl_verified=acl_verified), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                credential = work / "credentials.json"
+                credential.write_text("{}\n")
+                credential.chmod(0o600)
+
+                def browser(*_args, env, **_kwargs):
+                    directory = Path(env["HETERONETWORK_CONSOLE_BROWSER_E2E_ARTIFACT_DIR"]) / "console-browser-test"
+                    directory.mkdir()
+                    report = {"result": "passed", "checks": checks, "authenticated": True,
+                              "sessionRestored": True, "httpOnlyRefreshCookie": True,
+                              "aclEditorVerified": acl_verified}
+                    (directory / "report.json").write_text(json.dumps(report))
+                    return subprocess.CompletedProcess([], 0, "", "")
+
+                with patch.object(verify.subprocess, "run", side_effect=browser):
+                    if acl_verified:
+                        result = verify.authenticated_browser_check(work, "10.250.0.2", credential)
+                        self.assertTrue(result["acl_editor_verified"])
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "ACL editor"):
+                            verify.authenticated_browser_check(work, "10.250.0.2", credential)
+
     def test_client_cleanup_uses_sponsor_after_vpn_route_disappears(self):
         inventory = {"all": {
             "vars": {"ansible_ssh_private_key_file": "/private/key",

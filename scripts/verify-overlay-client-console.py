@@ -439,13 +439,15 @@ def authenticated_browser_check(work, gateway, credential_file):
     }
     if (checks != required or browser_report.get("authenticated") is not True
             or browser_report.get("sessionRestored") is not True
-            or browser_report.get("httpOnlyRefreshCookie") is not True):
-        raise RuntimeError("authenticated console browser E2E omitted a required session check")
+            or browser_report.get("httpOnlyRefreshCookie") is not True
+            or browser_report.get("aclEditorVerified") is not True):
+        raise RuntimeError("authenticated console browser E2E omitted a required session or ACL editor check")
     return {
         "result": "passed",
         "authenticated": True,
         "session_restored": True,
         "http_only_refresh_cookie": True,
+        "acl_editor_verified": True,
         "checks": checks,
     }
 

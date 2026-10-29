@@ -473,6 +473,10 @@ test("ACL rules can be edited as individual values and saved", async ({ page }) 
   await page.goto("/ui/#/acl");
   await page.getByRole("button", { name: "ルールを追加" }).click();
   await expect(page.getByRole("combobox", { name: "アクション" })).toHaveCSS("background-image", /linear-gradient/);
+  const roles = page.getByRole("textbox", { name: "送信元ロールを追加" }).last();
+  await roles.fill("ui-e2e-unsaved");
+  await roles.press("Enter");
+  await expect(page.getByText("ui-e2e-unsaved", { exact: true })).toBeVisible();
   await page.getByLabel("送信元タグを追加").fill("trusted");
   await page.getByLabel("送信元タグを追加").press("Enter");
   await page.getByLabel("宛先タグを追加").fill("database");
@@ -482,7 +486,7 @@ test("ACL rules can be edited as individual values and saved", async ({ page }) 
   await page.getByRole("combobox", { name: "プロトコル" }).selectOption("tcp");
   await page.getByRole("button", { name: "ポリシーを保存" }).click();
   await expect.poll(() => saved?.acl_rules?.length).toBe(1);
-  expect(saved.acl_rules[0]).toMatchObject({id:"rule-1",action:"allow",protocol:"tcp",from_tags:["trusted"],to_tags:["database"],routes:["10.1.0.0/16"]});
+  expect(saved.acl_rules[0]).toMatchObject({id:"rule-1",action:"allow",protocol:"tcp",from_roles:["ui-e2e-unsaved"],from_tags:["trusted"],to_tags:["database"],routes:["10.1.0.0/16"]});
   await expect(page.getByText("ポリシーを保存しました。")).toBeVisible();
 });
 
