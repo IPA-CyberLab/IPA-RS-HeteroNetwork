@@ -182,6 +182,13 @@ export function MermaidDiagram({ source }) {
   );
   const [svg, setSvg] = useState("");
   const [error, setError] = useState(null);
+  const [theme, setTheme] = useState(() => document.documentElement.dataset.theme);
+
+  useEffect(() => {
+    const observer = new MutationObserver(() => setTheme(document.documentElement.dataset.theme));
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -195,7 +202,7 @@ export function MermaidDiagram({ source }) {
     loadMermaid()
       .then((mermaid) => {
         if (cancelled) return null;
-        const dark = document.documentElement.dataset.theme === "dark";
+        const dark = theme === "dark";
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
@@ -206,7 +213,8 @@ export function MermaidDiagram({ source }) {
             primaryTextColor: "#171717",
             primaryBorderColor: "#737373",
             lineColor: dark ? "#d4d4d4" : "#525252",
-            textColor: dark ? "#f5f5f5" : "#171717",
+            textColor: "#171717",
+            edgeLabelBackground: "#ffffff",
             secondaryColor: "#f2f2f2",
             tertiaryColor: "#f7f7f7",
           },
@@ -223,7 +231,7 @@ export function MermaidDiagram({ source }) {
     return () => {
       cancelled = true;
     };
-  }, [renderId, source]);
+  }, [renderId, source, theme]);
 
   if (error) return <ErrorAlert error={error} />;
   if (!svg) return <Loading label="トポロジー図を生成しています" />;

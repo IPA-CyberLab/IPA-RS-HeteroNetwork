@@ -373,6 +373,7 @@ test("device login shows a local waiting page before Keycloak responds", async (
 test("HeteroNetwork console renders overview and hierarchical topology", async ({ page }, testInfo) => {
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.addInitScript(() => localStorage.setItem("heteronetwork_theme", "light"));
   await installMockBackend(page);
   await page.goto("/ui/");
 
@@ -405,7 +406,12 @@ test("HeteroNetwork console renders overview and hierarchical topology", async (
   await expect(page.getByRole("heading", { name: "オーバーレイトポロジー" })).toBeVisible();
   await expect(page.locator(".topology-diagram svg")).toHaveCount(1);
   await expect(page.locator(".topology-diagram svg")).toContainText("uc-k8sp1");
+  await expect(page.locator(".topology-diagram path.flowchart-link").first()).toHaveCSS("stroke", "rgb(82, 82, 82)");
   await page.screenshot({path:testInfo.outputPath("topology-monochrome.png"), fullPage:true});
+  await page.getByRole("button", {name:"ダークモードに切り替え"}).click();
+  await expect(page.locator(".topology-diagram path.flowchart-link").first()).toHaveCSS("stroke", "rgb(212, 212, 212)");
+  await expect(page.locator(".topology-diagram .nodeLabel p").first()).toHaveCSS("color", "rgb(23, 23, 23)");
+  await page.screenshot({path:testInfo.outputPath("topology-monochrome-dark.png"), fullPage:true});
   expect(pageErrors).toEqual([]);
 });
 
