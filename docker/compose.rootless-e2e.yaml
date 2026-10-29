@@ -78,6 +78,8 @@ services:
   agent:
     build:
       network: host
+      entitlements:
+        - network.host
     network_mode: !reset null
     networks:
       default:
@@ -137,6 +139,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       network: host
+      entitlements:
+        - network.host
     entrypoint:
       - /usr/local/bin/iparsd
     network_mode: !reset null

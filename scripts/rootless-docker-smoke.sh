@@ -189,6 +189,17 @@ grep -F 'HETERONETWORK_AGENT_RUNTIME_BACKEND=linux-command' "$rendered_config" >
 grep -F 'HETERONETWORK_AGENT_WIREGUARD_BACKEND=userspace-boringtun' "$rendered_config" >/dev/null
 grep -F '/dev/net/tun' "$rendered_config" >/dev/null
 grep -F 'NET_ADMIN' "$rendered_config" >/dev/null
+DOCKER_HOST="unix://${docker_socket}" "$docker_bin" compose \
+  -p "$project_name" \
+  -f "$repo_root/docker/compose.yaml" \
+  -f "$repo_root/docker/compose.rootless.yaml" \
+  -f "$repo_root/docker/compose.rootless-dataplane.yaml" \
+  config --format json >"$tmp_dir/rootless-build-config.json"
+if ! jq -e 'all(.services[] | select(.build.network == "host"); any(.build.entitlements[]?; . == "network.host"))' \
+  "$tmp_dir/rootless-build-config.json" >/dev/null; then
+  echo "rootless host-network builds must explicitly declare the network.host entitlement" >&2
+  exit 1
+fi
 
 override_path="$tmp_dir/preflight.override.yaml"
 cat >"$override_path" <<'EOF'
@@ -356,6 +367,11 @@ rootless_host_workload_diagnostics() {
 if ! rootless_e2e_compose config --format json >"$tmp_dir/rootless-e2e-config.json"; then
   echo "rootless e2e Compose config rendering failed" >&2
   "$docker_bin" compose version >&2 || true
+  exit 1
+fi
+if ! jq -e 'all(.services[] | select(.build.network == "host"); any(.build.entitlements[]?; . == "network.host"))' \
+  "$tmp_dir/rootless-e2e-config.json" >/dev/null; then
+  echo "rootless e2e host-network builds must explicitly declare the network.host entitlement" >&2
   exit 1
 fi
 if ! jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_network_b" '

@@ -2,24 +2,34 @@ services:
   control-plane:
     build:
       network: host
+      entitlements:
+        - network.host
 
   signal:
     build:
       network: host
+      entitlements:
+        - network.host
 
   stun:
     build:
       network: host
+      entitlements:
+        - network.host
 
   relay:
     build:
       network: host
+      entitlements:
+        - network.host
     cap_add: !reset []
     devices: !reset []
 
   agent:
     build:
       network: host
+      entitlements:
+        - network.host
     cap_add: !reset []
     devices: !reset []
     environment: !override

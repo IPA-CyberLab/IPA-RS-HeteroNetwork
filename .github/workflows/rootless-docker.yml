@@ -1,0 +1,92 @@
+name: Rootless Docker acceptance
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'scripts/rootless-docker-smoke.sh'
+      - 'scripts/rootless-compose-attach.sh'
+      - 'docker/compose.rootless*.yaml'
+      - 'docker/compose.yaml'
+      - '.github/workflows/rootless-docker.yml'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'scripts/rootless-docker-smoke.sh'
+      - 'scripts/rootless-compose-attach.sh'
+      - 'docker/compose.rootless*.yaml'
+      - 'docker/compose.yaml'
+      - '.github/workflows/rootless-docker.yml'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTUP_TOOLCHAIN: 1.96.1
+
+jobs:
+  rootless-docker-smoke:
+    name: Rootless Docker BoringTun smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install rootless Docker helpers
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            fuse-overlayfs \
+            jq \
+            rootlesskit \
+            slirp4netns \
+            uidmap
+          user_name="$(id -un)"
+          if ! awk -F: -v user="$user_name" '$1 == user && $3 >= 65536 { found = 1 } END { exit !found }' /etc/subuid; then
+            sudo usermod --add-subuids 100000-165535 "$user_name"
+          fi
+          if ! awk -F: -v user="$user_name" '$1 == user && $3 >= 65536 { found = 1 } END { exit !found }' /etc/subgid; then
+            sudo usermod --add-subgids 100000-165535 "$user_name"
+          fi
+          command -v dockerd
+          command -v rootlesskit
+          command -v slirp4netns
+          command -v fuse-overlayfs
+
+      # Compose 5.6's Bake integration does not forward network.host to
+      # Buildx; keep the same rootless host-network build until that fix ships.
+      - name: Pin Compose for the rootless build
+        run: |
+          set -euo pipefail
+          install -d -m 0755 "$HOME/.docker/cli-plugins"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-x86_64 \
+            --output "$RUNNER_TEMP/docker-compose"
+          printf '%s  %s\n' '7af95166a730b87e172d4fc9aefea8725d3c6c7327d59149267b452114ddb7d4' "$RUNNER_TEMP/docker-compose" | sha256sum --check --strict
+          install -m 0755 "$RUNNER_TEMP/docker-compose" "$HOME/.docker/cli-plugins/docker-compose"
+          docker compose version
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Enable TUN device
+        run: |
+          set -euo pipefail
+          sudo modprobe tun
+          sudo modprobe nf_conntrack
+          sudo test -c /dev/net/tun
+
+      - name: Run rootless BoringTun two-agent dataplane smoke
+        env:
+          CARGO: cargo
+          COMPOSE_BAKE: "false"
+        run: scripts/rootless-docker-smoke.sh
