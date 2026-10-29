@@ -14123,12 +14123,28 @@ exit 47
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
-        assert!(body.contains("Cloudscape"));
-        assert!(body.contains("AppLayout"));
+        assert!(body.contains("ui-topnav"));
+        assert!(body.contains("card ui-card"));
         assert!(body.contains("service_directory"));
         assert!(body.contains("client-enrollment"));
         assert!(body.contains("/ui/vendor/mermaid.min.js"));
         assert!(!body.contains("function renderServices()"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/styles.css")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains(".btn-primary"));
+        assert!(body.contains(".card"));
+        assert!(body.contains(".select"));
 
         let response = app
             .clone()
