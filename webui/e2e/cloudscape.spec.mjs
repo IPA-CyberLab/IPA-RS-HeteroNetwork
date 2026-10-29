@@ -370,7 +370,7 @@ test("device login shows a local waiting page before Keycloak responds", async (
   await popup.close();
 });
 
-test("HeteroNetwork console renders overview and hierarchical topology", async ({ page }) => {
+test("HeteroNetwork console renders overview and hierarchical topology", async ({ page }, testInfo) => {
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await installMockBackend(page);
@@ -405,6 +405,7 @@ test("HeteroNetwork console renders overview and hierarchical topology", async (
   await expect(page.getByRole("heading", { name: "オーバーレイトポロジー" })).toBeVisible();
   await expect(page.locator(".topology-diagram svg")).toHaveCount(1);
   await expect(page.locator(".topology-diagram svg")).toContainText("uc-k8sp1");
+  await page.screenshot({path:testInfo.outputPath("topology-monochrome.png"), fullPage:true});
   expect(pageErrors).toEqual([]);
 });
 
@@ -490,12 +491,38 @@ test("ACL rules can be edited as individual values and saved", async ({ page }) 
   await expect(page.getByText("ポリシーを保存しました。")).toBeVisible();
 });
 
-test("theme changes persist without hiding navigation", async ({ page }) => {
+async function expectMonochromeTheme(page) {
+  const colors = await page.evaluate(() => {
+    const probe = document.createElement("span");
+    document.body.append(probe);
+    const values = ["primary", "primary-content", "secondary", "accent", "neutral", "info", "success", "warning", "error", "base-100", "base-200", "base-content"].map((name) => {
+      probe.style.color = `var(--color-${name})`;
+      return getComputedStyle(probe).color;
+    });
+    probe.remove();
+    return values;
+  });
+  for (const color of colors) {
+    const match = /^rgb\((\d+), (\d+), (\d+)\)$/.exec(color);
+    expect(match, `Expected a grayscale theme color, got ${color}`).not.toBeNull();
+    expect(match[1]).toBe(match[2]);
+    expect(match[2]).toBe(match[3]);
+  }
+}
+
+test("monochrome theme changes persist without hiding navigation", async ({ page }, testInfo) => {
   await installMockBackend(page);
   await page.addInitScript(() => { if (!localStorage.getItem("heteronetwork_theme")) localStorage.setItem("heteronetwork_theme", "light"); });
   await page.goto("/ui/#/nodes");
+  await expect(page.getByRole("heading", {name:"ノード",exact:true})).toBeVisible();
+  await expectMonochromeTheme(page);
+  await expect(page.locator(".ui-layout__sidebar")).toHaveCSS("background-color", "rgb(255, 255, 255)");
+  await page.screenshot({path:testInfo.outputPath("monochrome-light.png"), fullPage:true});
   await page.getByRole("button", {name:"ダークモードに切り替え"}).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expectMonochromeTheme(page);
+  await expect(page.locator(".ui-layout__sidebar")).toHaveCSS("background-color", "rgb(23, 23, 23)");
+  await page.screenshot({path:testInfo.outputPath("monochrome-dark.png"), fullPage:true});
   await expect(page.getByRole("heading", {name:"ノード",exact:true})).toBeVisible();
   expect(await page.evaluate(() => localStorage.getItem("heteronetwork_theme"))).toBe("dark");
   await page.reload();

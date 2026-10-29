@@ -195,12 +195,21 @@ export function MermaidDiagram({ source }) {
     loadMermaid()
       .then((mermaid) => {
         if (cancelled) return null;
+        const dark = document.documentElement.dataset.theme === "dark";
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
-          theme: document.documentElement.dataset.theme === "dark"
-            ? "dark"
-            : "default",
+          theme: "base",
+          themeVariables: {
+            background: dark ? "#171717" : "#ffffff",
+            primaryColor: "#ffffff",
+            primaryTextColor: "#171717",
+            primaryBorderColor: "#737373",
+            lineColor: dark ? "#d4d4d4" : "#525252",
+            textColor: dark ? "#f5f5f5" : "#171717",
+            secondaryColor: "#f2f2f2",
+            tertiaryColor: "#f7f7f7",
+          },
           flowchart: { htmlLabels: true, curve: "basis" },
         });
         return mermaid.render(renderId, source);

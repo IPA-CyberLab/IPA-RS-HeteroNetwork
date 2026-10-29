@@ -173,8 +173,8 @@ export function topologyMermaid(topology) {
     );
   }
 
-  lines.push("classDef group fill:#f2f8fd,stroke:#0972d3,color:#16191f");
-  lines.push("classDef node fill:#ffffff,stroke:#687078,color:#16191f");
+  lines.push("classDef group fill:#f2f2f2,stroke:#555555,color:#171717");
+  lines.push("classDef node fill:#ffffff,stroke:#737373,color:#171717");
   if (groups.length) lines.push(`class ${groups.map((group) => mermaidId("group", group.group_id)).join(",")} group`);
   if (nodes.length) lines.push(`class ${nodes.map((node) => mermaidId("node", node.node_id)).join(",")} node`);
   return lines.join("\n");

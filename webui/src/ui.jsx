@@ -39,6 +39,7 @@ import {
   Shield,
   Sun,
   Terminal,
+  TriangleAlert,
   Trash2,
   UserRound,
   X
@@ -286,7 +287,7 @@ export function Alert({
   dismissible,
   onDismiss
 }) {
-  const IconComponent = type === "error" ? CircleAlert : type === "warning" ? CircleAlert : type === "success" ? CheckCircle2 : CircleHelp;
+  const IconComponent = type === "error" ? CircleAlert : type === "warning" ? TriangleAlert : type === "success" ? CheckCircle2 : CircleHelp;
   return <div
     className={`alert ui-alert ui-alert--${type}`}
     role={type === "error" ? "alert" : "status"}
