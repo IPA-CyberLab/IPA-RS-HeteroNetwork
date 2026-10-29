@@ -112,21 +112,44 @@ try {
   const palette = await restoredPage.evaluate(() => {
     const probe = document.createElement("span");
     document.body.append(probe);
-    const colors = ["primary", "primary-content", "secondary", "accent", "neutral", "info", "success", "warning", "error", "base-100", "base-200", "base-content"].map((name) => {
+    const names = ["primary", "primary-content", "success", "warning", "error", "base-100", "base-200", "base-content"];
+    const colors = Object.fromEntries(names.map((name) => {
       probe.style.color = `var(--color-${name})`;
-      return getComputedStyle(probe).color;
-    });
+      return [name, getComputedStyle(probe).color];
+    }));
     probe.remove();
     const sidebar = document.querySelector(".ui-layout__sidebar");
     const brand = document.querySelector(".ui-brand__mark span");
     if (!sidebar || !brand) throw new Error("Console theme elements are missing");
-    return [...colors, getComputedStyle(sidebar).backgroundColor, getComputedStyle(brand).backgroundColor];
+    return { ...colors, sidebar: getComputedStyle(sidebar).backgroundColor, brand: getComputedStyle(brand).backgroundColor };
   });
-  if (palette.some((color) => {
-    const match = /^rgb\((\d+), (\d+), (\d+)\)$/.exec(color);
-    return !match || match[1] !== match[2] || match[2] !== match[3];
-  })) throw new Error("The live console palette is not monochrome");
-  report.monochromeVerified = true;
+  const rgb = (name) => {
+    const match = /^rgb\((\d+), (\d+), (\d+)\)$/.exec(palette[name]);
+    if (!match) throw new Error(`Invalid theme color for ${name}`);
+    return match.slice(1).map(Number);
+  };
+  const contrast = (a, b) => {
+    const luminance = (color) => color.map((v) => {
+      const c = v / 255;
+      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    }).reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+    const [lower, upper] = [luminance(a), luminance(b)].sort((x, y) => x - y);
+    return (upper + 0.05) / (lower + 0.05);
+  };
+  for (const name of ["base-100", "base-200", "base-content", "sidebar"]) {
+    const [r, g, b] = rgb(name);
+    if (r !== g || g !== b) throw new Error(`The ${name} background or text must stay neutral`);
+  }
+  const [r, g, b] = rgb("primary");
+  if (b <= r || b <= g || palette.brand !== palette.primary ||
+      contrast(rgb("primary"), rgb("primary-content")) < 4.5) {
+    throw new Error("The live console accent is missing or lacks contrast");
+  }
+  if (new Set([palette.success, palette.warning, palette.error]).size !== 3 ||
+      ["success", "warning", "error"].some((name) => contrast(rgb(name), rgb("base-100")) < 4.5)) {
+    throw new Error("The live console status colors are not distinct and readable");
+  }
+  report.paletteVerified = true;
 
   // Exercise the new ACL editor against the live read-only policy without
   // persisting the temporary rule or allowing a policy write from the browser.

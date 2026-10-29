@@ -441,15 +441,15 @@ def authenticated_browser_check(work, gateway, credential_file):
             or browser_report.get("sessionRestored") is not True
             or browser_report.get("httpOnlyRefreshCookie") is not True
             or browser_report.get("aclEditorVerified") is not True
-            or browser_report.get("monochromeVerified") is not True):
-        raise RuntimeError("authenticated console browser E2E omitted a required session, ACL editor or monochrome check")
+            or browser_report.get("paletteVerified") is not True):
+        raise RuntimeError("authenticated console browser E2E omitted a required session, ACL editor or palette check")
     return {
         "result": "passed",
         "authenticated": True,
         "session_restored": True,
         "http_only_refresh_cookie": True,
         "acl_editor_verified": True,
-        "monochrome_verified": True,
+        "palette_verified": True,
         "checks": checks,
     }
 
