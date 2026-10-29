@@ -2896,7 +2896,7 @@ self_test() {
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"
   grep -Fq 'swapBehavior: NoSwap' <<<"$rendered"
-  grep -Fq 'value: "20s"' <<<"$rendered"
+  grep -FA1 'name: "node-monitor-grace-period"' <<<"$rendered" | grep -Fq 'value: "60s"'
   grep -Fq 'value: "500"' <<<"$rendered"
   grep -Fq 'value: "5000"' <<<"$rendered"
   rendered="$(render_containerd_apparmor_profile)"
