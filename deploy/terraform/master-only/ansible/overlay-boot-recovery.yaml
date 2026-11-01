@@ -30,6 +30,14 @@
         group: root
         mode: '0755'
 
+    - name: Install live stopped-peer reconciliation
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/reconcile-stopped-wireguard.py"
+        dest: /opt/heteronetwork/libexec/reconcile-stopped-wireguard.py
+        owner: root
+        group: root
+        mode: '0755'
+
     - name: Install the approved public recovery roster
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/terraform/master-only/overlay-boot-peers.json"
@@ -54,6 +62,12 @@
           - /run/credentials/heteronetwork-control-plane.service/database-url
       when: inventory_hostname == 'uc-k8sp5'
       changed_when: false
+
+    - name: Remove stopped peers from the live WireGuard interface
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/libexec/reconcile-stopped-wireguard.py, --roster, /etc/heteronetwork/overlay-boot-peers.json]
+      register: stopped_wireguard_peers
+      changed_when: "'stopped_peers_removed=0' not in stopped_wireguard_peers.stdout"
 
     - name: Create the agent dependency directory
       ansible.builtin.file:
