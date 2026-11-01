@@ -26,8 +26,10 @@ unrelated address. Terraform/Ansible declare the changes; the playbook was
 applied to the five reachable nodes. The HeteroCloud rollout then verified the
 running image digest and ready endpoints before activating IAM controls.
 
-The recurring stale path and heartbeat rejection on `uc-k8sp1` and `uc-k8sp2`
-remain an underlying agent reconciliation issue. The firewall is a traffic
-fence, not a fix for the rejected heartbeats. Do not reactivate `uc-k8sp4`
-without first reconciling its old workloads and confirming current software and
-cluster membership.
+The two affected agents were restarted one at a time. Both resumed successful
+heartbeats, and their Kubernetes nodes and overlay connectivity remained ready
+through the checks. The stopped node's WireGuard key was still reintroduced;
+the exact reintroduction mechanism has not been resolved. The firewall remains
+the traffic fence, and the heartbeat recovery needs continued monitoring. Do
+not reactivate `uc-k8sp4` without first reconciling its old workloads and
+confirming current software and cluster membership.

@@ -57,6 +57,14 @@ class NodeLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "node identity"):
             store.statements(self.roster)
 
+    def test_scoped_infrastructure_bundle_contains_stopped_node_fencing(self):
+        spec = importlib.util.spec_from_file_location("publish_iac", Path(__file__).with_name("publish-master-only.py"))
+        publisher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(publisher)
+        expected = {"scripts/reconcile-stopped-wireguard.py", "scripts/reconcile-stopped-overlay-firewall.py",
+                    "scripts/verify-heterocloud-iam-rollout.py"}
+        self.assertTrue(expected.issubset(set(publisher.files())))
+
     def test_database_environment_preserves_tls_and_encoded_credentials(self):
         spec = importlib.util.spec_from_file_location("lifecycle_connection", Path(__file__).with_name("reconcile-node-lifecycle.py"))
         store = importlib.util.module_from_spec(spec)
