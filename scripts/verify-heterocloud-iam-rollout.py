@@ -45,7 +45,7 @@ def verify(data, digest, replicas):
         if spec.get("replicas") != replicas or any(
             status.get(field, 0) != replicas
             for field in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas")
-        ):
+        ) or status.get("observedGeneration", 0) < deployment["metadata"].get("generation", 1):
             problems.append(f"{name} does not have {replicas} fully updated and ready replicas")
         if not images.get(container, "").endswith("@" + digest):
             problems.append(f"{name} does not specify the expected digest")

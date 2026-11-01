@@ -17,7 +17,7 @@ def fixture():
         image = "example.test/heterocloud@" + DIGEST
         items.append({"kind": "Deployment", "metadata": {"name": deployment},
                       "spec": {"replicas": 2, "template": {"spec": {"containers": [{"name": container, "image": image}]}}},
-                      "status": dict.fromkeys(("replicas", "updatedReplicas", "readyReplicas", "availableReplicas"), 2)})
+                      "status": {**dict.fromkeys(("replicas", "updatedReplicas", "readyReplicas", "availableReplicas"), 2), "observedGeneration": 1}})
         for index in range(2):
             name = f"{component}-{index}"
             items.append({"kind": "Pod", "metadata": {"name": name, "labels": {
@@ -54,6 +54,12 @@ class VerifyRolloutTest(unittest.TestCase):
         pod["status"]["conditions"][0]["status"] = "False"
         self.assertTrue(verify_rollout.verify(data, DIGEST, 2))
         self.assertTrue(verify_rollout.verify({"items": []}, DIGEST, 2))
+
+    def test_unobserved_deployment_generation_is_rejected(self):
+        data = fixture()
+        deployment = next(item for item in data["items"] if item.get("kind") == "Deployment")
+        deployment["metadata"]["generation"] = 2
+        self.assertTrue(verify_rollout.verify(data, DIGEST, 2))
 
     def test_invalid_digest_and_count_are_rejected(self):
         with self.assertRaises(ValueError):
