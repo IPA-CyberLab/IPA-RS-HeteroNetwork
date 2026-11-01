@@ -34,9 +34,27 @@ class StoppedOverlayFirewallTest(unittest.TestCase):
 
     def test_resuming_node_removes_its_fence(self):
         self.roster["node_states"]["uc-k8sp4"] = {"state": "active"}
-        self.assertEqual(firewall.reconcile(self.roster, self.run_command), 0)
+        def with_existing_fence(argv, **kwargs):
+            if argv == ["iptables", "-S", firewall.CHAIN]:
+                self.calls.append((argv, None))
+                rules = f"-A {firewall.CHAIN} -s 10.250.0.11/32 -j DROP\n-A {firewall.CHAIN} -d 10.250.0.11/32 -j DROP\n"
+                return subprocess.CompletedProcess(argv, 0, rules, "")
+            return self.run_command(argv, **kwargs)
+        self.assertEqual(firewall.reconcile(self.roster, with_existing_fence), 0)
         payload = next(payload for argv, payload in self.calls if argv[0] == "iptables-restore")
         self.assertNotIn("10.250.0.11", payload)
+
+    def test_already_reconciled_firewall_is_not_rewritten(self):
+        def already_reconciled(argv, **kwargs):
+            self.calls.append((argv, kwargs.get("input")))
+            output = ""
+            if argv == ["iptables", "-S", firewall.CHAIN]:
+                output = f"-A {firewall.CHAIN} -s 10.250.0.11/32 -j DROP\n-A {firewall.CHAIN} -d 10.250.0.11/32 -j DROP\n"
+            elif argv[:2] == ["iptables", "-S"]:
+                output = f"-A {argv[2]} -j {firewall.CHAIN}\n"
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        self.assertEqual(firewall.reconcile(self.roster, already_reconciled), 1)
+        self.assertFalse(any(argv[0] == "iptables-restore" or argv[:2] == ["iptables", "-I"] for argv, _ in self.calls))
 
     def test_invalid_address_fails_before_mutation(self):
         peer = next(p for p in self.roster["peers"] if p["hostname"] == "uc-k8sp4")

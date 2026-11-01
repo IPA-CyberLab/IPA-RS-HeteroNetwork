@@ -36,13 +36,19 @@ def stopped_addresses(roster):
 def reconcile(roster, run=subprocess.run):
     addresses = stopped_addresses(roster)  # Fail before changing firewall rules.
     created = run(["iptables", "-N", CHAIN], capture_output=True, text=True, timeout=10)
-    if created.returncode:
-        run(["iptables", "-S", CHAIN], capture_output=True, text=True, timeout=10, check=True)
+    if created.returncode not in (0, 1):
+        raise RuntimeError("failed to create stopped-node firewall chain")
+    listed = run(["iptables", "-S", CHAIN], capture_output=True, text=True, timeout=10, check=True)
     lines = ["*filter", f":{CHAIN} - [0:0]", f"-F {CHAIN}"]
+    expected_rules = []
     for address in addresses:
-        lines.extend((f"-A {CHAIN} -s {address} -j DROP", f"-A {CHAIN} -d {address} -j DROP"))
+        rules = (f"-A {CHAIN} -s {address} -j DROP", f"-A {CHAIN} -d {address} -j DROP")
+        lines.extend(rules)
+        expected_rules.extend(shlex.split(rule) for rule in rules)
     lines.extend(("COMMIT", ""))
-    run(["iptables-restore", "--noflush"], input="\n".join(lines), capture_output=True, text=True, timeout=10, check=True)
+    current_rules = [shlex.split(line) for line in listed.stdout.splitlines() if line.startswith(f"-A {CHAIN} ")]
+    if current_rules != expected_rules:
+        run(["iptables-restore", "--noflush"], input="\n".join(lines), capture_output=True, text=True, timeout=10, check=True)
     for hook in ("INPUT", "OUTPUT", "FORWARD"):
         listed = run(["iptables", "-S", hook], capture_output=True, text=True, timeout=10, check=True)
         rules = [shlex.split(line) for line in listed.stdout.splitlines() if line.startswith(f"-A {hook} ")]
@@ -60,7 +66,7 @@ def main():
         with open("/run/lock/heteronetwork-stopped-firewall.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             count = reconcile(roster)
-    except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"stopped overlay firewall reconciliation failed: {type(error).__name__}", file=sys.stderr)
         return 1
     print(f"stopped_addresses_fenced={count}")
