@@ -6,6 +6,7 @@ resource "terraform_data" "overlay_boot_recovery" {
     filesha256("${local.repo_root}/scripts/node_lifecycle.py"),
     filesha256("${local.repo_root}/scripts/reconcile-node-lifecycle.py"),
     filesha256("${local.repo_root}/scripts/reconcile-stopped-wireguard.py"),
+    filesha256("${local.repo_root}/scripts/reconcile-stopped-overlay-firewall.py"),
     filesha256("${local.repo_root}/scripts/overlay_power_recovery_e2e.py"),
     filesha256("${path.module}/overlay-boot-peers.json")
   ]

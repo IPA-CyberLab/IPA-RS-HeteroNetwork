@@ -38,6 +38,14 @@
         group: root
         mode: '0755'
 
+    - name: Install stopped-overlay firewall reconciliation
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/reconcile-stopped-overlay-firewall.py"
+        dest: /opt/heteronetwork/libexec/reconcile-stopped-overlay-firewall.py
+        owner: root
+        group: root
+        mode: '0755'
+
     - name: Install the approved public recovery roster
       ansible.builtin.copy:
         src: "{{ hnn_repo_root }}/deploy/terraform/master-only/overlay-boot-peers.json"
@@ -62,6 +70,58 @@
           - /run/credentials/heteronetwork-control-plane.service/database-url
       when: inventory_hostname == 'uc-k8sp5'
       changed_when: false
+
+    - name: Install stopped-node firewall service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-stopped-firewall.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Fence operator-stopped HeteroNetwork overlay addresses
+          After=network-pre.target
+          Before=heteronetwork-agent.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 /opt/heteronetwork/libexec/reconcile-stopped-overlay-firewall.py --roster /etc/heteronetwork/overlay-boot-peers.json
+          [Install]
+          WantedBy=multi-user.target
+      register: stopped_firewall_service
+
+    - name: Install stopped-node firewall reconciliation timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-stopped-firewall.timer
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Keep stopped HeteroNetwork nodes fenced
+          [Timer]
+          OnBootSec=30s
+          OnUnitActiveSec=30s
+          Unit=heteronetwork-stopped-firewall.service
+          [Install]
+          WantedBy=timers.target
+      register: stopped_firewall_timer
+
+    - name: Reload stopped-node firewall units
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: stopped_firewall_service.changed or stopped_firewall_timer.changed
+
+    - name: Enable and apply the stopped-node firewall
+      ansible.builtin.systemd_service:
+        name: heteronetwork-stopped-firewall.service
+        enabled: true
+        state: started
+
+    - name: Enable periodic firewall reconciliation
+      ansible.builtin.systemd_service:
+        name: heteronetwork-stopped-firewall.timer
+        enabled: true
+        state: started
 
     - name: Remove stopped peers from the live WireGuard interface
       ansible.builtin.command:
