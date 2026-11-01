@@ -137,6 +137,18 @@
         group: root
         mode: '0755'
 
+    - name: Require the stopped-node firewall before the agent starts
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-agent.service.d/93-stopped-firewall.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Requires=heteronetwork-stopped-firewall.service
+          After=heteronetwork-stopped-firewall.service
+      register: stopped_firewall_dependency
+
     - name: Rebuild only recovery host routes before each agent boot
       ansible.builtin.copy:
         dest: /etc/systemd/system/heteronetwork-agent.service.d/92-overlay-boot-recovery.conf
@@ -151,7 +163,7 @@
     - name: Load the next-boot policy without restarting the running VPN
       ansible.builtin.systemd_service:
         daemon_reload: true
-      when: overlay_boot_unit.changed
+      when: overlay_boot_unit.changed or stopped_firewall_dependency.changed
 
     - name: Install the isolated native Agent recovery E2E
       ansible.builtin.copy:
