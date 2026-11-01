@@ -22,13 +22,16 @@ SERVICES = {
 }
 
 
-def verify(data, digest, replicas):
+def verify(data, digest, replicas, desired=None):
     if not digest.startswith("sha256:") or len(digest) != 71 or any(
         char not in "0123456789abcdef" for char in digest[7:]
     ):
         raise ValueError("expected a lowercase sha256 image digest")
     if replicas < 1:
         raise ValueError("replica count must be positive")
+    desired = replicas if desired is None else desired
+    if desired < replicas:
+        raise ValueError("desired replicas cannot be below the required ready count")
 
     items = data.get("items", [])
     deployments = {item["metadata"]["name"]: item for item in items if item.get("kind") == "Deployment"}
@@ -42,11 +45,11 @@ def verify(data, digest, replicas):
             continue
         spec, status = deployment["spec"], deployment.get("status", {})
         images = {c["name"]: c["image"] for c in spec["template"]["spec"]["containers"]}
-        if spec.get("replicas") != replicas or any(
-            status.get(field, 0) != replicas
-            for field in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas")
-        ) or status.get("observedGeneration", 0) < deployment["metadata"].get("generation", 1):
-            problems.append(f"{name} does not have {replicas} fully updated and ready replicas")
+        if (spec.get("replicas") != desired or status.get("replicas", 0) != desired
+                or status.get("updatedReplicas", 0) != desired
+                or status.get("readyReplicas", 0) < replicas or status.get("availableReplicas", 0) < replicas
+                or status.get("observedGeneration", 0) < deployment["metadata"].get("generation", 1)):
+            problems.append(f"{name} does not have {desired} updated replicas with at least {replicas} ready")
         if not images.get(container, "").endswith("@" + digest):
             problems.append(f"{name} does not specify the expected digest")
 
@@ -54,8 +57,8 @@ def verify(data, digest, replicas):
                 and item["metadata"].get("labels", {}).get("app.kubernetes.io/instance") == "heterocloud"
                 and item["metadata"].get("labels", {}).get("app.kubernetes.io/component") == component
                 and not item["metadata"].get("deletionTimestamp")]
-        if len(pods) != replicas:
-            problems.append(f"{component} has {len(pods)} non-terminating pods, expected {replicas}")
+        if len(pods) != desired:
+            problems.append(f"{component} has {len(pods)} non-terminating pods, expected {desired}")
         for pod in pods:
             pod_name = pod["metadata"]["name"]
             pod_images = {c["name"]: c["image"] for c in pod["spec"]["containers"]}
@@ -63,11 +66,14 @@ def verify(data, digest, replicas):
             state = states.get(container, {})
             ready = any(c.get("type") == "Ready" and c.get("status") == "True"
                         for c in pod.get("status", {}).get("conditions", []))
-            if not ready or not state.get("ready") or not pod_images.get(container, "").endswith("@" + digest) \
-                    or not state.get("imageID", "").endswith("@" + digest):
-                problems.append(f"{pod_name} is not ready on the expected image")
-            else:
+            if not pod_images.get(container, "").endswith("@" + digest):
+                problems.append(f"{pod_name} does not specify the expected image")
+            elif ready and (not state.get("ready") or not state.get("imageID", "").endswith("@" + digest)):
+                problems.append(f"{pod_name} is ready on an unexpected image")
+            elif ready:
                 serving_pods[component].add(pod_name)
+        if len(serving_pods[component]) < replicas:
+            problems.append(f"{component} has fewer than {replicas} verified ready pods")
 
     endpoint_slices = [item for item in items if item.get("kind") == "EndpointSlice"]
     for service, component in SERVICES.items():
@@ -76,7 +82,7 @@ def verify(data, digest, replicas):
                      for endpoint in item.get("endpoints", [])
                      if endpoint.get("conditions", {}).get("ready") is True]
         targets = {endpoint.get("targetRef", {}).get("name") for endpoint in endpoints}
-        if targets != serving_pods[component] or len(endpoints) != replicas:
+        if targets != serving_pods[component] or len(endpoints) != len(serving_pods[component]):
             problems.append(f"{service} endpoints do not exactly match the verified {component} pods")
     return problems
 
@@ -85,9 +91,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--digest", required=True)
     parser.add_argument("--replicas", required=True, type=int)
+    parser.add_argument("--desired-replicas", type=int, help="desired count, if some new pods are pending")
     args = parser.parse_args()
     try:
-        problems = verify(json.load(sys.stdin), args.digest, args.replicas)
+        problems = verify(json.load(sys.stdin), args.digest, args.replicas, args.desired_replicas)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"rollout verification failed: {error}", file=sys.stderr)
         return 1
@@ -95,7 +102,7 @@ def main():
         for problem in problems:
             print(problem, file=sys.stderr)
         return 1
-    print(f"verified {args.replicas} replicas for each deployment and all serving endpoints on {args.digest}")
+    print(f"verified at least {args.replicas} ready replicas per deployment and all serving endpoints on {args.digest}")
     return 0
 
 

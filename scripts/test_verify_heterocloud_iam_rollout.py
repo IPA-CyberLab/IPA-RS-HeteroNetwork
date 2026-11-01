@@ -67,6 +67,22 @@ class VerifyRolloutTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_rollout.verify(fixture(), DIGEST, 0)
 
+    def test_pending_new_replicas_are_allowed_only_with_explicit_desired_count(self):
+        data = fixture()
+        for item in data["items"]:
+            if item.get("kind") == "Deployment":
+                item["spec"]["replicas"] = 3
+                item["status"]["replicas"] = item["status"]["updatedReplicas"] = 3
+        for component, (_, container) in verify_rollout.COMPONENTS.items():
+            data["items"].append({"kind": "Pod", "metadata": {"name": component + "-pending", "labels": {
+                "app.kubernetes.io/instance": "heterocloud", "app.kubernetes.io/component": component}},
+                "spec": {"containers": [{"name": container, "image": "example.test/heterocloud@" + DIGEST}]},
+                "status": {"conditions": [{"type": "Ready", "status": "False"}]}})
+        self.assertEqual(verify_rollout.verify(data, DIGEST, 2, 3), [])
+        self.assertTrue(verify_rollout.verify(data, DIGEST, 2))
+        data["items"][-1]["spec"]["containers"][0]["image"] = "example.test/old@sha256:" + "b" * 64
+        self.assertTrue(verify_rollout.verify(data, DIGEST, 2, 3))
+
 
 if __name__ == "__main__":
     unittest.main()
