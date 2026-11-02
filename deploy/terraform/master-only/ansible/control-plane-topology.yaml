@@ -1,0 +1,150 @@
+- name: Roll out the verified control-plane topology binary one host at a time
+  hosts: master_only:bootstrap:enrollment_issuer:standard
+  serial: 1
+  gather_facts: false
+  become: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_cp_digest: "{{ lookup('env', 'HNN_CONTROL_PLANE_SHA256') }}"
+    hnn_cp_directory: "/opt/heteronetwork/control-plane-releases/{{ hnn_cp_digest }}"
+  tasks:
+    - name: Require an immutable declared binary digest
+      ansible.builtin.assert:
+        that: hnn_cp_digest is match('^[a-f0-9]{64}$')
+
+    - name: Create versioned binary directory
+      ansible.builtin.file:
+        path: "{{ hnn_cp_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the exact CI-built control-plane binary
+      ansible.builtin.copy:
+        src: "{{ hnn_work_dir }}/iparsd-{{ hnn_cp_digest }}"
+        dest: "{{ hnn_cp_directory }}/iparsd"
+        owner: root
+        group: root
+        mode: '0755'
+      register: hnn_cp_binary
+
+    - name: Verify the installed binary digest
+      ansible.builtin.stat:
+        path: "{{ hnn_cp_directory }}/iparsd"
+        checksum_algorithm: sha256
+      register: hnn_cp_verified
+
+    - name: Require the declared binary
+      ansible.builtin.assert:
+        that: hnn_cp_verified.stat.checksum == hnn_cp_digest
+
+    - name: Create the control-plane systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/heteronetwork-control-plane.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Pin only the control plane to the verified binary
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-control-plane.service.d/99-topology-binary.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart={{ hnn_cp_directory }}/iparsd control-plane
+      register: hnn_cp_override
+
+    - name: Reload the changed systemd configuration
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: hnn_cp_override.changed
+
+    - name: Check whether this host is currently serving the control plane
+      ansible.builtin.command: systemctl is-active heteronetwork-control-plane.service
+      register: hnn_cp_active
+      changed_when: false
+      failed_when: false
+
+    - name: Identify the running control-plane process
+      ansible.builtin.command: systemctl show heteronetwork-control-plane.service --property=MainPID --value
+      register: hnn_cp_pid
+      changed_when: false
+      when: hnn_cp_active.rc == 0
+
+    - name: Inspect the binary actually running
+      ansible.builtin.stat:
+        path: "/proc/{{ hnn_cp_pid.stdout | trim }}/exe"
+        checksum_algorithm: sha256
+        follow: true
+      register: hnn_cp_running
+      when: hnn_cp_active.rc == 0
+
+    - name: Determine whether the serving process needs a restart
+      ansible.builtin.set_fact:
+        hnn_cp_needs_restart: "{{ hnn_cp_active.rc == 0 and (hnn_cp_running.stat.checksum | default('')) != hnn_cp_digest }}"
+
+    - name: Check other control-plane endpoints before restarting a serving host
+      ansible.builtin.uri:
+        url: "http://{{ item }}:19088/healthz"
+        status_code: 200
+        use_proxy: false
+        timeout: 3
+      loop: "{{ hnn_control_planes | difference([vpn_ip]) }}"
+      register: hnn_cp_peers
+      failed_when: false
+      changed_when: false
+      when: hnn_cp_needs_restart
+
+    - name: Refuse to restart the last healthy control plane
+      ansible.builtin.assert:
+        that: hnn_cp_peers.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 200) | list | length >= 1
+      when: hnn_cp_needs_restart
+
+    - name: Restart only this serving control plane
+      ansible.builtin.systemd_service:
+        name: heteronetwork-control-plane.service
+        state: restarted
+      when: hnn_cp_needs_restart
+
+    - name: Wait until this control plane is healthy again
+      ansible.builtin.uri:
+        url: "http://{{ vpn_ip }}:19088/healthz"
+        status_code: 200
+        use_proxy: false
+        timeout: 3
+      register: hnn_cp_health
+      until: hnn_cp_health.status | default(0) == 200
+      retries: 30
+      delay: 1
+      when: hnn_cp_needs_restart
+
+    - name: Recheck whether the control plane is serving
+      ansible.builtin.command: systemctl is-active heteronetwork-control-plane.service
+      register: hnn_cp_final_active
+      changed_when: false
+      failed_when: false
+
+    - name: Identify the final serving process
+      ansible.builtin.command: systemctl show heteronetwork-control-plane.service --property=MainPID --value
+      register: hnn_cp_final_pid
+      changed_when: false
+      when: hnn_cp_final_active.rc == 0
+
+    - name: Verify the final serving process digest
+      ansible.builtin.stat:
+        path: "/proc/{{ hnn_cp_final_pid.stdout | trim }}/exe"
+        checksum_algorithm: sha256
+        follow: true
+      register: hnn_cp_final_binary
+      when: hnn_cp_final_active.rc == 0
+
+    - name: Refuse an old serving binary after a concurrent promotion
+      ansible.builtin.assert:
+        that: hnn_cp_final_binary.stat.checksum == hnn_cp_digest
+      when: hnn_cp_final_active.rc == 0
