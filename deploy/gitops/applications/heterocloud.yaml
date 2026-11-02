@@ -9,14 +9,14 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: 13b4db7f9d7f9f7da4c505604131c24e714cdf1d
+    targetRevision: fdca824b2d2bf5e7da317295e59b12dbae45cf0b
     path: deploy/helm/heterocloud
     helm:
       releaseName: heterocloud
       valueFiles:
       - ../../environments/heteronet/values.yaml
       values: |
-        replicaCount: 3
+        replicaCount: 2
         workloadIdentity:
           enabled: true
           namespace: heterocloud-flash-workloads
@@ -24,12 +24,12 @@ spec:
             - 10.96.0.1/32
             - 10.250.0.0/24
         image:
-          tag: "0.1.110-platform.7@sha256:fe7f2eb4e492c0b8f3de65b1b955255bc51909ff7c82601caa787dfe6525585b"
+          tag: "0.1.110-platform.9@sha256:deeb410be8db0d6bddc34ae10b9b01df4ba70c300fb39242da3983b39cdc0ad1"
         worker:
-          replicaCount: 3
+          replicaCount: 2
           vpcEndpoint: http://heterocloud-vpc-api.heterocloud-vpc.svc.cluster.local:8080/
         ownerConsole:
-          replicaCount: 3
+          replicaCount: 2
           externalIPs:
             - 10.250.0.4
             - 10.250.0.5
