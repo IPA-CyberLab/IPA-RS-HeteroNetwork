@@ -39,8 +39,12 @@ The control-plane fix excludes explicitly stopped nodes from backbone
 membership, active path destinations, route indexing, and aggregate route
 calculation. It retains their registration for later operator resumption. A
 regression test exercises stopping and resuming an actual backbone neighbor and
-checks neighbor maps and destination paths. The independent firewall remains
-the traffic fence while the fixed control plane is tested and rolled out; this
-document does not by itself imply that rollout has completed. Do not
-reactivate `uc-k8sp4` without reconciling its old workloads and confirming
-current software and cluster membership.
+checks neighbor maps and destination paths. GitHub Actions 41391701815 passed
+the Rust suite and real VPN transport/1,000-member tests; its verified native
+server was installed through Terraform on all five reachable hosts, restarting
+the two serving control planes serially. After the two-minute topology
+migration grace, both affected agents no longer contained the stopped peer.
+Both control-plane health endpoints and HeteroCloud remained reachable. The
+independent stopped-node firewall remains enabled. Do not reactivate
+`uc-k8sp4` without reconciling its old workloads and confirming current
+software and cluster membership.
