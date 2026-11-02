@@ -12,7 +12,7 @@ import sys
 
 # Add only a release whose tests passed and whose image was built from the
 # implementation of organization_registry_credentials_enabled.
-SUPPORTED_DIGESTS = {"sha256:f1fa2604777714325289ecf5ee8c743d0dda8f3a424415b2706ac0ee95d1ff16"}
+SUPPORTED_DIGESTS = {"sha256:f1fa2604777714325289ecf5ee8c743d0dda8f3a424415b2706ac0ee95d1ff16", "sha256:1346a90187cc39926c5df2b36ed9093528e8fe0e1b65f3ab8177a635ec1a729f"}
 
 
 def verified_worker(data, digest, replicas, desired_replicas):
