@@ -4127,6 +4127,12 @@ where
             .and_then(|index| snapshot.nodes.get(*index))
             .cloned()
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if source.is_administratively_stopped() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "stopped nodes cannot join the bounded overlay backbone".to_string(),
+            });
+        }
         if source.role.is_client() {
             return Err(ControlPlaneError::NodeUpdateRejected {
                 node_id: node_id.clone(),
@@ -4255,7 +4261,9 @@ where
     ) -> Result<ControlPlaneTopologyResponse, ControlPlaneError> {
         let generated_at = Utc::now();
         let (policy, snapshot) = self.current_overlay_snapshot().await?;
-        let mut nodes = snapshot.nodes.clone();
+        // The topology only contains native, non-stopped backbone members.
+        // Other registered nodes remain visible in the node inventory.
+        let mut nodes = snapshot.backbone_nodes.clone();
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let topology = self
             .overlay_topology_for_snapshot(&snapshot, &policy)
@@ -4596,7 +4604,14 @@ where
             .map(|node| node.node_id.clone())
             .collect::<BTreeSet<_>>();
         health_by_node.retain(|node_id, _| node_ids.contains(node_id));
-        let active_nodes = nodes
+        // A stopped node remains registered for an operator to resume later,
+        // but must never be used as a backbone hop or path destination.
+        let eligible_nodes = nodes
+            .iter()
+            .filter(|node| !node.is_administratively_stopped())
+            .cloned()
+            .collect::<Vec<_>>();
+        let active_nodes = eligible_nodes
             .iter()
             .filter(|node| {
                 overlay_node_health_allows(
@@ -4615,7 +4630,7 @@ where
             .collect::<BTreeMap<_, _>>();
         // HTTP application nodes do not forward the native UDP backbone. They
         // have dedicated bridge routes and must never replace its neighbors.
-        let backbone_nodes = nodes
+        let backbone_nodes = eligible_nodes
             .iter()
             .filter(|node| !node.is_http_only())
             .cloned()
@@ -4629,8 +4644,8 @@ where
             max_degree: policy.overlay_max_degree,
             permutation_seed: self.config.cluster_id.as_str().to_string(),
         });
-        let aggregate_routes = aggregate_overlay_routes(&nodes);
-        let route_index = OverlayRouteIndex::build(&nodes);
+        let aggregate_routes = aggregate_overlay_routes(&eligible_nodes);
+        let route_index = OverlayRouteIndex::build(&eligible_nodes);
         if self
             .store
             .get_overlay_routing_epoch(&self.config.cluster_id)
@@ -12746,6 +12761,97 @@ mod tests {
         assert!(acl_filter_peer(&target, &source, &policy).is_none());
         target.tags.remove(&marker);
         assert!(client_gateway_candidate_score(&target, now, &policy).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stopped_node_is_removed_from_backbone_and_paths_until_resumed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster = ClusterId::from_string("cluster-a");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster, Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?),
+            store.clone(),
+        );
+        let mut nodes = Vec::new();
+        for index in 0..5_u8 {
+            let mut node = node_record(&format!("lifecycle-backbone-{index}"));
+            node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, index + 2)));
+            store.insert_node(node.clone()).await?;
+            nodes.push(node);
+        }
+        let target = &nodes[4];
+        let before = plane.overlay_topology_snapshot().await?;
+        assert_eq!(before.node_count, 5);
+        let mut target_was_neighbor = false;
+        for node in &nodes[..4] {
+            let map = plane.neighbor_map_for(&node.node_id).await?;
+            target_was_neighbor |= map
+                .neighbors
+                .iter()
+                .any(|peer| peer.node.node_id == target.node_id);
+        }
+        assert!(
+            target_was_neighbor,
+            "the test target must actually be a backbone neighbor"
+        );
+
+        let marker = Tag::from_string("heteronetwork-stopped");
+        store
+            .nodes
+            .write()
+            .await
+            .get_mut(&target.node_id)
+            .ok_or("target missing")?
+            .tags
+            .insert(marker.clone());
+        plane.invalidate_overlay_node_snapshot().await;
+        let stopped = plane.overlay_topology_snapshot().await?;
+        assert_eq!(stopped.node_count, 4);
+        assert_ne!(stopped.topology_epoch, before.topology_epoch);
+        assert!(stopped
+            .nodes
+            .iter()
+            .all(|node| node.node_id != target.node_id));
+        for node in &nodes[..4] {
+            let map = plane.neighbor_map_for(&node.node_id).await?;
+            assert!(map
+                .neighbors
+                .iter()
+                .all(|peer| peer.node.node_id != target.node_id));
+            assert!(map
+                .pinned_peers
+                .iter()
+                .all(|peer| peer.node_id != target.node_id));
+        }
+        assert!(plane.neighbor_map_for(&target.node_id).await.is_err());
+        let path = OverlayPathQuery {
+            source: nodes[0].node_id.clone(),
+            destination: target.vpn_ip.0,
+            source_identity_proof: ipars_types::api::NodeApiRequestSignature {
+                signed_at: Utc::now(),
+                nonce: "stopped-node-test".to_string(),
+                signature: String::new(),
+            },
+        };
+        assert!(matches!(
+            plane.overlay_path_for(&path).await,
+            Err(ControlPlaneError::OverlayDestinationNotFound(_))
+        ));
+
+        store
+            .nodes
+            .write()
+            .await
+            .get_mut(&target.node_id)
+            .ok_or("target missing")?
+            .tags
+            .remove(&marker);
+        plane.invalidate_overlay_node_snapshot().await;
+        let resumed = plane.overlay_topology_snapshot().await?;
+        assert_eq!(resumed.node_count, 5);
+        assert_eq!(resumed.topology_epoch, before.topology_epoch);
+        assert!(plane.overlay_path_for(&path).await.is_ok());
         Ok(())
     }
 
