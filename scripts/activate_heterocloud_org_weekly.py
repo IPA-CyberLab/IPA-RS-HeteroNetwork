@@ -174,6 +174,11 @@ def main():
         problems = verify_policies(before, provider(), before.get("enabled") is True)
         if problems:
             raise RuntimeError("pre-activation: " + "; ".join(problems))
+        if before.get("enabled") is True:
+            if snapshot() != before:
+                raise RuntimeError("quota state changed during verification; retry")
+            print(f"Verified organization weekly policies for {len(before['services'])} Flash services; already enabled.")
+            return 0
         deployment = next(i for i in cloud["items"] if i.get("kind") == "Deployment" and i.get("metadata", {}).get("name") == "heterocloud-heterocloud-worker")
         container = next(c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "worker")
         command = container.get("command", []) + container.get("args", [])
