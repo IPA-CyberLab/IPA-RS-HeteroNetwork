@@ -17,7 +17,7 @@ from urllib.parse import unquote, urlsplit
 
 FLASH_COMPONENTS = {"api", "controller", "activator", "capacity", "backup-verifier"}
 LIMITS = ("max_weekly_cpu_millicore_seconds", "max_weekly_memory_mib_seconds", "max_weekly_gpu_seconds")
-SUPPORTED_CLOUD_DIGESTS = {"sha256:6e93235aac7732f99aa85f76f67aae88f7b216e159fe943be61e34d2f803e66a", "sha256:557302cf2facc153795328921729efbbaab9a310eb54ce440a0a9dfd78cdd1af"}
+SUPPORTED_CLOUD_DIGESTS = {"sha256:6e93235aac7732f99aa85f76f67aae88f7b216e159fe943be61e34d2f803e66a", "sha256:557302cf2facc153795328921729efbbaab9a310eb54ce440a0a9dfd78cdd1af", "sha256:8d27f736bd182a5d5ebb36f59d18c0551e9b4bde49b590bbf8ebbb365c898e1b"}
 SUPPORTED_FLASH_DIGESTS = {"sha256:1b996062281da5c7562f41c8793cf3a5743d98778297e182f0d63cd27cc13520"}
 
 
