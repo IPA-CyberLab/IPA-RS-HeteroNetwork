@@ -12,7 +12,7 @@ import sys
 from urllib.parse import unquote, urlsplit
 
 
-SUPPORTED_DIGESTS = {"sha256:6e93235aac7732f99aa85f76f67aae88f7b216e159fe943be61e34d2f803e66a", "sha256:557302cf2facc153795328921729efbbaab9a310eb54ce440a0a9dfd78cdd1af", "sha256:8d27f736bd182a5d5ebb36f59d18c0551e9b4bde49b590bbf8ebbb365c898e1b"}
+SUPPORTED_DIGESTS = {"sha256:6e93235aac7732f99aa85f76f67aae88f7b216e159fe943be61e34d2f803e66a", "sha256:557302cf2facc153795328921729efbbaab9a310eb54ce440a0a9dfd78cdd1af", "sha256:8d27f736bd182a5d5ebb36f59d18c0551e9b4bde49b590bbf8ebbb365c898e1b", "sha256:f1fa2604777714325289ecf5ee8c743d0dda8f3a424415b2706ac0ee95d1ff16"}
 
 
 def verify_rollout(data, digest, replicas, desired_replicas):
