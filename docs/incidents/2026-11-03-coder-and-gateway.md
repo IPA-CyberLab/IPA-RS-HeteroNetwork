@@ -32,7 +32,27 @@ The next rollout was still not fully clean: from 2,062 probes, 2,059 returned
 200, two had transport errors and one returned 503 at 07:24:42 UTC. Envoy again
 reported `no_healthy_upstream`; at approximately the same time Kubernetes
 recorded an API readiness-probe timeout while one replica was being replaced.
-Both serving API replicas were subsequently healthy. The readiness window is a
-partial mitigation, not evidence that rollout-related 503s are eliminated.
-The gateway's one-failure active health check and full endpoint ejection need
-further investigation and a tested correction.
+Both serving API replicas were subsequently healthy. The readiness window
+alone was therefore insufficient.
+
+The gateway configuration now tolerates brief health-check failures, retains a
+fallback when every endpoint is marked unhealthy, and limits passive endpoint
+ejection to half of the pool. The OIDC callback still retries only connection
+failures that occur before the request is accepted. Terraform published the
+reviewed Git source and Argo CD applied both traffic policies.
+
+An isolated `.invalid` test route exercised the live gateway with disposable
+backends. Once Envoy had actually marked the only backend unhealthy, 127
+requests succeeded with no errors while the backend still served traffic. A
+second healthy backend was then introduced; after the unhealthy state was
+observed, all 10 follow-up requests reached the healthy backend. The temporary
+resources were removed. This tests the specific failure and failover behavior;
+it does not guarantee zero errors under every node or network failure.
+The live check is available as `scripts/e2e_heterocloud_gateway_failover.py`;
+the policy invariants and its syntax are checked by infrastructure CI.
+
+The subsequent HeteroCloud name-management rollout was monitored through the
+public entrance. All 2,411 probes returned HTTP 200, with a maximum observed
+response time of 1.002 seconds. This is evidence for that rollout only, not a
+guarantee against other failures. Two replicas per component were serving;
+the third desired replica remained pending while a worker node was offline.
