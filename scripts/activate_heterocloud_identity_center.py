@@ -12,7 +12,7 @@ import sys
 
 # Add only a release whose tests passed and whose image was built from the
 # implementation of identity_center_enabled.
-SUPPORTED_DIGESTS = {"sha256:1346a90187cc39926c5df2b36ed9093528e8fe0e1b65f3ab8177a635ec1a729f", "sha256:691e7ed9143b873fd3d7e5bab2d6e777d1ba3ef6b6c9aaf71fc71c6eeed2f137", "sha256:0a5a0c71297f36b56ebde70feb9a36fee68274e42348c974d971683ce99067df"}
+SUPPORTED_DIGESTS = {"sha256:1346a90187cc39926c5df2b36ed9093528e8fe0e1b65f3ab8177a635ec1a729f", "sha256:691e7ed9143b873fd3d7e5bab2d6e777d1ba3ef6b6c9aaf71fc71c6eeed2f137", "sha256:0a5a0c71297f36b56ebde70feb9a36fee68274e42348c974d971683ce99067df", "sha256:e09bd5b6dc8f35c94cc59596427dfcadbd730e91dc7a977527779964fba9e123"}
 
 
 def verified_worker(data, digest, replicas, desired_replicas):
