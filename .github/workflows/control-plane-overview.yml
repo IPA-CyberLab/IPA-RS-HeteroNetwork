@@ -57,6 +57,25 @@ jobs:
       - name: Verify PostgreSQL token metrics against record semantics
         env:
           IPARS_TEST_POSTGRES_URL: postgresql://ipars:test-only@127.0.0.1:5432/ipars_admin_ledger_test
-        run: cargo test --locked -p ipars-store postgres_token_metrics_match_record_status_and_tombstones -- --ignored
+        run: cargo test --locked -p ipars-store postgres_token_metrics_ -- --ignored
       - name: Verify authenticated overview and node details
         run: cargo test --locked -p ipars-control-plane-http http_admin_overview_updates_for_three_node_nat_discovery
+
+  native-server:
+    needs: overview-regression
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Build the tested control-plane server
+        run: cargo build --locked --release -p ipars-daemon --bin iparsd
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: overview-native-server
+          path: target/release/iparsd
+          retention-days: 7
