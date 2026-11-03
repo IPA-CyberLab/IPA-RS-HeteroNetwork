@@ -17,7 +17,7 @@ from urllib.parse import unquote, urlsplit
 
 FLASH_COMPONENTS = {"api", "controller", "activator", "capacity", "backup-verifier"}
 LIMITS = ("max_weekly_cpu_millicore_seconds", "max_weekly_memory_mib_seconds", "max_weekly_gpu_seconds")
-SUPPORTED_CLOUD_DIGESTS = {"sha256:6e93235aac7732f99aa85f76f67aae88f7b216e159fe943be61e34d2f803e66a", "sha256:557302cf2facc153795328921729efbbaab9a310eb54ce440a0a9dfd78cdd1af", "sha256:8d27f736bd182a5d5ebb36f59d18c0551e9b4bde49b590bbf8ebbb365c898e1b", "sha256:f1fa2604777714325289ecf5ee8c743d0dda8f3a424415b2706ac0ee95d1ff16", "sha256:1346a90187cc39926c5df2b36ed9093528e8fe0e1b65f3ab8177a635ec1a729f", "sha256:691e7ed9143b873fd3d7e5bab2d6e777d1ba3ef6b6c9aaf71fc71c6eeed2f137"}
+SUPPORTED_CLOUD_DIGESTS = {"sha256:6e93235aac7732f99aa85f76f67aae88f7b216e159fe943be61e34d2f803e66a", "sha256:557302cf2facc153795328921729efbbaab9a310eb54ce440a0a9dfd78cdd1af", "sha256:8d27f736bd182a5d5ebb36f59d18c0551e9b4bde49b590bbf8ebbb365c898e1b", "sha256:f1fa2604777714325289ecf5ee8c743d0dda8f3a424415b2706ac0ee95d1ff16", "sha256:1346a90187cc39926c5df2b36ed9093528e8fe0e1b65f3ab8177a635ec1a729f", "sha256:691e7ed9143b873fd3d7e5bab2d6e777d1ba3ef6b6c9aaf71fc71c6eeed2f137", "sha256:0a5a0c71297f36b56ebde70feb9a36fee68274e42348c974d971683ce99067df"}
 SUPPORTED_FLASH_DIGESTS = {"sha256:1b996062281da5c7562f41c8793cf3a5743d98778297e182f0d63cd27cc13520"}
 
 
