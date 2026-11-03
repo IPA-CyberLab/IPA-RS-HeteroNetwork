@@ -4082,31 +4082,70 @@ impl TokenLedger for PostgresControlPlaneStore {
         cluster_id: &ClusterId,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
-        let records = sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = $1")
-            .bind(cluster_id.as_str())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(sql_error)?;
-        let revocations =
-            sqlx::query("SELECT record_json FROM token_revocations WHERE cluster_id = $1")
-                .bind(cluster_id.as_str())
-                .fetch_all(&self.pool)
-                .await
-                .map_err(sql_error)?;
-        let mut metrics = TokenLedgerMetrics::default();
-        let mut token_nonces = BTreeSet::new();
-        for record in records.into_iter().map(pg_row_to_token) {
-            let record = record?;
-            token_nonces.insert(record.nonce.clone());
-            metrics.observe_record(&record, now);
-        }
-        for revocation in revocations.into_iter().map(pg_row_to_revocation) {
-            let revocation = revocation?;
-            if !token_nonces.contains(&revocation.nonce) {
-                metrics.observe_revocation_tombstone();
-            }
-        }
-        Ok(metrics)
+        // Token claims can contain a large signed enrollment manifest. Fetching
+        // every JSON record for an overview needlessly transfers that data on
+        // each scrape; only these aggregate counters leave PostgreSQL.
+        let row = sqlx::query(
+            r#"
+            WITH classified AS (
+                SELECT CASE
+                    WHEN record_json->>'revoked_at' IS NOT NULL THEN 'revoked'
+                    -- PostgreSQL timestamps round to microseconds, but the
+                    -- stored RFC3339 expiration and Rust clock can contain
+                    -- nanoseconds. Keep the fractional seconds as numeric.
+                    WHEN EXTRACT(EPOCH FROM
+                             (regexp_replace(record_json->>'expires_at', '\.[0-9]+', ''))::timestamptz)
+                         + COALESCE(('0.' || substring(record_json->>'expires_at' FROM '\.([0-9]+)'))::numeric, 0)
+                         <= $2::bigint::numeric + $3::integer::numeric / 1000000000
+                        THEN 'expired'
+                    WHEN record_json->>'max_uses' IS NOT NULL
+                         AND (record_json->>'uses')::bigint >= (record_json->>'max_uses')::bigint
+                        THEN 'exhausted'
+                    ELSE 'active'
+                END AS status,
+                (record_json->>'uses')::numeric AS uses
+                FROM tokens WHERE cluster_id = $1
+            ), tombstones AS (
+                SELECT COUNT(*) AS count FROM token_revocations AS revocation
+                WHERE revocation.cluster_id = $1 AND NOT EXISTS (
+                    SELECT 1 FROM tokens AS token
+                    WHERE token.cluster_id = revocation.cluster_id
+                      AND token.nonce = revocation.nonce
+                )
+            )
+            SELECT COUNT(*) AS issued_count,
+                   COUNT(*) FILTER (WHERE status = 'active') AS active_count,
+                   COUNT(*) FILTER (WHERE status = 'revoked') AS revoked_count,
+                   COUNT(*) FILTER (WHERE status = 'expired') AS expired_count,
+                   COUNT(*) FILTER (WHERE status = 'exhausted') AS exhausted_count,
+                   LEAST(COALESCE(SUM(uses), 0), 18446744073709551615::numeric)::text AS use_count,
+                   (SELECT count FROM tombstones) AS tombstone_count
+            FROM classified
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(now.timestamp())
+        .bind(now.timestamp_subsec_nanos() as i32)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        let count = |column: &str| -> Result<u64, ControlPlaneError> {
+            let value: i64 = row.try_get(column).map_err(sql_error)?;
+            u64::try_from(value)
+                .map_err(|error| ControlPlaneError::Store(format!("invalid token metric: {error}")))
+        };
+        let tombstones = count("tombstone_count")?;
+        let use_count: String = row.try_get("use_count").map_err(sql_error)?;
+        Ok(TokenLedgerMetrics {
+            issued_count: count("issued_count")?.saturating_add(tombstones),
+            active_count: count("active_count")?,
+            revoked_count: count("revoked_count")?.saturating_add(tombstones),
+            expired_count: count("expired_count")?,
+            exhausted_count: count("exhausted_count")?,
+            use_count: use_count.parse().map_err(|error| {
+                ControlPlaneError::Store(format!("invalid token uses: {error}"))
+            })?,
+        })
     }
 }
 
@@ -5229,6 +5268,122 @@ mod tests {
         exercise_admin_rotation(first.clone(), second.clone(), cluster).await?;
         first.pool.close().await;
         second.pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable ipars_admin_ledger_test PostgreSQL database"]
+    async fn postgres_token_metrics_match_record_status_and_tombstones(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("IPARS_TEST_POSTGRES_URL")?;
+        let pool = PgPool::connect(&url).await?;
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            database, "ipars_admin_ledger_test",
+            "test refuses other databases"
+        );
+        let store = PostgresControlPlaneStore::from_pool(pool).await?;
+        let cluster = ClusterId::from_string(format!("token-metrics-{}", NodeId::new()));
+        let other_cluster =
+            ClusterId::from_string(format!("token-metrics-other-{}", NodeId::new()));
+        let now = DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 123_456_789)
+            .ok_or("invalid test timestamp")?;
+        let make_record = |nonce: &str| {
+            let mut token_claims = claims(cluster.clone());
+            token_claims.nonce = nonce.to_owned();
+            TokenLedgerRecord::from_claims(&token_claims, now)
+        };
+        let mut active = make_record("active");
+        active.uses = 2;
+        active.max_uses = Some(3);
+        let mut revoked = make_record("revoked");
+        revoked.revoked_at = Some(now);
+        revoked.expires_at = now - chrono::Duration::seconds(1);
+        revoked.max_uses = Some(1);
+        revoked.uses = 1;
+        let mut expired = make_record("expired");
+        expired.expires_at = now;
+        expired.max_uses = Some(1);
+        expired.uses = 1;
+        let mut exhausted = make_record("exhausted");
+        exhausted.max_uses = Some(2);
+        exhausted.uses = 2;
+        let mut zero_limit = make_record("zero-limit");
+        zero_limit.max_uses = Some(0);
+        let mut unlimited = make_record("unlimited");
+        unlimited.max_uses = None;
+        unlimited.uses = u32::MAX;
+        let mut future_nanos = make_record("future-nanos");
+        future_nanos.expires_at = now + chrono::Duration::nanoseconds(1);
+        let mut past_nanos = make_record("past-nanos");
+        past_nanos.expires_at = now - chrono::Duration::nanoseconds(1);
+        let mut whole_seconds = make_record("whole-seconds");
+        whole_seconds.expires_at = DateTime::<Utc>::from_timestamp(now.timestamp(), 0)
+            .ok_or("invalid whole-second timestamp")?;
+        let records = [
+            active,
+            revoked,
+            expired,
+            exhausted,
+            zero_limit,
+            unlimited,
+            future_nanos,
+            past_nanos,
+            whole_seconds,
+        ];
+        let mut expected = TokenLedgerMetrics::default();
+        for record in &records {
+            sqlx::query("INSERT INTO tokens (cluster_id, nonce, record_json) VALUES ($1, $2, $3)")
+                .bind(cluster.as_str())
+                .bind(&record.nonce)
+                .bind(serde_json::to_value(record)?)
+                .execute(&store.pool)
+                .await?;
+            expected.observe_record(record, now);
+        }
+        for nonce in ["revoked", "orphan"] {
+            let revocation = TokenRevocationRecord {
+                cluster_id: cluster.clone(),
+                nonce: nonce.to_owned(),
+                issuer: NodeId::from_string("issuer"),
+                key_id: KeyId::from_string("root"),
+                revoked_at: now,
+            };
+            sqlx::query("INSERT INTO token_revocations (cluster_id, nonce, record_json) VALUES ($1, $2, $3)")
+                .bind(cluster.as_str())
+                .bind(nonce)
+                .bind(serde_json::to_value(revocation)?)
+                .execute(&store.pool)
+                .await?;
+        }
+        expected.observe_revocation_tombstone();
+        // A token with the same nonce in another cluster must not hide a tombstone.
+        let mut other = make_record("orphan");
+        other.cluster_id = other_cluster.clone();
+        sqlx::query("INSERT INTO tokens (cluster_id, nonce, record_json) VALUES ($1, $2, $3)")
+            .bind(other_cluster.as_str())
+            .bind(&other.nonce)
+            .bind(serde_json::to_value(&other)?)
+            .execute(&store.pool)
+            .await?;
+        assert_eq!(store.token_metrics(&cluster, now).await?, expected);
+        assert_eq!(
+            store.token_metrics(&ClusterId::new(), now).await?,
+            TokenLedgerMetrics::default()
+        );
+        for id in [&cluster, &other_cluster] {
+            sqlx::query("DELETE FROM token_revocations WHERE cluster_id = $1")
+                .bind(id.as_str())
+                .execute(&store.pool)
+                .await?;
+            sqlx::query("DELETE FROM tokens WHERE cluster_id = $1")
+                .bind(id.as_str())
+                .execute(&store.pool)
+                .await?;
+        }
+        store.pool.close().await;
         Ok(())
     }
 

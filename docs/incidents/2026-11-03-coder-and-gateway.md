@@ -20,6 +20,26 @@ Other stopped workspaces still using the discarded index can encounter the same
 problem until they are updated to their active template version. They were not
 started or modified as part of the `ramen` recovery.
 
+## HeteroNetwork console acceptance
+
+The GitHub-hosted VPN and Chromium test intermittently received HTTP 503 from
+the authenticated `/v1/admin/overview` endpoint. VPN handshake, DNS and the
+Grafana and Prometheus checks had succeeded. A repeat run passed, so a pass by
+itself did not establish that the intermittent failure had been resolved.
+During a failing run, the control plane logged a token-ledger read lasting
+4.32 seconds; the agent's per-candidate administrative timeout is five seconds.
+This timing is consistent with a timeout but does not by itself prove which
+candidate produced the final 503.
+
+The overview now fetches independent sections concurrently, obtains node
+health and NAT classifications in batches, and calculates token counters in
+PostgreSQL instead of transferring every token and its claims for each request.
+On a read-only comparison against the live ledger, both implementations
+produced the same counters while the returned payload fell from 1,467,787 to
+19 bytes. A disposable PostgreSQL test checks expiry boundaries, revocation
+precedence, tombstones, cluster isolation, and empty ledgers. The optimization
+reduces work; network and database latency can still cause failures.
+
 ## Public API rollout
 
 During a console rollout at 06:53 UTC, an external probe observed one HTTP 503.

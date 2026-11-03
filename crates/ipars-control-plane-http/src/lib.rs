@@ -6537,10 +6537,11 @@ async fn admin_node_snapshot<S>(
 where
     S: ControlPlaneStore,
 {
-    let nodes = plane.list_nodes().await?;
+    let ((nodes, health_by_node), nat_by_node) =
+        tokio::try_join!(plane.list_nodes_with_health(), plane.nat_classifications())?;
     let mut snapshot = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let nat_classification = plane.nat_classification_for(&node.node_id).await?;
+        let nat_classification = nat_by_node.get(&node.node_id).cloned();
         let mut public_ips = node
             .endpoint_candidates
             .iter()
@@ -6569,7 +6570,7 @@ where
             public_ips.insert(observed_ip);
         }
         snapshot.push(ControlPlaneNodeOverview {
-            health: plane.health_for_node(&node.node_id).await?,
+            health: health_by_node.get(&node.node_id).cloned(),
             nat_classification,
             public_ips: public_ips.into_iter().collect(),
             agent_build: plane.agent_build_for_node(&node.node_id).await,
@@ -6682,15 +6683,23 @@ where
 {
     let generated_at = Utc::now();
     let config = state.plane.config();
+    let (cluster_policy, metrics, nodes, paths, nat_discovery, service_directory) = tokio::try_join!(
+        state.plane.current_cluster_policy(),
+        control_plane_metrics(&state),
+        admin_node_snapshot(&state.plane),
+        state.plane.list_paths(),
+        state.plane.nat_discovery_overview(),
+        state.plane.service_directory(),
+    )?;
     Ok(Json(ControlPlaneOverviewResponse {
         cluster_id: config.cluster_id.clone(),
         vpn_pool: config.vpn_pool,
-        cluster_policy: state.plane.current_cluster_policy().await?,
-        metrics: control_plane_metrics(&state).await?,
-        nodes: admin_node_snapshot(&state.plane).await?,
-        paths: state.plane.list_paths().await?,
-        nat_discovery: state.plane.nat_discovery_overview().await?,
-        service_directory: state.plane.service_directory().await?,
+        cluster_policy,
+        metrics,
+        nodes,
+        paths,
+        nat_discovery,
+        service_directory,
         generated_at,
     }))
 }
@@ -7067,26 +7076,24 @@ where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let mut metrics = state.plane.metrics().await?;
-    let keycloak_placement = state
-        .plane
-        .keycloak_placement(
+    let (mut metrics, keycloak_placement, token_metrics) = tokio::try_join!(
+        state.plane.metrics(),
+        state.plane.keycloak_placement(
             KEYCLOAK_AUTOPILOT_VERSION,
             KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
             KEYCLOAK_AUTOPILOT_MAX_CANDIDATES,
             Utc::now(),
-        )
-        .await?;
+        ),
+        state
+            .join_service
+            .token_metrics(&state.plane.config().cluster_id, Utc::now()),
+    )?;
     metrics.ha_ready = metrics.ha_ready
         && keycloak_placement.replicas.len() == KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS
         && keycloak_placement
             .replicas
             .iter()
             .all(|replica| replica.ready);
-    let token_metrics = state
-        .join_service
-        .token_metrics(&metrics.cluster_id, Utc::now())
-        .await?;
     apply_token_ledger_metrics(&mut metrics, token_metrics);
     Ok(metrics)
 }

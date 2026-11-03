@@ -3071,6 +3071,19 @@ where
             .collect())
     }
 
+    pub async fn list_nodes_with_health(
+        &self,
+    ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
+        let (nodes, health) = self.store.list_nodes_and_health().await?;
+        Ok((
+            nodes
+                .into_iter()
+                .filter(|node| !node.role.is_client())
+                .collect(),
+            health,
+        ))
+    }
+
     pub async fn registered_nodes_with_health(
         &self,
     ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
