@@ -5388,6 +5388,116 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable ipars_admin_ledger_test PostgreSQL database"]
+    async fn postgres_token_metrics_complete_over_a_slow_database_link(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::task::JoinSet;
+
+        let url = std::env::var("IPARS_TEST_POSTGRES_URL")?;
+        let options = PgConnectOptions::from_str(&url)?;
+        assert_eq!(
+            options.get_host(),
+            "127.0.0.1",
+            "test refuses a nonlocal host"
+        );
+        assert_eq!(options.get_database(), Some("ipars_admin_ledger_test"));
+        let direct = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await?;
+        let store = PostgresControlPlaneStore::from_pool(direct).await?;
+        let cluster = ClusterId::from_string(format!("token-slow-link-{}", NodeId::new()));
+        let now = Utc::now();
+        for index in 0..16 {
+            let mut token_claims = claims(cluster.clone());
+            token_claims.nonce = format!("slow-link-{index}");
+            let record = TokenLedgerRecord::from_claims(&token_claims, now);
+            sqlx::query("INSERT INTO tokens (cluster_id, nonce, record_json) VALUES ($1, $2, $3::jsonb || jsonb_build_object('padding', repeat('x', 131072)))")
+                .bind(cluster.as_str())
+                .bind(&record.nonce)
+                .bind(serde_json::to_value(&record)?)
+                .execute(&store.pool)
+                .await?;
+        }
+
+        // Forward PostgreSQL traffic over a loopback link capped at 64 KiB/s
+        // in the database-to-client direction. This reproduces a slow path
+        // without touching the production network or exposing credentials.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let listen_port = listener.local_addr()?.port();
+        let target_port = options.get_port();
+        let proxy = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            while let Ok((client, _)) = listener.accept().await {
+                connections.spawn(async move {
+                    let Ok(upstream) = TcpStream::connect(("127.0.0.1", target_port)).await else {
+                        return;
+                    };
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                    let requests = tokio::io::copy(&mut client_read, &mut upstream_write);
+                    let responses = async {
+                        let mut buffer = [0_u8; 8192];
+                        loop {
+                            let count = upstream_read.read(&mut buffer).await?;
+                            if count == 0 {
+                                break;
+                            }
+                            client_write.write_all(&buffer[..count]).await?;
+                            tokio::time::sleep(Duration::from_secs_f64(count as f64 / 65_536.0))
+                                .await;
+                        }
+                        Ok::<(), std::io::Error>(())
+                    };
+                    tokio::select! { _ = requests => {}, _ = responses => {} }
+                });
+            }
+        });
+        let slow_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.host("127.0.0.1").port(listen_port))
+            .await?;
+        let slow_store = PostgresControlPlaneStore {
+            pool: slow_pool.clone(),
+            mesh_wakeups: Default::default(),
+        };
+        let metrics = tokio::time::timeout(
+            Duration::from_secs(3),
+            slow_store.token_metrics(&cluster, now),
+        )
+        .await??;
+        assert_eq!(metrics.issued_count, 16);
+        assert_eq!(metrics.active_count, 16);
+        // The former full-record read cannot meet the same deadline over this link.
+        let full_read = tokio::time::timeout(
+            Duration::from_secs(3),
+            sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = $1")
+                .bind(cluster.as_str())
+                .fetch_all(&slow_pool),
+        )
+        .await;
+        assert!(
+            full_read.is_err(),
+            "full token transfer unexpectedly met the deadline"
+        );
+
+        proxy.abort();
+        drop(slow_store);
+        drop(slow_pool);
+        sqlx::query("DELETE FROM tokens WHERE cluster_id = $1")
+            .bind(cluster.as_str())
+            .execute(&store.pool)
+            .await?;
+        store.pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sqlite_admin_capability_restart_and_preuse_revocation(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (url, path) = temp_sqlite_url("admin-restart");

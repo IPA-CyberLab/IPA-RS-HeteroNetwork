@@ -38,7 +38,10 @@ On a read-only comparison against the live ledger, both implementations
 produced the same counters while the returned payload fell from 1,467,787 to
 19 bytes. A disposable PostgreSQL test checks expiry boundaries, revocation
 precedence, tombstones, cluster isolation, and empty ledgers. The optimization
-reduces work; network and database latency can still cause failures.
+also passes a disposable PostgreSQL test with the return link restricted to
+64 KiB/s: aggregate retrieval meets a three-second deadline while reading the
+same full records exceeds it. The optimization reduces work; network and
+database latency can still cause failures.
 
 ## Public API rollout
 
