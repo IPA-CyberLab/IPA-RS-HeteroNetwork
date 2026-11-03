@@ -43,6 +43,16 @@ also passes a disposable PostgreSQL test with the return link restricted to
 same full records exceeds it. The optimization reduces work; network and
 database latency can still cause failures.
 
+Terraform rolled out the CI-built server serially to all five configured
+hosts, with no Ansible failures. Both serving control planes answered their
+health checks afterward. A probe observed 169 HTTP 200 responses from Coder
+during part of the rollout. The HeteroCloud probe's default Python user agent
+was blocked by Cloudflare with HTTP 403; a browser user agent received 200
+after the rollout, so that probe is not evidence of continuous availability.
+The [post-rollout GitHub Actions run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/41604916300)
+established a real WireGuard handshake and passed the authenticated Chromium
+checks. The temporary VPN client was removed afterward.
+
 ## Public API rollout
 
 During a console rollout at 06:53 UTC, an external probe observed one HTTP 503.
