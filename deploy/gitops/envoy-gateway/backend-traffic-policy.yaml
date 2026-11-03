@@ -22,24 +22,31 @@ spec:
       # requests off at the former 3s edge timeout.
       timeout: 12s
   healthCheck:
-    panicThreshold: 0
+    # Keep attempting available endpoints when all health checks briefly fail.
+    # A single slow probe during a two-node rollout previously caused 503s.
+    panicThreshold: 50
     active:
       type: HTTP
-      interval: 2s
-      timeout: 1s
+      interval: 3s
+      timeout: 3s
       healthyThreshold: 1
-      unhealthyThreshold: 1
+      unhealthyThreshold: 3
       http:
         path: /api/v1/health/live
         expectedStatuses:
           - 200
+        retriableStatuses:
+          - 500
+          - 502
+          - 503
+          - 504
     passive:
       interval: 1s
       baseEjectionTime: 30s
       consecutive5XxErrors: 2
       consecutiveGatewayErrors: 2
       consecutiveLocalOriginFailures: 1
-      maxEjectionPercent: 100
+      maxEjectionPercent: 50
       splitExternalLocalOriginErrors: true
   timeout:
     http:
