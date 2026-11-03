@@ -16,7 +16,7 @@ spec:
       valueFiles:
       - ../../environments/heteronet/values.yaml
       values: |
-        replicaCount: 2
+        replicaCount: 3
         workloadIdentity:
           enabled: true
           namespace: heterocloud-flash-workloads
@@ -26,10 +26,10 @@ spec:
         image:
           tag: "0.1.111-ui.2@sha256:0a5a0c71297f36b56ebde70feb9a36fee68274e42348c974d971683ce99067df"
         worker:
-          replicaCount: 2
+          replicaCount: 3
           vpcEndpoint: http://heterocloud-vpc-api.heterocloud-vpc.svc.cluster.local:8080/
         ownerConsole:
-          replicaCount: 2
+          replicaCount: 3
           externalIPs:
             - 10.250.0.4
             - 10.250.0.5
