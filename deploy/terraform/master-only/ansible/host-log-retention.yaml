@@ -1,0 +1,83 @@
+- name: Bound host log growth without changing workload data
+  hosts: master_only:bootstrap:enrollment_issuer:standard
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Validate and install compressed size-based system log rotation
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/terraform/master-only/ansible/files/rsyslog-retention.conf"
+        dest: /etc/logrotate.d/rsyslog
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/logrotate --debug --state /dev/null %s
+
+    - name: Create the logrotate timer override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/logrotate.timer.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Check log sizes hourly
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/terraform/master-only/ansible/files/logrotate-hourly.conf"
+        dest: /etc/systemd/system/logrotate.timer.d/10-heteronetwork.conf
+        owner: root
+        group: root
+        mode: '0644'
+      register: hnn_logrotate_timer
+
+    - name: Reload systemd when the timer changes
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: hnn_logrotate_timer.changed
+
+    - name: Enable the logrotate timer
+      ansible.builtin.systemd_service:
+        name: logrotate.timer
+        enabled: true
+        state: started
+
+    - name: Create the persistent journal configuration directory
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Measure the existing persistent journal before setting its limit
+      ansible.builtin.command: du -s -B1 /var/log/journal
+      register: hnn_journal_usage
+      changed_when: false
+      check_mode: false
+
+    - name: Keep existing journal data while preventing further unbounded growth
+      ansible.builtin.set_fact:
+        hnn_journal_max_bytes: "{{ [1073741824, (((hnn_journal_usage.stdout.split()[0] | int) + 268435455) // 268435456) * 268435456] | max }}"
+
+    - name: Limit duplicate local journal retention
+      ansible.builtin.template:
+        src: "{{ hnn_repo_root }}/deploy/terraform/master-only/ansible/files/journald-retention.conf.j2"
+        dest: /etc/systemd/journald.conf.d/60-heteronetwork-retention.conf
+        owner: root
+        group: root
+        mode: '0644'
+      register: hnn_journald_retention
+
+    - name: Apply the journal limit
+      ansible.builtin.systemd_service:
+        name: systemd-journald.service
+        state: restarted
+      when: hnn_journald_retention.changed
+
+    - name: Verify the timer is active
+      ansible.builtin.command: systemctl is-active logrotate.timer
+      changed_when: false
