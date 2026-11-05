@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -285,6 +286,7 @@ def main():
     parser.add_argument('--flash-ops', type=Path, default=Path(__file__).resolve().parents[2] / 'IPA-RS-HeteroCloud-Flash' / 'ops')
     args = parser.parse_args()
     global offsite
+    sys.path.insert(0, str(args.flash_ops.resolve()))
     spec = importlib.util.spec_from_file_location('flash_offsite_e2e', args.flash_ops / 'offsite.py')
     offsite = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(offsite)
