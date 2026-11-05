@@ -12,6 +12,18 @@ scoped to this bucket's object read/write operations. Store endpoint, bucket,
 region (`auto`), access_key and secret_key in an owned 0600 JSON file. Do not paste
 credentials into Git, chat, command arguments or Terraform variables.
 
+This is the **operator-wide** export of the managed backup store and can include
+data from multiple organizations. Never point it at an organization's private
+bucket. Organization-specific backup destinations are configured separately in
+Flash and are not included by this operator-wide exporter.
+
+The same configuration supports other public HTTPS S3-compatible endpoints.
+An optional `prefix` confines copies to that key prefix; `addressing_style` may
+be `path` (default) or `virtual`. An optional `session_token` is signed with
+each request. Temporary credentials are not automatically renewed; rotate the
+protected input and reconcile the Secret before expiry. Ensure the scoped key
+can list, read, write and delete only the designated backup bucket/prefix.
+
 Run `scripts/configure-flash-offsite.py` using `--config-file`, `--kubeconfig` and
 `--recovery-key-file`. It writes the destination Secret without exporting values
 and saves the catalog key to the protected recovery file before publishing. Keep

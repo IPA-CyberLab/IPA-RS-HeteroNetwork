@@ -8,6 +8,7 @@ Re-running validates existing configuration and reuses its access key.
 import argparse
 import base64
 import json
+import secrets
 import socket
 import subprocess
 import time
@@ -35,6 +36,18 @@ def validate_key(key, bucket):
     require(bool(key.get('secretAccessKey')), 'backup key secret is unavailable')
 
 
+def validate_proxy_key(secret):
+    labels = secret.get('metadata', {}).get('labels', {})
+    require(labels.get('app.kubernetes.io/managed-by') == 'heteronetwork-iac' and
+            labels.get('app.kubernetes.io/part-of') == 'flash-backups',
+            'backup proxy key exists but is not managed by HeteroNetwork')
+    try:
+        value = base64.b64decode(secret['data']['hmac-key'], validate=True)
+    except (KeyError, ValueError):
+        raise RuntimeError('backup proxy key is invalid') from None
+    require(len(value) >= 32, 'backup proxy key is invalid')
+
+
 class Provisioner:
     def __init__(self, args):
         self.args = args
@@ -59,6 +72,22 @@ class Provisioner:
                 return json.loads(raw)
         except urllib.error.HTTPError as error:
             raise RuntimeError('Garage administration failed: ' + operation + ' HTTP ' + str(error.code)) from None
+
+    def ensure_proxy_key(self):
+        name = 'flash-backup-s3-proxy'
+        namespace = self.args.export_namespace
+        current = self.kube('-n', namespace, 'get', 'secret', name, '--ignore-not-found', '-o', 'json')
+        if current is not None:
+            validate_proxy_key(current)
+            return
+        # Create rather than apply: a race must fail closed, not rotate an
+        # existing key and strand backups. Reconciliation reuses it forever.
+        self.kube('create', '-f', '-', '-o', 'json', body={
+            'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
+            'metadata': {'name': name, 'namespace': namespace, 'labels': {
+                'app.kubernetes.io/managed-by': 'heteronetwork-iac',
+                'app.kubernetes.io/part-of': 'flash-backups'}},
+            'data': {'hmac-key': base64.b64encode(secrets.token_bytes(32)).decode()}})
 
     def run(self):
         args = self.args
@@ -113,6 +142,7 @@ class Provisioner:
             self.kube('apply', '--server-side', '--field-manager=heteronetwork-flash-backups', '-f', '-', '-o', 'json', body={'apiVersion': 'v1', 'kind': 'Secret',
                 'metadata': {'name': args.export_secret, 'namespace': args.export_namespace, 'labels': {'app.kubernetes.io/part-of': 'flash-backups'}},
                 'type': 'Opaque', 'data': {'config.json': base64.b64encode(json.dumps(export_config).encode()).decode()}})
+            self.ensure_proxy_key()
 
             self.api('AllowBucketKey', {'bucketId': bucket['id'], 'accessKeyId': key['accessKeyId'],
                                       'permissions': {'read': True, 'write': True, 'owner': False}})

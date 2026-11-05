@@ -28,6 +28,21 @@ class ProtectedOffsiteConfiguration(unittest.TestCase):
             file.write_text(json.dumps(dict(config,private_source=True)))
             with self.assertRaises(ValueError):module.configuration(file)
 
+    def test_custom_s3_prefix_addressing_and_temporary_credentials(self):
+        config = {"endpoint": "https://s3.example.test:9443", "bucket": "private-test-backups",
+                  "access_key": "a", "secret_key": "b", "region": "us-east-1",
+                  "prefix": "tenant/backup", "addressing_style": "virtual", "session_token": "test-token"}
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "config.json"
+            file.write_text(json.dumps(config));file.chmod(0o600)
+            self.assertEqual(module.configuration(file), config)
+            for update in ({"prefix": "../other"}, {"prefix": "/absolute"}, {"prefix": "a/./b"},
+                           {"addressing_style": "other"}, {"session_token": "bad\nheader"},
+                           {"region": "invalid/region"}, {"endpoint": None}):
+                with self.subTest(update=update):
+                    file.write_text(json.dumps(dict(config, **update)))
+                    with self.assertRaises(ValueError): module.configuration(file)
+
 
 if __name__ == "__main__":
     unittest.main()

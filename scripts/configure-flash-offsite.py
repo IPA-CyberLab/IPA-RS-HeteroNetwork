@@ -22,17 +22,34 @@ def configuration(path):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
         raise ValueError("Destination configuration requires an owned regular 0600 file")
     value = json.loads(path.read_text())
-    if set(value) - {"endpoint", "bucket", "region", "access_key", "secret_key"}:
+    if not isinstance(value, dict) or not isinstance(value.get("endpoint"), str) or not isinstance(value.get("bucket"), str):
+        raise ValueError("Destination requires an endpoint and bucket")
+    if set(value) - {"endpoint", "bucket", "region", "access_key", "secret_key", "session_token", "prefix", "addressing_style"}:
         raise ValueError("Unexpected destination configuration fields")
     endpoint = urllib.parse.urlsplit(value["endpoint"])
     if endpoint.scheme != "https" or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment or endpoint.path not in ("", "/") or not endpoint.hostname:
         raise ValueError("Destination requires an HTTPS S3 origin")
+    if endpoint.port is not None and not 1 <= endpoint.port <= 65535:
+        raise ValueError("Invalid S3 endpoint port")
     if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", value["bucket"]):
         raise ValueError("Invalid destination bucket")
     for name in ("access_key", "secret_key"):
-        if not isinstance(value.get(name), str) or not 8 <= len(value[name]) <= 512:
+        if (not isinstance(value.get(name), str) or not 1 <= len(value[name]) <= 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in value[name])):
             raise ValueError("Destination credential is missing or invalid")
     value.setdefault("region", "auto")
+    if not isinstance(value["region"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value["region"]):
+        raise ValueError("Invalid S3 signing region")
+    prefix = value.get("prefix", "")
+    if (not isinstance(prefix, str) or len(prefix.encode()) > 1024 or prefix.startswith("/")
+            or any(part in (".", "..") for part in prefix.split("/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in prefix)):
+        raise ValueError("Invalid destination prefix")
+    if value.get("addressing_style", "path") not in ("path", "virtual"):
+        raise ValueError("Invalid S3 addressing style")
+    token = value.get("session_token")
+    if token is not None and (not isinstance(token, str) or not token or len(token) > 8192 or "\r" in token or "\n" in token):
+        raise ValueError("Invalid temporary S3 session token")
     return value
 
 

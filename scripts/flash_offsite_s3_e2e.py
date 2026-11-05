@@ -82,8 +82,15 @@ def main():
             buckets.append(bucket)
             admin("UpdateBucket", {"quotas": {"maxSize": 16*1024**2, "maxObjects": 100}}, id=bucket["id"])
             admin("AllowBucketKey", {"bucketId": bucket["id"], "accessKeyId": key["accessKeyId"], "permissions": {"read": True, "write": True, "owner": False}})
-            stores.append(offsite.S3({"endpoint": endpoint, "bucket": prefix+"-"+name, "region": "heteronet-global", "access_key": key["accessKeyId"], "secret_key": key["secretAccessKey"], "private_source": True}))
+            stores.append(offsite.S3({"endpoint": endpoint, "bucket": prefix+"-"+name, "region": "heteronet-global", "access_key": key["accessKeyId"], "secret_key": key["secretAccessKey"], "private_source": True,
+                                      "prefix": "isolated/"+run+"/"+name}))
         source, destination, recovery = stores
+        # An operator can dedicate a prefix rather than an entire bucket. An
+        # unrelated object must survive both copy and disaster recovery.
+        outside_copy = offsite.S3(dict(destination.config, prefix=""))
+        outside_recovery = offsite.S3(dict(recovery.config, prefix=""))
+        for store in (outside_copy, outside_recovery):
+            store.request("PUT", "unrelated/keep", b"fixture-object-must-survive")
         payload = secrets.token_bytes(2*1024**2)
         expected = {"volumes/test/blocks/payload": payload, "volumes/test/backup.cfg": json.dumps({"run_id": run}).encode()}
         for name, value in expected.items():source.request("PUT", name, value)
@@ -99,6 +106,10 @@ def main():
         for name, value in expected.items():
             if recovery.request("GET", name) != value:raise RuntimeError("recovered_bytes_mismatch")
         report["checks"]["recovered_original_bytes_after_source_deletion"] = True
+        for store in (outside_copy, outside_recovery):
+            if store.request("GET", "unrelated/keep") != b"fixture-object-must-survive":
+                raise RuntimeError("objects_outside_configured_prefix_changed")
+        report["checks"]["unrelated_prefixes_preserved"] = True
         try:offsite.restore_generation(destination, recovery, catalog, signing_key)
         except RuntimeError:report["checks"]["nonempty_recovery_destination_refused"] = True
         else:raise RuntimeError("nonempty_restore_was_allowed")
