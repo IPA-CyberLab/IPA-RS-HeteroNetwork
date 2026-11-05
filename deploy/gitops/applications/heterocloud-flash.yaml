@@ -41,6 +41,8 @@ spec:
           freePercent: 25
           imageExpansionFactor: 6
         backups:
+          destinations:
+            enabled: true
           offsite:
             # Enable only after independent destination credentials and recovery
             # have been verified. The primary bucket shares the cluster's site.
