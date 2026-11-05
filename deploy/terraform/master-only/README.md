@@ -133,7 +133,7 @@ waits for the enrollment Control Plane and Keycloak edge to recover.
 
 ## Apply
 
-Install Terraform >=1.10, ansible-core 2.19.5, Python with PyYAML and kubectl.
+Install Terraform >=1.16.4, ansible-core 2.19.5, Python with PyYAML and kubectl.
 The lockfile pins the Terraform providers. Use an operator kubeconfig that can
 reach the existing cluster, the authorized SSH key, and a private work directory:
 
