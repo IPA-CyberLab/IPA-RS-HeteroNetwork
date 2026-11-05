@@ -16,6 +16,9 @@ on:
       - 'scripts/reconcile-coder-workspace-readiness.py'
       - 'scripts/test_reconcile_coder_workspace_readiness.py'
       - 'deploy/coder/workspace-readiness.json'
+      - 'scripts/reconcile-coder-template-scheduling.py'
+      - 'scripts/test_reconcile_coder_template_scheduling.py'
+      - 'deploy/coder/workspace-scheduling.json'
       - 'scripts/*flash*oom*.py'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
@@ -94,6 +97,9 @@ on:
       - 'scripts/reconcile-coder-workspace-readiness.py'
       - 'scripts/test_reconcile_coder_workspace_readiness.py'
       - 'deploy/coder/workspace-readiness.json'
+      - 'scripts/reconcile-coder-template-scheduling.py'
+      - 'scripts/test_reconcile_coder_template_scheduling.py'
+      - 'deploy/coder/workspace-scheduling.json'
       - 'scripts/*flash*oom*.py'
       - 'deploy/gitops/cluster-dns/**'
       - 'deploy/gitops/public-dns-quorum/**'
@@ -182,6 +188,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_verify_storage_redundancy.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_overlay_boot.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_coder_workspace_readiness.py -v
+          python3 -B -m unittest discover -s scripts -p test_reconcile_coder_template_scheduling.py -v
           python3 -B -m unittest discover -s scripts -p test_heterocloud_gateway_health_policy.py -v
           python3 -B -m unittest discover -s scripts -p test_node_lifecycle.py -v
           python3 -B -m unittest discover -s scripts -p 'test_reconcile_stopped_*.py' -v

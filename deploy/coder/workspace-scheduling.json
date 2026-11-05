@@ -1,0 +1,11 @@
+{
+  "endpoint": "https://coder.mizuame.app",
+  "owner_id": "ff8325de-89f0-403c-b490-6973274d9ce0",
+  "organization_id": "d9fb5034-f433-454b-a05b-7e9df734b1f4",
+  "template_ids": [
+    "14e0910e-b43c-43a8-be19-99a2ece2bb29",
+    "7a6c19c0-025f-4139-8ea4-7fc4a4bf12fb"
+  ],
+  "default_ttl_ms": 0,
+  "allow_user_autostop": true
+}
