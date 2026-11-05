@@ -10,10 +10,12 @@ import base64
 import importlib.util
 import json
 import os
+import secrets
 from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +41,7 @@ class TwoTargets(module.Probe):
         self.tunnels = []
         self.targets = []
         self.created_classes = []
+        self.fixture_owners = {}
         self.snapshots = []
         self.stage = 'preflight'
         self.report = {'test': 'two-real-longhorn-s3-targets', 'run': self.nonce,
@@ -158,17 +161,120 @@ class TwoTargets(module.Probe):
         if self.exec(name, 'cat /data/marker') != marker:
             raise RuntimeError('fixture restore marker mismatch')
 
+    def configure_external_proxy(self):
+        origin = urllib.parse.urlsplit(self.args.public_endpoint)
+        if origin.scheme != 'https' or not origin.hostname or origin.username or origin.password or origin.path not in ('', '/') or origin.query or origin.fragment:
+            raise RuntimeError('fixture external endpoint must be an HTTPS origin')
+        if not self.args.proxy_image or '@sha256:' not in self.args.proxy_image:
+            raise RuntimeError('fixture proxy image must be pinned by digest')
+        proxy_spec = importlib.util.spec_from_file_location('flash_proxy_fixture', self.args.flash_ops / 's3_egress_proxy.py')
+        proxy = importlib.util.module_from_spec(proxy_spec)
+        proxy_spec.loader.exec_module(proxy)
+        key = secrets.token_bytes(32)
+        identity = uuid.uuid4().hex + '.' + uuid.uuid4().hex
+        host = origin.hostname.lower().rstrip('.')
+        port = origin.port or 443
+        credential = proxy.token_for(key, identity, host, port)
+        proxy_url = 'http://' + identity + ':' + credential + '@external-proxy.' + self.namespace + '.svc.cluster.local:8088'
+        source = (self.args.flash_ops / 's3_egress_proxy.py').read_text()
+        wrapper = '''import s3_egress_proxy as p\nkey=open('/var/run/proxy/key','rb').read()\ndef connect(address, port):\n print('fixture proxy connected', flush=True)\n return p.system_connector(address, port)\nwith p.Server(('0.0.0.0',8088),key,connector=connect) as server:\n server.serve_forever()\n'''
+        self.apply({'apiVersion':'v1','kind':'ConfigMap','metadata':{'name':'external-proxy','namespace':self.namespace},
+                    'data':{'s3_egress_proxy.py':source,'run.py':wrapper}})
+        self.apply({'apiVersion':'v1','kind':'Secret','type':'Opaque','metadata':{'name':'external-proxy-key','namespace':self.namespace},
+                    'data':{'key':base64.b64encode(key).decode()}})
+        self.apply({'apiVersion':'v1','kind':'Pod','metadata':{'name':'external-proxy','namespace':self.namespace,'labels':{'app':'external-proxy'}},
+                    'spec':{'automountServiceAccountToken':False,'restartPolicy':'Never',
+                      'securityContext':{'runAsNonRoot':True,'runAsUser':65532,'runAsGroup':65532,'fsGroup':65532},
+                      'containers':[{'name':'proxy','image':self.args.proxy_image,'command':['python3','-u','-B','/opt/proxy/run.py'],
+                        'ports':[{'containerPort':8088}], 'resources':{'requests':{'cpu':'10m','memory':'32Mi'},'limits':{'cpu':'250m','memory':'128Mi'}},
+                        'securityContext':{'allowPrivilegeEscalation':False,'readOnlyRootFilesystem':True,'capabilities':{'drop':['ALL']}},
+                        'volumeMounts':[{'name':'scripts','mountPath':'/opt/proxy','readOnly':True},{'name':'key','mountPath':'/var/run/proxy','readOnly':True}]}],
+                      'volumes':[{'name':'scripts','configMap':{'name':'external-proxy'}},{'name':'key','secret':{'secretName':'external-proxy-key','defaultMode':288}}]}})
+        self.apply({'apiVersion':'v1','kind':'Service','metadata':{'name':'external-proxy','namespace':self.namespace},
+                    'spec':{'selector':{'app':'external-proxy'},'ports':[{'port':8088,'targetPort':8088}]}})
+        self.wait('wait for isolated S3 proxy', lambda: p if (p := self.get('pod','external-proxy')) and
+                  any(c['type']=='Ready' and c['status']=='True' for c in p.get('status',{}).get('conditions',[])) else None, 300)
+        if self.args.test_provider_registration:
+            organization = uuid.uuid4()
+            destination = uuid.uuid4()
+            name = 'hc-backup-' + destination.hex
+            verification_class = 'hc-verify-' + destination.hex
+            self.fixture_owners[name] = (str(organization), str(destination))
+            self.fixture_owners[verification_class] = (str(organization), str(destination))
+            self.targets.append(name)
+            self.created_classes.extend([name, verification_class])
+            fixture = {'organization_id':str(organization),'id':str(destination),'proxy_key':list(key),
+                'proxy_origin':'http://external-proxy.'+self.namespace+'.svc.cluster.local:8088',
+                'destination':{'endpoint':self.args.public_endpoint,'bucket':self.bucket_names[0],
+                    'region':self.region,'prefix':'isolated-probe','virtual_hosted':False,
+                    'access_key':self.keys[0]['accessKeyId'],'secret_key':self.keys[0]['secretAccessKey']}}
+            provider_repo = self.args.flash_ops.resolve().parent
+            with tempfile.NamedTemporaryFile(mode='w', prefix='flash-backup-destination-fixture-', delete=True) as file:
+                os.chmod(file.name, 0o600)
+                json.dump(fixture,file)
+                file.flush()
+                environment=os.environ.copy()
+                environment['KUBECONFIG']=self.args.kubeconfig
+                environment['FLASH_BACKUP_DESTINATION_E2E_FIXTURE']=file.name
+                result=subprocess.run([self.args.cargo,'test','--offline','--locked','--test','backup_destination_real',
+                    'registers_a_real_synthetic_destination'],cwd=provider_repo,env=environment,
+                    capture_output=True,text=True,timeout=360)
+            if result.returncode:
+                diagnostic = (result.stdout + '\n' + result.stderr)[-3000:]
+                for value in (self.keys[0]['accessKeyId'], self.keys[0]['secretAccessKey'], credential, proxy_url):
+                    diagnostic = diagnostic.replace(value, '[redacted]')
+                print('provider acceptance diagnostic:', diagnostic, flush=True)
+                self.report['checks']['provider_fixture_resources']={
+                    'secret_created':bool(self.get('secret',name,'longhorn-system')),
+                    'target_created':bool(self.get('backuptargets.longhorn.io',name,'longhorn-system')),
+                    'restore_class_created':bool(self.get('storageclass',name)),
+                    'verify_class_created':bool(self.get('storageclass',verification_class))}
+                raise RuntimeError('provider could not register the isolated destination')
+            self.wait('wait for registered HTTPS S3 target',lambda: t if (t := self.get('backuptargets.longhorn.io',name,'longhorn-system'))
+                      and t.get('status',{}).get('available') else None,180)
+            self.target_names[0]=name
+            self.classes[0]=name
+            self.report['checks']['provider_registered_scoped_s3_destination']=True
+            return
+        name = self.target_names[0]
+        existing = self.get('secret',name,'longhorn-system')
+        if not existing or existing['metadata'].get('labels',{}).get('heterocloud.io/backup-probe') != self.nonce:
+            raise RuntimeError('fixture storage credential identity changed')
+        self.kube('-n','longhorn-system','patch','secret',name,'--type=merge','--patch-file=/dev/stdin',body={
+            'metadata':{'resourceVersion':existing['metadata']['resourceVersion']},'stringData':{
+                'AWS_ENDPOINTS':self.args.public_endpoint,'HTTPS_PROXY':proxy_url,'HTTP_PROXY':proxy_url,'NO_PROXY':''}})
+
     def execute(self):
-        self.stage = 'targets'
-        self.storage_setup()
-        self.stage = 'source'
         self.apply({'apiVersion': 'v1', 'kind': 'Namespace',
                     'metadata': {'name': self.namespace, 'labels': {'heterocloud.io/backup-probe': self.nonce}}})
+        self.stage = 'targets'
+        self.storage_setup()
+        if self.args.public_endpoint:
+            # Exercise TLS and signed S3 operations using only the first
+            # random, bucket-scoped fixture credential, never production data.
+            self.stage = 'public-s3'
+            public = offsite.S3({'endpoint': self.args.public_endpoint, 'bucket': self.bucket_names[0],
+                'region': self.region, 'access_key': self.keys[0]['accessKeyId'],
+                'secret_key': self.keys[0]['secretAccessKey']})
+            public.request('PUT', 'synthetic-probe', b'fixture')
+            if public.request('GET', 'synthetic-probe') != b'fixture':
+                raise RuntimeError('public S3 fixture contents mismatch')
+            public.request('DELETE', 'synthetic-probe')
+            self.report['checks']['public_s3_fixture_write_read_delete'] = True
+            if self.args.test_external_proxy:
+                self.stage = 'external-s3-proxy'
+                self.configure_external_proxy()
+        self.stage = 'source'
         pvc = self.claim_with_target('source', 0)
         self.pod('source', 'source')
         self.exec('source', 'printf first > /data/marker; sync')
         self.stage = 'backup-a'
         self.snapshot('backup-a')
+        if self.args.test_external_proxy:
+            logs = self.kube('-n',self.namespace,'logs','external-proxy')
+            if 'fixture proxy connected' not in logs:
+                raise RuntimeError('Longhorn did not use the fixture proxy')
+            self.report['checks']['longhorn_backup_used_https_connect_proxy'] = True
         if not list(self.stores[0].listing()):
             raise RuntimeError('first target is empty')
         if list(self.stores[1].listing()):
@@ -208,6 +314,12 @@ class TwoTargets(module.Probe):
 
     def cleanup(self):
         errors = []
+        def owned(obj, name):
+            labels = obj.get('metadata', {}).get('labels', {})
+            expected = self.fixture_owners.get(name)
+            return labels.get('heterocloud.io/backup-probe') == self.nonce or (expected is not None and
+                labels.get('flash.heterocloud.io/organization') == expected[0] and
+                labels.get('flash.heterocloud.io/backup-destination') == expected[1])
         def attempt(label, function):
             try:
                 function()
@@ -236,19 +348,19 @@ class TwoTargets(module.Probe):
         def remove_classes():
             for name in self.created_classes:
                 obj = self.get('storageclass', name)
-                if obj and obj['metadata'].get('labels', {}).get('heterocloud.io/backup-probe') == self.nonce:
+                if obj and owned(obj,name):
                     self.kube('delete', 'storageclass', name, '--wait=false')
                 elif obj: raise RuntimeError('fixture class identity changed')
         classes_removed = attempt('classes', remove_classes)
         def remove_targets():
             for name in self.targets:
                 obj = self.get('backuptargets.longhorn.io', name, 'longhorn-system')
-                if obj and obj['metadata'].get('labels', {}).get('heterocloud.io/backup-probe') == self.nonce:
+                if obj and owned(obj,name):
                     self.kube('-n', 'longhorn-system', 'delete', 'backuptargets.longhorn.io', name, '--wait=false')
                     self.wait('remove fixture target', lambda: self.get('backuptargets.longhorn.io', name, 'longhorn-system') is None, 180)
                 elif obj: raise RuntimeError('fixture target identity changed')
                 secret = self.get('secret', name, 'longhorn-system')
-                if secret and secret['metadata'].get('labels', {}).get('heterocloud.io/backup-probe') == self.nonce:
+                if secret and owned(secret,name):
                     self.kube('-n', 'longhorn-system', 'delete', 'secret', name, '--wait=false')
                 elif secret: raise RuntimeError('fixture secret identity changed')
         targets_removed = namespace_removed and attempt('targets', remove_targets)
@@ -283,8 +395,17 @@ def main():
     parser.add_argument('--snapshot-class', default='flash-disk-backup')
     parser.add_argument('--image', required=True)
     parser.add_argument('--report', required=True)
+    parser.add_argument('--public-endpoint', help='Optional HTTPS S3 endpoint for signed synthetic-object checks')
+    parser.add_argument('--test-external-proxy', action='store_true', help='Use an isolated CONNECT proxy for the first public S3 backup')
+    parser.add_argument('--test-provider-registration', action='store_true', help='Register the first target through the actual Flash provider implementation')
+    parser.add_argument('--proxy-image', help='Python-capable image pinned by digest for the isolated proxy')
+    parser.add_argument('--cargo', default='cargo')
     parser.add_argument('--flash-ops', type=Path, default=Path(__file__).resolve().parents[2] / 'IPA-RS-HeteroCloud-Flash' / 'ops')
     args = parser.parse_args()
+    if args.test_external_proxy and not args.public_endpoint:
+        parser.error('--test-external-proxy requires --public-endpoint')
+    if args.test_provider_registration and not args.test_external_proxy:
+        parser.error('--test-provider-registration requires --test-external-proxy')
     global offsite
     sys.path.insert(0, str(args.flash_ops.resolve()))
     spec = importlib.util.spec_from_file_location('flash_offsite_e2e', args.flash_ops / 'offsite.py')
