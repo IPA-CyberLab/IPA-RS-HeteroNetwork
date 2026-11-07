@@ -15,8 +15,9 @@ spec:
       releaseName: heterocloud-flow
       valueFiles:
         - ../../environments/heteronet/values.yaml
-      # Monitoring is isolated from the low-IOPS control-plane members. Three
-      # host-network replicas retain one endpoint after any two node faults.
+      # Monitoring is isolated from the dedicated control-plane members. The
+      # two available workers each host one copy; a third failure domain is
+      # still needed for three-way monitoring redundancy.
       values: |
         redis:
           sentinel:
@@ -37,22 +38,20 @@ spec:
             allowedNodes:
               - uc-k8sp5
               - ichikawap1
-              - uc-k8sp4
           grafana:
             nodeSelector:
               monitoring.heteronetwork.io/ha: "true"
             allowedNodes:
               - uc-k8sp5
               - ichikawap1
-              - uc-k8sp4
       parameters:
         # Preserve the approved security release while reconciling infrastructure.
         - name: image.tag
           value: "security-1e0ba0f806c40660ad3a2527fcea5e28676b5542-39580680976@sha256:e95afea05cf01936748872adb8af3d75da0a02f56eb17dacd883f87e73f3c090"
         - name: monitoring.prometheus.replicaCount
-          value: "3"
+          value: "2"
         - name: monitoring.grafana.replicaCount
-          value: "3"
+          value: "2"
   destination:
     server: https://kubernetes.default.svc
     namespace: heterocloud-flow
