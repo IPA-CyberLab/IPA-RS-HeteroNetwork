@@ -47,3 +47,24 @@ An additional independent worker/storage failure domain and an independently
 verified backup are still required; neither exists merely because two API
 replicas are running. The root cause of the repeated Longhorn replica failure
 and the effect of workload I/O on control-plane storage remain under investigation.
+
+At 08:20 UTC the affected workspace volume still had one read/write replica on
+`ichikawap1` and one write-only rebuilding replica on `uc-k8sp5`. Longhorn
+events show repeated file-sync connection resets and rebuild attempts. Both
+storage nodes reported free space and a short host-to-host ICMP check did not
+lose packets; neither observation proves the network or disks are healthy under
+sustained rebuild load. No replica or user data was removed during diagnosis.
+Across the cluster, eight attached volumes were degraded: seven had two
+read/write replicas against a desired three, and the affected workspace had one
+read/write and one rebuilding replica against a desired two. Four detached
+Syouyu volumes were faulted; their recoverability was not established.
+
+Storage robustness is now collected through a namespace-scoped read-only
+Longhorn API role. Prometheus evaluates separate degraded, faulted, and
+inventory-unavailable alerts; duplicate collectors are deduplicated. The live
+collector reported the affected volume as degraded, and Prometheus fired the
+corresponding alert after the configured delay. Prometheus and Grafana
+were adjusted to the two actually available monitoring workers, rather than
+claiming three-way redundancy while `uc-k8sp4` is excluded. Alert delivery to
+an external receiver is not configured. These changes improve detection but do
+not restore the missing replica or establish the cause of the connection resets.
