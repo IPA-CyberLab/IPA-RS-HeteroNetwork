@@ -18,10 +18,14 @@ chain, but do not yet establish the initiating cause of the storage failures.
 
 The `ichikawap1` host was also a declared and running PostgreSQL member, but
 its bundle retained a proxy-only marker from an earlier role. This prevented
-the identity reconciler from treating it as an eligible replica. Clearing that
-marker is permitted only after the member's authority files match the protected
-source, all full-bundle certificates validate, and both database services are
-active; the reconciliation performs a check-only run before applying it.
+the identity reconciler from treating it as an eligible replica. At 07:18 UTC,
+the operator cleared that marker after validating the bundle. The database
+autopilot then applied topology revision 14 and restarted the PostgreSQL primary
+at 07:19 UTC, causing a failover to `uc-k8sp5` and another identity interruption.
+The checks did not account for that automatic reconciliation, so the marker
+repair has been removed from the routine identity deployment. Future marker
+changes require a separately reviewed database plan, including its effect on
+the active primary. Do not infer data-loss status from service readiness alone.
 
 The placement reconciler now allows a slower individual response within a
 bounded total scan, resumes an interrupted scan at the next endpoint, and
@@ -30,8 +34,9 @@ response by a fresh local TTL. It still stops a replica when its lease expires;
 it does not change PostgreSQL durability or copy credentials to other nodes.
 The runtime is distributed serially via the Terraform-managed Ansible playbook
 and can be reconciled from an exact master commit using the protected workflow.
-Installing this script does not restart a database, user workload, or identity
-replica; the existing timer runs the new version on its next reconciliation.
+Installing the script alone does not restart a database or user workload; the
+existing timer runs the new version on its next reconciliation. This distinction
+did not apply to the subsequently removed marker repair described above.
 
 The shell acceptance suite exercises unavailable endpoints, resumed directory
 scans, lease expiry and delayed responses. The live VPN/Chromium test passed on

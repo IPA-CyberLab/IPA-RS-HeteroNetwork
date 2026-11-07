@@ -76,11 +76,20 @@ jobs:
       - name: Publish sanitized result
         if: always()
         run: |
-          if test -s "${KEYCLOAK_RUNTIME_ROOT:-}/result.json"; then
-            python3 - "$KEYCLOAK_RUNTIME_ROOT/result.json" <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import json, sys
-          value = json.load(open(sys.argv[1], encoding='utf-8'))
-          print(json.dumps({'hosts': sorted(value.get('hosts', {})), 'errors': len(value.get('errors', []))}))
+          if test -d "${KEYCLOAK_RUNTIME_ROOT:-}"; then
+            python3 - "$KEYCLOAK_RUNTIME_ROOT" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, pathlib, sys
+          for name in ('check', 'result'):
+              path = pathlib.Path(sys.argv[1]) / (name + '.json')
+              if path.is_file() and path.stat().st_size:
+                  try:
+                      value = json.loads(path.read_text())
+                      errors = value.get('errors', [])
+                      print(json.dumps({'phase': name, 'hosts': sorted(value.get('hosts', {})),
+                                        'errors': len(errors),
+                                        'failure_tasks': sorted({error.get('task', 'unknown') for error in errors})}))
+                  except (ValueError, TypeError):
+                      print(json.dumps({'phase': name, 'result': 'unreadable'}))
           PY
           fi
       - name: Remove private inputs
