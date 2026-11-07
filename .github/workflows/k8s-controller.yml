@@ -1,0 +1,52 @@
+name: Kubernetes controller build
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - crates/ipars-k8s-controller/**
+      - crates/ipars-types/**
+      - Cargo.lock
+      - Cargo.toml
+      - docker/Dockerfile.k8s-controller
+      - .github/workflows/k8s-controller.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt
+      - name: Test controller placement and reconciliation
+        env:
+          RUSTUP_TOOLCHAIN: 1.96.1
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked -p ipars-k8s-controller
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Publish immutable controller image
+        env:
+          IMAGE: ghcr.io/ipa-cyberlab/heteronetwork-k8s-controller
+        run: |
+          set -euo pipefail
+          docker build --file docker/Dockerfile.k8s-controller --tag "$IMAGE:$GITHUB_SHA" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker image inspect "$IMAGE:$GITHUB_SHA" --format '{{index .RepoDigests 0}}' > "$RUNNER_TEMP/controller-image.txt"
+          cat "$RUNNER_TEMP/controller-image.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: k8s-controller-image
+          path: ${{ runner.temp }}/controller-image.txt
+          if-no-files-found: error

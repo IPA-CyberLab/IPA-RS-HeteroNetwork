@@ -11,6 +11,7 @@ metadata:
     monitoring.heteronetwork.io/ha: 'false'
     networking.heteronetwork.io/overlay-dns-sync: 'false'
     heteronetwork.io/lifecycle: stopped
+    networking.heteronetwork.io/turn-ingress: 'false'
     flash.heterocloud.io/gvisor-ready: 'false'
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'false'
@@ -46,6 +47,7 @@ metadata:
   name: uc-k8sp5
   labels:
     monitoring.heteronetwork.io/ha: 'true'
+    networking.heteronetwork.io/turn-ingress: 'true'
     networking.heteronetwork.io/overlay-dns-sync: 'true'
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -57,6 +59,7 @@ metadata:
   name: ichikawap1
   labels:
     monitoring.heteronetwork.io/ha: 'true'
+    networking.heteronetwork.io/turn-ingress: 'true'
     networking.heteronetwork.io/overlay-dns-sync: 'true'
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false

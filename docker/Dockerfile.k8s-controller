@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release --locked -p ipars-k8s-controller --bin ipars-k8s-controller
+
+FROM ghcr.io/ipa-cyberlab/heteronetwork@sha256:b9e03d10af1ce0700b067e9460e513f64a9fc13f80a6cbdc41ac8cd5b30e8956
+COPY --from=build --chmod=0755 /src/target/release/ipars-k8s-controller /usr/local/bin/ipars-k8s-controller

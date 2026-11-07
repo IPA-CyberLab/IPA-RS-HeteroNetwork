@@ -23,7 +23,7 @@ def apply_lifecycle(resources):
             labels['heteronetwork.io/lifecycle'] = 'stopped'
             for key in ['networking.heteronetwork.io/public-ingress', 'database.heteronetwork.io/proxy-ready',
                         'monitoring.heteronetwork.io/ha', 'networking.heteronetwork.io/overlay-dns-sync',
-                        'flash.heterocloud.io/gvisor-ready']:
+                        'networking.heteronetwork.io/turn-ingress', 'flash.heterocloud.io/gvisor-ready']:
                 labels[key] = 'false'
             resource['metadata'].setdefault('annotations', {}).update({
                 'networking.heteronetwork.io/public-ingress-enabled': 'false',
@@ -88,6 +88,7 @@ for edge in ('bootstrap', 'enrollment_issuer'):
     name=edge_nodes[edge]['name']
     standard_resources.append({'apiVersion':'v1','kind':'Node','metadata':{'name':name,
         'labels':{'monitoring.heteronetwork.io/ha':'true',
+                  'networking.heteronetwork.io/turn-ingress':'true',
                   'networking.heteronetwork.io/overlay-dns-sync':'true'},
         'annotations':{'argocd.argoproj.io/sync-options':'Prune=false,Delete=false',
                        'argocd.argoproj.io/sync-wave':'0'}}})

@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub const LOAD_BALANCER_CLASS: &str = "heteronetwork.io/public";
 pub const TRAFFIC_MODE_KEY: &str = "networking.heteronetwork.io/traffic-mode";
 pub const PUBLIC_INGRESS_LABEL: &str = "networking.heteronetwork.io/public-ingress";
+pub const TURN_INGRESS_LABEL: &str = "networking.heteronetwork.io/turn-ingress";
+pub const DIRECT_PLACEMENT_CLASS_ANNOTATION: &str =
+    "networking.heteronetwork.io/direct-placement-class";
 pub const PUBLIC_INGRESS_ENABLED_ANNOTATION: &str =
     "networking.heteronetwork.io/public-ingress-enabled";
 pub const NODE_ID_ANNOTATION: &str = "networking.heteronetwork.io/node-id";
@@ -564,6 +567,24 @@ pub fn direct_pod_patch(pod: &Pod) -> Result<json_patch::Patch, String> {
     if mode.map(String::as_str) != Some("direct") {
         return Ok(json_patch::Patch(Vec::new()));
     }
+    // TURN-only ingress is independent of the public HTTPS/DNS ingress set.
+    // Node labels remain operator-controlled; an unknown class fails closed.
+    let placement_class = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(DIRECT_PLACEMENT_CLASS_ANNOTATION))
+        .map(String::as_str)
+        .unwrap_or("public");
+    let placement_label = match placement_class {
+        "public" => PUBLIC_INGRESS_LABEL,
+        "turn" => TURN_INGRESS_LABEL,
+        _ => {
+            return Err(format!(
+                "unknown direct placement class {placement_class:?}"
+            ))
+        }
+    };
     let mut desired = pod.clone();
     let spec = desired
         .spec
@@ -571,14 +592,14 @@ pub fn direct_pod_patch(pod: &Pod) -> Result<json_patch::Patch, String> {
         .ok_or_else(|| "direct Pod must include spec".to_string())?;
     let selector = spec.node_selector.get_or_insert_with(BTreeMap::new);
     if selector
-        .get(PUBLIC_INGRESS_LABEL)
+        .get(placement_label)
         .is_some_and(|value| value != "true")
     {
         return Err(format!(
-            "direct Pod nodeSelector {PUBLIC_INGRESS_LABEL} must be true"
+            "direct Pod nodeSelector {placement_label} must be true"
         ));
     }
-    selector.insert(PUBLIC_INGRESS_LABEL.to_string(), "true".to_string());
+    selector.insert(placement_label.to_string(), "true".to_string());
     desired
         .metadata
         .annotations
@@ -778,6 +799,68 @@ mod tests {
         let encoded = serde_json::to_string(&patch).expect("patch JSON");
         assert!(encoded.contains("public-ingress"));
         assert!(encoded.contains("placement-injected"));
+    }
+
+    #[test]
+    fn turn_placement_uses_a_separate_operator_controlled_node_label() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    TRAFFIC_MODE_KEY.to_string(),
+                    "direct".to_string(),
+                )])),
+                annotations: Some(BTreeMap::from([(
+                    DIRECT_PLACEMENT_CLASS_ANNOTATION.to_string(),
+                    "turn".to_string(),
+                )])),
+                ..ObjectMeta::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: None,
+        };
+        let patch = direct_pod_patch(&pod).expect("turn placement patch");
+        let mut value = serde_json::to_value(&pod).expect("pod JSON");
+        json_patch::patch(&mut value, &patch).expect("apply patch");
+        let selectors = &value["spec"]["nodeSelector"];
+        assert_eq!(selectors[TURN_INGRESS_LABEL], "true");
+        assert!(selectors.get(PUBLIC_INGRESS_LABEL).is_none());
+    }
+
+    #[test]
+    fn direct_placement_rejects_unknown_classes_and_conflicting_selectors() {
+        let mut pod = Pod {
+            metadata: ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    TRAFFIC_MODE_KEY.to_string(),
+                    "direct".to_string(),
+                )])),
+                annotations: Some(BTreeMap::from([(
+                    DIRECT_PLACEMENT_CLASS_ANNOTATION.to_string(),
+                    "unknown".to_string(),
+                )])),
+                ..ObjectMeta::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: None,
+        };
+        assert!(direct_pod_patch(&pod)
+            .expect_err("unknown class")
+            .contains("unknown direct"));
+        pod.metadata
+            .annotations
+            .as_mut()
+            .expect("annotations")
+            .insert(
+                DIRECT_PLACEMENT_CLASS_ANNOTATION.to_string(),
+                "turn".to_string(),
+            );
+        pod.spec.as_mut().expect("spec").node_selector = Some(BTreeMap::from([(
+            TURN_INGRESS_LABEL.to_string(),
+            "false".to_string(),
+        )]));
+        assert!(direct_pod_patch(&pod)
+            .expect_err("conflicting selector")
+            .contains(TURN_INGRESS_LABEL));
     }
 
     #[test]
