@@ -1,0 +1,75 @@
+name: Control plane recovery set
+
+on:
+  push:
+    paths:
+      - 'scripts/control_plane_dr*.py'
+      - 'scripts/test_control_plane_dr.py'
+      - 'scripts/test_control_plane_dr_postgres_source.py'
+      - 'scripts/test_control_plane_dr_etcd_source.py'
+      - 'docs/disaster-recovery.md'
+      - '.github/workflows/control-plane-dr.yml'
+  pull_request:
+    paths:
+      - 'scripts/control_plane_dr*.py'
+      - 'scripts/test_control_plane_dr.py'
+      - 'scripts/test_control_plane_dr_postgres_source.py'
+      - 'scripts/test_control_plane_dr_etcd_source.py'
+      - 'docs/disaster-recovery.md'
+      - '.github/workflows/control-plane-dr.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  encrypted-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Install pinned restic
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2 \
+            -o "$RUNNER_TEMP/restic.bz2"
+          echo 'f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c  '"$RUNNER_TEMP/restic.bz2" | sha256sum --check
+          bzip2 -dc "$RUNNER_TEMP/restic.bz2" > "$RUNNER_TEMP/restic"
+          chmod 0755 "$RUNNER_TEMP/restic"
+      - name: Test encrypted, bounded backup and safe restore
+        env:
+          HC_DR_TEST_RESTIC: ${{ runner.temp }}/restic
+        run: python3 -B -m unittest discover -s scripts -p test_control_plane_dr.py -v
+      - name: Verify PostgreSQL source rejects lag, failover and unsupported layouts
+        run: python3 -B -m unittest discover -s scripts -p test_control_plane_dr_postgres_source.py -v
+      - name: Verify etcd source refuses swappable snapshots and identity changes
+        run: python3 -B -m unittest discover -s scripts -p test_control_plane_dr_etcd_source.py -v
+      - name: Install fixture PostgreSQL
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-16
+      - name: Restore a real isolated PostgreSQL database
+        run: |
+          sudo python3 -B scripts/control_plane_dr_postgres_e2e.py \
+            --restic "$RUNNER_TEMP/restic" \
+            --pg-bin /usr/lib/postgresql/16/bin \
+            --pg-share /usr/share/postgresql/16 \
+            --pg-lib /usr/lib/x86_64-linux-gnu
+      - name: Install pinned etcd fixture tools
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/etcd-io/etcd/releases/download/v3.6.8/etcd-v3.6.8-linux-amd64.tar.gz \
+            -o "$RUNNER_TEMP/etcd.tar.gz"
+          echo 'cf9cfe91a4856cb90eed9c99e6aee4b708db2c7888b88a6f116281f04b0ea693  '"$RUNNER_TEMP/etcd.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/etcd-bin"
+          tar -xzf "$RUNNER_TEMP/etcd.tar.gz" -C "$RUNNER_TEMP/etcd-bin" --strip-components=1 \
+            etcd-v3.6.8-linux-amd64/etcd etcd-v3.6.8-linux-amd64/etcdctl etcd-v3.6.8-linux-amd64/etcdutl
+          sudo chown -R root:root "$RUNNER_TEMP/etcd-bin"
+          sudo chmod 0755 "$RUNNER_TEMP/etcd-bin"
+      - name: Restore a real isolated etcd snapshot
+        run: |
+          sudo python3 -B scripts/control_plane_dr_etcd_e2e.py \
+            --restic "$RUNNER_TEMP/restic" --etcd-bin "$RUNNER_TEMP/etcd-bin"

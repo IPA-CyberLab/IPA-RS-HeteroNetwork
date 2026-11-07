@@ -25,6 +25,11 @@ variable "bucket_name" {
   default = "heterocloud-flash-disaster-backups"
 }
 
+variable "control_plane_bucket_name" {
+  type    = string
+  default = "heterocloud-control-plane-disaster-backups"
+}
+
 resource "cloudflare_r2_bucket" "backups" {
   account_id    = var.account_id
   name          = var.bucket_name
@@ -42,10 +47,31 @@ resource "cloudflare_r2_managed_domain" "private" {
   enabled     = false
 }
 
+resource "cloudflare_r2_bucket" "control_plane" {
+  account_id    = var.account_id
+  name          = var.control_plane_bucket_name
+  location      = "apac"
+  jurisdiction  = "default"
+  storage_class = "Standard"
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_r2_managed_domain" "control_plane_private" {
+  account_id  = var.account_id
+  bucket_name = cloudflare_r2_bucket.control_plane.name
+  enabled     = false
+}
+
 output "s3_endpoint" {
   value = "https://${var.account_id}.r2.cloudflarestorage.com"
 }
 
 output "bucket_name" {
   value = cloudflare_r2_bucket.backups.name
+}
+
+output "control_plane_bucket_name" {
+  value = cloudflare_r2_bucket.control_plane.name
 }

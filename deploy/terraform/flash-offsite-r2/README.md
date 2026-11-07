@@ -1,7 +1,8 @@
 # Private independent Flash backups
 
-This optional module creates a private Cloudflare R2 bucket outside the Kubernetes
-cluster. `prevent_destroy` protects the bucket. Public r2.dev access is explicitly
+This optional module creates separate private Flash and control-plane Cloudflare
+R2 buckets outside the Kubernetes cluster. `prevent_destroy` protects both.
+Public r2.dev access is explicitly
 disabled; no public custom domain is created. Source: Cloudflare provider
 [bucket](https://github.com/cloudflare/terraform-provider-cloudflare/blob/v5.13.0/docs/resources/r2_bucket.md)
 and [managed domain](https://github.com/cloudflare/terraform-provider-cloudflare/blob/v5.13.0/docs/resources/r2_managed_domain.md)
@@ -16,6 +17,11 @@ This is the **operator-wide** export of the managed backup store and can include
 data from multiple organizations. Never point it at an organization's private
 bucket. Organization-specific backup destinations are configured separately in
 Flash and are not included by this operator-wide exporter.
+
+The control-plane bucket is a separate recovery destination. Its creation does
+not configure source snapshots, credentials, encryption keys or schedules.
+See [control-plane recovery sets](../../../docs/disaster-recovery.md) for the
+current implementation and uncompleted site-recovery prerequisites.
 
 The same configuration supports other public HTTPS S3-compatible endpoints.
 An optional `prefix` confines copies to that key prefix; `addressing_style` may
