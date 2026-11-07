@@ -32,6 +32,12 @@ spec:
               - --aof-load-corrupt-tail-max-size
               - "4096"
         monitoring:
+          resourceExporter:
+            # Built and tested by the Flow resource-monitoring workflow.
+            image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-resource-exporter:b21d102b65e9aa2aebf6169611733f0cd733a5a1@sha256:678594846a98a622c786efe236dfddc13c694051dfaca360703cf17827f53b69"
+            storageHealth:
+              enabled: true
+              namespace: longhorn-system
           prometheus:
             nodeSelector:
               monitoring.heteronetwork.io/ha: "true"
