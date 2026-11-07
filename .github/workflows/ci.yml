@@ -107,6 +107,7 @@ jobs:
           bash -n scripts/rollout-console-owner-update.sh
           node --check scripts/keycloak-ha-e2e-smoke.mjs
           scripts/keycloak-autopilot-smoke.sh
+          python3 -B scripts/test_keycloak_timeout_e2e.py
           node scripts/keycloak-ha-e2e-smoke.mjs
 
       - name: Install minimum supported Rust
