@@ -91,6 +91,20 @@ Longhorn manager rollouts now use a maximum of one unavailable manager for
 same-version patch changes. Full version upgrades require separate review of
 the chart's upgrade guidance.
 
+A later read-only inventory at about 09:55 UTC found five attached degraded
+volumes with one `RW` replica: the Flash homes for the Coder `dYdx` and
+`CKB-VM` workspaces, `coder-postgres`, and two Registry Redis volumes. Four
+additional attached volumes were healthy according to Longhorn but explicitly
+configured with only one replica. The inventory also showed five degraded
+attached volumes with two `RW` replicas, two healthy attached volumes with
+two, four detached faulted volumes and 37 detached volumes of unknown
+robustness. Replica rebuilds continued and individual counts changed during
+inspection; these numbers are a point-in-time observation. Both active
+Longhorn disks reported schedulable with free space, which does not establish
+that rebuilds or storage I/O are healthy. A new critical alert fires for any
+attached volume with at most one observed `RW` replica, including deliberately
+single-replica volumes; unavailable observations are reported separately.
+
 ## Overlay DNS and monitoring follow-up
 
 The overlay DNS discovery deployment had one running controller and one pod
