@@ -68,3 +68,52 @@ were adjusted to the two actually available monitoring workers, rather than
 claiming three-way redundancy while `uc-k8sp4` is excluded. Alert delivery to
 an external receiver is not configured. These changes improve detection but do
 not restore the missing replica or establish the cause of the connection resets.
+
+## Subsequent storage investigation
+
+At approximately 09:10–09:11 UTC the affected Longhorn v1.12.1 engine's
+pre-rebuild snapshot purge exceeded the manager's 30-second engine poll
+timeout. Manager logs then show a second rebuild starting while the first was
+still active, an `already rebuilding` error, and removal of the write-only
+replica. File-sync resets followed the removal; those resets do not establish
+that the network initiated the failure. The pattern recurred while the volume
+still had only one read/write copy. High I/O pressure was observed on
+`ichikawap1`, but a causal link to the slow purge has not been established.
+
+This is consistent with [Longhorn issue 13914](https://github.com/longhorn/longhorn/issues/13914)
+and the upstream [manager fix](https://github.com/longhorn/longhorn-manager/pull/5323).
+The fix was backported to the upstream v1.12 branch for a future v1.12.2
+release. At investigation time that release was not available. The manager
+change can be applied to v1.12.1 source, but it and the related engine fix have
+not been validated together against this cluster; no custom storage image has
+been deployed. The sole healthy replica must not be removed to force a rebuild.
+Longhorn manager rollouts now use a maximum of one unavailable manager for
+same-version patch changes. Full version upgrades require separate review of
+the chart's upgrade guidance.
+
+## Overlay DNS and monitoring follow-up
+
+The overlay DNS discovery deployment had one running controller and one pod
+still assigned to the stopped `uc-k8sp4` node. Its blanket toleration allowed
+the latter to remain there indefinitely. Its policy now selects the two active
+workers and bounds not-ready and unreachable tolerations at 30 seconds; both
+controllers became ready on separate active workers. The single-controller
+state was a failover risk, but was not established as the cause of the DNS
+timeouts in the live client test. A stricter separation policy keeps a
+replacement pending while only one eligible node remains, so that recovery
+restores the two controllers on separate nodes. An [isolated node-loss E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42360502284)
+paused a worker, verified DNS changes during the outage, and verified separate
+placement and record removal after recovery. This exercises the controller in
+a disposable kind cluster, not a production node shutdown.
+
+Recent authenticated GitHub Actions VPN/browser runs did not all pass: one
+timed out resolving Grafana, another exceeded the three-second Grafana HTTP
+budget, and a later run failed while reconciling the dedicated test identity.
+On `ichikawap1`, Grafana logged an interrupted settings lookup for the
+three-second request. Twenty read-only `SELECT 1` queries through the same
+database proxy averaged approximately 90 ms from that node versus approximately
+2 ms from `uc-k8sp5`; repeated inter-node probes also showed variable latency.
+These measurements identify a performance difference, not a proven root cause
+for every failed test. The [next real VPN and authenticated browser run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42360502185)
+passed within the existing deadlines, but one passing run does not establish
+that the intermittent failures have been eliminated. The deadline is unchanged.
