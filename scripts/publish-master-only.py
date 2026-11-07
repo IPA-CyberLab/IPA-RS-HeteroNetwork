@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def files():
     paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/postgres-ha-autopilot.sh','scripts/keycloak-autopilot.sh','scripts/master-only-iac.py',
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/test_verify_standard_node.py',
-           'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py',
+           'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py','scripts/ensure-flash-ssh-host-key.py','scripts/test_ensure_flash_ssh_host_key.py',
            'scripts/verify-storage-redundancy.py','scripts/test_verify_storage_redundancy.py',
            'scripts/reconcile-overlay-boot.py','scripts/test_reconcile_overlay_boot.py','scripts/overlay_power_recovery_e2e.py',
            'scripts/node_lifecycle.py','scripts/test_node_lifecycle.py','scripts/reconcile-node-lifecycle.py',
@@ -56,7 +56,9 @@ def files():
     paths += ['deploy/gitops/cluster-dns/nodelocaldns.yaml','deploy/gitops/cluster-dns/keycloak-ha-connector.yaml',
               'deploy/gitops/cluster-dns/postgres-ha-connector.yaml','deploy/gitops/cluster-dns/service-route.yaml',
               'deploy/gitops/network-policy-engine/kube-router.yaml','deploy/gitops/longhorn-prerequisites/node-prerequisites.yaml',
-              'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml']
+              'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml',
+              'deploy/gitops/envoy-gateway/kustomization.yaml','deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml',
+              'deploy/gitops/envoy-gateway/flash-ssh-backend-traffic-policy.yaml']
     for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns','scripts/storage-heartbeat-e2e']:
         for p in (ROOT/directory).rglob('*'):
             if not p.is_file() or '.terraform' in p.parts or '__pycache__' in p.parts: continue

@@ -9,6 +9,7 @@ on:
       - 'scripts/*flash*backup*.py'
       - 'scripts/*flash*offsite*.py'
       - 'scripts/*flash*operations*.py'
+      - 'scripts/*flash*ssh*host*key*.py'
       - 'scripts/flash_operations_live_e2e.mjs'
       - 'scripts/flash_capacity_live_e2e.py'
       - 'scripts/flash_legacy_recovery_e2e.py'
@@ -39,6 +40,9 @@ on:
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'deploy/gitops/envoy-gateway/backend-traffic-policy.yaml'
+      - 'deploy/gitops/envoy-gateway/flash-ssh-backend-traffic-policy.yaml'
+      - 'deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml'
+      - 'deploy/gitops/envoy-gateway/kustomization.yaml'
       - 'deploy/gitops/envoy-gateway/oidc-callback-backend-traffic-policy.yaml'
       - 'scripts/test_heterocloud_gateway_health_policy.py'
       - 'scripts/e2e_heterocloud_gateway_failover.py'
@@ -90,6 +94,7 @@ on:
       - 'scripts/*flash*backup*.py'
       - 'scripts/*flash*offsite*.py'
       - 'scripts/*flash*operations*.py'
+      - 'scripts/*flash*ssh*host*key*.py'
       - 'scripts/flash_operations_live_e2e.mjs'
       - 'scripts/flash_capacity_live_e2e.py'
       - 'scripts/flash_legacy_recovery_e2e.py'
@@ -120,6 +125,9 @@ on:
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'deploy/gitops/envoy-gateway/backend-traffic-policy.yaml'
+      - 'deploy/gitops/envoy-gateway/flash-ssh-backend-traffic-policy.yaml'
+      - 'deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml'
+      - 'deploy/gitops/envoy-gateway/kustomization.yaml'
       - 'deploy/gitops/envoy-gateway/oidc-callback-backend-traffic-policy.yaml'
       - 'scripts/test_heterocloud_gateway_health_policy.py'
       - 'scripts/e2e_heterocloud_gateway_failover.py'
@@ -185,6 +193,7 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
           python3 -B -m unittest discover -s scripts -p test_onboarding_acceptance.py -v
+          python3 -B -m unittest discover -s scripts -p test_ensure_flash_ssh_host_key.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_storage_redundancy.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_overlay_boot.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_coder_workspace_readiness.py -v

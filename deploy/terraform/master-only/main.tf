@@ -208,6 +208,15 @@ import {
   id       = "apiVersion=argoproj.io/v1alpha1,kind=Application,namespace=argocd,name=${each.key}"
 }
 
+resource "terraform_data" "flash_ssh_host_key" {
+  triggers_replace = [filesha256("${local.repo_root}/scripts/ensure-flash-ssh-host-key.py")]
+  provisioner "local-exec" {
+    working_dir = local.repo_root
+    command     = "python3 scripts/ensure-flash-ssh-host-key.py"
+    environment = { KUBECONFIG = pathexpand(var.kubeconfig_path) }
+  }
+}
+
 resource "kubernetes_manifest" "external_application" {
   for_each = local.managed_external_application_files
   manifest = merge(local.external_application_manifests[each.key], {
@@ -225,7 +234,7 @@ resource "kubernetes_manifest" "external_application" {
     force_conflicts = true
   }
   lifecycle { prevent_destroy = true }
-  depends_on = [kubernetes_manifest.gitops_project]
+  depends_on = [kubernetes_manifest.gitops_project, terraform_data.flash_ssh_host_key]
 }
 
 resource "terraform_data" "application_helm_value_cleanup" {

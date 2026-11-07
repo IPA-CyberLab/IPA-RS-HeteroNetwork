@@ -1,0 +1,94 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: heterocloud-flash-ssh
+  namespace: heterocloud
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: heterocloud-flash-ssh
+  # During the node-not-ready grace period DNS can still expose a stale Pod
+  # endpoint. Retry failed requests while active and passive checks eject that
+  # endpoint, allowing a surviving API replica to take over immediately.
+  retry:
+    numRetries: 7
+    perRetry:
+      # The Registry image listing fans out to Harbor. Let the API's own 10s
+      # upstream deadline return a controlled error instead of cutting valid
+      # requests off at the former 3s edge timeout.
+      timeout: 12s
+  healthCheck:
+    # Keep attempting available endpoints when all health checks briefly fail.
+    # A single slow probe during a two-node rollout previously caused 503s.
+    panicThreshold: 50
+    active:
+      type: HTTP
+      interval: 3s
+      timeout: 3s
+      healthyThreshold: 1
+      unhealthyThreshold: 3
+      http:
+        path: /api/v1/health/live
+        expectedStatuses:
+          - 200
+        retriableStatuses:
+          - 500
+          - 502
+          - 503
+          - 504
+    passive:
+      interval: 1s
+      baseEjectionTime: 30s
+      consecutive5XxErrors: 2
+      consecutiveGatewayErrors: 2
+      consecutiveLocalOriginFailures: 1
+      maxEjectionPercent: 50
+      splitExternalLocalOriginErrors: true
+  timeout:
+    http:
+      # SSH sessions are bounded by the provider to eight hours. Keep the
+      # edge limit slightly longer without extending ordinary API requests.
+      requestTimeout: 8h1m
+  rateLimit:
+    # This per-proxy limit remains active when the global Redis-backed
+    # limiter is unavailable. The global rule below still provides the
+    # normal shared 200 req/s ceiling across all Envoy replicas.
+    local:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+    global:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+          shared: true
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+          shared: true
