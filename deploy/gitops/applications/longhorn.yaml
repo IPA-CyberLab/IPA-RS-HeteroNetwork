@@ -35,6 +35,11 @@ spec:
           replicas: 2
         longhornManager:
           priorityClass: system-node-critical
+          # Same-version manager patches must not restart both worker
+          # managers at once. Reassess this when upgrading Longhorn versions.
+          updateStrategy:
+            rollingUpdate:
+              maxUnavailable: 1
         csi:
           attacherReplicaCount: 3
           provisionerReplicaCount: 3

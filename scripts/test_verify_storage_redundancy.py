@@ -3,6 +3,8 @@ import importlib.util
 from pathlib import Path
 import unittest
 
+import yaml
+
 
 spec = importlib.util.spec_from_file_location('storage_audit', Path(__file__).with_name('verify-storage-redundancy.py'))
 A = importlib.util.module_from_spec(spec)
@@ -10,6 +12,12 @@ spec.loader.exec_module(A)
 
 
 class StorageRedundancyTest(unittest.TestCase):
+    def test_manager_rollout_retains_another_worker_manager(self):
+        path = Path(__file__).resolve().parents[1] / 'deploy/gitops/applications/longhorn.yaml'
+        app = yaml.safe_load(path.read_text())
+        values = yaml.safe_load(app['spec']['source']['helm']['values'])
+        self.assertEqual(values['longhornManager']['updateStrategy']['rollingUpdate']['maxUnavailable'], 1)
+
     def fixture(self):
         condition = [{'type': 'Ready', 'status': 'True'}]
         volumes = {'items': [{'metadata': {'name': 'registry'}, 'spec': {'numberOfReplicas': 3}}]}
