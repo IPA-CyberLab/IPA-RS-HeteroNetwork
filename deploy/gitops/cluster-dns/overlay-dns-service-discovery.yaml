@@ -98,8 +98,16 @@ spec:
       automountServiceAccountToken: true
       nodeSelector:
         kubernetes.io/os: linux
+        dns.heteronetwork.io/discovery: "true"
       tolerations:
-        - operator: Exists
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

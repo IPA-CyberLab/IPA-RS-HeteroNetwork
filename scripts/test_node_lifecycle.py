@@ -100,6 +100,8 @@ class NodeLifecycleTests(unittest.TestCase):
                 self.assertEqual(storage["spec"]["allowScheduling"], state == "active")
                 if state == "stopped":
                     self.assertEqual(node["metadata"]["labels"]["networking.heteronetwork.io/turn-ingress"], "false")
+                    self.assertEqual(node["metadata"]["labels"]["dns.heteronetwork.io/discovery"], "false")
                 for name in ("uc-k8sp5", "ichikawap1"):
                     worker = next(r for r in resources if r["apiVersion"] == "v1" and r["metadata"]["name"] == name)
                     self.assertEqual(worker["metadata"]["labels"]["networking.heteronetwork.io/turn-ingress"], "true")
+                    self.assertEqual(worker["metadata"]["labels"]["dns.heteronetwork.io/discovery"], "true")

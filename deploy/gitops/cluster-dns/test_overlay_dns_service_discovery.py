@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+import yaml
 
 
 MODULE_PATH = Path(__file__).with_name("overlay-dns-service-discovery.py")
@@ -54,6 +55,19 @@ def endpoint_slice(namespace, service_name, endpoints):
 
 
 class OverlayDnsServiceDiscoveryTests(unittest.TestCase):
+    def test_controller_can_move_from_a_stopped_node_without_entering_control_plane(self):
+        resources = yaml.safe_load_all(Path(__file__).with_name("overlay-dns-service-discovery.yaml").read_text())
+        deployment = next(resource for resource in resources if resource and resource.get("kind") == "Deployment")
+        self.assertGreaterEqual(deployment["spec"]["replicas"], 2)
+        pod = deployment["spec"]["template"]["spec"]
+        self.assertEqual(pod["nodeSelector"]["dns.heteronetwork.io/discovery"], "true")
+        tolerations = pod.get("tolerations", [])
+        self.assertFalse(any(not entry.get("key") for entry in tolerations))
+        for key in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"):
+            entries = [entry for entry in tolerations if entry.get("key") == key and entry.get("effect") == "NoExecute"]
+            self.assertEqual(len(entries), 1)
+            self.assertLessEqual(entries[0].get("tolerationSeconds", float("inf")), 30)
+
     def setUp(self):
         self.base = {
             "schema_version": 1,

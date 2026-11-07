@@ -12,6 +12,7 @@ metadata:
     networking.heteronetwork.io/overlay-dns-sync: 'false'
     heteronetwork.io/lifecycle: stopped
     networking.heteronetwork.io/turn-ingress: 'false'
+    dns.heteronetwork.io/discovery: 'false'
     flash.heterocloud.io/gvisor-ready: 'false'
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'false'
@@ -48,6 +49,7 @@ metadata:
   labels:
     monitoring.heteronetwork.io/ha: 'true'
     networking.heteronetwork.io/turn-ingress: 'true'
+    dns.heteronetwork.io/discovery: 'true'
     networking.heteronetwork.io/overlay-dns-sync: 'true'
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -60,6 +62,7 @@ metadata:
   labels:
     monitoring.heteronetwork.io/ha: 'true'
     networking.heteronetwork.io/turn-ingress: 'true'
+    dns.heteronetwork.io/discovery: 'true'
     networking.heteronetwork.io/overlay-dns-sync: 'true'
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
