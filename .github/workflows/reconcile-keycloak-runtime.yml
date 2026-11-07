@@ -1,0 +1,81 @@
+name: Reconcile Keycloak placement runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact reviewed master commit to apply
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: heteronet-keycloak-runtime-production
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: heteronet-e2e
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Validate immutable source and prepare Ansible
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" origin/master
+          root="$RUNNER_TEMP/heteronetwork-keycloak-runtime"
+          install -d -m 0700 "$root"
+          python3 -m venv "$root/venv"
+          "$root/venv/bin/pip" install --disable-pip-version-check --no-input 'ansible-core==2.19.5'
+          echo "KEYCLOAK_RUNTIME_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Prepare protected host access
+        env:
+          HNN_E2E_SSH_PRIVATE_KEY: ${{ secrets.HNN_E2E_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$HNN_E2E_SSH_PRIVATE_KEY"
+          umask 077
+          printf '%s\n' "$HNN_E2E_SSH_PRIVATE_KEY" > "$KEYCLOAK_RUNTIME_ROOT/id_ed25519"
+          python3 scripts/prepare-database-ha.py --work-dir "$KEYCLOAK_RUNTIME_ROOT/inputs" \
+            --ssh-key "$KEYCLOAK_RUNTIME_ROOT/id_ed25519" > "$KEYCLOAK_RUNTIME_ROOT/preparation.json"
+      - name: Install the placement reconciler serially
+        env:
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+          ANSIBLE_CALLBACK_PLUGINS: ${{ github.workspace }}/deploy/terraform/master-only/ansible/callback_plugins
+          ANSIBLE_STDOUT_CALLBACK: hnn_json
+        run: |
+          set -euo pipefail
+          test -n "$HNN_IAC_BECOME_PASSWORD"
+          "$KEYCLOAK_RUNTIME_ROOT/venv/bin/ansible-playbook" \
+            -i "$KEYCLOAK_RUNTIME_ROOT/inputs/inventory.json" \
+            deploy/terraform/master-only/ansible/keycloak-autopilot-runtime.yaml \
+            > "$KEYCLOAK_RUNTIME_ROOT/result.json"
+      - name: Publish sanitized result
+        if: always()
+        run: |
+          if test -s "${KEYCLOAK_RUNTIME_ROOT:-}/result.json"; then
+            python3 - "$KEYCLOAK_RUNTIME_ROOT/result.json" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          value = json.load(open(sys.argv[1], encoding='utf-8'))
+          print(json.dumps({'hosts': sorted(value.get('hosts', {})), 'errors': len(value.get('errors', []))}))
+          PY
+          fi
+      - name: Remove private inputs
+        if: always()
+        run: |
+          root="${KEYCLOAK_RUNTIME_ROOT:-$RUNNER_TEMP/heteronetwork-keycloak-runtime}"
+          if test -d "$root"; then
+            find "$root" -type f -exec shred -u {} + 2>/dev/null || rm -rf "$root"
+            rm -rf "$root"
+          fi

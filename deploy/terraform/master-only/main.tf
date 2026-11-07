@@ -48,7 +48,7 @@ locals {
   bundle_sha = sha256(join("", concat(
     [filesha256("${local.repo_root}/scripts/kubeadm-ha-node.sh")],
     [for f in sort(tolist(fileset(path.module, "ansible/**"))) : filesha256("${path.module}/${f}")
-    if f != "ansible/storage-recovery-audit.yaml" && f != "ansible/database-sync-replica.yaml" && f != "ansible/overlay-boot-recovery.yaml" && f != "ansible/openbao-custodian.yaml" && f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/node-root-storage.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/flash-backups.yaml" && f != "ansible/flash-operations.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/runtime-restart.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
+    if f != "ansible/keycloak-autopilot-runtime.yaml" && f != "ansible/storage-recovery-audit.yaml" && f != "ansible/database-sync-replica.yaml" && f != "ansible/overlay-boot-recovery.yaml" && f != "ansible/openbao-custodian.yaml" && f != "ansible/git-source.yaml" && f != "ansible/apiserver-etcd.yaml" && f != "ansible/node-health.yaml" && f != "ansible/node-root-storage.yaml" && f != "ansible/etcd-policy.yaml" && f != "ansible/gpu.yaml" && f != "ansible/gpu-inventory.yaml" && f != "ansible/gvisor.yaml" && f != "ansible/flash-backups.yaml" && f != "ansible/flash-operations.yaml" && f != "ansible/security-inventory.yaml" && f != "ansible/containerd-security.yaml" && f != "ansible/runtime-restart.yaml" && f != "ansible/database-ha.yaml" && f != "ansible/database-proxy.yaml" && f != "ansible/openbao-storage.yaml" && !startswith(f, "ansible/openbao-dcs-") && !startswith(f, "ansible/templates/secret-manager-db-h-") && !strcontains(f, "/standard") && !strcontains(f, "/console") && (endswith(f, ".yaml") || endswith(f, ".j2") || endswith(f, ".py"))],
     [sha256(jsonencode(var.native_binary_sha256))]
   )))
   inventory = {
@@ -537,6 +537,26 @@ resource "terraform_data" "standard_host_configuration" {
     environment = {
       HNN_IAC_INVENTORY        = local_file.inventory.filename
       HNN_IAC_NODE             = each.key
+      ANSIBLE_CALLBACK_PLUGINS = "${abspath(path.module)}/ansible/callback_plugins"
+      ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
+    }
+  }
+  depends_on = [local_file.inventory, local_file.known_hosts]
+}
+
+resource "terraform_data" "keycloak_autopilot_runtime" {
+  triggers_replace = [
+    filesha256("${path.module}/ansible/keycloak-autopilot-runtime.yaml"),
+    filesha256("${local.repo_root}/scripts/keycloak-autopilot.sh"),
+    sha256(jsonencode(local.standard_nodes)),
+    sha256(jsonencode(local.bootstrap)),
+    sha256(jsonencode(local.enrollment_issuer))
+  ]
+  provisioner "local-exec" {
+    working_dir = abspath(path.module)
+    command     = "ansible-playbook -i \"$HNN_IAC_INVENTORY\" ansible/keycloak-autopilot-runtime.yaml"
+    environment = {
+      HNN_IAC_INVENTORY        = local_file.inventory.filename
       ANSIBLE_CALLBACK_PLUGINS = "${abspath(path.module)}/ansible/callback_plugins"
       ANSIBLE_STDOUT_CALLBACK  = "hnn_json"
     }

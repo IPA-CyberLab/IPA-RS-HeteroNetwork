@@ -13,6 +13,8 @@ readonly MAX_SECRET_BYTES="4096"
 readonly MAX_RESPONSE_BYTES="262144"
 readonly MAX_CONTROL_PLANE_URLS="16"
 readonly MAX_CONTROL_PLANE_ATTEMPTS="$MAX_CONTROL_PLANE_URLS"
+readonly CONTROL_PLANE_REQUEST_TIMEOUT_SECONDS="8"
+readonly CONTROL_PLANE_TOTAL_BUDGET_SECONDS="16"
 readonly DESIRED_REPLICAS="5"
 readonly MAX_REPLICAS="$DESIRED_REPLICAS"
 readonly MAX_GENERATION="9223372036854775807"
@@ -526,7 +528,7 @@ write_curl_config() {
       'silent' \
       'show-error' \
       'connect-timeout = 1' \
-      'max-time = 2' \
+      "max-time = $CONTROL_PLANE_REQUEST_TIMEOUT_SECONDS" \
       "max-filesize = $MAX_RESPONSE_BYTES"
     printf 'header = "Authorization: Bearer %s"\n' "$bearer_token"
   } >"$target_file"
@@ -547,7 +549,7 @@ sanitized_control_plane_endpoint() {
 
 request_reconciliation() {
   local base cursor attempt attempts index url_count selected_curl_config
-  local http_status curl_exit credential_scope
+  local http_status curl_exit credential_scope budget_deadline request_timeout now lease_deadline
   response_file="$(mktemp "$runtime_dir/response.XXXXXX")"
   curl_config_file="$(mktemp "$runtime_dir/curl.XXXXXX")"
   write_curl_config "$curl_config_file" "$autopilot_bearer_token"
@@ -561,8 +563,27 @@ request_reconciliation() {
     || attempts="$MAX_CONTROL_PLANE_ATTEMPTS"
   # Prefer a trusted promoted local CP, then the Agent gateway's live directory.
   # Enrollment-time URLs remain bounded fallbacks only.
-  cursor=0
+  cursor="$(read_nonnegative_state_value "$control_plane_cursor_path" 0)"
+  ((10#$cursor < url_count)) || cursor=0
+  # A slow database must not cause every control-plane replica to accumulate
+  # abandoned requests. Leave time for the next lease renewal.
+  budget_deadline=$((SECONDS + CONTROL_PLANE_TOTAL_BUDGET_SECONDS))
   for ((attempt = 0; attempt < attempts; attempt++)); do
+    request_timeout=$((budget_deadline - SECONDS))
+    ((request_timeout > 0)) || break
+    ((request_timeout <= CONTROL_PLANE_REQUEST_TIMEOUT_SECONDS)) \
+      || request_timeout="$CONTROL_PLANE_REQUEST_TIMEOUT_SECONDS"
+    if [[ -f "$assignment_lease_deadline_path" ]]; then
+      now="$(date +%s)"
+      lease_deadline="$(read_nonnegative_state_value "$assignment_lease_deadline_path" 0)"
+      if ((10#$lease_deadline <= 10#$now)); then
+        # Allow an immediately successful renewal, but do not wait on a slow
+        # control plane while an old placement is already expired.
+        request_timeout=1
+      elif ((10#$lease_deadline - 10#$now < request_timeout)); then
+        request_timeout="$((10#$lease_deadline - 10#$now))"
+      fi
+    fi
     index="$(((10#$cursor + attempt) % url_count))"
     base="${control_plane_urls[$index]}"
     # The promotion credential is scoped to this exact validated local endpoint only.
@@ -574,7 +595,7 @@ request_reconciliation() {
     fi
     candidate_response_file="$(mktemp "$runtime_dir/response-candidate.XXXXXX")"
     curl_exit=0
-    if http_status="$(curl --config "$selected_curl_config" \
+    if http_status="$(curl --config "$selected_curl_config" --max-time "$request_timeout" \
       --header 'Content-Type: application/json' \
       --data-binary "@$request_file" \
       --output "$candidate_response_file" \
@@ -587,17 +608,22 @@ request_reconciliation() {
     if [[ "$curl_exit" == 0 && "$http_status" =~ ^2[0-9]{2}$ ]]; then
       mv -f "$candidate_response_file" "$response_file"
       candidate_response_file=""
-      write_state_value "$control_plane_cursor_path" \
-        "$(((index + 1) % url_count))"
+      # A healthy local endpoint is preferred on the next reconciliation.
+      write_state_value "$control_plane_cursor_path" 0
       return 0
     fi
     [[ "$http_status" =~ ^[0-9]{3}$ ]] || http_status=unknown
     log "Control Plane reconcile failed: endpoint=$(sanitized_control_plane_endpoint "$base") http_status=$http_status curl_exit=$curl_exit credential_scope=$credential_scope"
+    if [[ -f "$assignment_lease_deadline_path" ]]; then
+      expire_local_assignment_if_needed
+    fi
     rm -f "$candidate_response_file"
     candidate_response_file=""
   done
+  # If the time budget cut a scan short, continue from the next endpoint on
+  # the next run. A full unsuccessful scan wraps to its original starting point.
   write_state_value "$control_plane_cursor_path" \
-    "$(((10#$cursor + attempts) % url_count))"
+    "$(((10#$cursor + attempt) % url_count))"
   return 1
 }
 
@@ -640,12 +666,19 @@ validate_response() {
 }
 
 update_assignment_lease() {
-  local now ttl
+  local now ttl expires_at expires_seconds deadline
   if jq -e '.assigned == true' "$response_file" >/dev/null; then
     now="$(date +%s)"
     ttl="$(jq -r '.lease_ttl_seconds' "$response_file")"
-    write_state_value "$assignment_lease_deadline_path" \
-      "$((10#$now + 10#$ttl))"
+    expires_at="$(jq -r --arg node_id "$node_id" '.replicas[] | select(.node_id == $node_id) | .lease_expires_at' "$response_file")"
+    [[ "$expires_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+(Z|[+-][0-9]{2}:[0-9]{2})$ ]] || return 1
+    expires_seconds="$(date -u -d "$expires_at" +%s 2>/dev/null)" || return 1
+    [[ "$expires_seconds" =~ ^[0-9]+$ ]] || return 1
+    deadline="$((10#$now + 10#$ttl))"
+    ((10#$expires_seconds >= 10#$deadline)) || deadline="$expires_seconds"
+    # A delayed response must not extend an already expired server lease.
+    ((10#$deadline > 10#$now)) || return 1
+    write_state_value "$assignment_lease_deadline_path" "$deadline"
   else
     rm -f "$assignment_lease_deadline_path"
   fi
@@ -738,7 +771,10 @@ withdraw_after_failures() {
     log "candidate withdrawal could not be confirmed; local cooldown remains active"
     return
   fi
-  update_assignment_lease
+  if ! update_assignment_lease; then
+    log "candidate withdrawal returned an invalid or expired assignment lease"
+    return
+  fi
   reconcile_edge_proxy
   if jq -e '.assigned == false' "$response_file" >/dev/null; then
     deactivate_local_replica
@@ -859,7 +895,11 @@ reconcile_command() {
   fi
   if ! request_reconciliation; then
     log "every attempted Control Plane is unavailable"
-    expire_local_assignment_if_needed
+    if [[ -f "$assignment_lease_deadline_path" ]] \
+      || systemctl is-active --quiet heteronetwork-keycloak.service \
+      || systemctl is-active --quiet heteronetwork-keycloak-backchannel.service; then
+      expire_local_assignment_if_needed
+    fi
     return
   fi
   if ! validate_response; then
@@ -867,7 +907,11 @@ reconcile_command() {
     expire_local_assignment_if_needed
     return
   fi
-  update_assignment_lease
+  if ! update_assignment_lease; then
+    log "Control Plane returned an invalid or expired assignment lease"
+    expire_local_assignment_if_needed
+    return
+  fi
   apply_assignment "$eligible"
 }
 

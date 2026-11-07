@@ -1,0 +1,37 @@
+# Identity availability during database and storage contention
+
+On 2026-11-07 the live VPN/browser acceptance test failed because no assigned
+identity replica was ready. External OIDC discovery alternated between HTTP 200
+and 503. Two identity connectors were unready; the stopped `uc-k8sp4` node was
+excluded and its stale connector status was not evidence of availability.
+
+The PostgreSQL primary was `ichikawap1` and its only synchronous standby was
+`uc-k8sp5`. The primary had high I/O pressure, many sessions waiting for
+synchronous replication, and transaction/tuple lock waiters. Control-plane logs
+showed commits lasting tens of seconds, while the identity placement client
+allowed only two seconds per request. When placement renewals repeatedly
+timed out, its 45-second assignment lease expired and the client stopped the
+replica. A later successful renewal briefly started it again. Concurrently, a
+degraded Coder workspace disk had a stalled Longhorn I/O device and repeated
+replica rebuilds. These observations establish a contention and timeout failure
+chain, but do not yet establish the initiating cause of the storage failures.
+
+The placement reconciler now allows a slower individual response within a
+bounded total scan, resumes an interrupted scan at the next endpoint, and
+checks the server's actual assignment expiry rather than extending a stale
+response by a fresh local TTL. It still stops a replica when its lease expires;
+it does not change PostgreSQL durability or copy credentials to other nodes.
+The runtime is distributed serially via the Terraform-managed Ansible playbook
+and can be reconciled from an exact master commit using the protected workflow.
+Installing this script does not restart a database, user workload, or identity
+replica; the existing timer runs the new version on its next reconciliation.
+
+The shell acceptance suite exercises unavailable endpoints, resumed directory
+scans, lease expiry and delayed responses. The live VPN/Chromium test passed on
+retry when identity became available, but that retry alone does not prove the
+intermittent incident is resolved. Monitor the actual script rollout, OIDC
+availability, PostgreSQL replication latency and Longhorn rebuilds separately.
+An additional independent worker/storage failure domain and an independently
+verified backup are still required; neither exists merely because two API
+replicas are running. The root cause of the repeated Longhorn replica failure
+and the effect of workload I/O on control-plane storage remain under investigation.

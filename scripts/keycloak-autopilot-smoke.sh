@@ -594,6 +594,16 @@ run_autopilot reconcile
 rm -f "$fake_state/response-generation-mismatch"
 [[ "$(<"$probe_lease_path")" == "$lease_before_local_bad_response" ]] \
   || fail "local Control Plane response bypassed generation validation"
+cp "$fixture_dir/response.json" "$test_dir/response-before-expired-lease.json"
+jq '.replicas[0].lease_expires_at = "2000-01-01T00:00:00Z"' \
+  "$test_dir/response-before-expired-lease.json" >"$fixture_dir/response.json"
+printf '%s\n' "$(( $(date +%s) - 1 ))" >"$probe_lease_path"
+run_autopilot reconcile
+assert_inactive heteronetwork-keycloak.service
+[[ ! -e "$probe_lease_path" ]] || fail "delayed response revived an expired server lease"
+mv "$test_dir/response-before-expired-lease.json" "$fixture_dir/response.json"
+run_autopilot reconcile
+assert_active heteronetwork-keycloak.service
 printf '%s\n' "$(( $(date +%s) - 1 ))" >"$probe_lease_path"
 requests_before_local_outage="$(count_reconcile_requests)"
 touch "$fake_state/api-down"
@@ -713,6 +723,14 @@ run_autopilot reconcile
 [[ "$(reconcile_url_at "$((requests_before_dedup + 3))")" \
   == "https://control-1.example.test/v1/keycloak-autopilot/reconcile" ]] \
   || fail "unavailable local candidates did not fall back to configured Control Planes"
+cursor_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/control-plane-cursor"
+printf '2\n' >"$cursor_path"
+requests_before_resumed_scan="$(count_reconcile_requests)"
+run_autopilot reconcile
+[[ "$(reconcile_url_at "$((requests_before_resumed_scan + 1))")" \
+  == "https://control-1.example.test/v1/keycloak-autopilot/reconcile" ]] \
+  || fail "an interrupted directory scan did not resume at the next endpoint"
+[[ "$(<"$cursor_path")" == "0" ]] || fail "successful reconciliation did not restore local preference"
 cp "$test_dir/original-keycloak.env" "$config_dir/keycloak-autopilot.env"
 rm -f "$fake_state/unavailable-reconcile-urls" "$promoted_env" "$promoted_token" \
   "$fake_state/active/heteronetwork-control-plane.service"
@@ -969,8 +987,12 @@ grep -Fq 'readonly MAX_CONTROL_PLANE_ATTEMPTS="$MAX_CONTROL_PLANE_URLS"' "$autop
   || fail "Control Plane retries do not cover the bounded directory"
 grep -Fq 'prefer_local_control_plane_gateway' "$autopilot" \
   || fail "autopilot does not prefer the live local Agent gateway"
-grep -Fq "'max-time = 2'" "$autopilot" \
-  || fail "a full Control Plane directory scan can outlive the assignment lease"
+grep -Fq 'readonly CONTROL_PLANE_REQUEST_TIMEOUT_SECONDS="8"' "$autopilot" \
+  || fail "per-endpoint reconciliation must have a bounded timeout"
+grep -Fq 'readonly CONTROL_PLANE_TOTAL_BUDGET_SECONDS="16"' "$autopilot" \
+  || fail "the complete reconciliation scan must have a bounded time budget"
+grep -Fq -- '--max-time "$request_timeout"' "$autopilot" \
+  || fail "reconciliation does not apply the remaining timeout budget"
 grep -Fqx 'ReadWritePaths=-/opt/heteronetwork/keycloak-26.6.4/conf' \
   "$systemd_dir/heteronetwork-keycloak-autopilot.service" \
   || fail "edge-only reconciliation still requires the full Keycloak tree"

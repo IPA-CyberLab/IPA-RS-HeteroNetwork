@@ -12,7 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def files():
-    paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/postgres-ha-autopilot.sh','scripts/master-only-iac.py',
+    paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/postgres-ha-autopilot.sh','scripts/keycloak-autopilot.sh','scripts/master-only-iac.py',
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/test_verify_standard_node.py',
            'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py',
            'scripts/verify-storage-redundancy.py','scripts/test_verify_storage_redundancy.py',
