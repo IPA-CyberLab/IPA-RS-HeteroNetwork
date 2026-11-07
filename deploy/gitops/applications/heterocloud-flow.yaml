@@ -34,7 +34,7 @@ spec:
         monitoring:
           resourceExporter:
             # Built and tested by the Flow resource-monitoring workflow.
-            image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-resource-exporter:b21d102b65e9aa2aebf6169611733f0cd733a5a1@sha256:678594846a98a622c786efe236dfddc13c694051dfaca360703cf17827f53b69"
+            image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-resource-exporter:31143415e1e905c8d6ef5cfffa1d9bdf4e2c9a14@sha256:9ad2cd19e7962bb9962f54991f97e4c234470dedb13fd63d77b6756d2c202bde"
             storageHealth:
               enabled: true
               namespace: longhorn-system
