@@ -1,0 +1,63 @@
+name: Overlay DNS discovery failover E2E
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'deploy/gitops/cluster-dns/overlay-dns-service-discovery*'
+      - 'scripts/overlay-dns-failover-e2e.py'
+      - '.github/workflows/overlay-dns-failover-e2e.yml'
+  pull_request:
+    paths:
+      - 'deploy/gitops/cluster-dns/overlay-dns-service-discovery*'
+      - 'scripts/overlay-dns-failover-e2e.py'
+      - '.github/workflows/overlay-dns-failover-e2e.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  node-loss-and-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      KUBECONFIG: /tmp/hnn-dns-failover-e2e/kubeconfig
+      HNN_DNS_FAULT_E2E: kind-only
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Create disposable three-node cluster
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+          mkdir -p /tmp/hnn-dns-failover-e2e
+          curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 --retry 2 https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64 -o /tmp/hnn-dns-failover-e2e/kind
+          curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 --retry 2 https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum -o /tmp/hnn-dns-failover-e2e/kind.sha256sum
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          root = Path('/tmp/hnn-dns-failover-e2e')
+          assert hashlib.sha256((root / 'kind').read_bytes()).hexdigest() == (root / 'kind.sha256sum').read_text().split()[0]
+          (root / 'cluster.yaml').write_text('kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n  - role: control-plane\n  - role: worker\n  - role: worker\n')
+          PY
+          chmod 0755 /tmp/hnn-dns-failover-e2e/kind
+          /tmp/hnn-dns-failover-e2e/kind create cluster --name hnn-dns-failover-e2e --wait 180s --config /tmp/hnn-dns-failover-e2e/cluster.yaml --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+      - name: Pause a worker and verify DNS updates and redundant recovery
+        run: python3 -B scripts/overlay-dns-failover-e2e.py
+      - name: Capture non-secret cluster diagnostics
+        if: always()
+        run: |
+          mkdir -p /tmp/hnn-dns-failover-e2e/results
+          kubectl --context kind-hnn-dns-failover-e2e get nodes,pods -A -o wide > /tmp/hnn-dns-failover-e2e/results/workloads.txt 2>&1 || true
+          kubectl --context kind-hnn-dns-failover-e2e get events -A --sort-by=.lastTimestamp > /tmp/hnn-dns-failover-e2e/results/events.txt 2>&1 || true
+          kubectl --context kind-hnn-dns-failover-e2e -n kube-system logs -l app.kubernetes.io/name=overlay-dns-service-discovery --all-containers --tail=100 > /tmp/hnn-dns-failover-e2e/results/controller.txt 2>&1 || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: overlay-dns-failover-e2e
+          path: /tmp/hnn-dns-failover-e2e/results
+          retention-days: 14
+      - name: Delete only this job's cluster
+        if: always()
+        run: /tmp/hnn-dns-failover-e2e/kind delete cluster --name hnn-dns-failover-e2e || true

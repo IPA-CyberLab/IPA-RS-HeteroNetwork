@@ -61,6 +61,10 @@ class OverlayDnsServiceDiscoveryTests(unittest.TestCase):
         self.assertGreaterEqual(deployment["spec"]["replicas"], 2)
         pod = deployment["spec"]["template"]["spec"]
         self.assertEqual(pod["nodeSelector"]["dns.heteronetwork.io/discovery"], "true")
+        anti_affinity = pod["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+        self.assertTrue(any(entry["topologyKey"] == "kubernetes.io/hostname" and
+                            entry["labelSelector"]["matchLabels"].get("app.kubernetes.io/component") == "controller"
+                            for entry in anti_affinity))
         tolerations = pod.get("tolerations", [])
         self.assertFalse(any(not entry.get("key") for entry in tolerations))
         for key in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"):
