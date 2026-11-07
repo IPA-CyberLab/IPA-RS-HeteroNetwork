@@ -16,6 +16,13 @@ degraded Coder workspace disk had a stalled Longhorn I/O device and repeated
 replica rebuilds. These observations establish a contention and timeout failure
 chain, but do not yet establish the initiating cause of the storage failures.
 
+The `ichikawap1` host was also a declared and running PostgreSQL member, but
+its bundle retained a proxy-only marker from an earlier role. This prevented
+the identity reconciler from treating it as an eligible replica. Clearing that
+marker is permitted only after the member's authority files match the protected
+source, all full-bundle certificates validate, and both database services are
+active; the reconciliation performs a check-only run before applying it.
+
 The placement reconciler now allows a slower individual response within a
 bounded total scan, resumes an interrupted scan at the next endpoint, and
 checks the server's actual assignment expiry rather than extending a stale

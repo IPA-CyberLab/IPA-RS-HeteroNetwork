@@ -49,6 +49,18 @@ jobs:
           printf '%s\n' "$HNN_E2E_SSH_PRIVATE_KEY" > "$KEYCLOAK_RUNTIME_ROOT/id_ed25519"
           python3 scripts/prepare-database-ha.py --work-dir "$KEYCLOAK_RUNTIME_ROOT/inputs" \
             --ssh-key "$KEYCLOAK_RUNTIME_ROOT/id_ed25519" > "$KEYCLOAK_RUNTIME_ROOT/preparation.json"
+      - name: Check the protected member state without changing hosts
+        env:
+          HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+          ANSIBLE_CALLBACK_PLUGINS: ${{ github.workspace }}/deploy/terraform/master-only/ansible/callback_plugins
+          ANSIBLE_STDOUT_CALLBACK: hnn_json
+        run: |
+          set -euo pipefail
+          test -n "$HNN_IAC_BECOME_PASSWORD"
+          "$KEYCLOAK_RUNTIME_ROOT/venv/bin/ansible-playbook" --check \
+            -i "$KEYCLOAK_RUNTIME_ROOT/inputs/inventory.json" \
+            deploy/terraform/master-only/ansible/keycloak-autopilot-runtime.yaml \
+            > "$KEYCLOAK_RUNTIME_ROOT/check.json"
       - name: Install the placement reconciler serially
         env:
           HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
