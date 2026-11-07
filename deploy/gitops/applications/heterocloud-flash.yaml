@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
-    targetRevision: da9166a0a4f577a7f6b4e5e809716b981398320d
+    targetRevision: bc032a6785132fb5f19f1e1375cf7ead7c6d96e2
     path: deploy/helm/heterocloud-flash
     helm:
       releaseName: heterocloud-flash
@@ -36,7 +36,7 @@ spec:
             - 10.250.0.11/32
         capacity:
           enabled: true
-          image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash-capacity:da9166a0a4f577a7f6b4e5e809716b981398320d@sha256:25ca4bd2ad1e1580b5af86336d62dbfcbbfa59489f601a2de1ff771b4f885695"
+          image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash-capacity:bc032a6785132fb5f19f1e1375cf7ead7c6d96e2@sha256:cb37db0e3c033d3a4b311fb0c19df0285fa3d5573cd76fdc944e42728a80dd2c"
           replicaCount: 2
           minFreeGiB: 10
           freePercent: 25
