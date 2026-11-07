@@ -211,6 +211,31 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
             verify.verify_monitoring_gateways("10.250.0.2,10.250.0.4")
         health.assert_not_called()
 
+    def test_monitoring_dns_failure_identifies_service_and_gateway(self):
+        with (
+            patch.object(verify, "overlay_dns_answers", side_effect=TimeoutError()),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"grafana\.heteronetwork\.internal DNS probe failed at 10\.250\.0\.2 \(TimeoutError\)",
+            ),
+        ):
+            verify.verify_monitoring_gateways("10.250.0.2")
+
+    def test_monitoring_http_failure_identifies_endpoint(self):
+        opener = unittest.mock.Mock()
+        opener.open.side_effect = TimeoutError()
+        with (
+            patch.object(verify.urllib.request, "build_opener", return_value=opener),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"grafana\.heteronetwork\.internal HTTP probe failed at 10\.250\.0\.10:13000 \(TimeoutError\)",
+            ),
+        ):
+            verify.monitoring_endpoint_health(
+                "grafana.heteronetwork.internal", "10.250.0.10",
+                verify.MONITORING_SERVICES["grafana.heteronetwork.internal"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

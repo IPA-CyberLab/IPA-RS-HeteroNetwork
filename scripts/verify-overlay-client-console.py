@@ -605,9 +605,14 @@ def monitoring_endpoint_health(name, address, service):
         f"http://{address}:{port}{service['path']}",
         headers={"Accept": "text/html", "Host": f"{name}:{port}"})
     started = time.monotonic()
-    with opener.open(request, timeout=MONITORING_OPEN_TIMEOUT_SECONDS) as response:
-        body = response.read(256 * 1024)
-        status = response.status
+    try:
+        with opener.open(request, timeout=MONITORING_OPEN_TIMEOUT_SECONDS) as response:
+            body = response.read(256 * 1024)
+            status = response.status
+    except OSError as error:
+        raise RuntimeError(
+            f"{name} HTTP probe failed at {address}:{port} ({type(error).__name__})"
+        ) from error
     open_ms = round((time.monotonic() - started) * 1000)
     if status != 200 or service["marker"] not in body:
         raise RuntimeError(f"{name} did not render from {address}")
@@ -622,10 +627,18 @@ def verify_monitoring_gateways(gateways):
         raise RuntimeError("at least one monitoring DNS gateway is required")
     report = {"dns": {}, "services": {}}
     for name, service in MONITORING_SERVICES.items():
+        def resolve(gateway):
+            try:
+                return overlay_dns_answers(gateway, name)
+            except (OSError, ValueError) as error:
+                raise RuntimeError(
+                    f"{name} DNS probe failed at {gateway} ({type(error).__name__})"
+                ) from error
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as executor:
             answers = dict(zip(
                 targets,
-                executor.map(lambda gateway: overlay_dns_answers(gateway, name), targets),
+                executor.map(resolve, targets),
             ))
         endpoint_sets = {tuple(sorted(set(values))) for values in answers.values()}
         if len(endpoint_sets) != 1 or not next(iter(endpoint_sets), ()):
