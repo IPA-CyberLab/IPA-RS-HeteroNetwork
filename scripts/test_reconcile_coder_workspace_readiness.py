@@ -52,6 +52,15 @@ class ArchiveTests(unittest.TestCase):
             with self.subTest(entries=entries), self.assertRaises(ValueError):
                 readiness.revised_archive(archive(*entries), readiness.digest(b'old'), b'new', b'wait')
 
+    def test_updates_waiter_when_reviewed_main_is_already_active(self):
+        original = archive(('main.tf', b'new', 'file'), ('wait-for-flash.sh', b'old-wait', 'file'),
+                           ('README.md', b'keep', 'file'))
+        updated = readiness.revised_archive(original, readiness.digest(b'old'), b'new', b'new-wait')
+        with tarfile.open(fileobj=io.BytesIO(updated)) as result:
+            self.assertEqual(result.extractfile('main.tf').read(), b'new')
+            self.assertEqual(result.extractfile('wait-for-flash.sh').read(), b'new-wait')
+            self.assertEqual(result.extractfile('README.md').read(), b'keep')
+
     def test_big_variant_changes_only_reviewed_defaults(self):
         source = (b'workspace_memory_mib = lookup(var.workspace_memory_overrides, data.coder_workspace.me.id, 8192)\n'
                   b'cpu_millis             = 4000\nother = 4000\n')

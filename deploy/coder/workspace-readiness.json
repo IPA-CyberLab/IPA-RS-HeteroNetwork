@@ -1,10 +1,10 @@
 {
   "endpoint": "https://coder.mizuame.app",
   "source_repository": "IPA-CyberLab/IPA-RS-HeteroCloud",
-  "source_commit": "01ec869b37bf02fd19929761576124f06efbdf07",
+  "source_commit": "c031f3410ff541a19376beff200c68e42bc4a9cf",
   "source_sha256": {
     "main.tf": "92063247b2738a24965cb86ad0ff400ddd87cf6e48e4c834bdc814e0309a48fb",
-    "wait-for-flash.sh": "73ba205f5b94b2ab5115d1c3cd1079d072206b0527f442c65b0c48fe59c0875b"
+    "wait-for-flash.sh": "6aead81390e666f69d17533c59c3efa4671a300153b3740f87be1d4fea8581d3"
   },
   "expected_workspace_image": "registry.heterocloud.mizuame.app/hc-019fbda8eff37610bdd58fe89e746c14/coder-standard-develop@sha256:c92ad25e123792881019b2b0b527d193bbcf19288a9c45a0605b98a27a7647b4",
   "owner_id": "ff8325de-89f0-403c-b490-6973274d9ce0",

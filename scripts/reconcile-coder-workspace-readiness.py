@@ -66,7 +66,9 @@ def revised_archive(archive, expected_old, replacement, waiter):
             raise ValueError('Expected root main.tf is missing')
         if digest(files['main.tf']) == digest(replacement) and files.get('wait-for-flash.sh') == waiter:
             return None
-        if digest(files['main.tf']) != expected_old:
+        # A later update may change only the waiter.  The already-published
+        # reviewed main.tf is also safe, but unrelated template edits are not.
+        if digest(files['main.tf']) not in (expected_old, digest(replacement)):
             raise ValueError('Active template changed since it was reviewed')
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode='w') as revised:
