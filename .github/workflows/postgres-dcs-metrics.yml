@@ -1,0 +1,26 @@
+name: PostgreSQL DCS metrics
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/postgres-dcs-metrics.py'
+      - 'scripts/test_postgres_dcs_metrics.py'
+      - 'deploy/terraform/master-only/postgres-dcs-metrics.tf'
+      - 'deploy/terraform/master-only/ansible/postgres-dcs-metrics.yaml'
+      - '.github/workflows/postgres-dcs-metrics.yml'
+  pull_request:
+    paths:
+      - 'scripts/postgres-dcs-metrics.py'
+      - 'scripts/test_postgres_dcs_metrics.py'
+      - 'deploy/terraform/master-only/postgres-dcs-metrics.tf'
+      - 'deploy/terraform/master-only/ansible/postgres-dcs-metrics.yaml'
+      - '.github/workflows/postgres-dcs-metrics.yml'
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - run: python3 -m unittest scripts/test_postgres_dcs_metrics.py -v

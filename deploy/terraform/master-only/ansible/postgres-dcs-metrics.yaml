@@ -1,0 +1,83 @@
+- name: Publish only aggregate DCS health to the private monitoring nodes
+  hosts: bootstrap:enrollment_issuer
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Require one of the reviewed database hosts
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in ['uc-k8sp5', 'ichikawap1']
+          - vpn_ip in ['10.250.0.2', '10.250.0.10']
+
+    - name: Install the bounded read-only DCS metrics projector
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/postgres-dcs-metrics.py"
+        dest: /opt/heteronetwork/libexec/postgres-dcs-metrics.py
+        owner: root
+        group: root
+        mode: '0755'
+      register: dcs_metrics_program
+
+    - name: Install the VPN-only aggregate metrics service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=HeteroNetwork PostgreSQL DCS aggregate metrics
+          Wants=network-online.target
+          After=network-online.target
+          StartLimitIntervalSec=0
+
+          [Service]
+          Type=simple
+          DynamicUser=yes
+          ExecStart=/usr/bin/python3 /opt/heteronetwork/libexec/postgres-dcs-metrics.py --listen {{ vpn_ip }} --port 19181 --allow {{ hostvars['uc-k8sp5'].vpn_ip }}/32 --allow {{ hostvars['ichikawap1'].vpn_ip }}/32
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          PrivateTmp=yes
+          PrivateDevices=yes
+          RestrictAddressFamilies=AF_INET AF_UNIX
+          CapabilityBoundingSet=
+          MemoryMax=64M
+          TasksMax=32
+          IPAddressDeny=any
+          IPAddressAllow=127.0.0.0/8
+          IPAddressAllow=10.250.0.0/16
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/heteronetwork-postgres-dcs-metrics.service
+        owner: root
+        group: root
+        mode: '0644'
+      register: dcs_metrics_unit
+
+    - name: Enable the local metrics projector
+      ansible.builtin.systemd_service:
+        name: heteronetwork-postgres-dcs-metrics.service
+        enabled: true
+        daemon_reload: "{{ dcs_metrics_unit.changed }}"
+        state: "{{ 'restarted' if dcs_metrics_unit.changed or dcs_metrics_program.changed else 'started' }}"
+      when: not ansible_check_mode
+
+    - name: Require a complete local DCS health sample
+      ansible.builtin.uri:
+        url: "http://{{ vpn_ip }}:19181/metrics"
+        use_proxy: false
+        return_content: true
+        timeout: 5
+      register: dcs_metrics_health
+      retries: 6
+      delay: 2
+      until:
+        - dcs_metrics_health.status == 200
+        - "'heteronetwork_postgres_dcs_has_leader' in dcs_metrics_health.content"
+        - "'heteronetwork_postgres_dcs_active_peers' in dcs_metrics_health.content"
+      when: not ansible_check_mode

@@ -143,6 +143,37 @@ replica failures have the same initiating cause.
   subsequently exceeded the Grafana three-second deadline. Public API monitoring recorded two timeouts
   during 150 probes while rolling out, and one timeout during 30 later probes.
   These results confirm that network and service latency remain intermittent.
+- At 12:49:54 UTC the PostgreSQL primary `db-b` demoted itself after its DCS
+  requests timed out and a TLS handshake to the other live database member
+  timed out during the configured failsafe check. PostgreSQL connections were
+  terminated; the same member recovered its lock and promoted itself at
+  12:50:18. Both Keycloak replicas subsequently stopped after their placement
+  leases expired and restarted at 12:50:55 and 12:51:08. The PostgreSQL DCS
+  is a separate etcd cluster from Kubernetes: its three voters still include
+  the explicitly stopped `uc-k8sp4` (`db-e`), leaving both surviving voters
+  necessary for quorum. The earlier Kubernetes etcd retirement did not change
+  this separate membership. A voter replacement requires an independent,
+  suitable host; the three Secret Manager custodians must remain dedicated.
+- Both live database hosts now expose only aggregate local DCS health to the
+  approved monitoring hosts over the private overlay. The exporter returns an
+  error instead of a healthy zero when the local metrics source is unavailable;
+  a request from another overlay node was rejected with HTTP 403. Each live
+  voter currently reports just one active peer. Prometheus rules warn about
+  missing peer connectivity, missing metrics, absent leaders and repeated
+  elections. These alerts do not add a voter or restore failure tolerance.
+- The PostgreSQL DCS snapshot captured at 12:57 UTC was restored to a
+  separate, unstarted data directory. Its encrypted, compressed R2 copy was
+  downloaded, authenticated and decompressed, and its SHA-256 matched the
+  original. The recovery manifest records the protected etcd-key reference.
+  This protects DCS state only; it does not contain the PostgreSQL databases.
+- A [subsequent VPN/browser run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42620011540)
+  failed during identity preparation, and [another run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42620318171)
+  exceeded the Grafana three-second budget. On `ichikawap1` Grafana's local
+  login response was repeatedly about 1.6–2.4 seconds while `uc-k8sp5` was
+  around 60–75 ms. Its readiness budget was tightened to one second to leave
+  room for VPN transit. Production DNS subsequently retained only the fast
+  replica. The slow replica can return after recovery, but until then Grafana
+  has only one ready endpoint and the application is degraded.
 
 ## Remaining storage risk
 
