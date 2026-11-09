@@ -96,6 +96,31 @@ replica failures have the same initiating cause.
   verified offsite backup, and its restored directory was not started as a
   production cluster. A causal link between this etcd timeout and the original
   OIDC error has not been established.
+- Network counters provided evidence of continuing receive loss. On
+  `uc-k8sp5` the physical interface accumulated approximately 496 missed
+  packets and 26 dropped packets over a ten-second sample while its average
+  receive rate was well below the link's nominal 1 Gbit/s. On `ichikawap1`,
+  the physical interface's receive FIFO error counter increased by 45 in five
+  seconds; CRC and frame error counters were zero. A short VPN ping sample
+  also showed one lost packet out of eight. These observations do not by
+  themselves prove the cause of the original identity incident.
+- The receive rings were 256/4096 descriptors on the `igb` NIC and 151/4078
+  on the `bnx2x` NIC. Both drivers reload or stop an active interface when
+  ring parameters change ([Linux igb implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/net/ethernet/intel/igb/igb_ethtool.c),
+  [Linux bnx2x implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/net/ethernet/broadcom/bnx2x/bnx2x_ethtool.c)).
+  The setting was not changed during this incident because multiple production
+  volumes still have only one known read/write replica and an independently
+  restorable backup has not been established. Prometheus now alerts separately
+  on sustained node receive errors, receive drops and missing kubelet metrics;
+  explicitly stopped nodes are removed from these scrape targets.
+- After the Flash cost release was rolled out, all API, owner and worker
+  deployments had two updated, available replicas and Argo CD was Healthy
+  and Synced. The new unauthenticated budget mutation endpoint returned 401.
+  [Live VPN/Chromium run 42613051961](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42613051961)
+  passed, but the two preceding runs failed on a slow Grafana endpoint and on
+  a DNS timeout to `ichikawap1`. Public API monitoring recorded two timeouts
+  during 150 probes while rolling out, and one timeout during 30 later probes.
+  These results confirm that network and service latency remain intermittent.
 
 ## Remaining storage risk
 
