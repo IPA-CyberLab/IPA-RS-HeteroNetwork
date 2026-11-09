@@ -40,6 +40,8 @@ on:
       - 'scripts/normalize_application_helm_values.py'
       - 'scripts/verify-apiserver-etcd.py'
       - 'scripts/test_verify_apiserver_etcd.py'
+      - 'scripts/reconcile-etcd-retirements.py'
+      - 'scripts/test_reconcile_etcd_retirements.py'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'deploy/gitops/envoy-gateway/backend-traffic-policy.yaml'
@@ -128,6 +130,8 @@ on:
       - 'scripts/normalize_application_helm_values.py'
       - 'scripts/verify-apiserver-etcd.py'
       - 'scripts/test_verify_apiserver_etcd.py'
+      - 'scripts/reconcile-etcd-retirements.py'
+      - 'scripts/test_reconcile_etcd_retirements.py'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'deploy/gitops/envoy-gateway/backend-traffic-policy.yaml'
@@ -227,6 +231,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_custom_domain_tls.py -v
           python3 -B -m unittest discover -s scripts -p test_gateway_health.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_apiserver_etcd.py -v
+          python3 -B -m unittest discover -s scripts -p test_reconcile_etcd_retirements.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_backup_store.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_backup_controller_e2e.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_offsite_config.py -v
