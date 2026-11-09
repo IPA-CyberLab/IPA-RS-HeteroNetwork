@@ -160,6 +160,7 @@ def main():
     parser.add_argument("--intent", type=Path, required=True)
     parser.add_argument("--roster", type=Path, required=True)
     parser.add_argument("--backup-dir", type=Path, required=True)
+    parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
     intent, roster = json.loads(args.intent.read_text()), json.loads(args.roster.read_text())
     item = validate_intent(intent, roster)
@@ -176,6 +177,9 @@ def main():
     validate_node(json.loads(cluster.kube("get", "node", item["node"], "-o", "json")), item["node"], dt.datetime.now(dt.timezone.utc))
     if survivors_for_retirement(cluster.members(), item) != remaining:
         raise ValueError("etcd membership changed during preflight")
+    if args.preflight_only:
+        print(json.dumps({"node": item["node"], "result": "preflight_passed", "remaining_voters": len(survivors)}))
+        return
     try:
         cluster.etcd(["https://127.0.0.1:2379"], "member", "remove", item["member_id"])
     except ValueError:

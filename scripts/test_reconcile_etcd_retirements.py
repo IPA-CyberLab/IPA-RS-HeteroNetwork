@@ -115,6 +115,31 @@ class RetirementTests(unittest.TestCase):
                     subject.main()
             self.assertFalse(fake.removed)
 
+    def test_preflight_only_never_removes_a_healthy_preflight_target(self):
+        class FakeCluster:
+            def __init__(self, *_):
+                self.removed = False
+            def members(self):
+                return MEMBERS
+            def kube(self, *_):
+                return json.dumps(NODE)
+            def healthy(self, *_):
+                pass
+            def etcd(self, *_):
+                self.removed = True
+        fake = FakeCluster()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "intent.json").write_text(json.dumps(INTENT))
+            (root / "roster.json").write_text(json.dumps(ROSTER))
+            with (patch.object(subject, "Cluster", return_value=fake),
+                  patch.object(subject, "validate_snapshot"),
+                  patch.object(subject, "validate_node"),
+                  patch("sys.argv", ["reconcile", "--kubeconfig", "test", "--intent", str(root / "intent.json"),
+                                     "--roster", str(root / "roster.json"), "--backup-dir", directory, "--preflight-only"])):
+                subject.main()
+            self.assertFalse(fake.removed)
+
     def test_committed_removal_with_client_timeout_is_verified_without_retry(self):
         class FakeCluster:
             def __init__(self, *_):
