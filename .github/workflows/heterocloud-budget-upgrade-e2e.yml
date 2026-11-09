@@ -1,0 +1,89 @@
+name: HeteroCloud budget image upgrade E2E
+on:
+  push:
+    branches: [codex/cost-image-e2e]
+    paths:
+      - 'scripts/heterocloud-budget-upgrade-e2e.mjs'
+      - '.github/workflows/heterocloud-budget-upgrade-e2e.yml'
+  workflow_dispatch:
+    inputs:
+      compat_release:
+        description: Compatibility-image release tag
+        required: true
+        default: v0.1.115-platform.2
+        type: string
+      upgrade_release:
+        description: Budget-image release tag
+        required: true
+        default: v0.1.116-platform.2
+        type: string
+permissions:
+  contents: read
+  packages: read
+jobs:
+  upgrade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: hc_test
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: heterocloud_test_stage
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U hc_test -d heterocloud_test_stage"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Verify both published immutable release artifacts
+        id: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPAT_TAG: ${{ inputs.compat_release || 'v0.1.115-platform.2' }}
+          UPGRADE_TAG: ${{ inputs.upgrade_release || 'v0.1.116-platform.2' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          repo = 'IPA-CyberLab/IPA-RS-HeteroCloud'
+          for key in ('compat', 'upgrade'):
+              tag = os.environ[f'{key.upper()}_TAG']
+              assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?', tag)
+              root = os.path.join(os.environ['RUNNER_TEMP'], key)
+              os.mkdir(root)
+              subprocess.run(['gh', 'release', 'download', tag, '--repo', repo, '--pattern', 'heterocloud-release-artifact.json', '--dir', root], check=True)
+              with open(os.path.join(root, 'heterocloud-release-artifact.json')) as file:
+                  item = json.load(file)
+              assert item['schema_version'] == 1 and item['component'] == 'heterocloud'
+              assert item['version'] == tag.removeprefix('v')
+              assert re.fullmatch(r'[a-f0-9]{40}', item['commit'])
+              assert re.fullmatch(r'ghcr\.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:[a-f0-9]{64}', item['image'])
+              ref = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/commits/{tag}']))
+              assert ref['sha'] == item['commit']
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write(f"{key}_commit={item['commit']}\n{key}_image={item['image']}\n")
+          PY
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: IPA-CyberLab/IPA-RS-HeteroCloud
+          ref: ${{ steps.artifacts.outputs.upgrade_commit }}
+          path: heterocloud-source
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+      - name: Exercise image upgrade, budget, rollback and browser
+        env:
+          HC_TEST_IMAGE: ${{ steps.artifacts.outputs.compat_image }}
+          HC_TEST_UPGRADE_IMAGE: ${{ steps.artifacts.outputs.upgrade_image }}
+          HC_TEST_SOURCE: ${{ github.workspace }}/heterocloud-source
+        run: node scripts/heterocloud-budget-upgrade-e2e.mjs
