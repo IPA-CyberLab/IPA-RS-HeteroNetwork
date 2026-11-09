@@ -9934,6 +9934,57 @@ mod tests {
                 .await?;
             assert_eq!(response.status(), expected_status);
         }
+        let original = store
+            .list_keycloak_candidates(&cluster_id, Utc::now(), None, 64)
+            .await?;
+        assert_eq!(original.len(), 1);
+        let retried = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keycloak-autopilot/reconcile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {keycloak_node_bearer}"),
+                    )
+                    .body(Body::from(keycloak_request.clone()))?,
+            )
+            .await?;
+        assert_eq!(retried.status(), StatusCode::OK);
+        let retry_body: Value =
+            serde_json::from_slice(&axum::body::to_bytes(retried.into_body(), usize::MAX).await?)?;
+        assert_eq!(
+            retry_body["replicas"][0]["lease_expires_at"],
+            serde_json::to_value(original[0].lease_expires_at)?
+        );
+        assert_eq!(
+            store
+                .list_keycloak_candidates(&cluster_id, Utc::now(), None, 64)
+                .await?,
+            original
+        );
+        let changed_request = serde_json::to_vec(&serde_json::json!({
+            "node_id": node.node_id.as_str(), "vpn_ip": node.vpn_ip.to_string(),
+            "eligible": true, "ready": true, "version": KEYCLOAK_AUTOPILOT_VERSION,
+            "generation": 1
+        }))?;
+        let changed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keycloak-autopilot/reconcile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {keycloak_node_bearer}"),
+                    )
+                    .body(Body::from(changed_request))?,
+            )
+            .await?;
+        assert_eq!(changed.status(), StatusCode::CONFLICT);
         let withdrawal = serde_json::to_vec(&serde_json::json!({
             "node_id": node.node_id.as_str(),
             "vpn_ip": node.vpn_ip.to_string(),

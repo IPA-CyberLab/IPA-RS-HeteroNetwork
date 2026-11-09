@@ -117,6 +117,21 @@ pub struct KeycloakCandidateLease {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
+impl KeycloakCandidateLease {
+    /// A retried request has the same generation and payload, but the server
+    /// calculates fresh timestamps for each HTTP attempt. Those timestamps
+    /// must not make the retry a new lease or extend the original expiry.
+    fn same_request_as(&self, other: &Self) -> bool {
+        self.cluster_id == other.cluster_id
+            && self.node_id == other.node_id
+            && self.vpn_ip == other.vpn_ip
+            && self.version == other.version
+            && self.ready == other.ready
+            && self.eligible == other.eligible
+            && self.generation == other.generation
+    }
+}
+
 fn default_keycloak_candidate_eligible() -> bool {
     true
 }
@@ -1687,11 +1702,16 @@ impl ControlPlaneStore for InMemoryStore {
     ) -> Result<bool, ControlPlaneError> {
         let key = (candidate.cluster_id.clone(), candidate.node_id.clone());
         let mut candidates = self.keycloak_candidates.write().await;
-        if candidates.get(&key).is_some_and(|current| {
-            current.lease_expires_at > candidate.updated_at
-                && current.generation >= candidate.generation
-        }) {
-            return Ok(false);
+        if let Some(current) = candidates.get(&key) {
+            if current.generation == candidate.generation {
+                return Ok(current.lease_expires_at > candidate.updated_at
+                    && current.same_request_as(&candidate));
+            }
+            if current.lease_expires_at > candidate.updated_at
+                && current.generation > candidate.generation
+            {
+                return Ok(false);
+            }
         }
         candidates.insert(key, candidate);
         Ok(true)
@@ -2834,8 +2854,23 @@ where
             });
         }
 
-        self.keycloak_placement(version, desired_replicas, max_candidates, now)
-            .await
+        let placement = self
+            .keycloak_placement(version, desired_replicas, max_candidates, now)
+            .await?;
+        // A later reconciliation can replace this request while its placement
+        // is being computed. Never return that later generation's longer lease
+        // in the response to the older request.
+        if placement
+            .replicas
+            .iter()
+            .any(|replica| replica.node_id == *node_id && replica.generation != generation)
+        {
+            return Err(ControlPlaneError::KeycloakCandidateGenerationConflict {
+                node_id: node_id.clone(),
+                generation,
+            });
+        }
+        Ok(placement)
     }
 
     pub async fn keycloak_placement(

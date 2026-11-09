@@ -1693,12 +1693,23 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
                 (cluster_id, node_id, lease_expires_at, generation, eligible, record_json)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(cluster_id, node_id) DO UPDATE SET
-                lease_expires_at = excluded.lease_expires_at,
+                lease_expires_at = CASE
+                    WHEN keycloak_candidate_leases.generation = excluded.generation
+                    THEN keycloak_candidate_leases.lease_expires_at
+                    ELSE excluded.lease_expires_at END,
                 generation = excluded.generation,
                 eligible = excluded.eligible,
-                record_json = excluded.record_json
-            WHERE keycloak_candidate_leases.lease_expires_at <= ?7
-               OR keycloak_candidate_leases.generation < excluded.generation
+                record_json = CASE
+                    WHEN keycloak_candidate_leases.generation = excluded.generation
+                    THEN keycloak_candidate_leases.record_json
+                    ELSE excluded.record_json END
+            WHERE (keycloak_candidate_leases.generation <> excluded.generation
+                   AND (keycloak_candidate_leases.lease_expires_at <= ?7
+                        OR keycloak_candidate_leases.generation < excluded.generation))
+               OR (keycloak_candidate_leases.generation = excluded.generation
+                   AND keycloak_candidate_leases.lease_expires_at > ?7
+                   AND json_remove(keycloak_candidate_leases.record_json, '$.updated_at', '$.lease_expires_at') =
+                       json_remove(excluded.record_json, '$.updated_at', '$.lease_expires_at'))
             "#,
         )
         .bind(candidate.cluster_id.as_str())
@@ -3696,12 +3707,23 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
                 (cluster_id, node_id, lease_expires_at, generation, eligible, record_json)
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT(cluster_id, node_id) DO UPDATE SET
-                lease_expires_at = excluded.lease_expires_at,
+                lease_expires_at = CASE
+                    WHEN keycloak_candidate_leases.generation = excluded.generation
+                    THEN keycloak_candidate_leases.lease_expires_at
+                    ELSE excluded.lease_expires_at END,
                 generation = excluded.generation,
                 eligible = excluded.eligible,
-                record_json = excluded.record_json
-            WHERE keycloak_candidate_leases.lease_expires_at <= $7
-               OR keycloak_candidate_leases.generation < excluded.generation
+                record_json = CASE
+                    WHEN keycloak_candidate_leases.generation = excluded.generation
+                    THEN keycloak_candidate_leases.record_json
+                    ELSE excluded.record_json END
+            WHERE (keycloak_candidate_leases.generation <> excluded.generation
+                   AND (keycloak_candidate_leases.lease_expires_at <= $7
+                        OR keycloak_candidate_leases.generation < excluded.generation))
+               OR (keycloak_candidate_leases.generation = excluded.generation
+                   AND keycloak_candidate_leases.lease_expires_at > $7
+                   AND (keycloak_candidate_leases.record_json - 'updated_at' - 'lease_expires_at') =
+                       (excluded.record_json - 'updated_at' - 'lease_expires_at'))
             "#,
         )
         .bind(candidate.cluster_id.as_str())
@@ -6845,6 +6867,123 @@ mod tests {
         drop(store_a);
         drop(store_b);
         let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    async fn exercise_keycloak_request_retry<S: ControlPlaneStore>(
+        store: &S,
+        cluster: &ClusterId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let original = keycloak_candidate(
+            cluster,
+            "retry-node",
+            17,
+            true,
+            now + Duration::seconds(45),
+            now,
+        );
+        assert!(store.upsert_keycloak_candidate(original.clone()).await?);
+        // A request committed before its HTTP response timed out. The same
+        // generation and payload can be retried, but never gains a new TTL.
+        let retry = KeycloakCandidateLease {
+            updated_at: now + Duration::seconds(5),
+            lease_expires_at: now + Duration::seconds(50),
+            ..original.clone()
+        };
+        assert!(store.upsert_keycloak_candidate(retry.clone()).await?);
+        assert_eq!(
+            store
+                .list_keycloak_candidates(cluster, now, None, 64)
+                .await?,
+            vec![original.clone()]
+        );
+        let different = KeycloakCandidateLease {
+            ready: false,
+            ..retry.clone()
+        };
+        assert!(!store.upsert_keycloak_candidate(different).await?);
+        let expired_retry = KeycloakCandidateLease {
+            updated_at: now + Duration::seconds(46),
+            lease_expires_at: now + Duration::seconds(91),
+            ..retry
+        };
+        assert!(
+            !store
+                .upsert_keycloak_candidate(expired_retry.clone())
+                .await?
+        );
+        let renewal = KeycloakCandidateLease {
+            generation: 2,
+            ..expired_retry
+        };
+        assert!(store.upsert_keycloak_candidate(renewal.clone()).await?);
+        let withdrawal = KeycloakCandidateLease {
+            eligible: false,
+            ready: false,
+            generation: 3,
+            updated_at: now + Duration::seconds(47),
+            lease_expires_at: now + Duration::seconds(92),
+            ..renewal
+        };
+        assert!(store.upsert_keycloak_candidate(withdrawal.clone()).await?);
+        let withdrawal_retry = KeycloakCandidateLease {
+            updated_at: now + Duration::seconds(48),
+            lease_expires_at: now + Duration::seconds(93),
+            ..withdrawal.clone()
+        };
+        assert!(
+            store
+                .upsert_keycloak_candidate(withdrawal_retry.clone())
+                .await?
+        );
+        assert!(
+            !store
+                .upsert_keycloak_candidate(KeycloakCandidateLease {
+                    eligible: true,
+                    ..withdrawal_retry
+                })
+                .await?
+        );
+        assert!(store
+            .list_keycloak_candidates(cluster, now, None, 64)
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_keycloak_retries_preserve_original_fenced_lease(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (url, path) = temp_sqlite_url("keycloak-idempotent-retry");
+        let store = SqliteControlPlaneStore::connect(&url).await?;
+        exercise_keycloak_request_retry(&store, &ClusterId::from_string("retry-test")).await?;
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable ipars_admin_ledger_test PostgreSQL database"]
+    async fn postgres_keycloak_retries_preserve_original_fenced_lease(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("IPARS_TEST_POSTGRES_URL")?;
+        let pool = PgPool::connect(&url).await?;
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            database, "ipars_admin_ledger_test",
+            "test refuses other databases"
+        );
+        let store = PostgresControlPlaneStore::from_pool(pool).await?;
+        let cluster = ClusterId::from_string(format!("keycloak-retry-{}", NodeId::new()));
+        exercise_keycloak_request_retry(&store, &cluster).await?;
+        sqlx::query("DELETE FROM keycloak_candidate_leases WHERE cluster_id = $1")
+            .bind(cluster.as_str())
+            .execute(&store.pool)
+            .await?;
+        store.pool.close().await;
         Ok(())
     }
 
