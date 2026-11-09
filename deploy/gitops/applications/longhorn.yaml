@@ -23,6 +23,10 @@ spec:
           reclaimPolicy: Retain
         defaultSettings:
           defaultReplicaCount: '{"v1":"2","v2":"2"}'
+          # Limit concurrent rebuilds to reduce I/O contention with the
+          # synchronous control-plane database. Existing rebuilds can finish;
+          # the requested replica counts remain unchanged.
+          concurrentReplicaRebuildPerNodeLimit: 1
           allowVolumeCreationWithDegradedAvailability: false
           replicaSoftAntiAffinity: false
           replicaAutoBalance: best-effort
