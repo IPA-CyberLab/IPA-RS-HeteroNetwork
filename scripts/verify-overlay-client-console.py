@@ -617,7 +617,8 @@ def monitoring_endpoint_health(name, address, service):
     if status != 200 or service["marker"] not in body:
         raise RuntimeError(f"{name} did not render from {address}")
     if open_ms > MONITORING_OPEN_TIMEOUT_SECONDS * 1000:
-        raise RuntimeError(f"{name} exceeded the monitoring UI open deadline")
+        raise RuntimeError(
+            f"{name} at {address}:{port} exceeded the monitoring UI open deadline ({open_ms} ms)")
     return {"address": address, "http": status, "open_ms": open_ms}
 
 

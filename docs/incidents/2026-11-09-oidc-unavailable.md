@@ -200,6 +200,20 @@ replica failures have the same initiating cause.
   and a read-only database query confirmed the record was absent. The verifier's
   cleanup path now also runs after a sponsorship timeout or a pre-tunnel
   failure, and can retry through alternative declared gateways.
+- After both receive-steering policies were applied, [VPN/browser run 42629826604](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42629826604)
+  established WireGuard, converged the console routes, and confirmed removal of
+  its temporary client. It still failed when a Prometheus DNS query to
+  `ichikawap1` timed out. Later direct samples from each worker to itself and
+  its peer each completed 20 out of 20 DNS queries. These are not equivalent
+  to the hosted runner's VPN path and do not establish why its query timed out.
+- [VPN/browser run 42630592496](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42630592496)
+  also removed its test client, but Grafana exceeded the three-second page
+  retrieval deadline. A later 20-second NIC sample counted 48 receive drops
+  on `uc-k8sp5`, although no missed receives were counted; `ichikawap1`
+  counted neither receive drops nor receive errors in that interval. These
+  samples do not identify the cause of the runner's Grafana delay. Failure
+  reports now include the endpoint and elapsed time when that deadline is
+  exceeded; the three-second budget itself has not been relaxed.
 
 ## Remaining storage risk
 

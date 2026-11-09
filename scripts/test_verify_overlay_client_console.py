@@ -284,6 +284,27 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
                 verify.MONITORING_SERVICES["grafana.heteronetwork.internal"],
             )
 
+    def test_slow_monitoring_response_reports_endpoint_and_elapsed_time(self):
+        response = unittest.mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b"Grafana"
+        opener = unittest.mock.Mock()
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = response
+        opener.open.return_value = context
+        with (
+            patch.object(verify.urllib.request, "build_opener", return_value=opener),
+            patch.object(verify.time, "monotonic", side_effect=[1.0, 4.125]),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"grafana\.heteronetwork\.internal at 10\.250\.0\.10:13000 .* \(3125 ms\)",
+            ),
+        ):
+            verify.monitoring_endpoint_health(
+                "grafana.heteronetwork.internal", "10.250.0.10",
+                verify.MONITORING_SERVICES["grafana.heteronetwork.internal"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
