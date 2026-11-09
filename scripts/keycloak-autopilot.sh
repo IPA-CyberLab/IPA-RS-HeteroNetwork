@@ -311,13 +311,31 @@ read_local_control_plane_identity() {
 
 prefer_local_control_plane_gateway() {
   local local_gateway="http://${vpn_ip}:${AGENT_CONTROL_PLANE_GATEWAY_PORT}"
-  local configured_url existing duplicate
+  local configured_url existing duplicate peer_address
   local -a preferred_urls=()
 
   # An authenticated promoted local CP avoids stale enrollment seeds and a failed gateway.
   if discover_local_control_plane; then
     preferred_urls+=("$local_control_plane_url")
   fi
+
+  # Explicitly configured private Control Plane peers are faster and more
+  # reliable than stale enrollment URLs or a saturated local Agent gateway.
+  # Only reorder the already trusted list; never discover a bearer recipient
+  # from untrusted network responses.
+  for configured_url in "${control_plane_urls[@]}"; do
+    if [[ "$configured_url" =~ ^http://([0-9.]+):19088$ ]]; then
+      peer_address="${BASH_REMATCH[1]}"
+      valid_private_ipv4 "$peer_address" || continue
+      duplicate=false
+      for existing in "${preferred_urls[@]}"; do
+        [[ "$configured_url" != "$existing" ]] || duplicate=true
+      done
+      if [[ "$duplicate" == false ]] && ((${#preferred_urls[@]} < MAX_CONTROL_PLANE_URLS - 1)); then
+        preferred_urls+=("$configured_url")
+      fi
+    fi
+  done
   preferred_urls+=("$local_gateway")
 
   for configured_url in "${control_plane_urls[@]}"; do

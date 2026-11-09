@@ -15,3 +15,44 @@
         group: root
         mode: '0755'
         validate: /bin/bash -n %s
+
+    - name: Inspect the existing protected placement configuration
+      ansible.builtin.stat:
+        path: /etc/heteronetwork/keycloak-autopilot.env
+        follow: false
+        get_checksum: false
+      register: hnn_keycloak_config
+      no_log: true
+
+    - name: Require a private, root-owned regular configuration
+      ansible.builtin.assert:
+        that:
+          - hnn_keycloak_config.stat.isreg | default(false)
+          - not (hnn_keycloak_config.stat.islnk | default(false))
+          - hnn_keycloak_config.stat.uid == 0
+          - hnn_keycloak_config.stat.nlink == 1
+          - hnn_keycloak_config.stat.mode == '0600'
+      when: hnn_keycloak_config.stat.exists
+      no_log: true
+
+    - name: Verify there is exactly one Control Plane peer setting
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/awk
+          - '/^HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64=/{n++} END {exit n == 1 ? 0 : 1}'
+          - /etc/heteronetwork/keycloak-autopilot.env
+      changed_when: false
+      when: hnn_keycloak_config.stat.exists
+      no_log: true
+
+    - name: Pin the active private Control Plane peers
+      ansible.builtin.lineinfile:
+        path: /etc/heteronetwork/keycloak-autopilot.env
+        regexp: '^HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='
+        line: "HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='{{ [('http://' ~ hostvars[groups['bootstrap'][0]].vpn_ip ~ ':19088'), ('http://' ~ hostvars[groups['enrollment_issuer'][0]].vpn_ip ~ ':19088')] | map('b64encode') | join(' ') }}'"
+        owner: root
+        group: root
+        mode: '0600'
+        validate: /bin/bash -n %s
+      when: hnn_keycloak_config.stat.exists
+      no_log: true

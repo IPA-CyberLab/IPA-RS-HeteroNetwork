@@ -239,6 +239,10 @@ case "$url" in
       printf '%s' "$HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN" >"$output"
       printf '%s' "$HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN" >&2
       status="$(<"$HETERONETWORK_SMOKE_STATE/local-http-failure")"
+      if [[ "$status" == timeout ]]; then
+        printf '000'
+        exit 28
+      fi
       printf '%s' "$status"
       [[ "$status" == 302 ]] && exit 0
       exit 22
@@ -711,6 +715,26 @@ done
 
 write_promoted_fixture
 cp "$config_dir/keycloak-autopilot.env" "$test_dir/original-keycloak.env"
+peer_url="http://10.250.0.42:19088/v1/keycloak-autopilot/reconcile"
+peer_urls="$(b64 "http://$vpn_ip:19088") $(b64 "https://stale.example.test") $(b64 "http://10.250.0.42:19088")"
+sed -i "s|^HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64=.*|HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='$peer_urls'|" \
+  "$config_dir/keycloak-autopilot.env"
+printf 'timeout' >"$fake_state/local-http-failure"
+requests_before_peer="$(count_reconcile_requests)"
+deactivations_before_peer="$(count_helper_command deactivate)"
+run_autopilot reconcile
+rm -f "$fake_state/local-http-failure"
+[[ "$(reconcile_url_at "$((requests_before_peer + 1))")" == "$local_cp_url" \
+  && "$(reconcile_url_at "$((requests_before_peer + 2))")" == "$peer_url" ]] \
+  || fail "local failure did not prefer the configured private peer"
+[[ "$(count_reconcile_requests)" == "$((requests_before_peer + 2))" ]] \
+  || fail "a healthy private peer did not stop fallback scanning"
+[[ "$(count_helper_command deactivate)" == "$deactivations_before_peer" ]] \
+  || fail "a healthy private peer unnecessarily stopped Keycloak"
+[[ ! -e "$fake_state/credential-scope-mismatch" ]] \
+  || fail "private peer fallback used a credential scoped to the local Control Plane"
+cp "$test_dir/original-keycloak.env" "$config_dir/keycloak-autopilot.env"
+
 dedup_urls="$(b64 "http://$vpn_ip:19088") $(b64 "http://$vpn_ip:9781") $(b64 "https://control-1.example.test")"
 sed -i "s|^HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64=.*|HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='$dedup_urls'|" \
   "$config_dir/keycloak-autopilot.env"
