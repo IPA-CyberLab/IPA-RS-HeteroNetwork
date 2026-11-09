@@ -44,6 +44,13 @@ try {
   await popup.locator('input[name="password"]').fill(password);
   stage = "submit identity form";
   await popup.locator("#kc-login").click();
+  await popup.waitForLoadState("domcontentloaded").catch(() => {});
+  const consent = popup.locator([
+    "#kc-accept", 'button[name="accept"]', 'input[name="accept"]',
+    'button:has-text("はい")', 'button:has-text("Yes")', 'button:has-text("Allow")',
+  ].join(", "));
+  await consent.first().waitFor({ state: "visible", timeout: 10_000 }).catch(() => {});
+  if (!popup.isClosed() && await consent.count() && await consent.first().isVisible()) await consent.first().click();
   stage = "receive console session";
   await page.waitForFunction(() => Boolean(sessionStorage.getItem("heteronetwork_access_token")), null, { timeout: 60_000 });
   stage = "remove client";
