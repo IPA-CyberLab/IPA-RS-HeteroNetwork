@@ -28,7 +28,8 @@ def cpus(value):
 
 
 def reconcile(config, sysfs=Path("/sys"), hostname=None):
-    if set(config) != {"node", "interface", "driver", "online_cpus", "queues", "rps_cpus"}:
+    required = {"node", "interface", "driver", "online_cpus", "queues", "rps_cpus"}
+    if not required.issubset(config) or set(config) - required - {"queue_indices", "numa_node"}:
         raise ValueError("invalid receive-steering configuration")
     for key in ("node", "interface", "driver"):
         if not isinstance(config[key], str) or not re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", config[key]):
@@ -48,9 +49,32 @@ def reconcile(config, sysfs=Path("/sys"), hostname=None):
     interface = root / "class/net" / config["interface"]
     if (interface / "device/driver").resolve(strict=True).name != config["driver"]:
         raise ValueError("NIC driver does not match")
-    queues = sorted((interface / "queues").glob("rx-*/rps_cpus"))
-    if len(queues) != config["queues"]:
+    all_queues = sorted((interface / "queues").glob("rx-*/rps_cpus"))
+    if len(all_queues) != config["queues"]:
         raise ValueError("receive queue count changed")
+    queue_map = {}
+    for queue in all_queues:
+        match = re.fullmatch(r"rx-(\d+)", queue.parent.name)
+        if not match or int(match.group(1)) in queue_map:
+            raise ValueError("invalid receive queue names")
+        queue_map[int(match.group(1))] = queue
+    if set(queue_map) != set(range(config["queues"])):
+        raise ValueError("receive queue numbering changed")
+    indices = config.get("queue_indices", list(range(config["queues"])))
+    if (not isinstance(indices, list) or not indices
+            or any(not isinstance(i, int) or isinstance(i, bool) or i not in queue_map for i in indices)
+            or len(set(indices)) != len(indices)):
+        raise ValueError("invalid selected receive queues")
+    queues = [queue_map[index] for index in indices]
+    if "numa_node" in config:
+        numa = config["numa_node"]
+        if not isinstance(numa, int) or isinstance(numa, bool) or not 0 <= numa <= 255:
+            raise ValueError("invalid NUMA node")
+        if (interface / "device/numa_node").read_text().strip() != str(numa):
+            raise ValueError("NIC NUMA node changed")
+        numa_cpus = cpus((root / f"devices/system/node/node{numa}/cpulist").read_text().strip())
+        if any((desired >> cpu) & 1 and cpu not in numa_cpus for cpu in range(desired.bit_length())):
+            raise ValueError("CPU mask crosses the NIC NUMA node")
     previous = [path.read_text().strip() for path in queues]
     # Refuse to silently replace a different administrator's RPS policy.
     if any(mask_value(value) not in (0, desired) for value in previous):
@@ -68,7 +92,7 @@ def reconcile(config, sysfs=Path("/sys"), hostname=None):
             queues[index].write_text(previous[index])
         raise
     return {"changed": bool(changed), "interface": config["interface"], "queues": len(queues),
-            "rps_cpus": config["rps_cpus"]}
+            "total_queues": len(all_queues), "rps_cpus": config["rps_cpus"]}
 
 
 def main():

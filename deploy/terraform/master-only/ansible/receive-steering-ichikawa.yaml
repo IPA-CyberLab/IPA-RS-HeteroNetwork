@@ -1,0 +1,81 @@
+- name: Distribute two busy receive queues on the database standby NIC
+  hosts: enrollment_issuer
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Require the reviewed worker
+      ansible.builtin.assert:
+        that: inventory_hostname == 'ichikawap1' and vpn_ip == '10.250.0.10'
+
+    - name: Install the versioned receive-steering reconciler
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/reconcile-receive-steering.py"
+        dest: /opt/heteronetwork/libexec/reconcile-receive-steering.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the hardware-specific and NUMA-bound policy
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/terraform/master-only/receive-steering-ichikawa.json"
+        dest: /etc/heteronetwork/receive-steering.json
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Install the boot and NIC re-add reconciliation service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=HeteroNetwork verified NIC receive steering
+          Requires=sys-subsystem-net-devices-ens2f0.device
+          After=sys-subsystem-net-devices-ens2f0.device
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 /opt/heteronetwork/libexec/reconcile-receive-steering.py --config /etc/heteronetwork/receive-steering.json
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/heteronetwork-receive-steering.service
+        owner: root
+        group: root
+        mode: '0644'
+      register: receive_steering_unit
+
+    - name: Reapply after the NIC is added again
+      ansible.builtin.copy:
+        content: |
+          ACTION=="add", SUBSYSTEM=="net", KERNEL=="ens2f0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="heteronetwork-receive-steering.service"
+        dest: /etc/udev/rules.d/90-heteronetwork-receive-steering.rules
+        owner: root
+        group: root
+        mode: '0644'
+      register: receive_steering_rule
+
+    - name: Reload rules for future device events
+      ansible.builtin.command: udevadm control --reload-rules
+      changed_when: true
+      when: receive_steering_rule.changed and not ansible_check_mode
+
+    - name: Enable the boot service
+      ansible.builtin.systemd_service:
+        name: heteronetwork-receive-steering.service
+        enabled: true
+        daemon_reload: "{{ receive_steering_unit.changed }}"
+      when: not ansible_check_mode
+
+    - name: Apply and verify the policy without restarting the NIC
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/reconcile-receive-steering.py
+          - --config
+          - /etc/heteronetwork/receive-steering.json
+      register: receive_steering_apply
+      changed_when: (receive_steering_apply.stdout | from_json).changed
+      when: not ansible_check_mode

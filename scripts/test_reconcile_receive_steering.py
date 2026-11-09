@@ -71,6 +71,28 @@ class ReceiveSteeringTests(unittest.TestCase):
             self.apply()
         self.assertEqual([p.read_text() for p in self.queues], ['0000', '0000'])
 
+    def test_selected_queues_stay_on_the_nic_numa_node(self):
+        (self.sysfs / 'devices/system/cpu/online').write_text('0-103\n')
+        cpulist = self.sysfs / 'devices/system/node/node0/cpulist'
+        cpulist.parent.mkdir(parents=True)
+        cpulist.write_text('0-25,52-77\n')
+        (self.interface / 'device/numa_node').write_text('0\n')
+        for index in range(2, 26):
+            queue = self.interface / f'queues/rx-{index}/rps_cpus'
+            queue.parent.mkdir(parents=True)
+            queue.write_text('0000\n')
+            self.queues.append(queue)
+        config = {**self.config, 'online_cpus': '0-103', 'queues': 26,
+                  'queue_indices': [0, 2], 'numa_node': 0, 'rps_cpus': '03ffffff'}
+        self.assertTrue(module.reconcile(config, self.sysfs, 'uc-k8sp5')['changed'])
+        self.assertEqual([self.queues[i].read_text() for i in (0, 2)], ['03ffffff', '03ffffff'])
+        self.assertTrue(all(self.queues[i].read_text() == '0000\n' for i in range(26) if i not in (0, 2)))
+        self.assertFalse(module.reconcile(config, self.sysfs, 'uc-k8sp5')['changed'])
+        with self.assertRaisesRegex(ValueError, 'NUMA'):
+            module.reconcile({**config, 'rps_cpus': '04000000'}, self.sysfs, 'uc-k8sp5')
+        with self.assertRaisesRegex(ValueError, 'selected'):
+            module.reconcile({**config, 'queue_indices': [0, 26]}, self.sysfs, 'uc-k8sp5')
+
 
 if __name__ == '__main__':
     unittest.main()

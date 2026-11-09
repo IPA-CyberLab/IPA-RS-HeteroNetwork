@@ -1,0 +1,10 @@
+{
+  "node": "ichikawap1",
+  "interface": "ens2f0",
+  "driver": "bnx2x",
+  "online_cpus": "0-103",
+  "queues": 26,
+  "queue_indices": [0, 2],
+  "numa_node": 0,
+  "rps_cpus": "03ffffff"
+}

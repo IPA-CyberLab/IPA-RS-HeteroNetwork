@@ -6,14 +6,14 @@ on:
       - 'scripts/reconcile-receive-steering.py'
       - 'scripts/test_reconcile_receive_steering.py'
       - 'deploy/terraform/master-only/receive-steering*'
-      - 'deploy/terraform/master-only/ansible/receive-steering.yaml'
+      - 'deploy/terraform/master-only/ansible/receive-steering*.yaml'
       - '.github/workflows/receive-steering.yml'
   pull_request:
     paths:
       - 'scripts/reconcile-receive-steering.py'
       - 'scripts/test_reconcile_receive_steering.py'
       - 'deploy/terraform/master-only/receive-steering*'
-      - 'deploy/terraform/master-only/ansible/receive-steering.yaml'
+      - 'deploy/terraform/master-only/ansible/receive-steering*.yaml'
       - '.github/workflows/receive-steering.yml'
 permissions:
   contents: read
