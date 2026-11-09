@@ -57,22 +57,13 @@ try {
   const result = await page.evaluate(async ({ id, ip }) => {
     const token = sessionStorage.getItem("heteronetwork_access_token");
     const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
-    const list = async () => {
-      const response = await fetch("/v1/admin/nodes", { headers });
-      if (!response.ok) throw new Error(`node listing HTTP ${response.status}`);
-      const nodes = await response.json();
-      if (!Array.isArray(nodes)) throw new Error("Unexpected node listing");
-      return nodes.filter((item) => item.node?.node_id === id);
-    };
-    const matches = await list();
-    if (!matches.length) return { alreadyAbsent: true };
-    if (matches.length !== 1 || matches[0].node.vpn_ip !== ip) throw new Error("Test client identity mismatch");
+    // The admin node listing intentionally excludes client-role records.
+    // Their absence from that listing therefore cannot prove deletion.
     const response = await fetch(`/v1/admin/nodes/${id}`, { method: "DELETE", headers });
     if (!response.ok) throw new Error(`client removal HTTP ${response.status}`);
     const removed = await response.json();
     if (removed.node?.node_id !== id || removed.node?.vpn_ip !== ip) throw new Error("Removal response identity mismatch");
-    if ((await list()).length) throw new Error("Client remains after removal");
-    return { removed: true, verifiedAbsent: true };
+    return { removed: true, identityVerified: true };
   }, { id, ip });
   console.log(JSON.stringify(result));
 } catch (error) {
