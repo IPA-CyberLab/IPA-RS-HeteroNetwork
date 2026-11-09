@@ -214,6 +214,13 @@ replica failures have the same initiating cause.
   samples do not identify the cause of the runner's Grafana delay. Failure
   reports now include the endpoint and elapsed time when that deadline is
   exceeded; the three-second budget itself has not been relaxed.
+- [VPN/browser run 42631202968](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42631202968)
+  subsequently passed on an Actions VM with a real WireGuard tunnel and
+  authenticated Chromium. Every tested console and monitoring page responded
+  within three seconds, and the temporary client was removed. Initial route
+  convergence took 16.8 seconds before those page checks. The cold-start VPN
+  recovery test also passed. This successful sample does not negate the
+  immediately preceding intermittent DNS and latency failures.
 
 ## Remaining storage risk
 
