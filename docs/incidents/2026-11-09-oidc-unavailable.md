@@ -186,7 +186,9 @@ replica failures have the same initiating cause.
   around 60–75 ms. Its readiness budget was tightened to one second to leave
   room for VPN transit. Production DNS subsequently retained only the fast
   replica. The slow replica can return after recovery, but until then Grafana
-  has only one ready endpoint and the application is degraded.
+  has only one ready endpoint and the application is degraded. Both current
+  Grafana pods later reported Ready; that point-in-time observation does not
+  establish stable response times or continued two-replica availability.
 - [VPN/browser run 42626737541](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42626737541)
   established a WireGuard handshake but failed because the `ichikawap1`
   console check did not converge in time. Its disposable client could not be
