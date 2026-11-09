@@ -63,7 +63,8 @@ class NodeLifecycleTests(unittest.TestCase):
         spec.loader.exec_module(publisher)
         expected = {"scripts/reconcile-stopped-wireguard.py", "scripts/reconcile-stopped-overlay-firewall.py",
                     "scripts/verify-heterocloud-iam-rollout.py", "scripts/reconcile-etcd-retirements.py",
-                    "scripts/test_reconcile_etcd_retirements.py"}
+                    "scripts/test_reconcile_etcd_retirements.py", "scripts/encrypted-etcd-snapshot.py",
+                    "scripts/test_encrypted_etcd_snapshot.py"}
         self.assertTrue(expected.issubset(set(publisher.files())))
 
     def test_database_environment_preserves_tls_and_encoded_credentials(self):

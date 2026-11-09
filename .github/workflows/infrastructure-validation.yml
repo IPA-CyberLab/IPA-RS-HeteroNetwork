@@ -42,6 +42,8 @@ on:
       - 'scripts/test_verify_apiserver_etcd.py'
       - 'scripts/reconcile-etcd-retirements.py'
       - 'scripts/test_reconcile_etcd_retirements.py'
+      - 'scripts/encrypted-etcd-snapshot.py'
+      - 'scripts/test_encrypted_etcd_snapshot.py'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'deploy/gitops/envoy-gateway/backend-traffic-policy.yaml'
@@ -132,6 +134,8 @@ on:
       - 'scripts/test_verify_apiserver_etcd.py'
       - 'scripts/reconcile-etcd-retirements.py'
       - 'scripts/test_reconcile_etcd_retirements.py'
+      - 'scripts/encrypted-etcd-snapshot.py'
+      - 'scripts/test_encrypted_etcd_snapshot.py'
       - 'deploy/gitops/envoy-gateway/public-web-dns.yaml'
       - 'deploy/gitops/envoy-gateway/public-gateway-health.yaml'
       - 'deploy/gitops/envoy-gateway/backend-traffic-policy.yaml'
@@ -201,7 +205,7 @@ jobs:
           fi
       - name: Verify acceptance rejects failed and stale E2E
         run: |
-          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2 cryptography==50.0.1
           python3 -B -m unittest discover -s scripts -p test_onboarding_acceptance.py -v
           python3 -B -m unittest discover -s scripts -p test_ensure_flash_ssh_host_key.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_storage_redundancy.py -v
@@ -232,6 +236,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_gateway_health.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_apiserver_etcd.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_etcd_retirements.py -v
+          python3 -B -m unittest discover -s scripts -p test_encrypted_etcd_snapshot.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_backup_store.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_backup_controller_e2e.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_offsite_config.py -v
