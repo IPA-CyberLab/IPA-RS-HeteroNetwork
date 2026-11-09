@@ -58,6 +58,23 @@ def validate_node(node, name, now):
         raise ValueError("target must have been not Ready for at least ten minutes")
 
 
+def survivor_endpoints(survivors):
+    if len(survivors) < 3:
+        raise ValueError("at least three voting members must remain")
+    endpoints = []
+    for member in survivors:
+        urls = member.get("clientURLs", [])
+        if len(urls) != 1:
+            raise ValueError("each remaining voter must have exactly one client endpoint")
+        url = urlparse(urls[0])
+        if url.scheme != "https" or not url.hostname or url.port != 2379 or url.path:
+            raise ValueError("invalid remaining etcd client endpoint")
+        endpoints.append(urls[0])
+    if len(set(endpoints)) != len(endpoints):
+        raise ValueError("remaining etcd client endpoints are not unique")
+    return endpoints
+
+
 def survivors_for_retirement(members, item):
     voters = members.get("members", [])
     if any(m.get("isLearner") for m in voters) or len({m["ID"] for m in voters}) != len(voters):
@@ -74,20 +91,7 @@ def survivors_for_retirement(members, item):
             or target.get("peerURLs") != [item["peer_url"]]):
         raise ValueError("live member identity does not match the approved retirement")
     survivors = [m for m in voters if m["ID"] != target["ID"]]
-    if len(survivors) < 3:
-        raise ValueError("at least three voting members must remain")
-    endpoints = []
-    for member in survivors:
-        urls = member.get("clientURLs", [])
-        if len(urls) != 1:
-            raise ValueError("each remaining voter must have exactly one client endpoint")
-        url = urlparse(urls[0])
-        if url.scheme != "https" or not url.hostname or url.port != 2379 or url.path:
-            raise ValueError("invalid remaining etcd client endpoint")
-        endpoints.append(urls[0])
-    if len(set(endpoints)) != len(endpoints):
-        raise ValueError("remaining etcd client endpoints are not unique")
-    return survivors, endpoints
+    return survivors, survivor_endpoints(survivors)
 
 
 def validate_health(survivors, endpoints, statuses, health):
@@ -165,8 +169,11 @@ def main():
     intent, roster = json.loads(args.intent.read_text()), json.loads(args.roster.read_text())
     item = validate_intent(intent, roster)
     cluster = Cluster(args.kubeconfig, intent["executor_node"])
-    remaining = survivors_for_retirement(cluster.members(), item)
+    members = cluster.members()
+    remaining = survivors_for_retirement(members, item)
     if remaining is None:
+        survivors = members["members"]
+        cluster.healthy(survivors, survivor_endpoints(survivors))
         print(json.dumps({"node": item["node"], "result": "already_absent"}))
         return
     survivors, endpoints = remaining

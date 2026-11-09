@@ -174,6 +174,27 @@ class RetirementTests(unittest.TestCase):
             self.assertEqual(fake.remove_calls, 1)
             self.assertEqual(fake.health_calls, 2)
 
+    def test_existing_retirement_still_checks_survivor_health(self):
+        class FakeCluster:
+            def __init__(self, *_):
+                self.health_calls = 0
+            def members(self):
+                return {"members": MEMBERS["members"][:-1]}
+            def healthy(self, *_):
+                self.health_calls += 1
+        fake = FakeCluster()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "intent.json").write_text(json.dumps(INTENT))
+            (root / "roster.json").write_text(json.dumps(ROSTER))
+            with (patch.object(subject, "Cluster", return_value=fake),
+                  patch.object(subject, "validate_snapshot") as snapshot,
+                  patch("sys.argv", ["reconcile", "--kubeconfig", "test", "--intent", str(root / "intent.json"),
+                                     "--roster", str(root / "roster.json"), "--backup-dir", directory])):
+                subject.main()
+            self.assertEqual(fake.health_calls, 1)
+            snapshot.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

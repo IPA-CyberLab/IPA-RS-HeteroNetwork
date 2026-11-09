@@ -64,6 +64,38 @@ replica failures have the same initiating cause.
   read/write replica. A scoped independent backup destination and an additional
   eligible worker remain necessary; the dedicated control-plane hosts and the
   administratively excluded worker have not been reassigned.
+- The identity-placement agent on `ichikawap1` subsequently showed local
+  control-plane timeouts before the 45-second lease expired. Both actual
+  control-plane peers accepted the node's scoped credential. The IaC-managed
+  agent now tries its configured private peer endpoints before the local agent
+  gateway, without sending its local-only credential to remote peers. This is
+  a failover mitigation, not removal of the shared database dependency.
+- Two later live VPN/browser runs failed: one could not finish identity setup,
+  while another exceeded the Grafana screen deadline. A subsequent run failed
+  convergence of the `uc-k8sp1` console route, then
+  [run 42608949533](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42608949533)
+  completed with a real WireGuard client and authenticated Chromium. One
+  successful run does not prove that intermittent gateway convergence is fixed.
+  The verifier now identifies the health, DNS and UI subchecks separately on
+  another convergence failure.
+- Grafana's lightweight health API could return promptly while its login UI
+  took more than three seconds. Its Kubernetes readiness probe now checks the
+  actual login page; liveness still uses the lightweight health API. A
+  [disposable Kubernetes test](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow/actions/runs/42608332247)
+  verified removal and readdition of a slow endpoint. The change was observed
+  in production, including temporary exclusion of a slow `ichikawap1` replica.
+  The underlying UI latency has not been conclusively attributed.
+- An unrelated Kubernetes API write timed out on etcd. The explicitly stopped
+  `uc-k8sp4` was still one of six voting etcd members. The other five reported
+  one leader and no errors. A private etcd snapshot was created, restored into
+  a separate data directory, copied to the IaC workspace and checked against
+  the source SHA-256. Terraform then retired the exact stopped voter with guards
+  for node identity, age of unavailability, backup, and health of all five
+  surviving members. The five remaining voters were healthy after removal;
+  quorum fell from four to three. This snapshot is not an independently
+  verified offsite backup, and its restored directory was not started as a
+  production cluster. A causal link between this etcd timeout and the original
+  OIDC error has not been established.
 
 ## Remaining storage risk
 
