@@ -14,6 +14,7 @@ const browser = await chromium.launch({
   headless: true,
   args: ["--disable-dev-shm-usage", "--host-resolver-rules=MAP console.heteronetwork.internal 127.0.0.1"],
 });
+let stage = "open console";
 try {
   const page = await browser.newPage({ serviceWorkers: "block" });
   await page.goto("http://console.heteronetwork.internal:9781/ui/", { waitUntil: "domcontentloaded", timeout: 30_000 });
@@ -22,6 +23,7 @@ try {
     if (!response.ok) throw new Error("Console configuration unavailable");
     return response.json();
   });
+  stage = "check issuer";
   const origin = new URL(config.device_verification_origin);
   if (origin.origin !== "https://heterocloud.mizuame.app" || origin.pathname !== "/" ||
       origin.username || origin.password || origin.search || origin.hash ||
@@ -29,8 +31,10 @@ try {
     throw new Error("Unexpected identity provider");
   }
   const popupPromise = page.waitForEvent("popup");
+  stage = "open sign-in";
   await page.getByRole("button", { name: "Keycloakでログイン" }).click();
   const popup = await popupPromise;
+  stage = "load identity form";
   await popup.locator('input[name="username"]').waitFor();
   const form = await popup.locator("#kc-login").evaluate((button) => ({ action: button.form?.action, method: button.form?.method }));
   const action = new URL(form.action);
@@ -38,8 +42,11 @@ try {
       form.method?.toLowerCase() !== "post") throw new Error("Unexpected credential submission destination");
   await popup.locator('input[name="username"]').fill(username);
   await popup.locator('input[name="password"]').fill(password);
+  stage = "submit identity form";
   await popup.locator("#kc-login").click();
+  stage = "receive console session";
   await page.waitForFunction(() => Boolean(sessionStorage.getItem("heteronetwork_access_token")), null, { timeout: 60_000 });
+  stage = "remove client";
   const result = await page.evaluate(async ({ id, ip }) => {
     const token = sessionStorage.getItem("heteronetwork_access_token");
     const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
@@ -64,7 +71,7 @@ try {
 } catch (error) {
   // Browser errors can contain authorization URLs and must not reach job logs.
   const http = /^(?:node listing|client removal) HTTP \d{3}$/.test(error.message) ? error.message : error.name;
-  console.error(`Cleanup failed: ${http}`);
+  console.error(`Cleanup failed at ${stage}: ${http}`);
   process.exitCode = 1;
 } finally {
   await browser.close();
