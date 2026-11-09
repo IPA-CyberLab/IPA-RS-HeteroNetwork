@@ -44,6 +44,26 @@ replica failures have the same initiating cause.
   volumes has not been established. At this point in time no Longhorn `Backup`
   objects were listed. That inventory does not establish whether backup data
   exists in any external store or whether it can be restored.
+- A retry failure was found in the control-plane lease protocol: a timed-out
+  request could commit, after which an identical retry through another endpoint
+  was rejected as a duplicate generation. Idempotent retries now preserve the
+  original expiry while changed, stale, and expired generations are rejected.
+  Both active control-plane hosts were upgraded serially to the verified
+  binary. The [retry tests](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42596808210)
+  and a subsequent [real VPN/Chromium acceptance run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42598578880)
+  passed. This fixes a demonstrated failure mode; the incident evidence does
+  not establish how frequently it caused the observed outages.
+- In a [disposable two-worker VM cluster](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42595524607),
+  an attached single-copy volume was preserved while Longhorn managers were
+  upgraded from 1.12.1 to 1.12.2, the second copy was rebuilt, and the volume
+  engine was upgraded. All 308 HTTP probes succeeded. This test does not
+  establish that production data is recoverable or make the upgrade reversible.
+- A later read-only inventory still found 12 attached degraded volumes and
+  four detached faulted volumes. Several desired three copies while only two
+  storage workers were eligible, and multiple attached volumes had just one
+  read/write replica. A scoped independent backup destination and an additional
+  eligible worker remain necessary; the dedicated control-plane hosts and the
+  administratively excluded worker have not been reassigned.
 
 ## Remaining storage risk
 
