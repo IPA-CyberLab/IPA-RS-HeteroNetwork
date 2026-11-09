@@ -1,0 +1,92 @@
+- name: Keep VPN and DNS online through a PostgreSQL proxy interruption
+  hosts: bootstrap:enrollment_issuer
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    helper_path: /opt/heteronetwork/libexec/public-services-autopilot.sh
+    legacy_original: b571093d6ec8aa0f5e0b1a071f73db4bc02d2bc5af8ad3eb6998a4ea4e3d87a6
+    legacy_patched: e47db39acfa9258cf6fb483281e7f4097ba8e09ad1054c8e57b1f154683febd8
+    current_original: ddd319ce6adc602fdec3935cef38fb549bae57dcff6824d457a573ca33ab047f
+  tasks:
+    - name: Require one of the explicitly reviewed hosts
+      ansible.builtin.assert:
+        that: inventory_hostname in ['uc-k8sp5', 'ichikawap1']
+
+    - name: Require the Agent and its reconciler timer to be active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, heteronetwork-agent.service, heteronetwork-public-services-autopilot.timer]
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect the installed public-services helper
+      ansible.builtin.stat:
+        path: "{{ helper_path }}"
+        checksum_algorithm: sha256
+        follow: false
+      register: installed_public_services
+
+    - name: Refuse to replace an unreviewed helper version
+      ansible.builtin.assert:
+        that:
+          - installed_public_services.stat.isreg | default(false)
+          - not (installed_public_services.stat.islnk | default(false))
+          - installed_public_services.stat.pw_name == 'root'
+          - >-
+            (inventory_hostname == 'uc-k8sp5' and
+             installed_public_services.stat.checksum in [legacy_original, legacy_patched]) or
+            (inventory_hostname == 'ichikawap1' and
+             installed_public_services.stat.checksum in
+             [current_original, lookup('file', hnn_repo_root ~ '/scripts/public-services-autopilot.sh', rstrip=False) | hash('sha256')])
+        fail_msg: The installed helper differs from the reviewed version; no Agent was restarted
+
+    - name: Create the protected legacy rollback directory
+      ansible.builtin.file:
+        path: /var/backups/heteronetwork/public-services-db-retention
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: inventory_hostname == 'uc-k8sp5'
+
+    - name: Install the checksum-guarded legacy backport
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/patch-legacy-public-services-db.py"
+        dest: /opt/heteronetwork/libexec/patch-legacy-public-services-db.py
+        owner: root
+        group: root
+        mode: '0755'
+      when: inventory_hostname == 'uc-k8sp5'
+
+    - name: Back up and atomically patch only the reviewed legacy helper
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/patch-legacy-public-services-db.py
+          - --file
+          - "{{ helper_path }}"
+          - --backup-dir
+          - /var/backups/heteronetwork/public-services-db-retention
+      register: legacy_result
+      changed_when: (legacy_result.stdout | from_json).changed
+      when: inventory_hostname == 'uc-k8sp5' and not ansible_check_mode
+
+    - name: Install the reviewed current helper without restarting its timer or Agent
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/public-services-autopilot.sh"
+        dest: "{{ helper_path }}"
+        owner: root
+        group: root
+        mode: '0755'
+        backup: true
+        validate: /bin/sh -n %s
+      when: inventory_hostname == 'ichikawap1'
+
+    - name: Require the Agent and reconciler timer to remain active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, heteronetwork-agent.service, heteronetwork-public-services-autopilot.timer]
+      changed_when: false
+      check_mode: false

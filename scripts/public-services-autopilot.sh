@@ -154,8 +154,12 @@ retain_existing_public_services() {
     fi
     if existing_public_services_are_staged &&
       ! unit_is_active "$control_plane_service"; then
-      systemctl start "$control_plane_service" >/dev/null 2>&1 ||
-        log "unable to restore Control Plane while retaining promoted services"
+      if postgres_proxy_is_ready; then
+        systemctl start "$control_plane_service" >/dev/null 2>&1 ||
+          log "unable to restore Control Plane while retaining promoted services"
+      else
+        log "not starting Control Plane while the PostgreSQL HA proxy is unavailable"
+      fi
     fi
     if [ -f "$signal_services_env" ] &&
       unit_is_loaded "$signal_service" &&
@@ -1515,6 +1519,18 @@ if [ ! -f "$postgres_password_file" ] || [ -L "$postgres_password_file" ] ||
   demote_control_and_exit "PostgreSQL HA credentials are unavailable"
 fi
 if ! postgres_proxy_is_ready; then
+  # Stop the stateless Control Plane so that a gateway cannot advertise its
+  # unconditional /healthz as ready. Keep the established Agent and its
+  # gateway drop-in: restarting the Agent also interrupts VPN DNS and existing
+  # client paths, and database health is not a credential revocation.
+  if existing_public_services_are_staged &&
+    [ -f "$agent_gateway_drop_in" ] && [ ! -L "$agent_gateway_drop_in" ]; then
+    if stop_unit "$control_plane_service"; then
+      log "local PostgreSQL HA proxy is unavailable; retaining Agent and staged configuration"
+      reconcile_finished=1
+      exit 0
+    fi
+  fi
   demote_control_and_exit "local PostgreSQL HA proxy is unavailable"
 fi
 

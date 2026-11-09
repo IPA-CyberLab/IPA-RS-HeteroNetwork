@@ -1,0 +1,38 @@
+name: VPN continuity during database failure
+on:
+  push:
+    branches: [master, codex/retain-vpn-during-db-outage]
+    paths:
+      - 'scripts/public-services-autopilot.sh'
+      - 'scripts/public-services-autopilot-smoke.sh'
+      - 'scripts/patch-legacy-public-services-db.py'
+      - 'scripts/test_patch_legacy_public_services_db.py'
+      - 'deploy/terraform/master-only/ansible/public-services-db-retention.yaml'
+      - 'deploy/terraform/master-only/public-services-db-retention.tf'
+      - '.github/workflows/public-services-db-retention.yml'
+  pull_request:
+    paths:
+      - 'scripts/public-services-autopilot.sh'
+      - 'scripts/public-services-autopilot-smoke.sh'
+      - 'scripts/patch-legacy-public-services-db.py'
+      - 'scripts/test_patch_legacy_public_services_db.py'
+      - 'deploy/terraform/master-only/ansible/public-services-db-retention.yaml'
+      - 'deploy/terraform/master-only/public-services-db-retention.tf'
+      - '.github/workflows/public-services-db-retention.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+      - name: Verify the legacy and current recovery paths
+        run: |
+          sh -n scripts/public-services-autopilot.sh
+          python3 -B -m unittest scripts/test_patch_legacy_public_services_db.py -v
+          scripts/public-services-autopilot-smoke.sh --status-retention-only
+          scripts/public-services-autopilot-smoke.sh

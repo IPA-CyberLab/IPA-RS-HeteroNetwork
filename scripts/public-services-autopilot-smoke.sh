@@ -2,7 +2,7 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-autopilot=$script_dir/public-services-autopilot.sh
+autopilot=${HETERONETWORK_PUBLIC_SERVICES_SMOKE_AUTOPILOT:-$script_dir/public-services-autopilot.sh}
 control_plane_unit=$script_dir/../deploy/systemd/heteronetwork-control-plane.service
 signal_unit=$script_dir/../deploy/systemd/heteronetwork-signal.service
 stun_unit=$script_dir/../deploy/systemd/heteronetwork-stun.service
@@ -407,6 +407,47 @@ assert_vpn_services_only() {
     fail "UDP-only promotion did not advertise Relay"
 }
 
+if [ "${1:-}" = "--db-outage-only" ]; then
+  prepare_dependencies
+  reset_auto_services
+  fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  write_status public "$fresh_time"
+  run_reconciler
+  run_reconciler
+  run_reconciler
+  assert_active heteronetwork-control-plane.service
+  [ -f "$agent_gateway_drop_in" ] || fail "initial Agent gateway routes are missing"
+  : >"$fake_state/postgres-down"
+  run_reconciler
+  assert_inactive heteronetwork-control-plane.service
+  assert_active heteronetwork-agent.service
+  assert_active heteronetwork-signal.service
+  assert_active heteronetwork-stun.service
+  [ -f "$services_env" ] && [ -f "$agent_gateway_drop_in" ] ||
+    fail "database outage removed the established Agent configuration"
+  ! grep -Eq '^(stop|kill|restart) .*heteronetwork-agent.service' "$systemctl_log" ||
+    fail "database outage interrupted the VPN Agent"
+  run_reconciler
+  assert_inactive heteronetwork-control-plane.service
+  ! grep -Eq '^(start|restart) .*heteronetwork-control-plane.service' "$systemctl_log" ||
+    fail "database outage restarted an unready Control Plane"
+  : >"$fake_state/status-unavailable"
+  run_reconciler
+  assert_inactive heteronetwork-control-plane.service
+  assert_active heteronetwork-agent.service
+  ! grep -Eq '^(start|restart) .*heteronetwork-control-plane.service' "$systemctl_log" ||
+    fail "status loss started a Control Plane without its database"
+  ! grep -Eq '^(stop|kill|restart) .*heteronetwork-agent.service' "$systemctl_log" ||
+    fail "status loss interrupted the VPN Agent"
+  rm -f "$fake_state/status-unavailable" "$fake_state/postgres-down"
+  run_reconciler
+  assert_active heteronetwork-control-plane.service
+  ! grep -Eq '^(stop|kill|restart) .*heteronetwork-agent.service' "$systemctl_log" ||
+    fail "database recovery interrupted the VPN Agent"
+  printf '%s\n' 'public-services DB outage continuity smoke passed'
+  exit 0
+fi
+
 if [ "${1:-}" = "--status-retention-only" ]; then
   prepare_dependencies
   reset_auto_services
@@ -426,6 +467,54 @@ if [ "${1:-}" = "--status-retention-only" ]; then
   run_reconciler
   ! grep -Eq '^restart .*heteronetwork-agent.service$' "$systemctl_log" ||
     fail "unchanged local CP staging restarted the agent"
+
+  # A transient database outage must withdraw the local Control Plane while
+  # leaving the already established VPN Agent and its DNS listener running.
+  : >"$fake_state/postgres-down"
+  run_reconciler
+  assert_inactive heteronetwork-control-plane.service
+  assert_active heteronetwork-agent.service
+  assert_active heteronetwork-signal.service
+  assert_active heteronetwork-stun.service
+  [ -f "$services_env" ] && [ -f "$agent_gateway_drop_in" ] ||
+    fail "database outage removed the established Agent configuration"
+  ! grep -Eq '^(stop|kill|restart) .*heteronetwork-agent.service' "$systemctl_log" ||
+    fail "database outage interrupted the VPN Agent"
+  run_reconciler
+  assert_inactive heteronetwork-control-plane.service
+  ! grep -Eq '^(start|restart) .*heteronetwork-control-plane.service' "$systemctl_log" ||
+    fail "database outage restarted an unready Control Plane"
+  ! grep -Eq '^(stop|kill|restart) .*heteronetwork-agent.service' "$systemctl_log" ||
+    fail "repeated database outage interrupted the VPN Agent"
+
+  # Losing Agent status during the same outage must not resurrect the local
+  # Control Plane until its database proxy is healthy again.
+  : >"$fake_state/status-unavailable"
+  run_reconciler
+  assert_inactive heteronetwork-control-plane.service
+  ! grep -Eq '^(start|restart) .*heteronetwork-control-plane.service' "$systemctl_log" ||
+    fail "status loss started a Control Plane without its database"
+  rm -f "$fake_state/status-unavailable" "$fake_state/postgres-down"
+  run_reconciler
+  assert_active heteronetwork-control-plane.service
+  ! grep -Eq '^(stop|kill|restart) .*heteronetwork-agent.service' "$systemctl_log" ||
+    fail "database recovery interrupted the VPN Agent"
+
+  # The retention path must not create a new Control Plane without a database.
+  reset_auto_services
+  prepare_dependencies
+  : >"$fake_state/postgres-down"
+  run_reconciler
+  run_reconciler
+  run_reconciler
+  assert_inactive heteronetwork-control-plane.service
+  [ ! -e "$services_env" ] || fail "database outage activated a new Control Plane"
+  rm -f "$fake_state/postgres-down"
+  run_reconciler
+  run_reconciler
+  run_reconciler
+  assert_active heteronetwork-control-plane.service
+
   : >"$fake_state/status-unavailable"
   run_reconciler
   assert_active heteronetwork-control-plane.service
