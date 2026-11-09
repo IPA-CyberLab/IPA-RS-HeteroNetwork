@@ -92,10 +92,16 @@ replica failures have the same initiating cause.
   the source SHA-256. Terraform then retired the exact stopped voter with guards
   for node identity, age of unavailability, backup, and health of all five
   surviving members. The five remaining voters were healthy after removal;
-  quorum fell from four to three. This snapshot is not an independently
-  verified offsite backup, and its restored directory was not started as a
-  production cluster. A causal link between this etcd timeout and the original
-  OIDC error has not been established.
+  quorum fell from four to three. A causal link between this etcd timeout and
+  the original OIDC error has not been established.
+- That etcd snapshot was compressed, encrypted with AES-256-GCM and stored in
+  the independent R2 control-plane recovery bucket. The object was downloaded,
+  authenticated and decompressed; its original SHA-256 matched the snapshot
+  previously restored into a separate data directory. The protected recovery
+  key was also matched against an environment-restricted GitHub Actions secret.
+  The recovered directory was not started as a production cluster. This is a
+  single etcd recovery point, not a scheduled backup or a backup of PostgreSQL,
+  Flash, Registry, Secret Manager, or Syouyu data.
 - Network counters provided evidence of continuing receive loss. On
   `uc-k8sp5` the physical interface accumulated approximately 496 missed
   packets and 26 dropped packets over a ten-second sample while its average
@@ -117,8 +123,9 @@ replica failures have the same initiating cause.
   deployments had two updated, available replicas and Argo CD was Healthy
   and Synced. The new unauthenticated budget mutation endpoint returned 401.
   [Live VPN/Chromium run 42613051961](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42613051961)
-  passed, but the two preceding runs failed on a slow Grafana endpoint and on
-  a DNS timeout to `ichikawap1`. Public API monitoring recorded two timeouts
+  passed, but other runs failed on a slow Grafana endpoint and on a DNS timeout
+  to `ichikawap1`; [run 42616784695](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42616784695)
+  subsequently exceeded the Grafana three-second deadline. Public API monitoring recorded two timeouts
   during 150 probes while rolling out, and one timeout during 30 later probes.
   These results confirm that network and service latency remain intermittent.
 
