@@ -11,6 +11,14 @@ the key makes all snapshots encrypted with it unrecoverable. Never commit it or
 print it in CI logs. The key file must be owned by the invoking user and
 unreadable to other users.
 
+The 2026-11-09 key also has an encrypted copy in the GitHub Actions environment
+`heteronet-disaster-recovery`; that environment only accepts the `master` branch.
+The `Verify etcd backup key custody` workflow compares its key with an expected
+SHA-256 fingerprint without revealing the key. A future recovery workflow must
+use that environment and deliver recovered material only to an authorized
+private destination. GitHub environment access depends on maintaining the
+repository and its security settings.
+
 For a private Cloudflare R2 bucket, a one-time transfer can stream ciphertext
 without an unencrypted temporary file:
 

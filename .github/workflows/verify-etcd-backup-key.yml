@@ -1,0 +1,33 @@
+name: Verify etcd backup key custody
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha256:
+        description: SHA-256 fingerprint of the local raw 32-byte recovery key
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: heteronet-disaster-recovery
+    steps:
+      - name: Check that the protected key matches without printing it
+        env:
+          RECOVERY_KEY_BASE64: ${{ secrets.HETERONETWORK_ETCD_BACKUP_KEY_20261109 }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, hmac, os, re
+          expected = os.environ['EXPECTED_SHA256']
+          if not re.fullmatch(r'[a-f0-9]{64}', expected):
+              raise SystemExit('Invalid expected fingerprint')
+          try:
+              key = base64.b64decode(os.environ['RECOVERY_KEY_BASE64'], validate=True)
+          except ValueError:
+              raise SystemExit('The protected recovery key is missing or invalid')
+          if len(key) != 32 or not hmac.compare_digest(hashlib.sha256(key).hexdigest(), expected):
+              raise SystemExit('The protected recovery key does not match')
+          print('Protected recovery key matches the local key.')
+          PY

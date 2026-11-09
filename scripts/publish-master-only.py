@@ -34,6 +34,7 @@ def files():
            'scripts/reconcile-etcd-retirements.py','scripts/test_reconcile_etcd_retirements.py',
            'scripts/encrypted-etcd-snapshot.py','scripts/test_encrypted_etcd_snapshot.py',
            '.github/workflows/storage-heartbeat-e2e.yml',
+           '.github/workflows/verify-etcd-backup-key.yml',
            'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',
            'scripts/heteronetwork-console-e2e.sh','scripts/heteronetwork-console-browser-e2e.mjs',
            'scripts/verify-overlay-client-console.py','scripts/test_verify_overlay_client_console.py',
