@@ -50,6 +50,8 @@ function psql(query) {
 }
 async function ready() {
   for (let attempt = 0; attempt < 90; attempt++) {
+    const running = execFileSync('docker', ['inspect', '--format', '{{.State.Running}}', 'hc-staged-migration-fixture'], {encoding: 'utf8'}).trim();
+    if (running !== 'true') throw new Error('fixture API container exited during startup');
     try {
       if ((await fetch(`${origin}/api/v1/health/ready`, {signal: AbortSignal.timeout(1500)})).ok) return;
     } catch { /* Wait for the application to bind. */ }
@@ -60,7 +62,7 @@ async function ready() {
 const name = 'hc-staged-migration-fixture';
 let browser;
 try {
-  execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network=host', '-v', `${secrets}:/run/fixture:ro`,
+  execFileSync('docker', ['run', '-d', '--name', name, '--network=host', '-v', `${secrets}:/run/fixture:ro`,
     ...Object.entries(env).flatMap(([key, value]) => ['-e', `${key}=${value}`]), image], {stdio: 'pipe'});
   await ready();
   assert.equal(psql('SELECT count(*) FROM _sqlx_migrations WHERE version = 36;'), '0');
