@@ -1,0 +1,74 @@
+name: HeteroCloud staged image migration E2E
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: HeteroCloud release tag with a published immutable image artifact
+        required: true
+        type: string
+permissions:
+  contents: read
+  packages: read
+jobs:
+  staged-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: hc_test
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: heterocloud_test_stage
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U hc_test -d heterocloud_test_stage"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Verify immutable release artifact and exact commit
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?', tag)
+          repo = 'IPA-CyberLab/IPA-RS-HeteroCloud'
+          root = os.environ['RUNNER_TEMP']
+          subprocess.run(['gh', 'release', 'download', tag, '--repo', repo, '--pattern', 'heterocloud-release-artifact.json', '--dir', root], check=True)
+          with open(os.path.join(root, 'heterocloud-release-artifact.json')) as file:
+              item = json.load(file)
+          assert item['schema_version'] == 1 and item['component'] == 'heterocloud'
+          assert item['version'] == tag.removeprefix('v')
+          assert re.fullmatch(r'[a-f0-9]{40}', item['commit'])
+          assert re.fullmatch(r'ghcr\.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:[a-f0-9]{64}', item['image'])
+          ref = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/commits/{tag}']))
+          assert ref['sha'] == item['commit']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"commit={item['commit']}\nimage={item['image']}\n")
+          PY
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: IPA-CyberLab/IPA-RS-HeteroCloud
+          ref: ${{ steps.artifact.outputs.commit }}
+          path: heterocloud-source
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+      - name: Exercise the exact image before and after the additive database migration
+        env:
+          HC_TEST_IMAGE: ${{ steps.artifact.outputs.image }}
+          HC_TEST_SOURCE: ${{ github.workspace }}/heterocloud-source
+        run: node scripts/heterocloud-staged-migration-e2e.mjs
