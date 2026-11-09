@@ -729,7 +729,7 @@ def wait_for_gateway_routes(gateways, timeout=60):
     raise RuntimeError("client console readiness did not remain stable across two probes")
 
 
-def remove_client(identity, client_id, peer, inventory):
+def remove_client(identity, client_id, peer, inventory, fallback_gateways=()):
     # Removing the VPN client can tear down its return route before the HTTP
     # response arrives. Send the signed request from the sponsor host, whose
     # own VPN route survives client deletion, and confirm an already-removed
@@ -739,15 +739,28 @@ def remove_client(identity, client_id, peer, inventory):
     bootstrap = all_hosts["children"]["bootstrap"]["hosts"]["uc-k8sp5"]["ansible_host"]
     known_hosts = variables["ansible_ssh_common_args"].split(
         "UserKnownHostsFile=", 1)[1].split()[0]
-    remote = ("python3 -c " + shlex.quote(REMOVE_CLIENT_REMOTE_SCRIPT)
-              + " " + shlex.quote(client_id) + " " + shlex.quote(peer["vpn_ip"]))
-    command = [
+    gateways = []
+    for value in ([peer["vpn_ip"]] if peer is not None else []) + list(fallback_gateways):
+        address = ipaddress.ip_address(value)
+        if address.version != 4 or address not in ipaddress.ip_network("10.250.0.0/16"):
+            raise RuntimeError("unsafe client cleanup gateway")
+        if str(address) not in gateways:
+            gateways.append(str(address))
+    if not gateways:
+        raise RuntimeError("no client cleanup gateway is available")
+    command_prefix = [
         "ssh", "-i", variables["ansible_ssh_private_key_file"],
         "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + known_hosts,
-        "-o", "ConnectTimeout=10", f"{variables['ansible_user']}@{bootstrap}", remote,
+        "-o", "ConnectTimeout=10", f"{variables['ansible_user']}@{bootstrap}",
     ]
-    for attempt in range(3):
+    attempts = max(3, len(gateways) * 2)
+    outcomes = {}
+    for attempt in range(attempts):
+        gateway = gateways[attempt % len(gateways)]
+        remote = ("python3 -c " + shlex.quote(REMOVE_CLIENT_REMOTE_SCRIPT)
+                  + " " + shlex.quote(client_id) + " " + shlex.quote(gateway))
+        command = [*command_prefix, remote]
         body = signed_client_control_request(identity, client_id, "remove")
         try:
             result = subprocess.run(command, input=body, capture_output=True, timeout=35)
@@ -756,14 +769,22 @@ def remove_client(identity, client_id, peer, inventory):
                 if response.get("status") == 200 or (response.get("status") == 404
                                                     and response.get("not_found") is True):
                     return True
-                if response.get("status") not in (408, 429, 500, 502, 503, 504):
+                status = response.get("status")
+                outcome = f"http_{status}" if isinstance(status, int) else "invalid_response"
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                # A gateway without the client API may return a generic 404;
+                # only an explicit node-not-found response proves removal.
+                if status not in (404, 408, 429, 500, 502, 503, 504):
                     raise RuntimeError(
-                        f"client removal was rejected with HTTP {response.get('status')}")
+                        f"client removal was rejected with HTTP {status}")
+            else:
+                outcomes["remote_error"] = outcomes.get("remote_error", 0) + 1
         except (OSError, subprocess.TimeoutExpired, ValueError):
-            pass
-        if attempt < 2:
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError("temporary E2E client removal was not confirmed after three attempts")
+            outcomes["transport_or_parse_error"] = outcomes.get("transport_or_parse_error", 0) + 1
+        if attempt < attempts - 1:
+            time.sleep(min(2 * (attempt + 1), 10))
+    raise RuntimeError("temporary E2E client removal was not confirmed across the available gateways: "
+                       + json.dumps(outcomes, sort_keys=True))
 
 
 def write_report(path, report):
@@ -796,6 +817,7 @@ def main():
     identity = None
     client_id = None
     peer = None
+    sponsorship_attempted = False
     try:
         if args.require_authenticated_console and args.credential_file is None:
             raise RuntimeError(
@@ -806,6 +828,9 @@ def main():
             report["console_identity_reconciled"] = True
             report["console_identity_created"] = identity_result["created"]
         request_uri, identity, private_key, client_id = generate_registration()
+        # The sponsor can commit registration even if its SSH response times
+        # out, so begin cleanup responsibility before sending the request.
+        sponsorship_attempted = True
         profile = decode_profile(sponsor(inventory, request_uri))
         peer, endpoint = select_gateway(profile)
         report.update({
@@ -840,14 +865,15 @@ def main():
     except Exception as error:
         report["failure"] = str(error)
     finally:
+        if sponsorship_attempted:
+            try:
+                report["client_removed"] = remove_client(
+                    identity, client_id, peer, inventory, args.gateways.split(","))
+            except Exception as error:
+                report["client_removed"] = False
+                report["client_removal_failure"] = str(error)[:500]
         if tunnel is not None:
             name, process, log = tunnel
-            if identity is not None and client_id is not None and peer is not None:
-                try:
-                    report["client_removed"] = remove_client(identity, client_id, peer, inventory)
-                except Exception as error:
-                    report["client_removed"] = False
-                    report["client_removal_failure"] = str(error)[:500]
             subprocess.run(["ip", "link", "delete", name], capture_output=True)
             if process is not None:
                 process.terminate()

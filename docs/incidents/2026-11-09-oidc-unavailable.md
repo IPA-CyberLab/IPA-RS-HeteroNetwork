@@ -121,10 +121,14 @@ replica failures have the same initiating cause.
   sample after the final Terraform/Ansible apply saw zero missed receives.
   The applied setting is limited to the verified `uc-k8sp5` NIC and CPU
   topology, is configured to reassert at boot and NIC add, and does not reset
-  the NIC or change IRQ affinity. It refuses a different existing RPS policy. A short
-  trial on `ichikawap1` reduced CPU pressure but had too few FIFO errors to
-  establish a durable error-rate improvement, so no setting was persisted
-  there. Dropped-packet counters and end-to-end latency still need monitoring.
+  the NIC or change IRQ affinity. It refuses a different existing RPS policy.
+  On `ichikawap1`, a later reversible comparison reduced the CPU load on the
+  two busy receive queues; 80 FIFO errors occurred after reverting, versus
+  zero in the two intervening 20-second trials. The production setting was
+  subsequently applied through Terraform and Ansible only to those two
+  verified queues and CPUs in the NIC's NUMA node. The short comparisons do
+  not establish a durable error-rate improvement. Dropped-packet counters and
+  end-to-end latency still need monitoring.
 - The receive rings were 256/4096 descriptors on the `igb` NIC and 151/4078
   on the `bnx2x` NIC. Both drivers reload or stop an active interface when
   ring parameters change ([Linux igb implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/net/ethernet/intel/igb/igb_ethtool.c),
@@ -161,6 +165,15 @@ replica failures have the same initiating cause.
   voter currently reports just one active peer. Prometheus rules warn about
   missing peer connectivity, missing metrics, absent leaders and repeated
   elections. These alerts do not add a voter or restore failure tolerance.
+- A separate availability feedback loop was found in the public-service
+  supervisor: a transient database-proxy failure demoted the local control
+  plane and also restarted the VPN Agent. The reviewed change stops the local
+  control plane while retaining the existing agent and its configuration,
+  then restores the control plane after database recovery. Missing or invalid
+  credentials still fail closed. Both hosts received their compatible
+  IaC-managed supervisor changes. [Fault-injection tests](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42625652576)
+  exercised outage, recovery, and a fresh boot without credentials in an
+  isolated environment; no production database failure was injected.
 - The PostgreSQL DCS snapshot captured at 12:57 UTC was restored to a
   separate, unstarted data directory. Its encrypted, compressed R2 copy was
   downloaded, authenticated and decompressed, and its SHA-256 matched the
@@ -174,6 +187,17 @@ replica failures have the same initiating cause.
   room for VPN transit. Production DNS subsequently retained only the fast
   replica. The slow replica can return after recovery, but until then Grafana
   has only one ready endpoint and the application is degraded.
+- [VPN/browser run 42626737541](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42626737541)
+  established a WireGuard handshake but failed because the `ichikawap1`
+  console check did not converge in time. Its disposable client could not be
+  confirmed removed by the verifier. Its specific registration was still
+  present on later inspection. The admin node list excludes client-role
+  records, so absence from that list was not proof of removal. The exact
+  client's ID, address and role were checked in the store, the [admin API
+  removed it](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/42629572327),
+  and a read-only database query confirmed the record was absent. The verifier's
+  cleanup path now also runs after a sponsorship timeout or a pre-tunnel
+  failure, and can retry through alternative declared gateways.
 
 ## Remaining storage risk
 

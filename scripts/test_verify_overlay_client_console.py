@@ -100,6 +100,44 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
                 verify.remove_client(identity, "node-" + "a" * 32,
                                      {"vpn_ip": "10.250.0.2"}, inventory)
 
+    def test_client_cleanup_falls_back_to_another_gateway(self):
+        inventory = {"all": {
+            "vars": {"ansible_ssh_private_key_file": "/private/key",
+                     "ansible_ssh_common_args": "-o UserKnownHostsFile=/private/known_hosts",
+                     "ansible_user": "mizuame"},
+            "children": {"bootstrap": {"hosts": {
+                "uc-k8sp5": {"ansible_host": "163.220.236.45"}}}},
+        }}
+        identity = type("Identity", (), {"sign": lambda _, body: b"s" * 64})()
+        with patch.object(verify.subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, b'{"status":404,"not_found":false}', b""),
+            subprocess.CompletedProcess([], 0, b'{"status":200}', b""),
+        ]) as remote, patch.object(verify.time, "sleep"):
+            self.assertTrue(verify.remove_client(
+                identity, "node-" + "a" * 32, {"vpn_ip": "10.250.0.2"},
+                inventory, ["10.250.0.2", "10.250.0.10"]))
+        self.assertTrue(remote.call_args_list[0].args[0][-1].endswith("10.250.0.2"))
+        self.assertTrue(remote.call_args_list[1].args[0][-1].endswith("10.250.0.10"))
+
+    def test_sponsor_timeout_still_cleans_up_even_before_a_tunnel_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "inventory.json").write_text("{}")
+            identity = object()
+            client_id = "node-" + "a" * 32
+            argv = ["verify-overlay-client-console.py", "--work-dir", str(work),
+                    "--gateways", "10.250.0.2,10.250.0.10"]
+            with (patch.object(sys, "argv", argv),
+                  patch.object(verify, "generate_registration", return_value=("uri", identity, "key", client_id)),
+                  patch.object(verify, "sponsor", side_effect=TimeoutError("sponsor timed out")),
+                  patch.object(verify, "remove_client", return_value=True) as cleanup,
+                  patch("builtins.print")):
+                with self.assertRaises(SystemExit) as result:
+                    verify.main()
+            self.assertEqual(result.exception.code, 1)
+            cleanup.assert_called_once_with(identity, client_id, None, {},
+                                            ["10.250.0.2", "10.250.0.10"])
+
     def test_dns_answer_must_match_query_and_gateway(self):
         query = verify.dns_a_query(verify.CONSOLE_DNS_NAME, 0x1234)
         self.assertEqual(
