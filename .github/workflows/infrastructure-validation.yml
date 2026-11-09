@@ -8,6 +8,8 @@ on:
       - 'deploy/terraform/flash-offsite-r2/**'
       - 'scripts/*flash*backup*.py'
       - 'scripts/*flash*offsite*.py'
+      - 'scripts/receive-r2-dr-credentials.py'
+      - 'scripts/test_receive_r2_dr_credentials.py'
       - 'scripts/*flash*operations*.py'
       - 'scripts/*flash*ssh*host*key*.py'
       - 'scripts/flash_operations_live_e2e.mjs'
@@ -94,6 +96,8 @@ on:
       - 'deploy/terraform/flash-offsite-r2/**'
       - 'scripts/*flash*backup*.py'
       - 'scripts/*flash*offsite*.py'
+      - 'scripts/receive-r2-dr-credentials.py'
+      - 'scripts/test_receive_r2_dr_credentials.py'
       - 'scripts/*flash*operations*.py'
       - 'scripts/*flash*ssh*host*key*.py'
       - 'scripts/flash_operations_live_e2e.mjs'
@@ -226,6 +230,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_flash_backup_store.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_backup_controller_e2e.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_offsite_config.py -v
+          python3 -B -m unittest discover -s scripts -p test_receive_r2_dr_credentials.py -v
           python3 -B -m unittest discover -s scripts -p test_flash_oom_inject.py -v
       - name: Check verifier syntax
         run: |

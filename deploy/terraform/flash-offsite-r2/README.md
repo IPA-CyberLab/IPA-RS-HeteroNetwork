@@ -13,6 +13,16 @@ scoped to this bucket's object read/write operations. Store endpoint, bucket,
 region (`auto`), access_key and secret_key in an owned 0600 JSON file. Do not paste
 credentials into Git, chat, command arguments or Terraform variables.
 
+For the existing HeteroCloud deployment, an account owner may create an R2
+object-read/write credential scoped to the two disaster-recovery buckets and
+run `python3 scripts/receive-r2-dr-credentials.py` in the shared workspace.
+The prompts do not echo the keys. The helper discovers the account through the
+existing Wrangler login, verifies both buckets with disposable objects, and
+creates owned `0600` `flash.json` and `control-plane.json` configurations in
+the owned `0700` `.heteronetwork-iac/r2-offsite` directory. It refuses to replace
+existing files. This step only receives and checks credentials; it does not
+enable an export, create backups, or verify a disaster recovery.
+
 This is the **operator-wide** export of the managed backup store and can include
 data from multiple organizations. Never point it at an organization's private
 bucket. Organization-specific backup destinations are configured separately in

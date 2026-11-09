@@ -1,0 +1,52 @@
+name: Longhorn patch upgrade E2E
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/longhorn-patch-upgrade-e2e.yml'
+      - 'scripts/storage-heartbeat-e2e/**'
+  pull_request:
+    paths:
+      - '.github/workflows/longhorn-patch-upgrade-e2e.yml'
+      - 'scripts/storage-heartbeat-e2e/**'
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-upgrade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      HNN_FAULT_E2E: isolated-vms-only
+      KUBECONFIG: /tmp/hnn-heartbeat-e2e/kubeconfig
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Create isolated control plane and native storage workers
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+          bash scripts/storage-heartbeat-e2e/setup.sh
+      - name: Upgrade degraded fixture and verify data recovery
+        run: python3 scripts/storage-heartbeat-e2e/upgrade.py
+      - name: Collect non-secret diagnostics
+        if: always()
+        run: |
+          mkdir -p /tmp/hnn-heartbeat-e2e/results
+          kubectl get nodes,pods -A -o wide > /tmp/hnn-heartbeat-e2e/results/workloads.txt 2>&1 || true
+          kubectl get events -A --sort-by=.lastTimestamp > /tmp/hnn-heartbeat-e2e/results/events.txt 2>&1 || true
+          kubectl -n longhorn-system logs -l app=longhorn-manager --all-containers --tail=300 > /tmp/hnn-heartbeat-e2e/results/longhorn.txt 2>&1 || true
+          kubectl -n longhorn-system get volumes.longhorn.io -o yaml > /tmp/hnn-heartbeat-e2e/results/volumes.yaml 2>&1 || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: longhorn-patch-upgrade-e2e
+          path: /tmp/hnn-heartbeat-e2e/results
+          retention-days: 14
+      - name: Destroy only this job's cluster
+        if: always()
+        run: |
+          python3 scripts/storage-heartbeat-e2e/vms.py destroy
+          kind delete cluster --name hnn-heartbeat-e2e
