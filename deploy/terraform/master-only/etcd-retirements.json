@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "executor_node": "uc-k8sp1",
+  "executor_node": "uc-k8sp5",
   "retirements": [
     {
       "node": "uc-k8sp4",
