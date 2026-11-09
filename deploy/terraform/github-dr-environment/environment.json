@@ -1,0 +1,6 @@
+{
+  "repository": "IPA-CyberLab/IPA-RS-HeteroNetwork",
+  "environment": "heteronet-disaster-recovery",
+  "allowed_branch": "master",
+  "required_secret_name": "HETERONETWORK_ETCD_BACKUP_KEY_20261109"
+}

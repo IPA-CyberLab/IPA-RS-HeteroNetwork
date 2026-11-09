@@ -33,8 +33,10 @@ def files():
            'scripts/verify-apiserver-etcd.py','scripts/test_verify_apiserver_etcd.py',
            'scripts/reconcile-etcd-retirements.py','scripts/test_reconcile_etcd_retirements.py',
            'scripts/encrypted-etcd-snapshot.py','scripts/test_encrypted_etcd_snapshot.py',
+           'scripts/reconcile-github-dr-environment.py','scripts/test_reconcile_github_dr_environment.py',
            '.github/workflows/storage-heartbeat-e2e.yml',
            '.github/workflows/verify-etcd-backup-key.yml',
+           '.github/workflows/github-dr-environment.yml',
            'scripts/accept-registered-nodes.py','scripts/verify-console-gateways.mjs','scripts/test_onboarding_acceptance.py',
            'scripts/heteronetwork-console-e2e.sh','scripts/heteronetwork-console-browser-e2e.mjs',
            'scripts/verify-overlay-client-console.py','scripts/test_verify_overlay_client_console.py',
@@ -63,7 +65,7 @@ def files():
               'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml',
               'deploy/gitops/envoy-gateway/kustomization.yaml','deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml',
               'deploy/gitops/envoy-gateway/flash-ssh-backend-traffic-policy.yaml']
-    for directory in ['deploy/terraform/master-only','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns','scripts/storage-heartbeat-e2e']:
+    for directory in ['deploy/terraform/master-only','deploy/terraform/github-dr-environment','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns','scripts/storage-heartbeat-e2e']:
         for p in (ROOT/directory).rglob('*'):
             if not p.is_file() or '.terraform' in p.parts or '__pycache__' in p.parts: continue
             if p.suffix in ['.tf','.py','.yaml','.j2','.json','.md','.cfg','.sh'] or p.name=='.terraform.lock.hcl':

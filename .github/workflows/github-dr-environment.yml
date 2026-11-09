@@ -1,0 +1,28 @@
+name: GitHub recovery environment IaC
+on:
+  push:
+    branches: [master, codex/dr-key-custody-iac]
+    paths:
+      - 'deploy/terraform/github-dr-environment/**'
+      - 'scripts/reconcile-github-dr-environment.py'
+      - 'scripts/test_reconcile_github_dr_environment.py'
+      - '.github/workflows/github-dr-environment.yml'
+  pull_request:
+    paths:
+      - 'deploy/terraform/github-dr-environment/**'
+      - 'scripts/reconcile-github-dr-environment.py'
+      - 'scripts/test_reconcile_github_dr_environment.py'
+      - '.github/workflows/github-dr-environment.yml'
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.4
+      - run: python3 -B -m unittest discover -s scripts -p test_reconcile_github_dr_environment.py -v
+      - run: terraform -chdir=deploy/terraform/github-dr-environment init -backend=false
+      - run: terraform -chdir=deploy/terraform/github-dr-environment validate

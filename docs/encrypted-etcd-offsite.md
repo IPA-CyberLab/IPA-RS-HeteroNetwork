@@ -19,6 +19,13 @@ use that environment and deliver recovered material only to an authorized
 private destination. GitHub environment access depends on maintaining the
 repository and its security settings.
 
+The environment name, allowed branch and required secret name are declared in
+`deploy/terraform/github-dr-environment/environment.json`. Apply that separate
+Terraform root using an authenticated GitHub CLI session to reconcile the
+environment. It refuses unexpected branch policies rather than weakening them.
+Terraform state contains only the secret *name*, never the recovery key value;
+install or rotate the key separately through the GitHub secret interface.
+
 For a private Cloudflare R2 bucket, compress the snapshot and save only the
 encrypted stream to a temporary file. Preserve both the original snapshot
 SHA-256 and the compressed plaintext SHA-256 printed by the encryption command:
