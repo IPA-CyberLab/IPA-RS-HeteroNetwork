@@ -178,6 +178,16 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
         self.assertEqual(ready.call_count, 3)
         self.assertGreaterEqual(elapsed, 0)
 
+    def test_gateway_timeout_diagnostics_check_all_components(self):
+        with (
+            patch.object(verify, "gateway_client_probe_is_ready", return_value=False),
+            patch.object(verify, "overlay_dns_resolves_to_gateway", return_value=True),
+            patch.object(verify, "gateway_console_ui_is_ready", return_value=False),
+        ):
+            self.assertEqual(verify.gateway_route_diagnostics("10.250.0.5"), {
+                "health": False, "dns": True, "console": False,
+            })
+
     def test_monitoring_requires_consistent_healthy_overlay_endpoints(self):
         endpoints = ["10.250.0.2", "10.250.0.10", "10.250.0.11"]
         with (

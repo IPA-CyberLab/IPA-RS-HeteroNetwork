@@ -691,6 +691,16 @@ def gateway_route_is_ready(gateway):
             and gateway_console_ui_is_ready(gateway))
 
 
+def gateway_route_diagnostics(gateway):
+    # Run every check once after a timeout; the normal fast path short-circuits
+    # and previously hid whether the route, DNS or console listener failed.
+    return {
+        "health": gateway_client_probe_is_ready(gateway),
+        "dns": overlay_dns_resolves_to_gateway(gateway),
+        "console": gateway_console_ui_is_ready(gateway),
+    }
+
+
 def wait_for_gateway_routes(gateways, timeout=60):
     started = time.monotonic()
     targets = tuple(sorted(set(gateways.split(","))))
@@ -710,9 +720,12 @@ def wait_for_gateway_routes(gateways, timeout=60):
                 return round((time.monotonic() - started) * 1000)
         time.sleep(0.2)
     if pending:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as executor:
+            ordered = sorted(pending)
+            diagnostics = dict(zip(ordered, executor.map(gateway_route_diagnostics, ordered)))
         raise RuntimeError(
             "client console routes, split DNS, and listeners did not converge on gateways: "
-            + ", ".join(sorted(pending)))
+            + json.dumps(diagnostics, sort_keys=True))
     raise RuntimeError("client console readiness did not remain stable across two probes")
 
 
