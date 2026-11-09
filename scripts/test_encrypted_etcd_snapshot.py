@@ -3,6 +3,8 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -70,6 +72,20 @@ class EncryptedSnapshotTests(unittest.TestCase):
             key.chmod(0o644)
             with self.assertRaisesRegex(ValueError, "owner-only"):
                 snapshot.read_key(key)
+
+    def test_cli_encrypts_from_a_pipe_and_verifies_its_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = Path(directory) / "key"
+            snapshot.generate_key(key)
+            payload = b"compressed-stream-fixture" * 300
+            encrypted = subprocess.run([sys.executable, str(Path(__file__).with_name("encrypted-etcd-snapshot.py")),
+                                        "encrypt", "--key", str(key), "--input", "-"],
+                                       input=payload, capture_output=True, check=True)
+            verified = subprocess.run([sys.executable, str(Path(__file__).with_name("encrypted-etcd-snapshot.py")),
+                                       "verify", "--key", str(key), "--sha256", hashlib.sha256(payload).hexdigest()],
+                                      input=encrypted.stdout, capture_output=True, check=True)
+            self.assertIn(b'"result": "verified"', verified.stderr)
+            self.assertNotIn(payload, encrypted.stdout)
 
 
 if __name__ == "__main__":

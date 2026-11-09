@@ -6,6 +6,7 @@ the encrypt command. Verification never outputs plaintext. Restore writes a new
 owner-only file only after the authentication tag and expected hash validate.
 """
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -143,7 +144,8 @@ def main():
     if args.operation == "encrypt":
         if args.input is None:
             raise ValueError("encrypt requires an input file")
-        with args.input.open("rb") as file:
+        source = nullcontext(sys.stdin.buffer) if str(args.input) == "-" else args.input.open("rb")
+        with source as file:
             result = encrypt(file, sys.stdout.buffer, key, args.bytes_per_second)
     elif args.operation == "verify":
         result = decrypt(sys.stdin.buffer, None, key, args.sha256 or "", args.bytes_per_second)
