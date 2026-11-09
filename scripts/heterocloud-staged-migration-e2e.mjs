@@ -15,16 +15,17 @@ assert.ok(source && temporary);
 const migration = readFileSync(join(source, 'migrations', '0036_flash_cost_budgets.sql'), 'utf8');
 const checksum = createHash('sha384').update(migration).digest('hex');
 const secrets = join(temporary, 'hc-stage-secrets');
-mkdirSync(secrets, { mode: 0o755 });
-chmodSync(secrets, 0o755); // The unprivileged container reads these disposable fixture files.
-const write = (name, content) => writeFileSync(join(secrets, name), content, { mode: 0o644 });
+mkdirSync(secrets, { mode: 0o700 });
+const write = (name, content) => writeFileSync(join(secrets, name), content, { mode: 0o600 });
 write('database-url', 'postgres://hc_test:fixture-only@127.0.0.1:5432/heterocloud_test_stage');
 write('csrf', 'fixture-csrf-key-with-more-than-32-bytes');
 write('flow', 'fixture-flow-key-with-more-than-32-bytes');
 write('syouyu', 'fixture-syouyu-key-with-more-than-32-bytes');
 write('password', 'fixture-only-password');
 execFileSync('openssl', ['genpkey', '-algorithm', 'ED25519', '-out', join(secrets, 'provider.pem')]);
-chmodSync(join(secrets, 'provider.pem'), 0o644);
+chmodSync(join(secrets, 'provider.pem'), 0o600);
+// The image runs as uid/gid 10001 and refuses world-readable secrets.
+execFileSync('sudo', ['chown', '-R', '10001:10001', secrets]);
 const origin = 'http://127.0.0.1:18080';
 const env = {
   HETEROCLOUD_LISTEN: '127.0.0.1:18080',
