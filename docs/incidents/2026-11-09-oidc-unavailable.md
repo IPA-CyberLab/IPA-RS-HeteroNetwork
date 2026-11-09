@@ -110,6 +110,21 @@ replica failures have the same initiating cause.
   seconds; CRC and frame error counters were zero. A short VPN ping sample
   also showed one lost packet out of eight. These observations do not by
   themselves prove the cause of the original identity incident.
+- On `uc-k8sp5`, received traffic was concentrated on an `igb` queue whose
+  CPU reached about 100% utilization. In a reversible comparison, the first
+  15-second baseline saw 760 missed receives across 53,294 received packets;
+  distributing receive processing across other online CPUs saw 12 and then
+  zero missed receives during consecutive 15-second samples of 55,284 and
+  54,858 packets. After reverting, 3,407 receives were missed in 15 seconds
+  with 53,227 received packets. The samples are not a controlled workload or
+  proof that all user-facing errors have been resolved. A second 15-second
+  sample after the final Terraform/Ansible apply saw zero missed receives.
+  The applied setting is limited to the verified `uc-k8sp5` NIC and CPU
+  topology, is configured to reassert at boot and NIC add, and does not reset
+  the NIC or change IRQ affinity. It refuses a different existing RPS policy. A short
+  trial on `ichikawap1` reduced CPU pressure but had too few FIFO errors to
+  establish a durable error-rate improvement, so no setting was persisted
+  there. Dropped-packet counters and end-to-end latency still need monitoring.
 - The receive rings were 256/4096 descriptors on the `igb` NIC and 151/4078
   on the `bnx2x` NIC. Both drivers reload or stop an active interface when
   ring parameters change ([Linux igb implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/net/ethernet/intel/igb/igb_ethtool.c),

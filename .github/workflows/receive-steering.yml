@@ -1,0 +1,26 @@
+name: Receive steering safety
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/reconcile-receive-steering.py'
+      - 'scripts/test_reconcile_receive_steering.py'
+      - 'deploy/terraform/master-only/receive-steering*'
+      - 'deploy/terraform/master-only/ansible/receive-steering.yaml'
+      - '.github/workflows/receive-steering.yml'
+  pull_request:
+    paths:
+      - 'scripts/reconcile-receive-steering.py'
+      - 'scripts/test_reconcile_receive_steering.py'
+      - 'deploy/terraform/master-only/receive-steering*'
+      - 'deploy/terraform/master-only/ansible/receive-steering.yaml'
+      - '.github/workflows/receive-steering.yml'
+permissions:
+  contents: read
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - run: python3 -m unittest scripts/test_reconcile_receive_steering.py -v

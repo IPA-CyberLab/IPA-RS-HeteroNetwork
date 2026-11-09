@@ -1,0 +1,8 @@
+{
+  "node": "uc-k8sp5",
+  "interface": "enp6s0",
+  "driver": "igb",
+  "online_cpus": "0-15",
+  "queues": 2,
+  "rps_cpus": "c3ff"
+}
