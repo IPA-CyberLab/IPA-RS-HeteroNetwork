@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 spec = importlib.util.spec_from_file_location("release_cleanup", Path(__file__).with_name("prune-control-plane-releases.py"))
@@ -19,6 +20,20 @@ class ReleaseCleanupTest(unittest.TestCase):
         self.now = time.time()
         self.active = hashlib.sha256(b"active").hexdigest()
         self.make_release(self.active, b"active")
+        self.untrusted = set()
+        original_lstat = Path.lstat
+
+        def fixture_lstat(path, *args, **kwargs):
+            info = original_lstat(path, *args, **kwargs)
+            if path.is_relative_to(self.root):
+                fields = list(info)
+                fields[4] = 1234 if path in self.untrusted else 0
+                return os.stat_result(fields)
+            return info
+
+        self.stat_patch = mock.patch.object(Path, "lstat", fixture_lstat)
+        self.stat_patch.start()
+        self.addCleanup(self.stat_patch.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -52,6 +67,11 @@ class ReleaseCleanupTest(unittest.TestCase):
         self.root.chmod(0o777)
         with self.assertRaises(ValueError):
             cleanup.candidates(self.root, self.active, set(), self.now)
+
+    def test_non_root_owned_release_is_preserved(self):
+        old = self.make_release("a" * 64)
+        self.untrusted.add(old)
+        self.assertEqual(cleanup.candidates(self.root, self.active, set(), self.now), [])
 
 
 if __name__ == "__main__":
