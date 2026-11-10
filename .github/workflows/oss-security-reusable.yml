@@ -120,10 +120,23 @@ jobs:
         run: |
           set -euo pipefail
           python3 .security-tooling/scripts/security_cargo_patch.py --report "$RUNNER_TEMP/inventory/security-scan.json" --output "$RUNNER_TEMP/applied-fixes.json" --live-osv --advisory-cache "$RUNNER_TEMP/osv-cache" --apply
-          cargo test --all-targets --locked
-          cargo clippy --all-targets --locked -- -D warnings
-          # Only the dependency lockfile may be changed by this automation.
-          test "$(git diff --name-only)" = Cargo.lock
+          # Only scanned Cargo lockfiles may change; verify every changed
+          # workspace before any of the changes can be published.
+          python3 - <<'PY'
+          import json,os,pathlib,subprocess,sys
+          sys.path.insert(0,'.security-tooling/scripts')
+          from security_cargo_patch import scanned_lockfiles,validate_changed_lockfiles
+          temp=pathlib.Path(os.environ['RUNNER_TEMP'])
+          report=json.loads((temp/'inventory/security-scan.json').read_text())
+          raw=subprocess.check_output(['git','diff','--name-only','-z']).decode().split('\0')
+          changed=validate_changed_lockfiles([p for p in raw if p],scanned_lockfiles(report))
+          (temp/'security-lockfiles.txt').write_text('\n'.join(changed)+'\n')
+          PY
+          while IFS= read -r lockfile; do
+            manifest="${lockfile%Cargo.lock}Cargo.toml"
+            cargo test --manifest-path "$manifest" --all-targets --locked
+            cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings
+          done < "$RUNNER_TEMP/security-lockfiles.txt"
       - name: Re-scan the patched lockfile
         run: |
           set -euo pipefail
@@ -161,7 +174,9 @@ jobs:
           git config core.hooksPath /dev/null
           git config user.name heterocloud-security
           git config user.email heterocloud-security@users.noreply.github.com
-          git add Cargo.lock
+          mapfile -t lockfiles < "$RUNNER_TEMP/security-lockfiles.txt"
+          test "${#lockfiles[@]}" -gt 0
+          git add -- "${lockfiles[@]}"
           git commit -m 'security: apply tested compatible dependency fixes'
           # Push uses the ephemeral job token over stdin through gh auth;
           # neither token nor credential-bearing remote is recorded in files.

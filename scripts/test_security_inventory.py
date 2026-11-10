@@ -10,7 +10,7 @@ import os
 
 from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, safe_trivy_report, scoped_registry_auth, stopped_inventory_nodes, validate_host_os
 from security_update_gate import assess, fingerprint
-from security_cargo_patch import fixes
+from security_cargo_patch import apply_fixes, fixes, scanned_lockfiles, validate_changed_lockfiles
 from security_containerd_update import preserved
 from security_candidate import candidate
 from security_gvisor_e2e import continuity
@@ -334,6 +334,59 @@ class RestartSafetyTests(unittest.TestCase):
 
 
 class CargoFixTests(unittest.TestCase):
+    def test_an_earlier_update_can_remove_a_later_planned_version(self):
+        planned = [{'package': 'tokio', 'installed_version': v, 'fixed_version': '1.53.3'}
+                   for v in ('1.52.3', '1.53.1')]
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / 'Cargo.lock'
+            lock.write_text('[[package]]\nname="tokio"\nversion="1.52.3"\n'
+                            '[[package]]\nname="tokio"\nversion="1.53.1"\n')
+            def update(*args, **kwargs):
+                lock.write_text('[[package]]\nname="tokio"\nversion="1.53.3"\n')
+            with mock.patch('security_cargo_patch.subprocess.run', side_effect=update) as cargo:
+                self.assertEqual(apply_fixes(planned, [lock]), (1, 1))
+            cargo.assert_called_once()
+
+    def test_stale_scan_fails_before_updating_any_package(self):
+        planned = [{'package': 'tokio', 'installed_version': '1.52.3', 'fixed_version': '1.53.3'}]
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / 'Cargo.lock'
+            lock.write_text('[[package]]\nname="tokio"\nversion="1.53.1"\n')
+            with mock.patch('security_cargo_patch.subprocess.run') as cargo:
+                with self.assertRaisesRegex(RuntimeError, 'does not match'):
+                    apply_fixes(planned, [lock])
+            cargo.assert_not_called()
+
+    def test_same_advisory_is_patched_in_separate_workspaces(self):
+        planned = [{'package': 'tokio', 'installed_version': v, 'fixed_version': '1.53.3'}
+                   for v in ('1.52.3', '1.53.1')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / 'prototypes' / 'sudo-quorum'
+            nested.mkdir(parents=True)
+            for parent, version in ((root, '1.52.3'), (nested, '1.53.1')):
+                (parent / 'Cargo.toml').write_text('[package]\nname="example"\nversion="0.1.0"\n')
+                (parent / 'Cargo.lock').write_text(f'[[package]]\nname="tokio"\nversion="{version}"\n')
+            report = {'Results': [{'Type': 'cargo', 'Target': 'Cargo.lock'},
+                                  {'Type': 'cargo', 'Target': 'prototypes/sudo-quorum/Cargo.lock'}]}
+            locks = scanned_lockfiles(report, root)
+            def update(command, **kwargs):
+                manifest = Path(command[command.index('--manifest-path') + 1])
+                (manifest.parent / 'Cargo.lock').write_text('[[package]]\nname="tokio"\nversion="1.53.3"\n')
+            with mock.patch('security_cargo_patch.subprocess.run', side_effect=update) as cargo:
+                self.assertEqual(apply_fixes(planned, locks), (2, 0))
+            self.assertEqual(cargo.call_count, 2)
+            changed = ['Cargo.lock', 'prototypes/sudo-quorum/Cargo.lock']
+            self.assertEqual(validate_changed_lockfiles(changed, locks, root), changed)
+            with self.assertRaises(ValueError):
+                validate_changed_lockfiles(['prototypes/sudo-quorum/Cargo.toml'], locks, root)
+
+    def test_untrusted_scan_target_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = {'Results': [{'Type': 'cargo', 'Target': '../Cargo.lock'}]}
+            with self.assertRaises(ValueError):
+                scanned_lockfiles(report, Path(directory))
+
     def test_pick_the_compatible_fix_for_zero_major_versions(self):
         report = {'Results': [{'Type': 'cargo', 'Vulnerabilities': [{'VulnerabilityID': 'GHSA-test', 'PkgName': 'rustls', 'InstalledVersion': '0.23.43', 'FixedVersion': '0.24.1, 0.23.45'}]}]}
         self.assertEqual(fixes(report)[0]['fixed_version'], '0.23.45')
