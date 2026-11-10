@@ -62,6 +62,12 @@ spec:
               enabled: true
               namespace: longhorn-system
           prometheus:
+            # Bound the footprint of each independent monitoring copy. This
+            # installation prioritizes current health over long-term history.
+            scrapeInterval: 30s
+            evaluationInterval: 30s
+            retentionTime: 24h
+            retentionSize: 1GB
             nodeSelector:
               monitoring.heteronetwork.io/ha: "true"
             allowedNodes:
