@@ -17,7 +17,23 @@
         group: root
         mode: '0755'
 
-    - name: Remove only unreferenced releases older than a day
+    - name: Preview unreferenced releases and binary backup files
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/prune-control-plane-releases.py
+          - --active-digest
+          - "{{ hnn_cp_digest }}"
+      register: hnn_release_cleanup_preview
+      changed_when: false
+      when: not ansible_check_mode and hnn_cp_digest | length > 0
+
+    - name: Report binary cleanup scope
+      ansible.builtin.debug:
+        msg: "{{ hnn_release_cleanup_preview.stdout }}"
+      when: not ansible_check_mode and hnn_cp_digest | length > 0
+
+    - name: Remove only unreferenced binaries older than a day
       ansible.builtin.command:
         argv:
           - /usr/bin/python3

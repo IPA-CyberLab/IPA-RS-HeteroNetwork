@@ -73,6 +73,41 @@ class ReleaseCleanupTest(unittest.TestCase):
         self.untrusted.add(old)
         self.assertEqual(cleanup.candidates(self.root, self.active, set(), self.now), [])
 
+    def test_only_old_regular_unreferenced_backup_is_selected(self):
+        old = "iparsd.1.2026-10-27@12:00:00~"
+        protected = "iparsd.2.2026-10-27@12:00:00~"
+        recent = "iparsd.3.2026-10-27@12:00:00~"
+        for name in (old, protected, recent):
+            path = self.root / name
+            path.write_bytes(b"old binary")
+            if name != recent:
+                os.utime(path, (self.now - 90000, self.now - 90000))
+        (self.root / "iparsd.4.2026-10-27@12:00:00~").symlink_to(self.root / old)
+        (self.root / "iparsd.5.invalid~").write_bytes(b"unknown format")
+        self.assertEqual(cleanup.backup_candidates(self.root, {protected}, self.now), [old])
+
+    def test_backup_referenced_by_local_symlink_is_protected(self):
+        name = "iparsd.1.2026-10-27@12:00:00~"
+        (self.root / name).write_bytes(b"old binary")
+        (self.root / "iparsd-current").symlink_to(self.root / name)
+        self.assertIn(name, cleanup.backup_references(self.root, unit_roots=(), process_root=self.root))
+
+    def test_backup_referenced_by_process_or_service_is_protected(self):
+        unit_name = "iparsd.1.2026-10-27@12:00:00~"
+        process_name = "iparsd.2.2026-10-27@12:00:00~"
+        for name in (unit_name, process_name):
+            (self.root / name).write_bytes(b"old binary")
+        units = self.root / "units"
+        units.mkdir()
+        (units / "example.service").write_text(f"ExecStart={self.root / unit_name}\n")
+        processes = self.root / "processes"
+        process = processes / "123"
+        (process / "fd").mkdir(parents=True)
+        (process / "exe").symlink_to(self.root / process_name)
+        (process / "cmdline").write_bytes(b"running\0")
+        protected = cleanup.backup_references(self.root, unit_roots=(units,), process_root=processes)
+        self.assertEqual(protected, {unit_name, process_name})
+
 
 if __name__ == "__main__":
     unittest.main()
