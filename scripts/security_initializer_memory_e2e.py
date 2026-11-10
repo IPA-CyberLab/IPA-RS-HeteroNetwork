@@ -143,6 +143,8 @@ def main():
             current = control.get(kind, name, namespace)
             if (current and current['metadata']['uid'] == uid
                     and current['metadata'].get('labels', {}).get('security.heteronetwork.io/memory-probe') == token):
+                if kind == 'persistentvolumeclaim':
+                    control.reclaim_probe_volume(current, 'security.heteronetwork.io/memory-probe', token)
                 control.kube('delete', kind, name, '-n', namespace, '--wait=false', text=True)
                 if kind == 'deployment':
                     deadline = time.monotonic() + 60

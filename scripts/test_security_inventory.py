@@ -21,7 +21,7 @@ from security_candidate_needed import new_os_fixes
 from security_candidate_baseline import select_release
 from security_runtime_restart_host import validate_request
 import security_runtime_restart_host as restart_host
-from security_runtime_restart import eligible as restart_eligible, memory_bytes, pod_memory_limit
+from security_runtime_restart import eligible as restart_eligible, memory_bytes, pod_memory_limit, probe_volume_patch, OWNER
 
 
 class InventoryTests(unittest.TestCase):
@@ -211,6 +211,23 @@ class UpdateGateTests(unittest.TestCase):
 
 
 class RestartSafetyTests(unittest.TestCase):
+    def test_probe_reclaim_requires_exact_label_and_claim_uid(self):
+        token = 'a' * 32
+        claim = {'metadata': {'namespace': 'test', 'name': 'fixture', 'uid': 'claim-uid', 'labels': {OWNER: token}},
+                 'spec': {'volumeName': 'pvc-fixture'}}
+        volume = {'metadata': {'name': 'pvc-fixture', 'resourceVersion': '17'},
+                  'spec': {'claimRef': {'namespace': 'test', 'name': 'fixture', 'uid': 'claim-uid'},
+                           'persistentVolumeReclaimPolicy': 'Retain', 'csi': {'driver': 'driver.longhorn.io'}}}
+        patch = probe_volume_patch(claim, volume, OWNER, token)
+        self.assertEqual(patch['metadata']['resourceVersion'], '17')
+        self.assertEqual(patch['spec']['persistentVolumeReclaimPolicy'], 'Delete')
+        volume['spec']['claimRef']['uid'] = 'different'
+        with self.assertRaises(RuntimeError):
+            probe_volume_patch(claim, volume, OWNER, token)
+        volume['spec']['claimRef']['uid'] = 'claim-uid'
+        with self.assertRaises(RuntimeError):
+            probe_volume_patch(claim, volume, OWNER, 'b' * 32)
+
     def setUp(self):
         self.artifact = {'sha256': 'b' * 64, 'sentry_sha256': 'c' * 64}
         self.pod = {'id': 'a' * 64, 'metadata': {'uid': 'uid', 'namespace': 'tenants'}, 'exe_sha256': 'd' * 64}

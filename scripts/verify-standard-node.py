@@ -21,6 +21,37 @@ def get(resource, *args):
     return json.loads(k(['get', resource, *args, '-o', 'json']).stdout)
 
 
+def reclaim_test_volume(namespace):
+    """Reclaim only the storage fixture owned by this uniquely named test."""
+    if not re.fullmatch(r'hnn-standard-e2e-[0-9]+', namespace):
+        raise ValueError('unexpected test namespace')
+    response = k(['get', 'pvc', 'data', '-n', namespace, '--ignore-not-found', '-o', 'json'])
+    if not response.stdout.strip():
+        return
+    claim = json.loads(response.stdout)
+    volume_name = claim.get('spec', {}).get('volumeName')
+    if not volume_name:
+        return
+    volume = get('pv', volume_name)
+    reference = volume.get('spec', {}).get('claimRef', {})
+    if (claim['metadata'].get('namespace') != namespace or
+            claim['metadata'].get('name') != 'data' or
+            not claim['metadata'].get('uid') or
+            reference.get('namespace') != namespace or reference.get('name') != 'data' or
+            reference.get('uid') != claim['metadata']['uid'] or
+            volume['metadata'].get('name') != volume_name or
+            volume['spec'].get('csi', {}).get('driver') != 'driver.longhorn.io' or
+            not volume['metadata'].get('resourceVersion')):
+        raise ValueError('storage fixture does not match its persistent volume')
+    if volume['spec'].get('persistentVolumeReclaimPolicy') == 'Delete':
+        return
+    if volume['spec'].get('persistentVolumeReclaimPolicy') != 'Retain':
+        raise ValueError('unexpected storage fixture reclaim policy')
+    patch = {'metadata': {'resourceVersion': volume['metadata']['resourceVersion']},
+             'spec': {'persistentVolumeReclaimPolicy': 'Delete'}}
+    k(['patch', 'pv', volume_name, '--type=merge', '-p', json.dumps(patch)])
+
+
 def endpoint_slice_has_ready_address(slices, address):
     """Return whether an EndpointSlice publishes address as usable."""
     for endpoint_slice in slices.get('items', []):
@@ -294,7 +325,11 @@ def main():
         print(json.dumps(failure_report, ensure_ascii=False), file=sys.stderr)
         raise
     finally:
-        k(['delete', 'namespace', ns, '--wait=false'], check=False)
+        try:
+            if args.exercise_storage:
+                reclaim_test_volume(ns)
+        finally:
+            k(['delete', 'namespace', ns, '--wait=false'], check=False)
     write_report(args.output, report)
     print(json.dumps(report, ensure_ascii=False))
 

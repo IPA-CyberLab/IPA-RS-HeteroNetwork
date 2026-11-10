@@ -1,0 +1,63 @@
+- name: Deduplicate the stopped-node firewall without restarting VPN or database
+  hosts: 'master_only:bootstrap:standard:enrollment_issuer'
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the shared lifecycle policy reader
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/node_lifecycle.py"
+        dest: /opt/heteronetwork/libexec/node_lifecycle.py
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Install the tested firewall reconciler
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/reconcile-stopped-overlay-firewall.py"
+        dest: /opt/heteronetwork/libexec/reconcile-stopped-overlay-firewall.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the declared node lifecycle roster
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/deploy/terraform/master-only/overlay-boot-peers.json"
+        dest: /etc/heteronetwork/overlay-boot-peers.json
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reconcile the fence and remove duplicate hooks atomically
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/reconcile-stopped-overlay-firewall.py
+          - --roster
+          - /etc/heteronetwork/overlay-boot-peers.json
+      changed_when: true
+
+    - name: Verify that each chain has exactly one managed stopped-node hook
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import importlib.util, shlex, subprocess, sys
+        path = '/opt/heteronetwork/libexec/reconcile-stopped-overlay-firewall.py'
+        sys.path.insert(0, '/opt/heteronetwork/libexec')
+        spec = importlib.util.spec_from_file_location('hnn_stopped_firewall', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for hook in ('INPUT', 'OUTPUT', 'FORWARD'):
+            output = subprocess.check_output(['iptables', '-S', hook], text=True, timeout=10)
+            rules = [shlex.split(line) for line in output.splitlines() if line.startswith(f'-A {hook} ')]
+            managed = [rule for rule in rules if module.managed_hook(rule, hook)]
+            if len(managed) != 1 or rules[0] != managed[0]:
+                raise SystemExit(f'{hook}: stopped-node hook is duplicated or misplaced')
+        print('one stopped-node hook per chain')
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false

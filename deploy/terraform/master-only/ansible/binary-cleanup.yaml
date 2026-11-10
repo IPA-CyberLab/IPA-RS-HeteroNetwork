@@ -1,0 +1,55 @@
+- name: Reclaim superseded binaries and installer archives
+  hosts: 'master_only:bootstrap:standard:enrollment_issuer'
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_cp_digest: "{{ lookup('env', 'HNN_CONTROL_PLANE_SHA256') }}"
+  tasks:
+    - name: Install the release cleanup tool
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/prune-control-plane-releases.py"
+        dest: /opt/heteronetwork/libexec/prune-control-plane-releases.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Remove only unreferenced releases older than a day
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/prune-control-plane-releases.py
+          - --active-digest
+          - "{{ hnn_cp_digest }}"
+          - --apply
+      register: hnn_release_cleanup
+      changed_when: (hnn_release_cleanup.stdout | from_json).removed > 0
+      when: not ansible_check_mode and hnn_cp_digest | length > 0
+
+    - name: Inspect the installed scanner
+      ansible.builtin.stat:
+        path: /opt/heteronetwork/security/trivy
+      register: hnn_scanner
+
+    - name: Remove the scanner download when its executable is installed
+      ansible.builtin.file:
+        path: /opt/heteronetwork/security/trivy.tar.gz
+        state: absent
+      when: hnn_scanner.stat.isreg | default(false) and hnn_scanner.stat.executable | default(false)
+
+    - name: Inspect the installed verifier
+      ansible.builtin.stat:
+        path: /opt/heteronetwork/security/gh
+      register: hnn_verifier
+
+    - name: Remove verifier installation artifacts when its executable is installed
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/heteronetwork/security/gh.tar.gz
+        - /opt/heteronetwork/security/gh_2.102.0_linux_amd64
+      when: hnn_verifier.stat.isreg | default(false) and hnn_verifier.stat.executable | default(false)

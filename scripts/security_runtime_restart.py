@@ -30,6 +30,27 @@ IMAGE = 'alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc
 OWNER = 'security.heteronetwork.io/restart-canary'
 
 
+def probe_volume_patch(claim, volume, label, token):
+    """Build a reclaim patch only for the nonce-labelled test PVC and its PV."""
+    meta, spec = claim['metadata'], claim['spec']
+    reference = volume.get('spec', {}).get('claimRef', {})
+    require(re.fullmatch(r'[0-9a-f]{32}', token) and meta.get('labels', {}).get(label) == token,
+            'probe PVC marker does not match')
+    require(meta.get('uid') and reference.get('uid') == meta['uid']
+            and reference.get('namespace') == meta.get('namespace')
+            and reference.get('name') == meta.get('name')
+            and volume['metadata'].get('name') == spec.get('volumeName')
+            and volume['metadata'].get('resourceVersion'),
+            'probe PVC does not own this volume')
+    policy = volume['spec'].get('persistentVolumeReclaimPolicy')
+    if policy == 'Delete':
+        return None
+    require(policy == 'Retain' and volume['spec'].get('csi', {}).get('driver') == 'driver.longhorn.io',
+            'unsupported probe volume reclaim policy')
+    return {'metadata': {'resourceVersion': volume['metadata']['resourceVersion']},
+            'spec': {'persistentVolumeReclaimPolicy': 'Delete'}}
+
+
 def probe_command(token):
     require(re.fullmatch(r'[0-9a-f]{32}', token), 'invalid canary marker')
     # Alpine's base BusyBox has nc but deliberately omits the httpd applet.
@@ -147,6 +168,17 @@ class Controller:
 
     def get(self, kind, name, namespace):
         return self.kube('get', kind, name, '-n', namespace, '--ignore-not-found', '-o', 'json')
+
+    def reclaim_probe_volume(self, claim, label, token):
+        name = claim.get('spec', {}).get('volumeName')
+        if not name:
+            return
+        volume = self.get('pv', name, claim['metadata']['namespace'])
+        require(volume, 'probe volume is missing')
+        patch = probe_volume_patch(claim, volume, label, token)
+        if patch:
+            self.kube('patch', 'pv', name, '--type=merge', '--patch-file=/dev/stdin',
+                      '-o', 'json', body=patch)
 
     def remote(self, node, action='inspect', **fields):
         challenge = secrets.token_hex(32)
@@ -630,6 +662,8 @@ class Controller:
             for kind, uid in reversed(created):
                 current = self.get(kind, name, namespace)
                 if current and current['metadata']['uid'] == uid and current['metadata'].get('labels', {}).get(OWNER) == token:
+                    if kind == 'persistentvolumeclaim':
+                        self.reclaim_probe_volume(current, OWNER, token)
                     self.kube('delete', kind, name, '-n', namespace, '--wait=false', text=True)
                     if kind == 'pod':
                         deadline = time.monotonic() + 60

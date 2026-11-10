@@ -1,0 +1,81 @@
+- name: Reclaim old Kubernetes pod records
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the node lifecycle reader and pod cleanup tool
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/libexec/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop: [node_lifecycle.py, prune-terminal-pods.py]
+
+    - name: Preview the UID-scoped cleanup
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - /opt/heteronetwork/libexec/prune-terminal-pods.py
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - --roster
+          - /etc/heteronetwork/overlay-boot-peers.json
+      register: pod_cleanup_preview
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Report the cleanup scope
+      ansible.builtin.debug:
+        msg: "{{ pod_cleanup_preview.stdout }}"
+      when: not ansible_check_mode
+
+    - name: Install the pod cleanup unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-pod-cleanup.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Remove old terminal pods and stale pods from retired nodes
+          Wants=network-online.target
+          After=network-online.target
+          [Service]
+          Type=oneshot
+          TimeoutStartSec=900
+          ExecStart=/usr/bin/python3 /opt/heteronetwork/libexec/prune-terminal-pods.py --kubeconfig /etc/kubernetes/admin.conf --roster /etc/heteronetwork/overlay-boot-peers.json --apply
+      register: pod_cleanup_unit
+
+    - name: Install periodic cleanup
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-pod-cleanup.timer
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Periodically reclaim old Kubernetes pod records
+          [Timer]
+          OnBootSec=10min
+          OnUnitActiveSec=6h
+          Unit=heteronetwork-pod-cleanup.service
+          [Install]
+          WantedBy=timers.target
+      register: pod_cleanup_timer
+
+    - name: Load and enable the cleanup timer
+      ansible.builtin.systemd_service:
+        name: heteronetwork-pod-cleanup.timer
+        enabled: true
+        state: started
+        daemon_reload: "{{ pod_cleanup_unit.changed or pod_cleanup_timer.changed }}"
+
+    - name: Remove currently eligible pods using UID preconditions
+      ansible.builtin.systemd_service:
+        name: heteronetwork-pod-cleanup.service
+        state: started

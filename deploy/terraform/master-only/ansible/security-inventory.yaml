@@ -85,6 +85,10 @@
         owner: root
         group: root
         mode: '0755'
+    - name: Remove the scanner archive after successful installation
+      ansible.builtin.file:
+        path: "{{ hnn_security_root }}/trivy.tar.gz"
+        state: absent
     - name: Install root-owned read-only inventory code
       tags: [security_code]
       ansible.builtin.copy:
@@ -214,6 +218,13 @@
         owner: root
         group: root
         mode: '0755'
+    - name: Remove verifier installation artifacts
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/heteronetwork/security/gh.tar.gz
+        - /opt/heteronetwork/security/gh_2.102.0_linux_amd64
     - name: Declare production security reconciliation targets and health checks
       tags: [security_code]
       ansible.builtin.copy:

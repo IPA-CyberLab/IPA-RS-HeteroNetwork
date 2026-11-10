@@ -19,12 +19,35 @@ spec:
       # two available workers each host one copy; a third failure domain is
       # still needed for three-way monitoring redundancy.
       values: |
+        # Keep two independent copies of each Flow component on the two
+        # application workers; seven copies on one host do not provide HA.
+        api:
+          replicaCount: 2
+        matchmaker:
+          replicaCount: 2
+        signaling:
+          replicaCount: 2
+        livekit:
+          replicaCount: 2
+        topologySpread:
+          maxSkew: 1
+          whenUnsatisfiable: DoNotSchedule
+        database:
+          proxy:
+            addresses:
+              - 10.250.0.2
+              - 10.250.0.4
+              - 10.250.0.5
+              - 10.250.0.6
+              - 10.250.0.10
+            endpointNodeNames:
+              "10.250.0.2": uc-k8sp5
         redis:
           sentinel:
             quorum: 2
           replica:
-            # Three eligible application hosts; dedicated custodians stay excluded.
-            replicaCount: 3
+            # Two application workers; dedicated custodians stay excluded.
+            replicaCount: 2
             pdb:
               minAvailable: 2
             extraFlags:

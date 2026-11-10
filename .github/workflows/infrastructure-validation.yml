@@ -34,6 +34,7 @@ on:
       - 'deploy/gitops/applications/custom-domains.yaml'
       - 'deploy/gitops/applications/heterocloud.yaml'
       - 'deploy/gitops/applications/heterocloud-flash.yaml'
+      - 'deploy/gitops/applications/heterocloud-flow.yaml'
       - 'deploy/gitops/applications/cert-manager.yaml'
       - 'deploy/gitops/applications/envoy-gateway.yaml'
       - 'scripts/configure_gateway_rollout.py'
@@ -67,6 +68,13 @@ on:
       - 'scripts/test_reconcile_stopped_wireguard.py'
       - 'scripts/reconcile-stopped-overlay-firewall.py'
       - 'scripts/test_reconcile_stopped_overlay_firewall.py'
+      - 'scripts/prune-terminal-pods.py'
+      - 'scripts/test_prune_terminal_pods.py'
+      - 'scripts/prune-control-plane-releases.py'
+      - 'scripts/test_prune_control_plane_releases.py'
+      - 'scripts/prune-unused-images.py'
+      - 'scripts/test_prune_unused_images.py'
+      - 'scripts/test_flow_capacity.py'
       - 'scripts/verify-heterocloud-iam-rollout.py'
       - 'scripts/test_verify_heterocloud_iam_rollout.py'
       - 'scripts/overlay_power_recovery_e2e.py'
@@ -126,6 +134,7 @@ on:
       - 'deploy/gitops/applications/custom-domains.yaml'
       - 'deploy/gitops/applications/heterocloud.yaml'
       - 'deploy/gitops/applications/heterocloud-flash.yaml'
+      - 'deploy/gitops/applications/heterocloud-flow.yaml'
       - 'deploy/gitops/applications/cert-manager.yaml'
       - 'deploy/gitops/applications/envoy-gateway.yaml'
       - 'scripts/configure_gateway_rollout.py'
@@ -159,6 +168,13 @@ on:
       - 'scripts/test_reconcile_stopped_wireguard.py'
       - 'scripts/reconcile-stopped-overlay-firewall.py'
       - 'scripts/test_reconcile_stopped_overlay_firewall.py'
+      - 'scripts/prune-terminal-pods.py'
+      - 'scripts/test_prune_terminal_pods.py'
+      - 'scripts/prune-control-plane-releases.py'
+      - 'scripts/test_prune_control_plane_releases.py'
+      - 'scripts/prune-unused-images.py'
+      - 'scripts/test_prune_unused_images.py'
+      - 'scripts/test_flow_capacity.py'
       - 'scripts/verify-heterocloud-iam-rollout.py'
       - 'scripts/test_verify_heterocloud_iam_rollout.py'
       - 'scripts/overlay_power_recovery_e2e.py'
@@ -215,6 +231,10 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_heterocloud_gateway_health_policy.py -v
           python3 -B -m unittest discover -s scripts -p test_node_lifecycle.py -v
           python3 -B -m unittest discover -s scripts -p 'test_reconcile_stopped_*.py' -v
+          python3 -B -m unittest discover -s scripts -p test_prune_terminal_pods.py -v
+          python3 -B -m unittest discover -s scripts -p test_prune_control_plane_releases.py -v
+          python3 -B -m unittest discover -s scripts -p test_prune_unused_images.py -v
+          python3 -B -m unittest discover -s scripts -p test_flow_capacity.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_heterocloud_iam_rollout.py -v
           python3 -B -m unittest discover -s scripts -p test_prepare_console_release.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_console_issuer.py -v

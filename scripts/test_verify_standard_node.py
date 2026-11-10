@@ -14,6 +14,38 @@ spec.loader.exec_module(verifier)
 
 
 class StandardNodeVerifierTest(unittest.TestCase):
+    def test_storage_fixture_requires_matching_claim_uid(self):
+        claim = {'metadata': {'namespace': 'hnn-standard-e2e-123', 'name': 'data', 'uid': 'claim-uid'},
+                 'spec': {'volumeName': 'pvc-fixture'}}
+        volume = {'metadata': {'name': 'pvc-fixture', 'resourceVersion': '9'},
+                  'spec': {'claimRef': {'namespace': 'hnn-standard-e2e-123', 'name': 'data',
+                                        'uid': 'different-uid'},
+                           'persistentVolumeReclaimPolicy': 'Retain',
+                           'csi': {'driver': 'driver.longhorn.io'}}}
+        response = subprocess.CompletedProcess([], 0, json.dumps(claim), '')
+        with patch.object(verifier, 'k', return_value=response) as command, \
+                patch.object(verifier, 'get', return_value=volume):
+            with self.assertRaises(ValueError):
+                verifier.reclaim_test_volume('hnn-standard-e2e-123')
+            self.assertEqual(command.call_count, 1)
+
+    def test_storage_fixture_sets_delete_with_resource_version(self):
+        claim = {'metadata': {'namespace': 'hnn-standard-e2e-123', 'name': 'data', 'uid': 'claim-uid'},
+                 'spec': {'volumeName': 'pvc-fixture'}}
+        volume = {'metadata': {'name': 'pvc-fixture', 'resourceVersion': '9'},
+                  'spec': {'claimRef': {'namespace': 'hnn-standard-e2e-123', 'name': 'data',
+                                        'uid': 'claim-uid'},
+                           'persistentVolumeReclaimPolicy': 'Retain',
+                           'csi': {'driver': 'driver.longhorn.io'}}}
+        response = subprocess.CompletedProcess([], 0, json.dumps(claim), '')
+        with patch.object(verifier, 'k', return_value=response) as command, \
+                patch.object(verifier, 'get', return_value=volume):
+            verifier.reclaim_test_volume('hnn-standard-e2e-123')
+        args = command.call_args.args[0]
+        self.assertEqual(args[:3], ['patch', 'pv', 'pvc-fixture'])
+        self.assertEqual(json.loads(args[-1])['metadata']['resourceVersion'], '9')
+        self.assertEqual(json.loads(args[-1])['spec']['persistentVolumeReclaimPolicy'], 'Delete')
+
     def test_endpoint_requires_matching_usable_address(self):
         slices = {'items': [{'endpoints': [
             {'addresses': ['10.244.1.1'], 'conditions': {'ready': True}},

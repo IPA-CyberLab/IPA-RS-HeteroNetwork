@@ -1,0 +1,52 @@
+- name: Reclaim unused container images
+  hosts: 'master_only:bootstrap:standard:enrollment_issuer'
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the protected image cleanup tool
+      tags: [image_cleanup_preview]
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/prune-unused-images.py"
+        dest: /opt/heteronetwork/libexec/prune-unused-images.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Preview images not referenced by cluster workloads or local containers
+      tags: [image_cleanup_preview]
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /opt/heteronetwork/libexec/prune-unused-images.py]
+      register: image_cleanup_preview
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Report candidate image count and logical size
+      tags: [image_cleanup_preview]
+      ansible.builtin.debug:
+        msg: "{{ image_cleanup_preview.stdout }}"
+      when: not ansible_check_mode
+
+    - name: Reclaim unused images through the container runtime
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /opt/heteronetwork/libexec/prune-unused-images.py, --apply]
+      register: image_cleanup_result
+      changed_when: (image_cleanup_result.stdout | from_json).removed > 0
+      when: not ansible_check_mode
+
+    - name: Report the completed image cleanup
+      ansible.builtin.debug:
+        msg: "{{ image_cleanup_result.stdout }}"
+      when: not ansible_check_mode
+
+    - name: Check the local Kubernetes API after cleanup
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, get, --raw=/readyz]
+      register: image_cleanup_health
+      changed_when: false
+      failed_when: image_cleanup_health.stdout | trim != 'ok'
+      when: not ansible_check_mode

@@ -1,0 +1,84 @@
+- name: Release firmware updater memory when it is idle
+  hosts: 'master_only:bootstrap:standard:enrollment_issuer'
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Detect the firmware updater configuration
+      ansible.builtin.stat:
+        path: /etc/fwupd/fwupd.conf
+        follow: false
+      register: fwupd_config
+
+    - name: Check whether the updater is running
+      ansible.builtin.command:
+        argv: [systemctl, is-active, --quiet, fwupd.service]
+      register: fwupd_active
+      changed_when: false
+      failed_when: fwupd_active.rc not in [0, 3, 4]
+      check_mode: false
+      when: fwupd_config.stat.exists
+
+    - name: Ask the updater to exit after any ongoing update finishes
+      ansible.builtin.command:
+        argv: [timeout, 45s, fwupdmgr, quit]
+      register: fwupd_quit
+      changed_when: fwupd_quit.rc == 0
+      when: fwupd_config.stat.exists and not ansible_check_mode and fwupd_active.rc == 0
+
+    - name: Wait until the updater is no longer running
+      ansible.builtin.command:
+        argv: [systemctl, is-active, --quiet, fwupd.service]
+      register: fwupd_stopped
+      until: fwupd_stopped.rc in [3, 4]
+      retries: 15
+      delay: 2
+      changed_when: false
+      failed_when: fwupd_stopped.rc not in [0, 3, 4]
+      when: fwupd_config.stat.exists and not ansible_check_mode and fwupd_active.rc == 0
+
+    - name: Validate the existing configuration before editing it
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import configparser, os, stat
+        path = '/etc/fwupd/fwupd.conf'
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise SystemExit('firmware updater configuration is not a protected regular file')
+        config = configparser.ConfigParser(interpolation=None, strict=True)
+        config.optionxform = str
+        with open(path) as source:
+            config.read_file(source)
+        if not config.has_section('fwupd'):
+            raise SystemExit('firmware updater section is missing')
+        for section in config.sections():
+            if section != 'fwupd' and any(config.has_option(section, key) for key in ('IdleTimeout', 'IdleInhibitStartupThreshold')):
+                raise SystemExit('idle settings appear in an unexpected section')
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: fwupd_config.stat.exists
+      no_log: true
+
+    - name: Set the idle shutdown delay
+      ansible.builtin.lineinfile:
+        path: /etc/fwupd/fwupd.conf
+        regexp: '^[ \t]*IdleTimeout[ \t]*='
+        line: 'IdleTimeout=30'
+        insertafter: '^\[fwupd\][ \t]*$'
+      when: fwupd_config.stat.exists
+      no_log: true
+
+    - name: Allow idle shutdown even after slow startup
+      ansible.builtin.lineinfile:
+        path: /etc/fwupd/fwupd.conf
+        regexp: '^[ \t]*IdleInhibitStartupThreshold[ \t]*='
+        line: 'IdleInhibitStartupThreshold=0'
+        insertafter: '^\[fwupd\][ \t]*$'
+      when: fwupd_config.stat.exists
+      no_log: true

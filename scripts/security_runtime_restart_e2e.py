@@ -18,7 +18,7 @@ import time
 from types import SimpleNamespace
 
 from security_inventory import atomic_json, utc_now
-from security_runtime_restart import Controller, IMAGE, ready, probe_command
+from security_runtime_restart import Controller, IMAGE, OWNER, ready, probe_command
 from security_runtime_restart_host import require
 
 
@@ -67,10 +67,10 @@ def fixture(controller, node):
     token = secrets.token_hex(16)
     name = 'restart-test-' + token[:12]
     controller.kube('create', '-f', '-', '-o', 'json', body={
-        'apiVersion': 'v1', 'kind': 'PersistentVolumeClaim', 'metadata': {'name': name, 'namespace': namespace},
+        'apiVersion': 'v1', 'kind': 'PersistentVolumeClaim', 'metadata': {'name': name, 'namespace': namespace, 'labels': {OWNER: token}},
         'spec': {'accessModes': ['ReadWriteOnce'], 'resources': {'requests': {'storage': '100Mi'}}}})
     controller.kube('create', '-f', '-', '-o', 'json', body={
-        'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name, 'namespace': namespace},
+        'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name, 'namespace': namespace, 'labels': {OWNER: token}},
         'spec': {'nodeSelector': {'kubernetes.io/hostname': node}, 'runtimeClassName': 'gvisor', 'restartPolicy': 'Always',
                  'automountServiceAccountToken': False, 'terminationGracePeriodSeconds': 5,
                  'securityContext': {'runAsUser': 65532, 'runAsNonRoot': True, 'fsGroup': 65532, 'seccompProfile': {'type': 'RuntimeDefault'}},
@@ -104,6 +104,9 @@ def delete_fixture(controller, pod):
     while controller.get('pod', name, namespace) and time.monotonic() < deadline:
         time.sleep(1)
     require(not controller.get('pod', name, namespace), 'test Pod did not terminate')
+    claim = controller.get('pvc', name, namespace)
+    if claim:
+        controller.reclaim_probe_volume(claim, OWNER, pod['metadata']['labels'][OWNER])
     controller.kube('delete', 'pvc', name, '-n', namespace, '--wait=false', text=True)
 
 
