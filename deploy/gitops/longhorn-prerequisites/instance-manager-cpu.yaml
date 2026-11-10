@@ -1,0 +1,13 @@
+apiVersion: longhorn.io/v1beta2
+kind: Node
+metadata:
+  name: ichikawap1
+  namespace: longhorn-system
+  annotations:
+    # Longhorn owns the node and its disks; this manifest manages only the
+    # reservation and must never prune the existing node or storage.
+    argocd.argoproj.io/sync-options: ServerSideApply=true,Prune=false,Delete=false
+spec:
+  # Millicores. The global percentage would reserve over 12 cores on this
+  # node. Two cores cover the current engine/replica count with headroom.
+  instanceManagerCPURequest: 2000

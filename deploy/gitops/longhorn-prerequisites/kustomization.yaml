@@ -5,3 +5,4 @@ resources:
   - syouyu-storage-class.yaml
   - storage-policy.yaml
   - registry-storage.yaml
+  - instance-manager-cpu.yaml
