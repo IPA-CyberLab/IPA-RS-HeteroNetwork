@@ -43,7 +43,7 @@ class NodeLifecycleTests(unittest.TestCase):
 
     def test_cluster_dns_daemonsets_exclude_declared_stopped_hosts(self):
         directory = ROSTER.parents[3] / "deploy/gitops/cluster-dns"
-        for name in ("nodelocaldns.yaml", "postgres-ha-connector.yaml", "keycloak-ha-connector.yaml"):
+        for name in ("nodelocaldns.yaml", "postgres-ha-connector.yaml", "keycloak-ha-connector.yaml", "service-route.yaml"):
             with self.subTest(name=name):
                 resources = list(yaml.safe_load_all((directory / name).read_text()))
                 daemon = next(item for item in resources if item and item.get("kind") == "DaemonSet")

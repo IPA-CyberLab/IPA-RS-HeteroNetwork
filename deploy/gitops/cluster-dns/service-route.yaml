@@ -24,6 +24,14 @@ spec:
       priorityClassName: system-node-critical
       nodeSelector:
         kubernetes.io/os: linux
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: heteronetwork.io/lifecycle
+                    operator: NotIn
+                    values: ["stopped"]
       tolerations:
         - operator: Exists
         - key: heteronetwork.io/control-plane-only
