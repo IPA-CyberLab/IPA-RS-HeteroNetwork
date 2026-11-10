@@ -12,7 +12,7 @@ spec:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 2
+      maxUnavailable: 1
   template:
     metadata:
       labels:
@@ -26,6 +26,9 @@ spec:
                   - key: heteronetwork.io/control-plane-only
                     operator: NotIn
                     values: ["true"]
+                  - key: heteronetwork.io/lifecycle
+                    operator: NotIn
+                    values: ["stopped"]
       hostPID: true
       priorityClassName: system-node-critical
       tolerations:
