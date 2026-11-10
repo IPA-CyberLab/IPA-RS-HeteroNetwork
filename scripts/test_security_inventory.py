@@ -8,7 +8,7 @@ import subprocess
 import socket
 import os
 
-from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, safe_trivy_report, scoped_registry_auth, validate_host_os
+from security_inventory import atomic_json, deployed_images, metrics, metrics_summary, normalize_trivy, safe_trivy_report, scoped_registry_auth, stopped_inventory_nodes, validate_host_os
 from security_update_gate import assess, fingerprint
 from security_cargo_patch import fixes
 from security_containerd_update import preserved
@@ -25,6 +25,16 @@ from security_runtime_restart import eligible as restart_eligible, memory_bytes,
 
 
 class InventoryTests(unittest.TestCase):
+    def test_only_stopped_cordoned_and_not_ready_nodes_are_excluded(self):
+        def node(name, label='stopped', unschedulable=True, ready='Unknown'):
+            return {'metadata': {'name': name, 'labels': {'heteronetwork.io/lifecycle': label}},
+                    'spec': {'unschedulable': unschedulable},
+                    'status': {'conditions': [{'type': 'Ready', 'status': ready}]}}
+        nodes = [node('stopped'), node('ready', ready='True'), node('uncordoned', unschedulable=False),
+                 node('active', label='active'), node('missing-condition')]
+        nodes[-1]['status']['conditions'] = []
+        self.assertEqual(stopped_inventory_nodes(nodes), {'stopped'})
+
     def test_image_source_revision_is_retained_without_other_labels(self):
         report = {'Metadata': {'ImageConfig': {'config': {'Labels': {'org.opencontainers.image.revision': 'a' * 40, 'secret-label': 'must-not-persist'}, 'Env': ['PRIVATE=value']}}}}
         safe = safe_trivy_report(report)

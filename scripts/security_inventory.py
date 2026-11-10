@@ -30,6 +30,19 @@ def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def stopped_inventory_nodes(nodes):
+    """Exclude only explicitly stopped, cordoned nodes that are not Ready."""
+    stopped = set()
+    for node in nodes:
+        metadata, spec, status = node.get('metadata', {}), node.get('spec', {}), node.get('status', {})
+        ready = [c for c in status.get('conditions', []) if c.get('type') == 'Ready']
+        if (metadata.get('labels', {}).get('heteronetwork.io/lifecycle') == 'stopped'
+                and spec.get('unschedulable') is True and len(ready) == 1
+                and ready[0].get('status') in ('False', 'Unknown') and metadata.get('name')):
+            stopped.add(metadata['name'])
+    return stopped
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -403,16 +416,18 @@ def refresh(args):
             results.append(result)
             print(json.dumps({'source': result['source']['reference'], 'status': result['status'], 'packages': len(result['packages']), 'findings': len(result['findings'])}), flush=True)
             atomic_json(root / 'progress.json', {'observed_at': utc_now(), 'completed_sources': len(results), 'total_sources': len(sources), 'errors': sum(r['status'] == 'error' for r in results)})
+    stopped_nodes = stopped_inventory_nodes(nodes)
     hosts = []
     if args.hosts:
-        hosts = fetch_hosts(json.loads(Path(args.hosts).read_text()), args.ssh_key, args.known_hosts)
+        targets = [host for host in json.loads(Path(args.hosts).read_text()) if host.get('name') not in stopped_nodes]
+        hosts = fetch_hosts(targets, args.ssh_key, args.known_hosts)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             hosts = list(executor.map(lambda h: match_host_packages(h, args.trivy, root / 'cache', root), hosts))
     packages = [p for r in [*results, *hosts] for p in r.get('packages', [])]
     findings = [v for r in [*results, *hosts] for v in r.get('findings', [])]
     errors = [{'source': r.get('source', r.get('node')), 'error': r.get('error', 'scan incomplete')} for r in [*results, *hosts] if r.get('status') != 'complete']
     errors += [{'source': h['node'], 'error': 'host OS package enumeration missing'} for h in hosts if h.get('status') == 'complete' and not any(p.get('ecosystem') in ('ubuntu', 'debian') for p in h.get('packages', []))]
-    missing_hosts = {n['metadata']['name'] for n in nodes} - {h['node'] for h in hosts}
+    missing_hosts = {n['metadata']['name'] for n in nodes} - stopped_nodes - {h['node'] for h in hosts}
     errors += [{'source': node, 'error': 'host inventory missing'} for node in sorted(missing_hosts)]
     max_age = policy['inventory_max_age_seconds']
     for host in hosts:
@@ -431,7 +446,7 @@ def refresh(args):
     errors += [{'source': r['repository'], 'error': r['error']} for r in releases if r['status'] != 'complete']
     catalog, product_errors = product_advisories()
     errors += product_errors
-    report = {'schema_version': 1, 'observed_at': utc_now(), 'status': 'complete' if not errors else 'incomplete', 'sources': [{k: r[k] for k in ['source', 'scanned_at', 'status', 'error'] if k in r} for r in results], 'nodes': [{'name': n['metadata']['name'], 'versions': n['status'].get('nodeInfo'), 'ready': any(c['type'] == 'Ready' and c['status'] == 'True' for c in n['status']['conditions'])} for n in nodes], 'hosts': [{k: h[k] for k in ['node', 'observed_at', 'status', 'binaries', 'active_runtimes', 'kernel', 'gpu_driver', 'error', 'containerd_patch'] if k in h} for h in hosts], 'packages': packages, 'findings': findings, 'errors': errors, 'releases': releases, 'product_advisories': catalog or old.get('product_advisories', [])}
+    report = {'schema_version': 1, 'observed_at': utc_now(), 'status': 'complete' if not errors else 'incomplete', 'sources': [{k: r[k] for k in ['source', 'scanned_at', 'status', 'error'] if k in r} for r in results], 'nodes': [{'name': n['metadata']['name'], 'versions': n['status'].get('nodeInfo'), 'ready': any(c['type'] == 'Ready' and c['status'] == 'True' for c in n['status']['conditions']), 'inventory_excluded_stopped': n['metadata']['name'] in stopped_nodes} for n in nodes], 'hosts': [{k: h[k] for k in ['node', 'observed_at', 'status', 'binaries', 'active_runtimes', 'kernel', 'gpu_driver', 'error', 'containerd_patch'] if k in h} for h in hosts], 'packages': packages, 'findings': findings, 'errors': errors, 'releases': releases, 'product_advisories': catalog or old.get('product_advisories', [])}
     atomic_json(root / 'inventory.json', report)
     write_csv(root / 'oss-cve.csv', packages, findings)
     atomic_json(root / 'metrics.json', metrics_summary(report))

@@ -315,7 +315,7 @@ resource "terraform_data" "host_configuration" {
 resource "terraform_data" "security_inventory" {
   input = { scan_interval_seconds = 900, allow_restart_fallback = true }
   triggers_replace = concat(
-    [filesha256("${path.module}/ansible/security-inventory.yaml")],
+    [filesha256("${path.module}/ansible/security-inventory.yaml"), sha256(jsonencode(local.inventory))],
     [for f in sort(tolist(fileset(local.repo_root, "scripts/security_*.py"))) : filesha256("${local.repo_root}/${f}")],
     [for f in sort(tolist(fileset(local.repo_root, "deploy/security/*"))) : filesha256("${local.repo_root}/${f}")]
   )
