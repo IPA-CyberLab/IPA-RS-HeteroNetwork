@@ -27,6 +27,9 @@ spec:
                   - key: heteronetwork.io/control-plane-only
                     operator: NotIn
                     values: ["true"]
+                  - key: heteronetwork.io/lifecycle
+                    operator: NotIn
+                    values: ["stopped"]
       automountServiceAccountToken: false
       nodeSelector:
         kubernetes.io/os: linux

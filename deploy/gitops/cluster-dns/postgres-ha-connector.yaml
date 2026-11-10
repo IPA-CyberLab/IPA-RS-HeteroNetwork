@@ -28,6 +28,9 @@ spec:
                   - key: heteronetwork.io/control-plane-only
                     operator: NotIn
                     values: ["true"]
+                  - key: heteronetwork.io/lifecycle
+                    operator: NotIn
+                    values: ["stopped"]
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       priorityClassName: system-node-critical
@@ -120,7 +123,8 @@ metadata:
   name: postgres-ha-connector
   namespace: kube-system
 spec:
-  minAvailable: 3
+  # Both available application hosts must retain a working connector.
+  minAvailable: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: postgres-ha-connector
