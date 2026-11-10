@@ -51,6 +51,7 @@ metadata:
     networking.heteronetwork.io/turn-ingress: 'true'
     dns.heteronetwork.io/discovery: 'true'
     networking.heteronetwork.io/overlay-dns-sync: 'true'
+    heteronetwork.io/lifecycle: active
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'
@@ -64,6 +65,7 @@ metadata:
     networking.heteronetwork.io/turn-ingress: 'true'
     dns.heteronetwork.io/discovery: 'true'
     networking.heteronetwork.io/overlay-dns-sync: 'true'
+    heteronetwork.io/lifecycle: active
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     argocd.argoproj.io/sync-wave: '0'

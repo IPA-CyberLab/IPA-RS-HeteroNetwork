@@ -111,6 +111,7 @@ class NodeLifecycleTests(unittest.TestCase):
                 node = next(r for r in resources if r["apiVersion"] == "v1" and r["metadata"]["name"] == "uc-k8sp4")
                 storage = next(r for r in resources if r["apiVersion"].startswith("longhorn.io/") and r["metadata"]["name"] == "uc-k8sp4")
                 self.assertEqual(node["spec"]["unschedulable"], state == "stopped")
+                self.assertEqual(node["metadata"]["labels"]["heteronetwork.io/lifecycle"], state)
                 self.assertEqual(storage["spec"]["allowScheduling"], state == "active")
                 if state == "stopped":
                     self.assertEqual(node["metadata"]["labels"]["networking.heteronetwork.io/turn-ingress"], "false")

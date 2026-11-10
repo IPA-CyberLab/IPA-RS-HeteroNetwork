@@ -17,6 +17,8 @@ def apply_lifecycle(resources):
     for resource in resources:
         name = resource['metadata']['name']
         if name not in stopped:
+            if resource['apiVersion'] == 'v1' and resource['kind'] == 'Node':
+                resource['metadata'].setdefault('labels', {})['heteronetwork.io/lifecycle'] = 'active'
             continue
         if resource['apiVersion'] == 'v1' and resource['kind'] == 'Node':
             labels = resource['metadata'].setdefault('labels', {})

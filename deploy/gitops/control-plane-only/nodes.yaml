@@ -8,6 +8,7 @@ metadata:
     node.kubernetes.io/exclude-from-external-load-balancers: ''
     heteronetwork.io/control-plane-only: 'true'
     networking.heteronetwork.io/public-ingress: 'false'
+    heteronetwork.io/lifecycle: active
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'false'
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -36,6 +37,7 @@ metadata:
     node.kubernetes.io/exclude-from-external-load-balancers: ''
     heteronetwork.io/control-plane-only: 'true'
     networking.heteronetwork.io/public-ingress: 'false'
+    heteronetwork.io/lifecycle: active
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'false'
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
@@ -64,6 +66,7 @@ metadata:
     node.kubernetes.io/exclude-from-external-load-balancers: ''
     heteronetwork.io/control-plane-only: 'true'
     networking.heteronetwork.io/public-ingress: 'false'
+    heteronetwork.io/lifecycle: active
   annotations:
     networking.heteronetwork.io/public-ingress-enabled: 'false'
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
