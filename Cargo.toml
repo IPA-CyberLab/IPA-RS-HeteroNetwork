@@ -84,3 +84,8 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+# Release binaries run on every node. Keep debug builds unchanged while
+# omitting non-runtime symbol tables from distributed executables.
+[profile.release]
+strip = "symbols"

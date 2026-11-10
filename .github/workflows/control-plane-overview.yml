@@ -74,6 +74,16 @@ jobs:
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Build the tested control-plane server
         run: cargo build --locked --release -p ipars-daemon --bin iparsd
+      - name: Verify the smaller server still starts
+        run: |
+          set -euo pipefail
+          target/release/iparsd --help >/dev/null
+          readelf -SW target/release/iparsd > "$RUNNER_TEMP/iparsd-sections.txt"
+          if grep -Eq '[[:space:]]\.symtab[[:space:]]' "$RUNNER_TEMP/iparsd-sections.txt"; then
+            echo 'Release executable still contains its full symbol table' >&2
+            exit 1
+          fi
+          stat --format='Control-plane binary: %s bytes' target/release/iparsd
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: overview-native-server
