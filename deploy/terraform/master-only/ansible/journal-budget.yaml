@@ -1,0 +1,55 @@
+- name: Bound and reclaim node journal storage
+  hosts: 'master_only:bootstrap:standard:enrollment_issuer'
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Create the journald configuration directory
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Persist the journal storage budget
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/90-heteronetwork-resources.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Journal]
+          SystemMaxUse=128M
+          SystemMaxFileSize=16M
+          RuntimeMaxUse=32M
+          MaxRetentionSec=7day
+      register: journal_budget_config
+
+    - name: Load the new budget
+      ansible.builtin.systemd_service:
+        name: systemd-journald.service
+        state: restarted
+      when: journal_budget_config.changed and not ansible_check_mode
+
+    - name: Rotate the current journal before reclaiming archived files
+      ansible.builtin.command:
+        argv: [journalctl, --rotate]
+      changed_when: true
+      when: not ansible_check_mode
+
+    - name: Reclaim archived journals beyond the requested limit
+      ansible.builtin.command:
+        argv: [journalctl, --vacuum-size=128M, --vacuum-time=7d]
+      changed_when: true
+      when: not ansible_check_mode
+
+    - name: Report the retained journal size
+      ansible.builtin.command:
+        argv: [journalctl, --disk-usage]
+      changed_when: false
+      when: not ansible_check_mode

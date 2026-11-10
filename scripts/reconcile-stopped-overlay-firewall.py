@@ -6,6 +6,8 @@ import fcntl
 import ipaddress
 import json
 from pathlib import Path
+import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -13,6 +15,15 @@ import sys
 from node_lifecycle import stopped_hosts
 
 CHAIN = "HNN-STOPPED-PEERS"
+ANCHOR_PREFIX = "hnn-stopped-"
+
+
+def managed_hook(rule, hook):
+    if rule == ["-A", hook, "-j", CHAIN]:
+        return True
+    return (len(rule) == 8 and rule[:5] == ["-A", hook, "-m", "comment", "--comment"]
+            and re.fullmatch(ANCHOR_PREFIX + r"[0-9a-f]{16}", rule[5]) is not None
+            and rule[6:] == ["-j", CHAIN])
 
 
 def stopped_addresses(roster):
@@ -39,21 +50,35 @@ def reconcile(roster, run=subprocess.run):
     if created.returncode not in (0, 1):
         raise RuntimeError("failed to create stopped-node firewall chain")
     listed = run(["iptables", "-S", CHAIN], capture_output=True, text=True, timeout=10, check=True)
-    lines = ["*filter", f":{CHAIN} - [0:0]", f"-F {CHAIN}"]
+    chain_lines = [f":{CHAIN} - [0:0]", f"-F {CHAIN}"]
     expected_rules = []
     for address in addresses:
         rules = (f"-A {CHAIN} -s {address} -j DROP", f"-A {CHAIN} -d {address} -j DROP")
-        lines.extend(rules)
+        chain_lines.extend(rules)
         expected_rules.extend(shlex.split(rule) for rule in rules)
-    lines.extend(("COMMIT", ""))
     current_rules = [shlex.split(line) for line in listed.stdout.splitlines() if line.startswith(f"-A {CHAIN} ")]
+    lines = ["*filter"]
     if current_rules != expected_rules:
-        run(["iptables-restore", "--noflush"], input="\n".join(lines), capture_output=True, text=True, timeout=10, check=True)
+        lines.extend(chain_lines)
     for hook in ("INPUT", "OUTPUT", "FORWARD"):
         listed = run(["iptables", "-S", hook], capture_output=True, text=True, timeout=10, check=True)
         rules = [shlex.split(line) for line in listed.stdout.splitlines() if line.startswith(f"-A {hook} ")]
-        if not rules or rules[0] != ["-A", hook, "-j", CHAIN]:
-            run(["iptables", "-I", hook, "1", "-j", CHAIN], capture_output=True, text=True, timeout=10, check=True)
+        existing = [rule for rule in rules if managed_hook(rule, hook)]
+        if len(existing) == 1 and rules[0] == existing[0]:
+            continue
+        # A uniquely tagged replacement stays in place while exact matches of
+        # old managed jumps are removed. Apply all changes in one transaction:
+        # there is no interval without the fence and unrelated rules survive.
+        while True:
+            tag = ANCHOR_PREFIX + secrets.token_hex(8)
+            if all(tag not in rule for rule in existing):
+                break
+        lines.append(shlex.join(["-I", hook, "1", "-m", "comment", "--comment", tag, "-j", CHAIN]))
+        lines.extend(shlex.join(["-D", hook, *rule[2:]]) for rule in existing)
+    if len(lines) > 1:
+        lines.extend(("COMMIT", ""))
+        run(["iptables-restore", "--noflush"], input="\n".join(lines),
+            capture_output=True, text=True, timeout=180, check=True)
     return len(addresses)
 
 

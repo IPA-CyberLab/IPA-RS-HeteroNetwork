@@ -30,7 +30,7 @@ class StoppedOverlayFirewallTest(unittest.TestCase):
         self.assertIn("-d 10.250.0.11/32 -j DROP", payload)
         self.assertNotIn("10.250.0.2", payload)
         for hook in ("INPUT", "OUTPUT", "FORWARD"):
-            self.assertTrue(any(argv == ["iptables", "-I", hook, "1", "-j", firewall.CHAIN] for argv, _ in self.calls))
+            self.assertRegex(payload, rf"-I {hook} 1 -m comment --comment hnn-stopped-[0-9a-f]{{16}} -j {firewall.CHAIN}")
 
     def test_resuming_node_removes_its_fence(self):
         self.roster["node_states"]["uc-k8sp4"] = {"state": "active"}
@@ -62,6 +62,43 @@ class StoppedOverlayFirewallTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             firewall.reconcile(self.roster, self.run_command)
         self.assertEqual(self.calls, [])
+
+    def test_duplicate_hooks_are_removed_atomically_without_touching_other_rules(self):
+        def duplicated(argv, **kwargs):
+            self.calls.append((argv, kwargs.get("input")))
+            output = ""
+            if argv == ["iptables", "-S", firewall.CHAIN]:
+                output = (f"-A {firewall.CHAIN} -s 10.250.0.11/32 -j DROP\n"
+                          f"-A {firewall.CHAIN} -d 10.250.0.11/32 -j DROP\n")
+            elif argv[:2] == ["iptables", "-S"]:
+                hook = argv[2]
+                output = (f"-A {hook} -j UNRELATED\n"
+                          + f"-A {hook} -j {firewall.CHAIN}\n" * 3000
+                          + f"-A {hook} -m comment --comment hnn-stopped-0123456789abcdef -j {firewall.CHAIN}\n")
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        self.assertEqual(firewall.reconcile(self.roster, duplicated), 1)
+        restores = [(argv, payload) for argv, payload in self.calls if argv[0] == "iptables-restore"]
+        self.assertEqual(len(restores), 1)
+        payload = restores[0][1]
+        self.assertNotIn("UNRELATED", payload)
+        for hook in ("INPUT", "OUTPUT", "FORWARD"):
+            self.assertEqual(payload.count(f"-D {hook} -j {firewall.CHAIN}\n"), 3000)
+            self.assertIn(f"-D {hook} -m comment --comment hnn-stopped-0123456789abcdef -j {firewall.CHAIN}", payload)
+            self.assertRegex(payload, rf"-I {hook} 1 -m comment --comment hnn-stopped-[0-9a-f]{{16}} -j {firewall.CHAIN}")
+
+    def test_existing_tagged_anchor_is_idempotent(self):
+        def tagged(argv, **kwargs):
+            self.calls.append((argv, kwargs.get("input")))
+            if argv == ["iptables", "-S", firewall.CHAIN]:
+                output = (f"-A {firewall.CHAIN} -s 10.250.0.11/32 -j DROP\n"
+                          f"-A {firewall.CHAIN} -d 10.250.0.11/32 -j DROP\n")
+            elif argv[:2] == ["iptables", "-S"]:
+                output = f"-A {argv[2]} -m comment --comment hnn-stopped-0123456789abcdef -j {firewall.CHAIN}\n"
+            else:
+                output = ""
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        self.assertEqual(firewall.reconcile(self.roster, tagged), 1)
+        self.assertFalse(any(argv[0] == "iptables-restore" for argv, _ in self.calls))
 
     def test_shared_address_fails_before_mutation(self):
         stopped = next(p for p in self.roster["peers"] if p["hostname"] == "uc-k8sp4")
