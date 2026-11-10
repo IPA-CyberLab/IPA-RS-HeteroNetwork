@@ -41,6 +41,17 @@ class NodeLifecycleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gateway_ips(path)
 
+    def test_node_local_dns_excludes_declared_stopped_hosts(self):
+        path = ROSTER.parents[3] / "deploy/gitops/cluster-dns/nodelocaldns.yaml"
+        resources = list(yaml.safe_load_all(path.read_text()))
+        dns = next(item for item in resources if item and item.get("kind") == "DaemonSet")
+        affinity = dns["spec"]["template"]["spec"]["affinity"]["nodeAffinity"]
+        terms = affinity["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        self.assertTrue(terms)
+        for term in terms:
+            self.assertIn({"key": "heteronetwork.io/lifecycle", "operator": "NotIn", "values": ["stopped"]},
+                          term["matchExpressions"])
+
     def test_stopped_local_host_cannot_rebuild_a_live_vpn_map(self):
         spec = importlib.util.spec_from_file_location("stopped_boot", Path(__file__).with_name("reconcile-overlay-boot.py"))
         boot = importlib.util.module_from_spec(spec)

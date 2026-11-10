@@ -135,6 +135,16 @@ spec:
       enableServiceLinks: true
       nodeSelector:
         kubernetes.io/os: linux
+      # A declared-stopped node must not consume maxUnavailable forever and
+      # prevent healthy nodes from receiving DNS configuration updates.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: heteronetwork.io/lifecycle
+                    operator: NotIn
+                    values: [stopped]
       tolerations:
         - key: CriticalAddonsOnly
           operator: Exists
