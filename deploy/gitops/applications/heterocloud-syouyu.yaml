@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
-    targetRevision: v0.1.6
+    targetRevision: d5d34ac77da519a6953b33231f9a765d57f81d12
     path: deploy/helm/heterocloud-syouyu
     helm:
       releaseName: heterocloud-syouyu
@@ -56,6 +56,10 @@ spec:
           audience: heterocloud-syouyu-data
           maxTokenTtlSeconds: 300
 
+        # The third Garage role shares one worker's failure domain.
+        layoutBootstrap:
+          enabled: true
+
         garage:
           replicaCount: 3
           resources:
@@ -84,7 +88,7 @@ spec:
             zones:
               - heteronet-storage-a
               - heteronet-storage-b
-              - heteronet-storage-c
+              - heteronet-storage-b # ordinal 2 shares uc-k8sp5's failure domain
             tags:
               - syouyu
               - longhorn
@@ -95,7 +99,7 @@ spec:
             enabled: false
           scheduling:
             topologyKey: kubernetes.io/hostname
-            antiAffinity: required
+            antiAffinity: preferred
             affinity:
               nodeAffinity:
                 requiredDuringSchedulingIgnoredDuringExecution:
@@ -105,12 +109,11 @@ spec:
                           operator: In
                           values:
                             - ichikawap1
-                            - uc-k8sp4
                             - uc-k8sp5
             topologySpread:
               enabled: true
               maxSkew: 1
-              whenUnsatisfiable: DoNotSchedule
+              whenUnsatisfiable: ScheduleAnyway
 
         pdb:
           api:
@@ -156,10 +159,6 @@ spec:
             - ipBlock:
                 cidr: 10.244.4.1/32
             - ipBlock:
-                cidr: 10.244.5.0/32 # uc-k8sp4
-            - ipBlock:
-                cidr: 10.244.5.1/32
-            - ipBlock:
                 cidr: 10.244.6.0/32 # ichikawap1
             - ipBlock:
                 cidr: 10.244.6.1/32
@@ -176,7 +175,6 @@ spec:
             - 10.96.0.0/12
             # kube-router evaluates egress after Service DNAT to API endpoints.
             - 10.250.0.10/32
-            - 10.250.0.11/32
             - 10.250.0.2/32
             - 10.250.0.4/32
             - 10.250.0.5/32

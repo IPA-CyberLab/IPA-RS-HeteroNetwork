@@ -13,6 +13,14 @@ HERE=Path(__file__).resolve().parent
 class MajorityTests(unittest.TestCase):
     def setUp(self):
         self.config=json.loads((HERE/'pool.json').read_text());self.config['enabled']=True
+        # Tests use a synthetic three-voter topology, independent of the live
+        # inventory, so retiring a production node does not delete coverage.
+        self.config['members']=[
+            {'id':'ichikawap1','node':'ichikawap1','vote_resource':'public-dns-vote-ichikawap1'},
+            {'id':'simulated-worker','node':'simulated-worker','vote_resource':'public-dns-vote-simulated-worker'},
+            {'id':'uc-k8sp5','node':'uc-k8sp5','vote_resource':'public-dns-vote-uc-k8sp5'}]
+        self.config['origins']=[{'id':'ichikawap1','address':'163.220.236.61'},
+                                {'id':'simulated-worker','address':'163.220.236.45'}]
         self.config['down_samples']=3;self.config['up_samples']=2
         self.published=['163.220.236.61'];self.now=1000.0;self.serial=0
     def votes(self, unhealthy=(), voters=None):
@@ -30,11 +38,11 @@ class MajorityTests(unittest.TestCase):
         return {'apiVersion':'externaldns.k8s.io/v1alpha1','kind':'DNSEndpoint','metadata':{'name':self.config['dns_resource'],'namespace':self.config['dns_namespace'],'uid':'endpoint-uid','resourceVersion':'10','labels':{'dns.heterocloud.io/publish':'true'}},'spec':{'endpoints':[{'dnsName':n,'recordType':'A','recordTTL':60,'targets':self.published} for n in self.config['records']]}}
     def test_second_origin_requires_two_new_majority_samples(self):
         s,d,r=self.round();self.assertEqual(d,['163.220.236.61'])
-        s,d,r=self.round(s);self.assertEqual(d,['163.220.236.54','163.220.236.61'])
+        s,d,r=self.round(s);self.assertEqual(d,['163.220.236.45','163.220.236.61'])
     def test_same_votes_cannot_be_counted_repeatedly(self):
         votes=self.votes();state=None
         for _ in range(8):state,d,r=q.decide(self.config,votes,state,self.published,self.now)
-        self.assertEqual(d,self.published);self.assertEqual(state['origins']['uc-k8sp4']['streak'],1)
+        self.assertEqual(d,self.published);self.assertEqual(state['origins']['simulated-worker']['streak'],1)
     def test_one_voters_repeated_samples_cannot_form_new_majority_rounds(self):
         votes=self.votes();state,d,r=q.decide(self.config,votes,None,self.published,self.now)
         for _ in range(8):
@@ -47,15 +55,29 @@ class MajorityTests(unittest.TestCase):
         self.assertIn('163.220.236.61',d);self.assertEqual(r['origins']['ichikawap1']['healthy_votes'],2)
     def test_majority_failure_withdraws_only_failed_origin_and_recovers(self):
         s,d,r=self.round();s,d,r=self.round(s)
-        bad=[('ichikawap1','ichikawap1'),('uc-k8sp4','ichikawap1')]
+        bad=[('ichikawap1','ichikawap1'),('simulated-worker','ichikawap1')]
         for _ in range(2):s,d,r=self.round(s,bad);self.assertIn('163.220.236.61',d)
-        s,d,r=self.round(s,bad);self.assertEqual(d,['163.220.236.54'])
-        s,d,r=self.round(s);self.assertEqual(d,['163.220.236.54'])
-        s,d,r=self.round(s);self.assertEqual(d,['163.220.236.54','163.220.236.61'])
+        s,d,r=self.round(s,bad);self.assertEqual(d,['163.220.236.45'])
+        s,d,r=self.round(s);self.assertEqual(d,['163.220.236.45'])
+        s,d,r=self.round(s);self.assertEqual(d,['163.220.236.45','163.220.236.61'])
     def test_missing_majority_retains_last_dns_without_shrinking_denominator(self):
         s,d,r=self.round(voters=['ichikawap1']);self.assertEqual(d,self.published)
         self.assertEqual(r['majority_required'],2);self.assertEqual(r['fresh_voters'],1)
         self.assertEqual(r['origins']['ichikawap1']['decision'],'unknown')
+    def test_two_voters_require_both_independent_observations(self):
+        self.config['members']=self.config['members'][:2]
+        self.config['origins']=self.config['origins'][:1]
+        q.validate_config(self.config)
+        state,targets,status=self.round(voters=['ichikawap1'])
+        self.assertEqual(targets,['163.220.236.61'])
+        self.assertEqual(status['majority_required'],2)
+        self.assertEqual(status['origins']['ichikawap1']['decision'],'unknown')
+        for _ in range(3):
+            state,targets,status=self.round(state,unhealthy=[('ichikawap1','ichikawap1')])
+        self.assertEqual(targets,['163.220.236.61'])
+        self.assertEqual(status['origins']['ichikawap1']['decision'],'unknown')
+        with self.assertRaises(ValueError):
+            q.validate_config({**self.config,'members':self.config['members'][:1]})
     def test_expired_votes_are_unknown_not_unhealthy(self):
         votes=self.votes();state,d,r=q.decide(self.config,votes,None,self.published,self.now+31)
         self.assertEqual(d,self.published);self.assertEqual(r['fresh_voters'],0)
@@ -95,14 +117,14 @@ class MajorityTests(unittest.TestCase):
         self.assertEqual(d,[]);self.assertTrue(r['all_down'])
         s,d,r=self.round(s);s,d,r=self.round(s);self.assertEqual(len(d),2)
     def test_patch_has_uid_version_and_entry_preconditions(self):
-        endpoint=self.endpoint();ops=q.dns_patch(self.config,endpoint,['163.220.236.54'])
+        endpoint=self.endpoint();ops=q.dns_patch(self.config,endpoint,['163.220.236.45'])
         self.assertEqual(ops[0]['path'],'/metadata/resourceVersion');self.assertEqual(ops[1]['path'],'/metadata/uid')
         self.assertTrue(all(x['path'].endswith('/targets') for x in ops if x['op']=='replace'))
         self.assertEqual(sum(x['op']=='replace' for x in ops),5)
     def test_unmanaged_private_record_and_record_settings_are_preserved(self):
-        endpoint=self.endpoint();private={'dnsName':'secrets.heterocloud.mizuame.app','recordType':'A','targets':['10.250.0.10','10.250.0.11']}
+        endpoint=self.endpoint();private={'dnsName':'secrets.heterocloud.mizuame.app','recordType':'A','targets':['10.250.0.10','10.250.0.12']}
         endpoint['spec']['endpoints'].insert(2,private)
-        ops=q.dns_patch(self.config,endpoint,['163.220.236.54'])
+        ops=q.dns_patch(self.config,endpoint,['163.220.236.45'])
         self.assertFalse(any(x['path'].startswith('/spec/endpoints/2') for x in ops))
         self.assertFalse(any(x['path'].endswith('/recordTTL') for x in ops))
     def test_missing_duplicate_unknown_target_or_wrong_owner_rejects_dns_patch(self):
@@ -114,7 +136,7 @@ class MajorityTests(unittest.TestCase):
             elif kind=='owner':e['metadata']['name']='foreign-record'
             elif kind=='type':e['spec']['endpoints'][0]['recordType']='CNAME'
             else:e['metadata']['deletionTimestamp']='2026-10-06T00:00:00Z'
-            with self.subTest(kind=kind),self.assertRaises(ValueError):q.dns_patch(self.config,e,['163.220.236.54'])
+            with self.subTest(kind=kind),self.assertRaises(ValueError):q.dns_patch(self.config,e,['163.220.236.45'])
     def test_duplicate_node_and_invalid_probe_or_private_origin_rejected(self):
         for kind in ['node','resource','ip','hostname','path','timeout','bool']:
             c=copy.deepcopy(self.config)

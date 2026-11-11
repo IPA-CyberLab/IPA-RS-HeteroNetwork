@@ -17,7 +17,13 @@ def files():
            'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py','scripts/ensure-flash-ssh-host-key.py','scripts/test_ensure_flash_ssh_host_key.py',
            'scripts/verify-storage-redundancy.py','scripts/test_verify_storage_redundancy.py',
            'scripts/reconcile-overlay-boot.py','scripts/test_reconcile_overlay_boot.py','scripts/overlay_power_recovery_e2e.py',
-           'scripts/node_lifecycle.py','scripts/test_node_lifecycle.py','scripts/reconcile-node-lifecycle.py',
+           'scripts/node_lifecycle.py','scripts/node_test_fixtures.py','scripts/test_node_lifecycle.py','scripts/reconcile-node-lifecycle.py',
+           'scripts/retire_hn_registration.py','scripts/test_retire_hn_registration.py',
+           'scripts/retire_node_inventory.py','scripts/test_retire_node_inventory.py',
+           'scripts/retire_node_kubernetes.py','scripts/test_retire_node_kubernetes.py',
+           'scripts/retire_lost_garage_volume.py','scripts/test_retire_lost_garage_volume.py',
+           'scripts/retire_database_member.py','scripts/test_retire_database_member.py',
+           'scripts/prune_retired_garage_volumes.py',
            'scripts/prune-terminal-pods.py','scripts/test_prune_terminal_pods.py',
            'scripts/prune-control-plane-releases.py','scripts/test_prune_control_plane_releases.py',
            'scripts/prune-unused-images.py','scripts/test_prune_unused_images.py',
@@ -75,14 +81,16 @@ def files():
            'deploy/environments/heteronet/values.yaml','deploy/gitops/project.yaml']
     paths += ['deploy/gitops/applications/'+n+'.yaml' for n in
               ['cluster-dns','network-policy-engine','longhorn','longhorn-prerequisites','flash-web','heterocloud-edge','openbao',
-               'heterocloud','heterocloud-flash','heterocloud-flow']]
+               'heterocloud','heterocloud-flash','heterocloud-flow','heterocloud-syouyu','heterocloud-vpc',
+               'heterocloud-vpc-egress','public-dns-quorum']]
     paths += ['deploy/gitops/cluster-dns/nodelocaldns.yaml','deploy/gitops/cluster-dns/keycloak-ha-connector.yaml',
               'deploy/gitops/cluster-dns/postgres-ha-connector.yaml','deploy/gitops/cluster-dns/service-route.yaml',
               'deploy/gitops/network-policy-engine/kube-router.yaml','deploy/gitops/longhorn-prerequisites/node-prerequisites.yaml',
               'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml',
-              'deploy/gitops/envoy-gateway/kustomization.yaml','deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml',
+              'deploy/gitops/envoy-gateway/kustomization.yaml','deploy/gitops/envoy-gateway/public-web-dns.yaml',
+              'deploy/gitops/envoy-gateway/README.md','deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml',
               'deploy/gitops/envoy-gateway/flash-ssh-backend-traffic-policy.yaml']
-    for directory in ['deploy/terraform/master-only','deploy/terraform/github-dr-environment','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns','scripts/storage-heartbeat-e2e']:
+    for directory in ['deploy/terraform/master-only','deploy/terraform/github-dr-environment','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns','deploy/gitops/public-dns-quorum','deploy/gitops/custom-domains','scripts/storage-heartbeat-e2e']:
         for p in (ROOT/directory).rglob('*'):
             if not p.is_file() or '.terraform' in p.parts or '__pycache__' in p.parts: continue
             if p.suffix in ['.tf','.py','.yaml','.j2','.json','.md','.cfg','.sh'] or p.name=='.terraform.lock.hcl':

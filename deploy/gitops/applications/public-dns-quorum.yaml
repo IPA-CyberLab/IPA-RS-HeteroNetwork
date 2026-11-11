@@ -22,11 +22,6 @@ spec:
     - /data
   - kind: ConfigMap
     namespace: heterocloud-dns
-    name: public-dns-vote-uc-k8sp4
-    jsonPointers:
-    - /data
-  - kind: ConfigMap
-    namespace: heterocloud-dns
     name: public-dns-vote-uc-k8sp5
     jsonPointers:
     - /data

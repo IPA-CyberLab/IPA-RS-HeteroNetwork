@@ -27,14 +27,12 @@ spec:
           vpcGuardCidrs:
             - 10.250.0.2/32
             - 10.250.0.10/32
-            - 10.250.0.11/32
           additionalProtectedCidrs:
             - 163.220.236.0/24
           dnsCidrs:
             - 10.96.0.10/32
           secretManagerCidrs:
             - 10.250.0.10/32
-            - 10.250.0.11/32
         capacity:
           enabled: true
           image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash-capacity:2521c9b17559112200463636f0a1185a91280280@sha256:9ff694bdb3b5859c1124205ecfc3f374f14d650485d38ba2dd718280f4eb9e5a"

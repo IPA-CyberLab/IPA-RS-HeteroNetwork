@@ -2,7 +2,7 @@
 
 See [user/API/CLI instructions](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud/blob/master/docs/networking/custom-domains.md).
 
-Terraform creates the Argo CD application and enables cert-manager Gateway API support. `site.json` contains site-specific names; the collector itself does not contain a production API endpoint. Two replicas run on uc-k8sp4 and uc-k8sp5, outside the dedicated Secret Manager masters.
+Terraform creates the Argo CD application and enables cert-manager Gateway API support. `site.json` contains site-specific names; the collector itself does not contain a production API endpoint. Two replicas run on ichikawap1 and uc-k8sp5, outside the dedicated Secret Manager masters.
 
 The controller verifies CNAME delegation to the requesting service using two public DNS resolvers. Flattened aliases require a service-specific TXT proof and matching public destination addresses. It provisions namespaced Certificates through the HTTP-01 ClusterIssuer and publishes only verified hostnames and their certificates to the gateway bundle. The collector cannot read the DNS-provider credentials or tenant secrets.
 

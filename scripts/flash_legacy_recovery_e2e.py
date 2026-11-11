@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--kubectl', required=True)
     parser.add_argument('--kubeconfig', required=True)
     parser.add_argument('--image', required=True)
-    parser.add_argument('--node', default='uc-k8sp4')
+    parser.add_argument('--node', default='uc-k8sp5')
     parser.add_argument('--report', type=Path, required=True)
     args = parser.parse_args()
     if not re.fullmatch(r'ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash(?::[^@]+)?@sha256:[a-f0-9]{64}', args.image):

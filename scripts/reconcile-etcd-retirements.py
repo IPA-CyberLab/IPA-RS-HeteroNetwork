@@ -131,11 +131,11 @@ def validate_snapshot(item, directory, now):
 
 
 class Cluster:
-    def __init__(self, kubeconfig, executor):
-        self.kubeconfig, self.executor = kubeconfig, executor
+    def __init__(self, kubeconfig, executor, kubectl="kubectl"):
+        self.kubeconfig, self.executor, self.kubectl = kubeconfig, executor, kubectl
 
     def kube(self, *args):
-        result = subprocess.run(["kubectl", "--kubeconfig", self.kubeconfig,
+        result = subprocess.run([self.kubectl, "--kubeconfig", self.kubeconfig,
                                  "--request-timeout=50s", *args],
                                 capture_output=True, text=True, timeout=60)
         if result.returncode:
@@ -167,6 +167,9 @@ def main():
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
     intent, roster = json.loads(args.intent.read_text()), json.loads(args.roster.read_text())
+    if intent.get("schema_version") == 1 and intent.get("retirements") == []:
+        print(json.dumps({"result": "no_pending_retirements"}))
+        return
     item = validate_intent(intent, roster)
     cluster = Cluster(args.kubeconfig, intent["executor_node"])
     members = cluster.members()

@@ -268,6 +268,29 @@
       no_log: true
       when: postgres_role == 'dcs-only'
 
+    # With two voters each voter is required for quorum. Do not silently
+    # restart either DCS or its Patroni process on a routine Terraform apply.
+    # A reviewed membership reload must first install and validate the new
+    # bundle on both members; a third voter is required for rolling restarts.
+    - name: Protect two-voter DCS from a disruptive automatic reconciliation
+      ansible.builtin.assert:
+        that:
+          - >-
+            (groups['postgres_members'] | length + groups['postgres_dcs_only'] | length) > 2 or
+            not (hnn_database_helper.changed or
+                 (postgres_role == 'member' and (
+                   hnn_database_member_bundle.changed or
+                   not hnn_database_member_unit.stat.exists or
+                   hnn_database_proxy_drift | default(true) | bool)) or
+                 (postgres_role == 'dcs-only' and (
+                   hnn_database_dcs_bundle.results | default([]) |
+                   selectattr('changed') | list | length > 0 or
+                   not hnn_database_dcs_unit.stat.exists)))
+        fail_msg: >-
+          A two-voter DCS needs both voters for quorum. Apply a verified live
+          membership reload or add a third voter before restarting a voter.
+      when: not ansible_check_mode
+
     - name: Reconcile the declared PostgreSQL or DCS role
       ansible.builtin.shell: |
         set -a

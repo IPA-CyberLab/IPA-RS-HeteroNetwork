@@ -3,7 +3,6 @@
   "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
   "hosts": {
     "uc-k8sp1": "node-af375fc07e62d98e36d0ba0bfdcbea51",
-    "uc-k8sp4": "node-30c455638eba4281a25bb8ec2c8b742b",
     "uc-k8sp5": "node-d295b84052d4a78d647b9b704c00c13e",
     "ichikawap1": "node-010adc8f711b1982b3f0d0870d54431e",
     "uc-k8sp2": "node-9befa279a7f75a740e5fb4e3b58ca9ee",
@@ -60,60 +59,6 @@
       },
       "routes": [],
       "registered_at": "2026-08-11T09:33:23.185796874Z"
-    },
-    {
-      "node_id": "node-30c455638eba4281a25bb8ec2c8b742b",
-      "hostname": "uc-k8sp4",
-      "cluster_id": "15c41a1b-428d-415d-80f6-9b7e10ff92b2",
-      "vpn_ip": "10.250.0.11",
-      "identity_public_key": "b006Zhq9VJP714nlwPyLR+kizn0HMh5lxc+fIvT+gvY=",
-      "wireguard_public_key": "UGuKtpuVB7spVjCCXbHnOrkHjLqYPBvCWhByUAQmsEY=",
-      "role": "worker",
-      "tags": [
-        "kubernetes-control-plane",
-        "kubernetes-ha-545a7a1911f9580a"
-      ],
-      "endpoint_candidates": [
-        {
-          "node_id": "node-30c455638eba4281a25bb8ec2c8b742b",
-          "kind": "public_udp",
-          "addr": "163.220.236.54:51820",
-          "observed_at": "2026-10-23T11:13:01.609693739Z",
-          "priority": 80,
-          "cost": 20,
-          "source": "stun_probe"
-        },
-        {
-          "node_id": "node-30c455638eba4281a25bb8ec2c8b742b",
-          "kind": "local_udp",
-          "addr": "163.220.236.54:51820",
-          "observed_at": "2026-10-23T11:13:01.609693739Z",
-          "priority": 70,
-          "cost": 30,
-          "source": "stun_probe"
-        }
-      ],
-      "relay_capability": {
-        "enabled_by_policy": true,
-        "public_endpoint": "163.220.236.54:18445",
-        "admission_url": "http://10.250.0.11:18447",
-        "max_sessions": 10000,
-        "active_sessions": 0,
-        "max_mbps": 1000,
-        "e2e_only": true
-      },
-      "token_policy": {
-        "allow_join": true,
-        "allow_relay": true,
-        "allowed_routes": [],
-        "allowed_tags": [
-          "kubernetes-control-plane",
-          "kubernetes-ha-545a7a1911f9580a"
-        ],
-        "max_token_uses": 1
-      },
-      "routes": [],
-      "registered_at": "2026-09-15T12:19:04.125007433Z"
     },
     {
       "node_id": "node-9befa279a7f75a740e5fb4e3b58ca9ee",
@@ -314,10 +259,5 @@
       "registered_at": "2026-09-14T13:27:36.840373723Z"
     }
   ],
-  "node_states": {
-    "uc-k8sp4": {
-      "state": "stopped",
-      "reason": "Operator excluded unreachable host on 2026-10-26"
-    }
-  }
+  "node_states": {}
 }

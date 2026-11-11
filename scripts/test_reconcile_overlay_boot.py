@@ -6,6 +6,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from node_test_fixtures import roster_with_stopped_node
+
 
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('boot_recovery',ROOT/'scripts/reconcile-overlay-boot.py')
@@ -17,9 +19,9 @@ class OverlayBootRecoveryTest(unittest.TestCase):
     def setUp(self):
         self.temporary=tempfile.TemporaryDirectory()
         self.root=Path(self.temporary.name)
-        self.roster=json.loads((ROOT/'deploy/terraform/master-only/overlay-boot-peers.json').read_text())
+        self.roster=roster_with_stopped_node()
         node=next(p for p in self.roster['peers'] if p['hostname']=='uc-k8sp5')
-        dead=next(p for p in self.roster['peers'] if p['hostname']=='uc-k8sp4')
+        dead=next(p for p in self.roster['peers'] if p['hostname']=='fixture-stopped')
         self.state={'node_id':node['node_id'],'registered_node':node,
                     'wireguard_public_key_b64':node['wireguard_public_key'],
                     'identity_public_key_b64':node['identity_public_key'],

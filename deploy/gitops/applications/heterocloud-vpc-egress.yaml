@@ -69,6 +69,10 @@ spec:
                     operator: NotIn
                     values:
                     - 'true'
+                  - key: heteronetwork.io/lifecycle
+                    operator: NotIn
+                    values:
+                    - stopped
           updateStrategy:
             type: RollingUpdate
             rollingUpdate:

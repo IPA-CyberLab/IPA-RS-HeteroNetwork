@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--kubeconfig", required=True)
     parser.add_argument("--capacity-source", type=Path, required=True)
     parser.add_argument("--image", required=True)
-    parser.add_argument("--node", default="uc-k8sp4")
+    parser.add_argument("--node", default="uc-k8sp5")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     if "@sha256:" not in args.image:raise SystemExit("A pinned cached image is required")

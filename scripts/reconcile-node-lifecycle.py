@@ -48,11 +48,11 @@ def statements(roster):
             raise ValueError("invalid lifecycle node identity")
         peer = peers[node_id]
         rows.append({"node_id": node_id, "vpn_ip": peer["vpn_ip"], "state": declaration["state"]})
-    if not rows:
-        raise ValueError("no lifecycle declarations")
     cluster = roster["cluster_id"]
     if str(uuid.UUID(cluster)) != cluster:
         raise ValueError("invalid lifecycle cluster identity")
+    if not rows:
+        return ""
     lock = f"ipars-control-plane:{len(cluster)}:{cluster}"
     deny = [dict(id="operator-stopped-" + direction, from_roles=[], to_roles=[],
                  from_tags=["heteronetwork-stopped"] if direction == "from" else [],
@@ -109,6 +109,9 @@ def main():
     if not url.startswith(("postgres://", "postgresql://")):
         raise SystemExit("A PostgreSQL control-plane credential is required")
     sql = statements(json.loads(args.roster.read_text()))
+    if not sql:
+        print(json.dumps({"result": "no_lifecycle_declarations"}))
+        return
     result = subprocess.run(["psql", "-XqAt", "--set", "ON_ERROR_STOP=1"],
                             input=sql, text=True, capture_output=True, timeout=30,
                             env=database_environment(url))

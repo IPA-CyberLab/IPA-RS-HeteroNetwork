@@ -16,7 +16,7 @@ spec:
       valueFiles:
       - ../../environments/heteronet/values.yaml
       values: |
-        # Two active worker nodes remain after uc-k8sp4 was excluded. Keep both
+        # Two active worker nodes remain. Keep both
         # available; host-port anti-affinity prevents scheduling a third.
         replicaCount: 2
         workloadIdentity:
@@ -45,7 +45,6 @@ spec:
             - 10.250.0.5
             - 10.250.0.6
             - 10.250.0.10
-            - 10.250.0.11
         hostAliases:
           - ip: "10.96.180.79"
             hostnames:

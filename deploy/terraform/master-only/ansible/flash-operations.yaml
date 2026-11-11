@@ -15,7 +15,7 @@
         mode: '0700'
     - name: Reconcile the explicit verification worker tag
       ansible.builtin.command:
-        argv: [/usr/bin/python3, /usr/local/sbin/heterocloud-flash-operations, --node, uc-k8sp4]
+        argv: [/usr/bin/python3, /usr/local/sbin/heterocloud-flash-operations, --node, "{{ groups['bootstrap'] | first }}"]
       register: hnn_flash_operations
       changed_when: (hnn_flash_operations.stdout | from_json).changed
     - name: Report public operations status

@@ -1,10 +1,10 @@
 # HeteroNetwork host infrastructure
 
 `overlay-boot-peers.json` also declares operator lifecycle flags in `node_states`.
-`uc-k8sp4` is currently `stopped`: Terraform and native release deployment skip
-that host, cold VPN recovery excludes it, and live E2E derives its expected
-gateways from the same roster. An unflagged unreachable gateway still fails E2E.
-The `standard-nodes` manifest keeps the Kubernetes Node cordoned with
+Terraform and native release deployment skip stopped hosts, cold VPN recovery
+excludes them, and live E2E derives its expected gateways from the same roster.
+An unflagged unreachable gateway still fails E2E. For a stopped host, the
+`standard-nodes` manifest keeps the Kubernetes Node cordoned with
 `heteronetwork.io/lifecycle=stopped`, disables ingress/discovery/runtime labels,
 and disables new Longhorn placements. Registration, VPN IP and existing storage
 are retained. This flag does not power off a host or evict its existing volumes.
@@ -21,7 +21,7 @@ and apply the reviewed IaC changes. The renderer restores the original schedulin
 and discovery declarations from that single lifecycle flag.
 
 `terraform_data.gvisor_configuration` installs the checksum-pinned Flash runtime
-installer and gVisor package on `uc-k8sp4` and `uc-k8sp5`. These hosts can run CPU
+installer and gVisor package on eligible workers. These hosts can run CPU
 Flash services independently of the enrollment issuer. Configuration changes
 restart only the containerd process after confirming its unit preserves existing
 shims, and verify that existing container tasks remain. A bounded, nonroot,
@@ -40,8 +40,7 @@ HeteroNetwork GitOps Application sources, and creates the `control-plane-only`
 Argo CD Application. The physical machines and their operating systems already
 exist; this module manages their HeteroNetwork and Kubernetes configuration.
 
-`standard-nodes.json` additionally registers `uc-k8sp4` (`100.111.33.52`,
-SSH endpoint `163.220.236.54`) as a full-service node. Its separate Ansible
+`standard-nodes.json` declares additional full-service nodes. Their Ansible
 resource installs the pinned Agent, enrolls through the existing issuer with
 a short-lived single-use token, joins the existing Kubernetes control plane,
 and enables the signed native public-service installation. An inactive old
@@ -120,13 +119,12 @@ already joined hosts. Cleaned hosts restore their existing HeteroNetwork
 identity and join the existing Kubernetes cluster with short-lived credentials
 issued on `uc-k8sp5`; no new cluster is initialized.
 
-`terraform_data.database_ha_configuration` also preserves the recovered HA
-topology. It maintains `uc-k8sp5` as PostgreSQL member `db-b`, `uc-k8sp4` as
-PostgreSQL member `db-e`, and `ichikawap1` as etcd-only voter `db-h`, using the
-protected revisioned bundle on `uc-k8sp5`. The dedicated Secret Manager masters
-remain free of PostgreSQL and application Pods. Only the replacement node's DCS
-certificate is transferred; database passwords and the CA private key are not
-copied to it. The
+`terraform_data.database_ha_configuration` also preserves the recovered database
+topology. `uc-k8sp5` (`db-b`) and `ichikawap1` (`db-h`) are PostgreSQL members
+and DCS voters, with synchronous replication. Both voters are required for quorum;
+a third independent voter is needed before the system can tolerate losing one.
+The dedicated Secret Manager masters remain free of PostgreSQL and application
+Pods. The protected revisioned bundle is maintained on `uc-k8sp5`. The
 protected `Reconcile database HA topology` workflow applies an exact reviewed
 master commit serially, verifies DCS quorum and synchronous replication, and
 waits for the enrollment Control Plane and Keycloak edge to recover.

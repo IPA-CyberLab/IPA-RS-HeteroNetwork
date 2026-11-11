@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import unittest
 
+from node_test_fixtures import roster_with_stopped_node
+
 from node_lifecycle import ROSTER
 
 
@@ -18,8 +20,8 @@ spec.loader.exec_module(reconciler)
 
 class ReconcileStoppedWireGuardTest(unittest.TestCase):
     def setUp(self):
-        self.roster = json.loads(ROSTER.read_text())
-        self.stopped = next(p["wireguard_public_key"] for p in self.roster["peers"] if p["hostname"] == "uc-k8sp4")
+        self.roster = roster_with_stopped_node()
+        self.stopped = next(p["wireguard_public_key"] for p in self.roster["peers"] if p["hostname"] == "fixture-stopped")
         self.active = next(p["wireguard_public_key"] for p in self.roster["peers"] if p["hostname"] == "uc-k8sp5")
         self.calls = []
 
@@ -37,7 +39,7 @@ class ReconcileStoppedWireGuardTest(unittest.TestCase):
         self.assertNotIn(["wg", "set", "heteronetwork0", "peer", self.active, "remove"], self.calls)
 
     def test_active_peer_is_never_removed_when_node_resumed(self):
-        self.roster["node_states"]["uc-k8sp4"] = {"state": "active"}
+        self.roster["node_states"]["fixture-stopped"] = {"state": "active"}
         self.assertEqual(reconciler.reconcile(self.roster, "heteronetwork0", self.run_command), 0)
         self.assertFalse(any(call[1] == "set" for call in self.calls))
 

@@ -1561,8 +1561,8 @@ def parse_address_map(raw, label, minimum, maximum, require_odd=False):
     entries = raw.split(",") if raw else []
     if not minimum <= len(entries) <= maximum:
         raise SystemExit(f"invalid {label} count")
-    if require_odd and len(entries) % 2 != 1:
-        raise SystemExit(f"{label} count must be odd")
+    if require_odd and len(entries) != 2 and len(entries) % 2 != 1:
+        raise SystemExit(f"{label} count must be two or odd")
     result = {}
     addresses = set()
     order = []
@@ -1610,10 +1610,10 @@ for entry in identities_raw.split(",") if identities_raw else []:
 if identity_order != member_order:
     raise SystemExit("database member and identity orders differ")
 dcs, _ = parse_address_map(
-    dcs_raw, "DCS member", 3, dcs_limit, require_odd=True
+    dcs_raw, "DCS member", 2, dcs_limit, require_odd=True
 )
 dcs_bootstrap, _ = parse_address_map(
-    dcs_bootstrap_raw, "DCS bootstrap member", 3, dcs_limit
+    dcs_bootstrap_raw, "DCS bootstrap member", 2, dcs_limit
 )
 for name, address in dcs.items():
     if (name in members or address in members.values()) and members.get(name) != address:
@@ -4236,9 +4236,9 @@ JSON
       die "proxy bundle accepted inconsistent database and DCS addresses"
     fi
     sed -i 's/^HETERONETWORK_DB_DCS_MEMBERS=.*/HETERONETWORK_DB_DCS_MEMBERS=db-a=192.0.2.1,db-b=192.0.2.2/' "$two_member_proxy/manifest.env"
-    if validate_proxy_bundle_directory "$two_member_proxy" >/dev/null 2>&1; then
-      die "proxy bundle accepted a two-voter DCS"
-    fi
+    sed -i 's/^HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=.*/HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=db-a=192.0.2.1,db-b=192.0.2.2/' "$two_member_proxy/manifest.env"
+    validate_proxy_bundle_directory "$two_member_proxy" \
+      || die "proxy bundle rejected a consistent two-voter DCS"
   )
   [[ "$(<"$proxy_extracted/$proxy_bundle_marker_name")" == \
     "$PROXY_BUNDLE_FORMAT_VERSION" ]]

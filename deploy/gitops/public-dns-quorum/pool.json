@@ -11,11 +11,6 @@
       "vote_resource": "public-dns-vote-ichikawap1"
     },
     {
-      "id": "uc-k8sp4",
-      "node": "uc-k8sp4",
-      "vote_resource": "public-dns-vote-uc-k8sp4"
-    },
-    {
       "id": "uc-k8sp5",
       "node": "uc-k8sp5",
       "vote_resource": "public-dns-vote-uc-k8sp5"
@@ -25,10 +20,6 @@
     {
       "id": "ichikawap1",
       "address": "163.220.236.61"
-    },
-    {
-      "id": "uc-k8sp4",
-      "address": "163.220.236.54"
     }
   ],
   "records": [

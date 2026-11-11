@@ -19,6 +19,8 @@ const cliBinary=argument('--cli');
 const kubeBinary=argument('--kubectl','kubectl');
 const kubeconfig=argument('--kubeconfig');
 const fixtureImage=argument('--image');
+const fixtureNode=argument('--node','uc-k8sp5');
+if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(fixtureNode)) throw new Error('invalid fixture node');
 if (!accountFile || !output || !cliBinary || !kubeconfig || !fixtureImage || !['http:','https:'].includes(base.protocol)) throw new Error('explicit endpoint, account, CLI, kubeconfig, image and report required');
 const run=randomUUID();
 const prefix='operations-e2e-'+run.slice(0,8);
@@ -192,7 +194,7 @@ async function rollingTest(){
     require(service,'stateless_cluster_endpoint_missing');
     const target=service.spec.clusterIP;const servicePort=service.spec.ports.find(p=>(p.protocol??'TCP')==='TCP').port;
     const probeName=prefix+'-http-probe';
-    const cached=JSON.parse(kube('get','node','uc-k8sp4','-o','json')).status.images.some(i=>i.names.some(n=>n.endsWith(fixtureImage.split('@')[1])));
+    const cached=JSON.parse(kube('get','node',fixtureNode,'-o','json')).status.images.some(i=>i.names.some(n=>n.endsWith(fixtureImage.split('@')[1])));
     require(cached,'isolated_probe_image_not_cached');
     const selector={'operations-e2e/probe':run};
     applyFixture({apiVersion:'networking.k8s.io/v1',kind:'NetworkPolicy',metadata:{name:probeName},spec:{podSelector:{matchLabels:selector},policyTypes:['Ingress','Egress'],ingress:[],egress:[{to:[{ipBlock:{cidr:target+'/32'}},{podSelector:{matchLabels:{'flash.heterocloud.io/instance':stateless.id}}}],ports:[{protocol:'TCP',port:8080}]}]}});
@@ -205,7 +207,7 @@ while time.time()<end:
  except Exception:errors+=1
  requests+=1;time.sleep(.2)
 print(json.dumps({'requests':requests,'errors':errors,'seen':sorted(seen)}),flush=True)`;
-    applyFixture({apiVersion:'v1',kind:'Pod',metadata:{name:probeName,labels:{...selector,'flash.heterocloud.io/organization':org}},spec:{runtimeClassName:'gvisor',nodeSelector:{'kubernetes.io/hostname':'uc-k8sp4'},restartPolicy:'Never',automountServiceAccountToken:false,containers:[{name:'probe',image:fixtureImage,imagePullPolicy:'Never',command:['python3','-B','-c',probeScript],resources:{requests:{cpu:'20m',memory:'32Mi','ephemeral-storage':'32Mi'},limits:{cpu:'100m',memory:'64Mi','ephemeral-storage':'32Mi'}},securityContext:{readOnlyRootFilesystem:true,allowPrivilegeEscalation:false,capabilities:{drop:['ALL']}}}]}});
+    applyFixture({apiVersion:'v1',kind:'Pod',metadata:{name:probeName,labels:{...selector,'flash.heterocloud.io/organization':org}},spec:{runtimeClassName:'gvisor',nodeSelector:{'kubernetes.io/hostname':fixtureNode},restartPolicy:'Never',automountServiceAccountToken:false,containers:[{name:'probe',image:fixtureImage,imagePullPolicy:'Never',command:['python3','-B','-c',probeScript],resources:{requests:{cpu:'20m',memory:'32Mi','ephemeral-storage':'32Mi'},limits:{cpu:'100m',memory:'64Mi','ephemeral-storage':'32Mi'}},securityContext:{readOnlyRootFilesystem:true,allowPrivilegeEscalation:false,capabilities:{drop:['ALL']}}}]}});
     await poll('probe_running',()=>get('pod',probeName)?.status?.phase==='Running',60);
     await sleep(2000);
     const rolling=await update(stateless,{...stateless.spec,args:[web('v2',10)]});

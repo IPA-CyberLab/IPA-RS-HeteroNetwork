@@ -21,7 +21,7 @@ readonly ETCD_VERSION="v3.6.11"
 readonly ETCD_LINUX_AMD64_SHA256="8756f7a4eaf921668a83de0bf13c0f65cae9186a165696e3ae8396afe6f557ed"
 readonly MIN_DATABASE_MEMBER_COUNT="2"
 readonly MAX_DATABASE_MEMBER_COUNT="32"
-readonly MIN_DCS_MEMBER_COUNT="3"
+readonly MIN_DCS_MEMBER_COUNT="2"
 readonly MAX_DCS_MEMBER_COUNT="9"
 readonly DCS_REPLACEMENT_MAX_APPLIED_INDEX_LAG="128"
 readonly -a BUNDLE_SECRET_NAMES=(
@@ -199,7 +199,11 @@ member_rows_for() {
   ((${#entries[@]} >= minimum && ${#entries[@]} <= maximum)) \
     || die "$label member count must be between $minimum and $maximum"
   if [[ "$require_odd" == "true" ]]; then
-    ((${#entries[@]} % 2 == 1)) || die "$label member count must be odd"
+    # A two-voter topology is explicitly supported when only two eligible
+    # hosts remain. It requires both voters for quorum and has no failure
+    # tolerance; larger steady-state topologies must remain odd.
+    ((${#entries[@]} == 2 || ${#entries[@]} % 2 == 1)) \
+      || die "$label member count must be two or odd"
   fi
 
   local -A seen_names=()
@@ -339,7 +343,11 @@ dcs_member_count() {
 synchronous_standby_count() {
   local count
   count="$(dcs_member_count)"
-  printf '%s' "$(((10#$count - 1) / 2))"
+  if ((10#$count == 2)); then
+    printf '%s' 1
+  else
+    printf '%s' "$(((10#$count - 1) / 2))"
+  fi
 }
 
 validate_cidr() {
@@ -2076,7 +2084,8 @@ verify_cluster() {
   expected_replicas="$((10#$expected_members - 1))"
   expected_sync="$(synchronous_standby_count)"
   expected_dcs="$(dcs_member_count)"
-  ((10#$expected_dcs % 2 == 1)) || die "steady-state DCS member count must be odd"
+  ((10#$expected_dcs == 2 || 10#$expected_dcs % 2 == 1)) \
+    || die "steady-state DCS member count must be two or odd"
   local healthy=0 primaries=0 name address status
   while read -r name address; do
     status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -2450,6 +2459,16 @@ self_test() {
     [[ "$(dcs_member_count)" == "3" ]]
     [[ "$(synchronous_standby_count)" == "1" ]]
     [[ "$(certificate_node_rows | wc -l | tr -d ' ')" == "3" ]]
+  )
+  (
+    members="db-a=100.64.10.1,db-b=100.64.10.2"
+    member_identities="db-a=node-a,db-b=node-b"
+    proxy_backends="$members"
+    dcs_members="$members"
+    dcs_bootstrap_members="$dcs_members"
+    validate_common_config
+    [[ "$(dcs_member_count)" == "2" ]]
+    [[ "$(synchronous_standby_count)" == "1" ]]
   )
   if (
     dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-f=100.64.10.6"

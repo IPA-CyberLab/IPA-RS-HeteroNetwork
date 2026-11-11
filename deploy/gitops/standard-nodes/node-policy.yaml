@@ -12,24 +12,28 @@ spec:
     namespaceSelector: {}
     objectSelector: {}
     resourceRules:
-      - apiGroups: ['']
-        apiVersions: [v1]
-        operations: [CREATE, UPDATE]
-        resources: [nodes]
-        scope: '*'
+    - apiGroups:
+      - ''
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - nodes
+      scope: '*'
   matchConditions:
-    - name: standard-node
-      expression: "object.metadata.name in ['uc-k8sp4']"
+  - name: standard-node
+    expression: 'false'
   mutations:
-    - patchType: JSONPatch
-      jsonPatch:
-        expression: |-
-          [JSONPatch{op: 'add', path: '/spec/taints',
-            value: has(object.spec.taints) ? object.spec.taints.filter(t,
-              !(t.key == 'node-role.kubernetes.io/control-plane' && t.effect == 'NoSchedule') &&
-              t.key != 'heteronetwork.io/control-plane-only') : []}] +
-          (has(object.metadata.labels) && 'node.kubernetes.io/exclude-from-external-load-balancers' in object.metadata.labels ?
-            [JSONPatch{op: 'remove', path: '/metadata/labels/node.kubernetes.io~1exclude-from-external-load-balancers'}] : [])
+  - patchType: JSONPatch
+    jsonPatch:
+      expression: "[JSONPatch{op: 'add', path: '/spec/taints',\n  value: has(object.spec.taints)\
+        \ ? object.spec.taints.filter(t,\n    !(t.key == 'node-role.kubernetes.io/control-plane'\
+        \ && t.effect == 'NoSchedule') &&\n    t.key != 'heteronetwork.io/control-plane-only')\
+        \ : []}] +\n(has(object.metadata.labels) && 'node.kubernetes.io/exclude-from-external-load-balancers'\
+        \ in object.metadata.labels ?\n  [JSONPatch{op: 'remove', path: '/metadata/labels/node.kubernetes.io~1exclude-from-external-load-balancers'}]\
+        \ : [])"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicyBinding

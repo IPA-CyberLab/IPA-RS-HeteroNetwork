@@ -92,7 +92,7 @@ class DomainTests(unittest.TestCase):
         import yaml
         deployment=next(x for x in yaml.safe_load_all((HERE/'infrastructure.yaml').read_text()) if x['kind']=='Deployment')
         pod=deployment['spec']['template']['spec'];nodes=pod['affinity']['nodeAffinity']['requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms'][0]['matchExpressions'][0]['values']
-        self.assertEqual(nodes,['uc-k8sp4','uc-k8sp5'])
+        self.assertEqual(nodes,['ichikawap1','uc-k8sp5'])
         self.assertTrue(pod['containers'][0]['securityContext']['readOnlyRootFilesystem'])
 
 if __name__=='__main__':unittest.main()

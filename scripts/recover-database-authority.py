@@ -30,6 +30,8 @@ LEGACY_DCS = {**EXPECTED_MEMBERS, "db-g": "100.94.130.38"}
 REPLACEMENT_DCS_REVISION = 3
 EXPECTED_RETIRED_MEMBERS = 4
 SYNC_REPLICA_REVISION = 4
+LOST_MEMBER_RETIREMENT_REVISION = 15
+TWO_HOST_DCS = {"db-b": "100.96.127.54", "db-h": "100.65.54.75"}
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_BYTES = 128 * 1024 * 1024
 KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -278,20 +280,22 @@ def inspect_authority(bundle, archive):
     require(re.fullmatch(r"[1-9][0-9]{0,17}", revision),
             "protected topology revision is invalid")
     revision = int(revision)
-    expected_dcs = (LEGACY_DCS if revision < REPLACEMENT_DCS_REVISION else EXPECTED_DCS)
+    expected_dcs = (TWO_HOST_DCS if revision >= LOST_MEMBER_RETIREMENT_REVISION else
+                    LEGACY_DCS if revision < REPLACEMENT_DCS_REVISION else EXPECTED_DCS)
+    required_members = TWO_HOST_DCS if revision >= LOST_MEMBER_RETIREMENT_REVISION else EXPECTED_MEMBERS
     require(dcs == expected_dcs and bootstrap == expected_dcs,
             "protected DCS authority does not match the recovered quorum")
-    require(all(members.get(name) == address for name, address in EXPECTED_MEMBERS.items()),
+    require(all(members.get(name) == address for name, address in required_members.items()),
             "protected authority is missing a recovered database member")
     require(set(identities) == set(members),
             "protected member identities do not match database members")
-    require(set(EXPECTED_MEMBERS) <= set(identities),
+    require(set(required_members) <= set(identities),
             "protected authority is missing a recovered member identity")
     require(len(set(identities.values())) == len(identities),
             "protected member identities are not unique")
     # db-h is an existing DCS voter promoted to a full synchronous replica.
     # Preserve that explicit migration rather than treating it as an old member.
-    retained = dict(EXPECTED_MEMBERS)
+    retained = dict(required_members)
     if revision >= SYNC_REPLICA_REVISION and members.get("db-h") == EXPECTED_DCS["db-h"]:
         retained["db-h"] = EXPECTED_DCS["db-h"]
     retired_members = set(members) - set(retained)

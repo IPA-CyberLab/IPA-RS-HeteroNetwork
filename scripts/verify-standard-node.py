@@ -163,8 +163,8 @@ def record_failure(report, output, namespace, error):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--node', default='uc-k8sp4')
-    parser.add_argument('--peer', default='uc-k8sp5')
+    parser.add_argument('--node', default='uc-k8sp5')
+    parser.add_argument('--peer', default='ichikawap1')
     parser.add_argument('--output')
     parser.add_argument('--exercise-storage', action='store_true')
     parser.add_argument('--allow-onboarding-pending', action='store_true')

@@ -30,14 +30,25 @@ def prepare(work_dir, ssh_key):
     groups = rendered["all"]["children"]
     members = groups["postgres_members"]["hosts"]
     voters = groups["postgres_dcs_only"]["hosts"]
+    module = ROOT / "deploy/terraform/master-only"
+    declared = json.loads((module / "nodes.json").read_text())
+    declared.update(json.loads((module / "standard-nodes.json").read_text()))
+    for node in json.loads((module / "edge-nodes.json").read_text()).values():
+        CONSOLE.require(node["name"] not in declared, "Database host inventory contains duplicate names")
+        declared[node["name"]] = node
     declared_members = {
-        "uc-k8sp5": ("db-b", "100.96.127.54"),
-        "uc-k8sp4": ("db-e", "100.111.33.52"),
-        "ichikawap1": ("db-h", "100.65.54.75"),
+        name: (node["postgres_name"], node["tailscale_ip"])
+        for name, node in declared.items() if node.get("postgres_role") == "member"
+    }
+    declared_voters = {
+        name: (node["postgres_name"], node["tailscale_ip"])
+        for name, node in declared.items() if node.get("postgres_role") == "dcs-only"
     }
     stopped = stopped_hosts(json.loads(ROSTER.read_text()))
     expected = {name: identity for name, identity in declared_members.items() if name not in stopped}
+    expected_voters = {name: identity for name, identity in declared_voters.items() if name not in stopped}
     CONSOLE.require(len(expected) >= 2, "Database HA requires at least two active declared members")
+    CONSOLE.require(len(set(expected.values())) == len(expected), "Database member identities must be unique")
     CONSOLE.require(
         set(members) == set(expected) and
         {(value["postgres_name"], value["tailscale_ip"]) for value in members.values()}
@@ -45,8 +56,9 @@ def prepare(work_dir, ssh_key):
         "Database member inventory does not match the recovered topology",
     )
     CONSOLE.require(
+        set(voters) == set(expected_voters) and
         {(value["postgres_name"], value["tailscale_ip"]) for value in voters.values()}
-        == set(),
+        == set(expected_voters.values()),
         "DCS voter inventory does not match the recovered topology",
     )
     CONSOLE.write_private(

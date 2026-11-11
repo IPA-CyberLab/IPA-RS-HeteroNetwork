@@ -1,6 +1,6 @@
 # Public gateway DNS with majority observations
 
-Three observers run on distinct, explicitly selected physical nodes. Every five
+Observers run on distinct, explicitly selected physical nodes. Every five
 seconds each checks the configured public IP directly, verifies HTTPS with the
 probe hostname as SNI, checks the exact gateway response, and checks the HTTP
 redirect. The probe traverses Caddy and Envoy without invoking a tenant container.
@@ -12,7 +12,7 @@ DNS is a separate DNSEndpoint outside their RBAC permissions. No Cloudflare
 token, private key or user credential is mounted into these workloads.
 
 The electorate is fixed by `pool.json`, not by whichever observers are currently
-reachable. With three members a decision needs two fresh, matching votes. Missing,
+reachable. The current two members must both supply fresh, matching votes. Missing,
 expired, malformed, future or differently configured votes are unknown, not failed.
 They cannot lower the required majority or authorize DNS withdrawal.
 
@@ -45,7 +45,9 @@ Normal failure exclusion takes three 5-second observations, plus ExternalDNS's
 5-second reconciliation. DNS TTL is currently 60 seconds; resolvers can retain
 older answers until their cache expires. Publisher failover can additionally wait
 for its 45-second lease. This is DNS failover, not instantaneous traffic failover,
-and three distinct nodes do not imply three independent ISPs or regions.
+and distinct nodes do not imply independent ISPs or regions. Currently only one
+public origin is commissioned, so there is no public-gateway failover until a
+second origin passes the HTTPS probe and is added to the pool.
 
 Observation timings, membership, probe name and addresses are configuration, not compiled
 hostnames. After changing `pool.json`, regenerate `workloads.yaml` with

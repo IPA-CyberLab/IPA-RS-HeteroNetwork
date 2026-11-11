@@ -97,3 +97,14 @@ for edge in ('bootstrap', 'enrollment_issuer'):
         'annotations':{'argocd.argoproj.io/sync-options':'Prune=false,Delete=false',
                        'argocd.argoproj.io/sync-wave':'0'}}})
 (standard_dest/'nodes.yaml').write_text(yaml.safe_dump_all(apply_lifecycle(standard_resources),sort_keys=False))
+
+# Admission rules must follow the same inventory as the rendered Node objects.
+# An empty standard-node inventory is valid after the last node is retired.
+policy_path = standard_dest / 'node-policy.yaml'
+if policy_path.exists():
+    policies = list(yaml.safe_load_all(policy_path.read_text()))
+    admission = next(item for item in policies if item['kind'] == 'MutatingAdmissionPolicy')
+    condition = next(item for item in admission['spec']['matchConditions'] if item['name'] == 'standard-node')
+    condition['expression'] = ('object.metadata.name in ' + json.dumps(sorted(standard))
+                               if standard else 'false')
+    policy_path.write_text(yaml.safe_dump_all(policies, sort_keys=False))

@@ -52,7 +52,7 @@ def main():
     parser.add_argument("--kubectl", required=True)
     parser.add_argument("--kubeconfig", required=True)
     parser.add_argument("--image", required=True, help="Pinned image with Python 3, cached on both workers")
-    parser.add_argument("--nodes", nargs=2, default=["uc-k8sp4", "uc-k8sp5"])
+    parser.add_argument("--nodes", nargs=2, default=["ichikawap1", "uc-k8sp5"])
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     if "@sha256:" not in args.image or len(set(args.nodes)) != 2:

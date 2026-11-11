@@ -50,7 +50,10 @@ def validate_config(raw):
     for key in ("namespace", "dns_namespace", "dns_resource", "state_resource"):
         require(isinstance(raw[key], str) and LABEL.fullmatch(raw[key]), "invalid resource name")
     members, origins = raw["members"], raw["origins"]
-    require(isinstance(members, list) and 3 <= len(members) <= 9, "membership must contain 3-9 voters")
+    # Two independent voters still require unanimous agreement.  This permits
+    # retiring a permanently lost host without fabricating a third failure
+    # domain; a single surviving voter cannot change DNS.
+    require(isinstance(members, list) and 2 <= len(members) <= 9, "membership must contain 2-9 voters")
     require(isinstance(origins, list) and 1 <= len(origins) <= 16, "invalid origin inventory")
     for member in members:
         require(set(member) == {"id", "node", "vote_resource"}, "invalid member fields")

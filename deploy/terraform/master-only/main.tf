@@ -654,7 +654,7 @@ resource "terraform_data" "database_ha_configuration" {
 
 resource "terraform_data" "gpu_host_configuration" {
   input = {
-    candidates     = ["uc-k8sp5", "uc-k8sp4", "ichikawap1"]
+    candidates     = sort(keys(local.gvisor_workers))
     expected_nodes = local.gpu_expected_nodes
     policy         = "automatic-supported-hardware"
   }

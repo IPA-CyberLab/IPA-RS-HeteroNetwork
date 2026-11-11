@@ -29,6 +29,18 @@ NODE = {"metadata": {"name": "retired"}, "spec": {"unschedulable": True},
 
 
 class RetirementTests(unittest.TestCase):
+    def test_empty_retirement_intent_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            intent = root / "intent.json"
+            roster = root / "roster.json"
+            intent.write_text(json.dumps({"schema_version": 1, "executor_node": "active", "retirements": []}))
+            roster.write_text(json.dumps({"hosts": {}, "node_states": {}}))
+            with patch("sys.argv", ["retire", "--kubeconfig", "unused", "--intent", str(intent),
+                                     "--roster", str(roster), "--backup-dir", str(root)]), \
+                 patch.object(subject, "Cluster") as cluster:
+                subject.main()
+            cluster.assert_not_called()
     def test_intent_requires_explicit_stopped_node_and_matching_registered_peer(self):
         self.assertEqual(subject.validate_intent(INTENT, ROSTER), ITEM)
         with self.assertRaisesRegex(ValueError, "explicitly stopped"):

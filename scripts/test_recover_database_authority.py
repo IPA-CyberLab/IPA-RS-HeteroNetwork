@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -193,6 +194,27 @@ class DatabaseAuthorityRecoveryTest(unittest.TestCase):
         self.assertEqual(digest(self.archive), original_archive_hash)
         self.assertFalse(self.backups.exists())
         self.assertNotIn("invalid-certificate", result.stderr)
+
+    def test_accepts_only_the_reviewed_two_host_topology_after_retirement(self):
+        shutil.rmtree(self.bundle)
+        members = "db-b=100.96.127.54,db-h=100.65.54.75"
+        environment = {**os.environ, "HETERONETWORK_DB_MEMBERS": members,
+                       "HETERONETWORK_DB_MEMBER_IDENTITIES": "db-b=node-b,db-h=node-h",
+                       "HETERONETWORK_DB_DCS_MEMBERS": members,
+                       "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS": members,
+                       "HETERONETWORK_DB_TOPOLOGY_REVISION": "15"}
+        subprocess.run([HELPER, "init-bundle", self.bundle], env=environment,
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (self.bundle / "cluster-id").write_text("fixture-cluster-id\n")
+        (self.bundle / "cluster-id").chmod(0o600)
+        self.pack()
+        result = self.recover(apply=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["result"], "unchanged")
+        data = (self.bundle / "manifest.env").read_text().replace("100.65.54.75", "100.65.54.76")
+        (self.bundle / "manifest.env").write_text(data)
+        self.pack()
+        self.assertNotEqual(self.recover(apply=False).returncode, 0)
 
 
 if __name__ == "__main__":

@@ -1,50 +1,6 @@
 apiVersion: v1
 kind: Node
 metadata:
-  name: uc-k8sp4
-  labels:
-    kubernetes.io/hostname: uc-k8sp4
-    node-role.kubernetes.io/control-plane: ''
-    heteronetwork.io/control-plane-only: 'false'
-    networking.heteronetwork.io/public-ingress: 'false'
-    database.heteronetwork.io/proxy-ready: 'false'
-    monitoring.heteronetwork.io/ha: 'false'
-    networking.heteronetwork.io/overlay-dns-sync: 'false'
-    heteronetwork.io/lifecycle: stopped
-    networking.heteronetwork.io/turn-ingress: 'false'
-    dns.heteronetwork.io/discovery: 'false'
-    flash.heterocloud.io/gvisor-ready: 'false'
-  annotations:
-    networking.heteronetwork.io/public-ingress-enabled: 'false'
-    argocd.argoproj.io/sync-options: Prune=false,Delete=false
-    argocd.argoproj.io/sync-wave: '0'
-    heteronetwork.io/lifecycle-reason: Operator excluded unreachable host on 2026-10-26
-spec:
-  unschedulable: true
----
-apiVersion: longhorn.io/v1beta2
-kind: Node
-metadata:
-  name: uc-k8sp4
-  namespace: longhorn-system
-  annotations:
-    argocd.argoproj.io/sync-options: Prune=false,Delete=false
-    argocd.argoproj.io/sync-wave: '0'
-spec:
-  name: uc-k8sp4
-  allowScheduling: false
-  disks:
-    iac-default-disk:
-      path: /var/lib/longhorn
-      diskType: filesystem
-      allowScheduling: false
-      evictionRequested: false
-      storageReserved: 68719476736
-      tags: []
----
-apiVersion: v1
-kind: Node
-metadata:
   name: uc-k8sp5
   labels:
     monitoring.heteronetwork.io/ha: 'true'

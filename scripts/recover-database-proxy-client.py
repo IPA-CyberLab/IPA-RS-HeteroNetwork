@@ -175,7 +175,8 @@ def proxy_metadata(directory, identity):
     revision = manifest.get("HETERONETWORK_DB_TOPOLOGY_REVISION", "")
     require(revision.isascii() and revision.isdigit() and int(revision) > 0,
             "database topology revision is invalid")
-    expected = dict(EXPECTED_MEMBERS)
+    expected = ({"db-b": "100.96.127.54", "db-h": "100.65.54.75"}
+                if int(revision) >= 15 else dict(EXPECTED_MEMBERS))
     if int(revision) >= 4 and members.get('db-h') == '100.65.54.75':
         expected['db-h'] = '100.65.54.75'
     require(members == expected,
