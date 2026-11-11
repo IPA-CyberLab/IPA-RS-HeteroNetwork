@@ -39,7 +39,7 @@ def _replace(path, payload, mode):
             os.unlink(temp)
 
 
-def plan(root, hostname, *, etcd_member_absent):
+def plan(root, hostname, *, etcd_member_absent, offline_retirement=False):
     """Return an immutable-by-convention plan without mutating the checkout."""
     root = Path(root).resolve()
     require(SAFE_HOST.fullmatch(hostname), "invalid Kubernetes node name")
@@ -53,7 +53,8 @@ def plan(root, hostname, *, etcd_member_absent):
     stopped = stopped_hosts(roster)
     require(hostname in standard and hostname in roster["hosts"],
             "target is not a declared standard host (protected hosts require a replacement plan)")
-    require(hostname in stopped, "target must first be explicitly stopped")
+    require(hostname in stopped or offline_retirement,
+            "target must first be explicitly stopped")
     node_id = roster["hosts"][hostname]
     matches = [peer for peer in roster["peers"] if peer.get("node_id") == node_id]
     require(len(matches) == 1 and matches[0].get("hostname") == hostname,

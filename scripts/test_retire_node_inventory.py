@@ -52,6 +52,8 @@ class RetireInventoryTests(unittest.TestCase):
         self.write("overlay-boot-peers.json", self.roster)
         with self.assertRaisesRegex(ValueError, "stopped"):
             self.plan()
+        proposed = inventory.plan(self.root, "a", etcd_member_absent=True, offline_retirement=True)
+        self.assertEqual(proposed["hostname"], "a")
 
     def test_refuses_disagreeing_identity(self):
         self.standard["a"]["vpn_ip"] = "10.0.0.9"

@@ -161,6 +161,7 @@ class Cluster:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kubeconfig", required=True)
+    parser.add_argument("--kubectl", default="kubectl")
     parser.add_argument("--intent", type=Path, required=True)
     parser.add_argument("--roster", type=Path, required=True)
     parser.add_argument("--backup-dir", type=Path, required=True)
@@ -171,7 +172,7 @@ def main():
         print(json.dumps({"result": "no_pending_retirements"}))
         return
     item = validate_intent(intent, roster)
-    cluster = Cluster(args.kubeconfig, intent["executor_node"])
+    cluster = Cluster(args.kubeconfig, intent["executor_node"], kubectl=args.kubectl)
     members = cluster.members()
     remaining = survivors_for_retirement(members, item)
     if remaining is None:

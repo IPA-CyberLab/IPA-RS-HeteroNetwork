@@ -12,7 +12,10 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def files():
-    paths=['.gitignore','scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/postgres-ha-autopilot.sh','scripts/keycloak-autopilot.sh','scripts/master-only-iac.py',
+    paths=['.gitignore','README.md','heteronet-admin','scripts/heteronet_admin.py','scripts/test_heteronet_admin.py',
+           'scripts/prune_overlay_dns_node.py','scripts/test_prune_overlay_dns_node.py',
+           'scripts/prune_node_declarations.py','scripts/test_prune_node_declarations.py',
+           'scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/postgres-ha-autopilot.sh','scripts/keycloak-autopilot.sh','scripts/master-only-iac.py',
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/test_verify_standard_node.py',
            'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py','scripts/ensure-flash-ssh-host-key.py','scripts/test_ensure_flash_ssh_host_key.py',
            'scripts/verify-storage-redundancy.py','scripts/test_verify_storage_redundancy.py',
@@ -102,10 +105,27 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--work-dir',required=True)
     parser.add_argument('--branch',default='master')
+    parser.add_argument('--committed-only', action='store_true',
+                        help='bundle the checked-out committed branch without rewriting it')
     args=parser.parse_args()
     work=Path(args.work_dir).expanduser().resolve()
     work.mkdir(parents=True,exist_ok=True)
     work.chmod(0o700)
+    if args.committed_only:
+        branch = subprocess.check_output(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], cwd=ROOT, text=True).strip()
+        if branch != args.branch:
+            raise ValueError('the checked-out branch does not match the bundle branch')
+        dirty = subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True)
+        if dirty:
+            raise ValueError('committed-only publication requires a clean checkout')
+        commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+        with tempfile.TemporaryDirectory(prefix='hnn-iac-bundle-', dir=work) as tmp:
+            bundle = Path(tmp) / 'infrastructure.bundle'
+            subprocess.run(['git', 'bundle', 'create', str(bundle), 'refs/heads/' + branch], cwd=ROOT, check=True)
+            bundle.chmod(0o600)
+            os.replace(bundle, work / 'infrastructure.bundle')
+        print(json.dumps({'commit': commit, 'branch': branch, 'bundle': str(work / 'infrastructure.bundle')}))
+        return
     paths=files()
     for path in paths:
         text=(ROOT/path).read_text()

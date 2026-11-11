@@ -1,0 +1,54 @@
+- name: Reclaim superseded local security and package caches
+  hosts: 'master_only:bootstrap:standard:enrollment_issuer'
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    # The current host collector enumerates packages locally and matches
+    # vulnerabilities on the bootstrap machine. Its old Trivy Java database
+    # is unused; the central scanner has a separate cache under /var/lib.
+    - name: Inspect the installed host security collector
+      ansible.builtin.command:
+        argv: [systemctl, show, --property=ExecStart, --value, heteronetwork-security-host.service]
+      register: hnn_host_collector
+      changed_when: false
+
+    - name: Require metadata-only host collection
+      ansible.builtin.assert:
+        that: "'--metadata-only' in hnn_host_collector.stdout"
+        fail_msg: Host collection still uses the local scanner cache
+
+    - name: Wait until local scanners finish before removing an old database
+      ansible.builtin.command:
+        argv: [pgrep, -x, trivy]
+      register: hnn_running_scanners
+      changed_when: false
+      failed_when: hnn_running_scanners.rc not in [0, 1]
+      until: hnn_running_scanners.rc == 1
+      retries: 60
+      delay: 10
+
+    - name: Inspect the superseded Java database
+      ansible.builtin.stat:
+        path: /var/cache/heteronetwork-security/java-db
+        follow: false
+      register: hnn_old_java_db
+
+    - name: Require an ordinary cache directory
+      ansible.builtin.assert:
+        that: not hnn_old_java_db.stat.exists or (hnn_old_java_db.stat.isdir and not hnn_old_java_db.stat.islnk)
+        fail_msg: Old Java database is not an ordinary directory
+
+    - name: Remove the unused per-host Java database
+      ansible.builtin.file:
+        path: /var/cache/heteronetwork-security/java-db
+        state: absent
+
+    - name: Remove downloaded APT package archives
+      ansible.builtin.command:
+        argv: [apt-get, clean]
+      changed_when: true

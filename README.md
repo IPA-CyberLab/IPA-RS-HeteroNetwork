@@ -44,6 +44,27 @@ ports; the [operations runbook](docs/OPERATIONS.md) also lists installer flags.
 For the first public node or a deployment without an existing console, follow
 the [operations runbook](docs/OPERATIONS.md).
 
+### Retire a lost worker
+
+From the infrastructure checkout, with the operator kubeconfig, SSH key and
+private Terraform work directory configured, run:
+
+```sh
+./heteronet-admin node retire NODE_NAME
+```
+
+The command verifies the offline node's identity and quorum, cordons it, backs
+up Kubernetes etcd before removing its voter, removes network and DNS
+registrations, publishes the inventory through Terraform and Argo CD, and
+removes the stale Kubernetes and Longhorn node objects. `--dry-run` checks the
+same prerequisites without changing anything. It prompts for the bootstrap
+host's sudo password; the password is not placed in command arguments.
+
+The current command requires the node to have been unavailable for ten minutes
+and its database membership and storage replicas to have already been moved. It stops with an
+error if those dependencies or separate service configuration still reference
+the node; it does not yet automate those migrations.
+
 ### Build from source
 
 Rust 1.88 or newer is required:

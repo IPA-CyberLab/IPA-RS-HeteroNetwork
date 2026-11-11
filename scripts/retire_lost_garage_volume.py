@@ -39,7 +39,7 @@ class Kube:
         return json.loads(self.command("get", *args, "-o", "json"))
 
     def patch(self, namespace, resource, name, patch):
-        self.command("-n", namespace, "patch", resource, name, "--type=json",
+        self.command(*(["-n", namespace] if namespace else []), "patch", resource, name, "--type=json",
                      "--patch-file=/dev/stdin", payload=json.dumps(patch))
 
 
