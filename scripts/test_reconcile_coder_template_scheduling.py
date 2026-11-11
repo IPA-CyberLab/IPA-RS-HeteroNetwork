@@ -1,6 +1,5 @@
 import copy
 import importlib.util
-import json
 import unittest
 from pathlib import Path
 
@@ -9,7 +8,17 @@ spec = importlib.util.spec_from_file_location(
     'coder_schedule', ROOT / 'scripts/reconcile-coder-template-scheduling.py')
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-CONFIG = json.loads((ROOT / 'deploy/coder/workspace-scheduling.json').read_text())
+# Keep coverage for several templates independent of the current deployment.
+CONFIG = {
+    'owner_id': 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    'organization_id': 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    'template_ids': [
+        'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+        'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    ],
+    'default_ttl_ms': 0,
+    'allow_user_autostop': True,
+}
 
 
 class Client:
