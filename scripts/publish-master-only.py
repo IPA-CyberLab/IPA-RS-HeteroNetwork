@@ -121,7 +121,7 @@ def main():
         commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         with tempfile.TemporaryDirectory(prefix='hnn-iac-bundle-', dir=work) as tmp:
             bundle = Path(tmp) / 'infrastructure.bundle'
-            subprocess.run(['git', 'bundle', 'create', str(bundle), 'refs/heads/' + branch], cwd=ROOT, check=True)
+            subprocess.run(['git', 'bundle', 'create', '--quiet', str(bundle), 'refs/heads/' + branch], cwd=ROOT, check=True)
             bundle.chmod(0o600)
             os.replace(bundle, work / 'infrastructure.bundle')
         print(json.dumps({'commit': commit, 'branch': branch, 'bundle': str(work / 'infrastructure.bundle')}))
