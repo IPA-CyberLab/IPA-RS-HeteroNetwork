@@ -1,7 +1,8 @@
 resource "terraform_data" "flash_operations" {
   triggers_replace = [
     filesha256("${local.repo_root}/scripts/provision-flash-operations.py"),
-    filesha256("${path.module}/ansible/flash-operations.yaml")
+    filesha256("${path.module}/ansible/flash-operations.yaml"),
+    sha256(jsonencode(local.inventory)),
   ]
   provisioner "local-exec" {
     working_dir = local.repo_root

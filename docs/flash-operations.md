@@ -84,7 +84,7 @@ that budget before enabling them on large services. This release does not turn
 on scheduled backups for every existing service.
 
 Two verifier controllers share one lease. A verifier restores into an independent
-temporary volume on the explicitly tagged worker `uc-k8sp4`, waits for physical
+temporary volume on the explicitly tagged bootstrap worker `uc-k8sp5`, waits for physical
 restore completion and runs a trusted gVisor job with a read-only mount. It never
 executes the restored application, mounts a service-account token or permits
 network traffic. Sampling is bounded to 1024 files and 128 MiB total, up to 1 MiB

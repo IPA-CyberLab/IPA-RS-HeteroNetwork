@@ -21,3 +21,52 @@
     - name: Report public operations status
       ansible.builtin.debug:
         msg: "{{ hnn_flash_operations.stdout | from_json }}"
+    - name: Install the backup verification placement reconciler
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heterocloud-flash-operations.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Reconcile Flash backup verification worker placement
+          After=network-online.target kubelet.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 /usr/local/sbin/heterocloud-flash-operations --node {{ groups['bootstrap'] | first }}
+          User=root
+          Group=root
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=true
+          Environment=HOME=/tmp
+          Nice=19
+          TimeoutStartSec=45s
+      register: hnn_flash_operations_service
+    - name: Install periodic placement reconciliation
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heterocloud-flash-operations.timer
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Keep Flash backup verification placement available
+
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=5min
+          RandomizedDelaySec=30s
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+      register: hnn_flash_operations_timer
+    - name: Enable periodic placement reconciliation
+      ansible.builtin.systemd_service:
+        name: heterocloud-flash-operations.timer
+        daemon_reload: "{{ hnn_flash_operations_service.changed or hnn_flash_operations_timer.changed }}"
+        enabled: true
+        state: started
