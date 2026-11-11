@@ -1,0 +1,180 @@
+{
+  "organization_id": "019fbda8-eff3-7610-bdd5-8fe89e746c14",
+  "project_id": "019fbdaa-c85e-7950-b0f1-356e78da4b6e",
+  "vpc": {
+    "id": "01a1cb47-4e1c-7d10-b41f-83f29e098939",
+    "name": "coder",
+    "spec": {
+      "description": "Coder control plane, private database, and workspaces",
+      "nat": {
+        "enabled": true
+      },
+      "region": "heteronet-global",
+      "rules": [
+        {
+          "description": "",
+          "destination": {
+            "name": "database",
+            "type": "security_group"
+          },
+          "port": 5432,
+          "protocol": "tcp",
+          "source": {
+            "name": "coder",
+            "type": "security_group"
+          }
+        },
+        {
+          "description": "",
+          "destination": {
+            "name": "coder",
+            "type": "security_group"
+          },
+          "port": 7080,
+          "protocol": "tcp",
+          "source": {
+            "name": "workspaces",
+            "type": "security_group"
+          }
+        }
+      ],
+      "security_groups": [
+        "coder",
+        "database",
+        "workspaces"
+      ]
+    }
+  },
+  "services": [
+    {
+      "id": "01a1cb47-94b2-7612-9915-4119564da9d4",
+      "name": "coder-postgres",
+      "spec": {
+        "args": [
+          "chmod 711 /root; exec /usr/local/bin/docker-entrypoint.sh postgres"
+        ],
+        "command": [
+          "/bin/sh",
+          "-c"
+        ],
+        "cpu_millis": 250,
+        "egress": {
+          "allow_same_organization": false,
+          "allowed_destination_cidrs": [],
+          "denied_destination_cidrs": [],
+          "mode": "disabled"
+        },
+        "env": {
+          "PGDATA": "/root/postgresql/data",
+          "POSTGRES_DB": "coder",
+          "POSTGRES_USER": "coder"
+        },
+        "ephemeral_storage_gib": 8,
+        "exposure": {
+          "allowed_source_cidrs": [],
+          "denied_source_cidrs": [],
+          "traffic_mode": "forwarded",
+          "type": "internal"
+        },
+        "image": "docker.io/library/postgres:17",
+        "memory_mib": 512,
+        "metadata": {
+          "application": "coder",
+          "managed_by": "coder-dind"
+        },
+        "network": {
+          "private_name": "postgres",
+          "security_groups": [
+            "database"
+          ],
+          "vpc_id": "01a1cb47-4e1c-7d10-b41f-83f29e098939"
+        },
+        "ports": [
+          {
+            "container_port": 5432,
+            "name": "postgres",
+            "protocol": "tcp",
+            "service_port": 5432
+          }
+        ],
+        "region": "heteronet-global",
+        "replicas": 1,
+        "rootfs_storage_gib": 1,
+        "secret_env": {
+          "POSTGRES_PASSWORD": "postgres-password"
+        }
+      }
+    },
+    {
+      "id": "01a1cb49-7d2a-7780-9d2b-237504859cfc",
+      "name": "coder",
+      "spec": {
+        "args": [],
+        "command": [
+          "/root/.local/bin/heterocloud-coder"
+        ],
+        "cpu_millis": 1000,
+        "egress": {
+          "allow_same_organization": false,
+          "allowed_destination_cidrs": [],
+          "denied_destination_cidrs": [],
+          "mode": "internet"
+        },
+        "env": {
+          "API_DATA_IS_SENSITIVE": "true",
+          "CODER_ACCESS_URL": "https://coder.mizuame.app",
+          "CODER_DERP_FORCE_WEBSOCKETS": "true",
+          "CODER_DISABLE_PASSWORD_AUTH": "true",
+          "CODER_HTTP_ADDRESS": "0.0.0.0:7080",
+          "CODER_OAUTH2_GITHUB_ALLOW_EVERYONE": "true",
+          "CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS": "false",
+          "CODER_OAUTH2_GITHUB_DEFAULT_PROVIDER_ENABLE": "true",
+          "CODER_PROVISIONER_DAEMONS": "1",
+          "CODER_TELEMETRY_ENABLE": "false",
+          "HOME": "/root"
+        },
+        "ephemeral_storage_gib": 8,
+        "exposure": {
+          "allowed_source_cidrs": [],
+          "denied_source_cidrs": [],
+          "endpoint_mode": "web",
+          "traffic_mode": "forwarded",
+          "type": "public"
+        },
+        "image": "ghcr.io/coder/coder@sha256:a48f82c2c437e032ce3f6970b4e937a7900cad3c76956956955099465b45e542",
+        "memory_mib": 1024,
+        "metadata": {
+          "application": "coder",
+          "managed_by": "coder-dind"
+        },
+        "network": {
+          "private_name": "coder",
+          "security_groups": [
+            "coder"
+          ],
+          "vpc_id": "01a1cb47-4e1c-7d10-b41f-83f29e098939"
+        },
+        "ports": [
+          {
+            "container_port": 7080,
+            "name": "http",
+            "protocol": "tcp",
+            "service_port": 30000
+          }
+        ],
+        "region": "heteronet-global",
+        "replicas": 1,
+        "rootfs_storage_gib": 2,
+        "secret_env": {
+          "CODER_PG_CONNECTION_URL": "postgres-url"
+        },
+        "task_role": "01a10c38-e0f1-7440-94dd-33ac1cc90444"
+      }
+    }
+  ],
+  "custom_domain": {
+    "hostname": "coder.mizuame.app",
+    "service_id": "01a1cb49-7d2a-7780-9d2b-237504859cfc"
+  },
+  "note": "Desired configuration snapshot; secret values are held by HeteroCloud and are not included."
+}

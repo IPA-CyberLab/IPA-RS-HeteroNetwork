@@ -1,0 +1,78 @@
+- name: Keep the Pod return route available on public ingress nodes
+  hosts: 'master_only:bootstrap:standard:enrollment_issuer'
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_pod_routing: "{{ lookup('file', hnn_repo_root ~ '/deploy/terraform/master-only/pod-routing-policy.json') | from_json }}"
+  tasks:
+    - name: Reconcile only declared ingress nodes
+      when: inventory_hostname in hnn_pod_routing.nodes
+      block:
+        - name: Require the existing Kubernetes routing helper
+          ansible.builtin.stat:
+            path: /opt/heteronetwork/libexec/kubernetes-pod-cidr-routing
+          register: hnn_existing_pod_routing
+
+        - name: Check that the existing routing helper is installed
+          ansible.builtin.assert:
+            that: hnn_existing_pod_routing.stat.exists and hnn_existing_pod_routing.stat.executable
+
+        - name: Install the idempotent routing guard
+          ansible.builtin.copy:
+            src: "{{ hnn_repo_root }}/scripts/reconcile-pod-routing.sh"
+            dest: /opt/heteronetwork/libexec/reconcile-pod-routing.sh
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Install the routing guard service
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/heteronetwork-pod-routing-guard.service
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Unit]
+              Description=Restore the Kubernetes Pod return route if removed
+              After=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/opt/heteronetwork/libexec/reconcile-pod-routing.sh {{ hnn_pod_routing.pod_cidr }} {{ hnn_pod_routing.priority }}
+
+        - name: Install the routing guard timer
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/heteronetwork-pod-routing-guard.timer
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Unit]
+              Description=Periodically check the Kubernetes Pod return route
+
+              [Timer]
+              OnBootSec=30s
+              OnUnitActiveSec=60s
+              AccuracySec=10s
+
+              [Install]
+              WantedBy=timers.target
+
+        - name: Enable the routing guard
+          ansible.builtin.systemd_service:
+            name: heteronetwork-pod-routing-guard.timer
+            daemon_reload: true
+            enabled: true
+            state: started
+
+        - name: Reconcile the route now
+          ansible.builtin.command:
+            argv:
+              - /opt/heteronetwork/libexec/reconcile-pod-routing.sh
+              - "{{ hnn_pod_routing.pod_cidr }}"
+              - "{{ hnn_pod_routing.priority | string }}"
+          changed_when: false
