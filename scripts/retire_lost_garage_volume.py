@@ -123,7 +123,12 @@ def delete_resources(kube, resources):
                     pass
             except urllib.error.HTTPError as error:
                 if error.code != 404:
-                    raise
+                    try:
+                        detail = json.loads(error.read(65536))
+                        reason = detail.get("message", detail.get("reason", "request rejected"))
+                    except (ValueError, OSError):
+                        reason = "request rejected"
+                    raise ValueError(f"Kubernetes could not delete {path}: {reason}") from error
     finally:
         process.terminate()
         try:

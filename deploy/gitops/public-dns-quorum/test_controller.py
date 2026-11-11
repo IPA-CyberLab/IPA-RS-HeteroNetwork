@@ -155,6 +155,8 @@ class MajorityTests(unittest.TestCase):
             self.assertEqual(role['rules'],[{'apiGroups':[''],'resources':['configmaps'],'resourceNames':[member['vote_resource']],'verbs':['get','patch']}])
         publisher=next(x for x in docs if x['kind']=='Role' and x['metadata']['name']=='public-dns-publisher-dns')
         self.assertEqual(publisher['rules'][0]['resourceNames'],['heterocloud-web-gateways'])
+        deployment=next(x for x in docs if x['kind']=='Deployment' and x['metadata']['name']=='public-dns-publisher')
+        self.assertEqual(deployment['spec']['strategy']['rollingUpdate'],{'maxSurge':0,'maxUnavailable':1})
     def test_voters_have_distinct_fixed_nodes_and_no_secret_manager_placement(self):
         docs=render.objects(self.config);nodes=[]
         for d in docs:

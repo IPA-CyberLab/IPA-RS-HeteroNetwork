@@ -38,7 +38,10 @@ def objects(config):
         container['livenessProbe']['initialDelaySeconds']=30
         affinity = {'nodeAffinity':{'requiredDuringSchedulingIgnoredDuringExecution':{'nodeSelectorTerms':[{'matchExpressions':[{'key':'kubernetes.io/hostname','operator':'In','values':nodes}]}]}}}
         if component=='publisher':affinity['podAntiAffinity']={'requiredDuringSchedulingIgnoredDuringExecution':[{'topologyKey':'kubernetes.io/hostname','labelSelector':{'matchLabels':labels}}]}
-        spec = {'replicas':1 if voter else 2,'selector':{'matchLabels':labels},'strategy':{'type':'RollingUpdate','rollingUpdate':{'maxSurge':0 if voter else 1,'maxUnavailable':1 if voter else 0}},
+        # Publishers have required host anti-affinity. With exactly two
+        # eligible hosts, a surge-only rollout cannot schedule a third Pod.
+        # Keep one publisher available while replacing the other in turn.
+        spec = {'replicas':1 if voter else 2,'selector':{'matchLabels':labels},'strategy':{'type':'RollingUpdate','rollingUpdate':{'maxSurge':0,'maxUnavailable':1}},
                 'template':{'metadata':{'labels':labels},'spec':{'serviceAccountName':name,'automountServiceAccountToken':True,'affinity':affinity,
                     'tolerations':[{'key':'node-role.kubernetes.io/control-plane','operator':'Exists','effect':'NoSchedule'}],
                     'securityContext':{'runAsNonRoot':True,'runAsUser':65532,'runAsGroup':65532,'seccompProfile':{'type':'RuntimeDefault'}},
