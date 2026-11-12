@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import os, re, uuid
-          assert re.fullmatch(r'[A-Za-z0-9.-]{1,253}', os.environ['TEST_HOST'])
+          assert re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?', os.environ['TEST_HOST'])
           assert 1 <= int(os.environ['TEST_PORT']) <= 65535
           org, service = os.environ['TEST_USERNAME'].split('+')
           uuid.UUID(org); uuid.UUID(service)
