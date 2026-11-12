@@ -1,0 +1,65 @@
+name: Flash public SSH E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: Public Flash SSH hostname
+        required: true
+        type: string
+      port:
+        description: Public SSH port
+        required: true
+        type: string
+      username:
+        description: Organization and service IDs joined with +
+        required: true
+        type: string
+      fingerprint:
+        description: Expected SHA256 SSH host key fingerprint
+        required: true
+        type: string
+      test_run_id:
+        description: Unique ID for the temporary test key
+        required: true
+        type: string
+
+run-name: Public Flash SSH E2E ${{ inputs.test_run_id }}
+permissions: {}
+jobs:
+  public-ssh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Connect from the GitHub-hosted VM
+        env:
+          TEST_HOST: ${{ inputs.host }}
+          TEST_PORT: ${{ inputs.port }}
+          TEST_USERNAME: ${{ inputs.username }}
+          TEST_FINGERPRINT: ${{ inputs.fingerprint }}
+          TEST_PRIVATE_KEY: ${{ secrets[format('HETERONET_PUBLIC_SSH_E2E_{0}', inputs.test_run_id)] }}
+          TEST_RUN_ID: ${{ inputs.test_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, uuid
+          assert re.fullmatch(r'[A-Za-z0-9.-]{1,253}', os.environ['TEST_HOST'])
+          assert 1 <= int(os.environ['TEST_PORT']) <= 65535
+          org, service = os.environ['TEST_USERNAME'].split('+')
+          uuid.UUID(org); uuid.UUID(service)
+          assert re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', os.environ['TEST_FINGERPRINT'])
+          assert re.fullmatch(r'[A-F0-9]{32}', os.environ['TEST_RUN_ID'])
+          assert os.environ['TEST_PRIVATE_KEY'].startswith('-----BEGIN OPENSSH PRIVATE KEY-----')
+          PY
+          umask 077
+          printf '%s\n' "$TEST_PRIVATE_KEY" > "$RUNNER_TEMP/flash-ssh-key"
+          ssh-keyscan -T 10 -t ed25519 -p "$TEST_PORT" "$TEST_HOST" > "$RUNNER_TEMP/flash-known-hosts"
+          actual=$(ssh-keygen -lf "$RUNNER_TEMP/flash-known-hosts" -E sha256 | awk '{print $2}')
+          test "$actual" = "$TEST_FINGERPRINT"
+          result=$(ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=$RUNNER_TEMP/flash-known-hosts" -o ConnectTimeout=15 \
+            -i "$RUNNER_TEMP/flash-ssh-key" -p "$TEST_PORT" -l "$TEST_USERNAME" "$TEST_HOST" \
+            'printf HETEROCLOUD_PUBLIC_SSH_OK')
+          test "$result" = HETEROCLOUD_PUBLIC_SSH_OK
+          echo 'Public SSH host verification, authentication and command execution succeeded.'
