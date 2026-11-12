@@ -142,6 +142,7 @@
           "type": "public"
         },
         "image": "ghcr.io/coder/coder@sha256:a48f82c2c437e032ce3f6970b4e937a7900cad3c76956956955099465b45e542",
+        "ssh_enabled": true,
         "memory_mib": 1024,
         "metadata": {
           "application": "coder",

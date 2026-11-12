@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: e2dcfdb5983b893252d0721568f65660a220261e
+    targetRevision: 9058b9a103738d68c1c35008462718db04585243
     path: deploy/helm/heterocloud
     helm:
       releaseName: heterocloud
@@ -26,7 +26,7 @@ spec:
             - 10.96.0.1/32
             - 10.250.0.0/24
         image:
-          tag: "0.1.116-platform.3@sha256:2f799df5deeed93d05cf4e0c1a5d1c5ec021f7cc44609ed3028e2e62923ae007"
+          tag: "0.1.116-platform.7@sha256:322f1a3fb0a921ea20776ca327dea83240324f7cced32500f2baf453750dc7c4"
         flashSsh:
           enabled: true
           hostKeySecretName: heterocloud-flash-ssh-host
@@ -34,7 +34,8 @@ spec:
             enabled: true
             port: 2222
             overlayDnsName: flash-ssh.heteronetwork.internal
-            advertisedHost: flash-ssh.heteronetwork.internal
+            advertisedHost: ssh.flash.heterocloud.mizuame.app
+            listenAddress: 0.0.0.0
         worker:
           replicaCount: 2
           vpcEndpoint: http://heterocloud-vpc-api.heterocloud-vpc.svc.cluster.local:8080/
