@@ -2,6 +2,9 @@ import copy
 import json
 import os
 from pathlib import Path
+import tempfile
+import tomllib
+import urllib.parse
 import unittest
 from unittest.mock import patch
 import controller as q
@@ -13,6 +16,7 @@ HERE=Path(__file__).resolve().parent
 class MajorityTests(unittest.TestCase):
     def setUp(self):
         self.config=json.loads((HERE/'pool.json').read_text());self.config['enabled']=True
+        self.config.pop('witness',None)
         # Tests use a synthetic three-voter topology, independent of the live
         # inventory, so retiring a production node does not delete coverage.
         self.config['members']=[
@@ -172,6 +176,93 @@ class MajorityTests(unittest.TestCase):
         import yaml
         config=json.loads((HERE/'pool.json').read_text())
         self.assertEqual(list(yaml.safe_load_all((HERE/'workloads.yaml').read_text())),render.objects(config))
+
+    def test_external_witness_forms_majority_only_with_fresh_local_vote(self):
+        self.config['members']=self.config['members'][:2]
+        self.config['witness']={'id':'external-witness','url':'https://witness.example.org/v1/probe'}
+        local=self.config['members'][0]['id'];self.published=['163.220.236.45','163.220.236.61']
+        state=None
+        for index in range(3):
+            votes=self.votes(unhealthy=[(local,'ichikawap1')],voters=[local])
+            votes['external-witness']={'schema_version':1,'config_digest':q.digest(self.config),
+                'voter_id':'external-witness','node':'external','sample_id':f'{index+100:032x}',
+                'observed_at':self.now,'origins':{
+                    'ichikawap1':{'healthy':False,'reason':'timeout'},
+                    'simulated-worker':{'healthy':True,'reason':'ok'}}}
+            state,targets,status=q.decide(self.config,votes,state,self.published,self.now)
+            self.now+=5
+        self.assertEqual(targets,['163.220.236.45'])
+        self.assertEqual(status['membership_size'],3)
+        self.assertEqual(status['majority_required'],2)
+        # No local observation means the witness alone cannot change DNS.
+        state,targets,status=q.decide(self.config,{'external-witness':votes['external-witness']},
+                                      state,targets,self.now)
+        self.assertEqual(targets,['163.220.236.45'])
+        self.assertEqual(status['origins']['ichikawap1']['decision'],'unknown')
+
+    def test_witness_only_polled_when_it_can_complete_a_majority(self):
+        self.config['members']=self.config['members'][:2]
+        self.config['witness']={'id':'external-witness','url':'https://witness.example.org/v1/probe'}
+        votes=self.votes()
+        self.assertFalse(q.witness_needed(self.config,votes,self.now))
+        self.assertTrue(q.witness_needed(self.config,{self.config['members'][0]['id']:votes[self.config['members'][0]['id']]},self.now))
+        self.assertFalse(q.witness_needed(self.config,{},self.now))
+        votes[self.config['members'][0]['id']]['origins']['ichikawap1']={'healthy':False,'reason':'timeout'}
+        self.assertTrue(q.witness_needed(self.config,votes,self.now))
+
+    def test_external_response_must_match_nonce_and_configured_origins(self):
+        self.config['members']=self.config['members'][:2]
+        self.config['witness']={'id':'external-witness','url':'https://witness.example.org/v1/probe'}
+        config=self.config
+        class Response:
+            status=200
+            def __init__(self,data):self.data=data
+            def __enter__(self):return self
+            def __exit__(self,*_):pass
+            def read(self,_):return self.data
+        class Opener:
+            def __init__(self,forged=False):self.forged=forged
+            def open(self,request,timeout):
+                nonce=urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)['nonce'][0]
+                data={'schema_version':1,'nonce':'f'*32 if self.forged else nonce,
+                      'origins':{x['id']:{'healthy':True,'reason':'ok'} for x in config['origins']}}
+                return Response(json.dumps(data).encode())
+        with tempfile.NamedTemporaryFile() as token:
+            token.write(b'a'*64);token.flush()
+            self.assertIsNotNone(q.witness_vote(config,token.name,Opener()))
+            self.assertIsNone(q.witness_vote(config,token.name,Opener(forged=True)))
+
+    def test_external_witness_secret_is_only_mounted_on_publishers(self):
+        self.config['witness']={'id':'external-witness','url':'https://witness.example.org/v1/probe'}
+        docs=render.objects(self.config)
+        for deployment in (x for x in docs if x['kind']=='Deployment'):
+            component=deployment['spec']['template']['metadata']['labels']['app.kubernetes.io/component']
+            volumes=deployment['spec']['template']['spec']['volumes']
+            self.assertEqual(any(x['name']=='witness-token' for x in volumes),component=='publisher')
+        policy=next(x for x in docs if x['kind']=='NetworkPolicy' and x['metadata']['name']=='public-dns-quorum-witness')
+        self.assertEqual(policy['spec']['podSelector']['matchLabels']['app.kubernetes.io/component'],'publisher')
+
+    def test_external_witness_rejects_insecure_or_ambiguous_urls(self):
+        for url in ('http://example.com/v1/probe','https://user:password@example.com/v1/probe',
+                    'https://localhost/v1/probe','https://127.0.0.1/v1/probe',
+                    'https://example.com/v1/probe?other=value','https://example.com:444/v1/probe'):
+            c=copy.deepcopy(self.config);c['witness']={'id':'external-witness','url':url}
+            with self.subTest(url=url),self.assertRaises(ValueError):q.validate_config(c)
+
+    def test_witness_probe_names_match_the_declared_public_origins(self):
+        import yaml
+        root=HERE.parents[2]
+        config=json.loads((HERE/'pool.json').read_text())
+        worker=tomllib.loads((root/'deploy/public-dns-witness/wrangler.toml').read_text())
+        names={x['id']:x['host'] for x in json.loads(worker['vars']['WITNESS_ORIGINS'])}
+        docs=list(yaml.safe_load_all((root/'deploy/gitops/envoy-gateway/public-web-dns.yaml').read_text()))
+        record=next(x for x in docs if x['metadata']['name']=='heterocloud-gateway-observer-addresses')
+        targets={x['dnsName']:x['targets'] for x in record['spec']['endpoints']}
+        route=list(yaml.safe_load_all((root/'deploy/gitops/envoy-gateway/public-gateway-health.yaml').read_text()))[0]
+        self.assertEqual(set(names),{x['id'] for x in config['origins']})
+        for origin in config['origins']:
+            self.assertEqual(targets[names[origin['id']]],[origin['address']])
+            self.assertIn(names[origin['id']],route['spec']['hostnames'])
 
 
 if __name__=='__main__':unittest.main()

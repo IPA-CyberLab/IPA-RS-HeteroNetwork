@@ -46,7 +46,7 @@ def validate_config(raw):
     allowed = {"schema_version", "namespace", "dns_namespace", "dns_resource", "state_resource",
                "members", "origins", "records", "probe", "fresh_seconds", "interval_seconds",
                "down_samples", "up_samples", "enabled", "all_down_policy"}
-    require(set(raw) == allowed, "invalid configuration fields")
+    require(set(raw) in (allowed, allowed | {"witness"}), "invalid configuration fields")
     for key in ("namespace", "dns_namespace", "dns_resource", "state_resource"):
         require(isinstance(raw[key], str) and LABEL.fullmatch(raw[key]), "invalid resource name")
     members, origins = raw["members"], raw["origins"]
@@ -61,6 +61,24 @@ def validate_config(raw):
             require(isinstance(member[key], str) and LABEL.fullmatch(member[key]), "invalid voter identity")
     for key in ("id", "node", "vote_resource"):
         require(len({x[key] for x in members}) == len(members), "voters must have distinct identities and nodes")
+    if "witness" in raw:
+        witness = raw["witness"]
+        require(isinstance(witness, dict) and set(witness) == {"id", "url"}, "invalid witness configuration")
+        require(isinstance(witness["id"], str) and LABEL.fullmatch(witness["id"]) and
+                witness["id"] not in {x["id"] for x in members}, "invalid witness identity")
+        require(isinstance(witness["url"], str) and len(witness["url"]) <= 512, "invalid witness URL")
+        url = urllib.parse.urlsplit(witness["url"])
+        require(url.scheme == "https" and url.hostname and not url.username and not url.password and
+                url.port in (None, 443) and url.path == "/v1/probe" and not url.query and not url.fragment,
+                "witness must use a fixed HTTPS URL")
+        require(not dns_name(url.hostname).startswith("*."), "invalid witness host")
+        require(not url.hostname.endswith((".internal", ".local", ".localhost")), "invalid witness host")
+        try:
+            ipaddress.ip_address(url.hostname)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("witness host must be a DNS name")
     for origin in origins:
         require(set(origin) == {"id", "address"} and LABEL.fullmatch(origin["id"]), "invalid origin fields")
         address = ipaddress.ip_address(origin["address"])
@@ -94,6 +112,13 @@ def digest(config):
 def parse_document(raw):
     require(isinstance(raw, (str, bytes)) and len(raw) <= MAX_BYTES, "document exceeds bound")
     return json.loads(raw)
+
+
+def electorate(config):
+    members = list(config["members"])
+    if config.get("witness"):
+        members.append({"id": config["witness"]["id"], "node": "external"})
+    return members
 
 
 def usable_vote(config, member, document, now):
@@ -146,7 +171,7 @@ def valid_state(config, value):
     try:
         require(isinstance(value, dict) and value["schema_version"] == 1 and value["config_digest"] == digest(config), "state configuration differs")
         require(set(value["origins"]) == {x["id"] for x in config["origins"]}, "state inventory differs")
-        members = {x["id"] for x in config["members"]}
+        members = {x["id"] for x in electorate(config)}
         for state in value["origins"].values():
             require(set(state) == {"active", "streak_vote", "streak", "last_samples"}, "invalid origin state")
             require(type(state["active"]) is bool and (state["streak_vote"] is None or type(state["streak_vote"]) is bool), "invalid committed state")
@@ -160,9 +185,10 @@ def valid_state(config, value):
 
 def decide(config, votes, previous, published, now):
     state = copy.deepcopy(previous) if valid_state(config, previous) else new_state(config, published)
-    valid = {m["id"]: usable_vote(config, m, votes.get(m["id"]), now) for m in config["members"]}
+    members = electorate(config)
+    valid = {m["id"]: usable_vote(config, m, votes.get(m["id"]), now) for m in members}
     valid = {k: v for k, v in valid.items() if v is not None}
-    majority = len(config["members"]) // 2 + 1
+    majority = len(members) // 2 + 1
     results = {}
     for origin in config["origins"]:
         key = origin["id"]
@@ -192,7 +218,7 @@ def decide(config, votes, previous, published, now):
     if not config["enabled"]:
         desired = published
     report = {"schema_version": 1, "config_digest": digest(config), "observed_at": now,
-              "enabled": config["enabled"], "majority_required": majority, "membership_size": len(config["members"]),
+              "enabled": config["enabled"], "majority_required": majority, "membership_size": len(members),
               "fresh_voters": len(valid), "origins": results, "published_targets": desired,
               "all_down": all_down, "all_down_policy": config["all_down_policy"],
               "all_down_retained": all_down and config["all_down_policy"] == "retain"}
@@ -212,6 +238,51 @@ def dns_patch(config, endpoint, desired):
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def witness_needed(config, votes, now):
+    """Poll the external witness only when it can complete a missing majority."""
+    if not config.get("witness"):
+        return False
+    local = [usable_vote(config, member, votes.get(member["id"]), now)
+             for member in config["members"]]
+    local = [vote for vote in local if vote is not None]
+    majority = len(electorate(config)) // 2 + 1
+    for origin in config["origins"]:
+        results = [vote["origins"][origin["id"]]["healthy"] for vote in local]
+        largest = max(results.count(True), results.count(False))
+        if largest < majority <= largest + 1:
+            return True
+    return False
+
+
+def witness_vote(config, token_path="/var/run/public-dns-witness/token", opener=None):
+    """Fetch a nonce-bound HTTPS vote. Failure or malformed data is unknown."""
+    try:
+        raw = Path(token_path).read_bytes()
+        require(len(raw) == 64 and re.fullmatch(rb"[0-9a-f]{64}", raw), "invalid witness token")
+        nonce = uuid.uuid4().hex
+        request = urllib.request.Request(config["witness"]["url"] + "?nonce=" + nonce,
+            headers={"Authorization": "Bearer " + raw.decode("ascii"),
+                     "Accept": "application/json", "Cache-Control": "no-cache",
+                     "User-Agent": "HeteroNetwork-DNS-Publisher/1.0"})
+        if opener is None:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
+                                                  urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        with opener.open(request, timeout=8) as response:
+            require(response.status == 200, "witness request failed")
+            content = response.read(16 * 1024 + 1)
+        require(len(content) <= 16 * 1024, "witness response exceeds bound")
+        result = parse_document(content)
+        require(isinstance(result, dict) and set(result) == {"schema_version", "nonce", "origins"} and
+                result["schema_version"] == 1 and result["nonce"] == nonce, "invalid witness response")
+        member = {"id": config["witness"]["id"], "node": "external"}
+        vote = {"schema_version": 1, "config_digest": digest(config), "voter_id": member["id"],
+                "node": member["node"], "sample_id": nonce, "observed_at": time.time(),
+                "origins": result["origins"]}
+        return usable_vote(config, member, vote, time.time())
+    except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError):
         return None
 
 
@@ -344,12 +415,18 @@ def publish_once(config, api):
             votes[member["id"]] = parse_document(raw) if raw else None
         except (ApiError, ValueError, KeyError, TypeError):
             votes[member["id"]] = None
+    witness_polled = witness_needed(config, votes, time.time())
+    if witness_polled:
+        votes[config["witness"]["id"]] = witness_vote(config)
     document = api.call("GET", path)
     current_lease = parse_document(document["data"]["lease.json"])
     require(current_lease["owner"] == identity and current_lease["expires_at"] - time.time() > 6, "publisher lease expired")
     raw = document.get("data", {}).get("state.json", "")
     previous = parse_document(raw) if raw else None
     state, desired, report = decide(config, votes, previous, published, time.time())
+    if config.get("witness"):
+        report["witness"] = {"polled": witness_polled,
+                             "available": votes.get(config["witness"]["id"]) is not None}
     # Commit consumed observations first. A competing publisher must refetch
     # the state after a conflict and cannot count those observations twice.
     api.call("PATCH", path, cm_patch(document, {"state.json": json.dumps(state, separators=(",", ":")), "status.json": json.dumps(report, separators=(",", ":"))}), "application/json-patch+json")

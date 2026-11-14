@@ -19,6 +19,7 @@ def files():
            'scripts/verify-master-only.py','scripts/verify-standard-node.py','scripts/test_verify_standard_node.py',
            'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py','scripts/ensure-flash-ssh-host-key.py','scripts/test_ensure_flash_ssh_host_key.py',
            'scripts/verify-storage-redundancy.py','scripts/test_verify_storage_redundancy.py',
+           'scripts/install-public-gateway-base.py','scripts/test_install_public_gateway_base.py',
            'scripts/reconcile-overlay-boot.py','scripts/test_reconcile_overlay_boot.py','scripts/overlay_power_recovery_e2e.py',
            'scripts/node_lifecycle.py','scripts/node_test_fixtures.py','scripts/test_node_lifecycle.py','scripts/reconcile-node-lifecycle.py',
            'scripts/retire_hn_registration.py','scripts/test_retire_hn_registration.py',
@@ -91,8 +92,11 @@ def files():
               'deploy/gitops/network-policy-engine/kube-router.yaml','deploy/gitops/longhorn-prerequisites/node-prerequisites.yaml',
               'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml',
               'deploy/gitops/envoy-gateway/kustomization.yaml','deploy/gitops/envoy-gateway/public-web-dns.yaml',
+              'deploy/gitops/envoy-gateway/envoyproxy.yaml','deploy/gitops/envoy-gateway/heterocloud-edge-local-proxy-service.yaml',
+              'deploy/gitops/envoy-gateway/public-gateway-health.yaml',
               'deploy/gitops/envoy-gateway/README.md','deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml',
               'deploy/gitops/envoy-gateway/flash-ssh-backend-traffic-policy.yaml']
+    paths += ['deploy/public-dns-witness/'+n for n in ['.gitignore','bootstrap.py','worker.mjs','worker.test.mjs','wrangler.toml']]
     for directory in ['deploy/terraform/master-only','deploy/terraform/github-dr-environment','deploy/gitops/control-plane-only','deploy/gitops/standard-nodes','deploy/gitops/gpu-runtime','deploy/gitops/cluster-dns','deploy/gitops/public-dns-quorum','deploy/gitops/custom-domains','scripts/storage-heartbeat-e2e']:
         for p in (ROOT/directory).rglob('*'):
             if not p.is_file() or '.terraform' in p.parts or '__pycache__' in p.parts: continue

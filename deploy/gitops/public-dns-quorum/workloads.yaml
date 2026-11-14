@@ -474,6 +474,9 @@ spec:
           readOnly: true
         - name: tmp
           mountPath: /tmp
+        - name: witness-token
+          mountPath: /var/run/public-dns-witness
+          readOnly: true
         readinessProbe:
           exec:
             command:
@@ -504,6 +507,10 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 4Mi
+      - name: witness-token
+        secret:
+          secretName: public-dns-witness-token
+          defaultMode: 292
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -582,8 +589,56 @@ spec:
   - to:
     - ipBlock:
         cidr: 163.220.236.61/32
+    - ipBlock:
+        cidr: 163.220.236.45/32
     ports:
     - protocol: TCP
       port: 443
     - protocol: TCP
       port: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: public-dns-quorum-witness
+  namespace: heterocloud-dns
+  labels:
+    app.kubernetes.io/name: public-dns-quorum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: public-dns-quorum
+      app.kubernetes.io/component: publisher
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 10.96.0.10/32
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 0.0.0.0/8
+        - 10.0.0.0/8
+        - 100.64.0.0/10
+        - 127.0.0.0/8
+        - 169.254.0.0/16
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 224.0.0.0/4
+        - 240.0.0.0/4
+    ports:
+    - protocol: TCP
+      port: 443

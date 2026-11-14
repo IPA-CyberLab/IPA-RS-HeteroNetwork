@@ -12,9 +12,17 @@ DNS is a separate DNSEndpoint outside their RBAC permissions. No Cloudflare
 token, private key or user credential is mounted into these workloads.
 
 The electorate is fixed by `pool.json`, not by whichever observers are currently
-reachable. The current two members must both supply fresh, matching votes. Missing,
-expired, malformed, future or differently configured votes are unknown, not failed.
-They cannot lower the required majority or authorize DNS withdrawal.
+reachable. Two observers run on the two worker hosts; an authenticated Cloudflare
+Worker supplies a third, off-host observation only when the local votes cannot
+already form a majority. Any two fresh, matching observations form a majority.
+Missing, expired, malformed, future or differently configured votes are unknown,
+not failed. They cannot lower the required majority or authorize DNS withdrawal.
+The remote observer never writes DNS and has no Cloudflare API or Kubernetes
+credentials. Its token is stored in the private operator directory, a Kubernetes
+Secret and the Worker secret store, never Git or Terraform state. Fixed DNS-only
+probe names point to individual gateway IPs; each is checked over HTTPS and HTTP.
+Changing origins requires updating both the probe DNS records and the Worker's
+declared inventory; the inventory test rejects mismatches.
 
 Three new majority samples are required to remove an origin; two to re-add it.
 The same sample cannot count twice, including across publisher replicas or restarts.
@@ -45,9 +53,10 @@ Normal failure exclusion takes three 5-second observations, plus ExternalDNS's
 5-second reconciliation. DNS TTL is currently 60 seconds; resolvers can retain
 older answers until their cache expires. Publisher failover can additionally wait
 for its 45-second lease. This is DNS failover, not instantaneous traffic failover,
-and distinct nodes do not imply independent ISPs or regions. Currently only one
-public origin is commissioned, so there is no public-gateway failover until a
-second origin passes the HTTPS probe and is added to the pool.
+and distinct nodes do not imply independent ISPs or regions. If the external
+witness and either local observer are both unavailable, DNS retains its previous
+targets rather than electing a smaller quorum. A working public gateway cannot
+make an unavailable database or storage quorum available.
 
 Observation timings, membership, probe name and addresses are configuration, not compiled
 hostnames. After changing `pool.json`, regenerate `workloads.yaml` with

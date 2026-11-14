@@ -33,6 +33,8 @@ def objects(config):
                      'securityContext':{'allowPrivilegeEscalation':False,'readOnlyRootFilesystem':True,'capabilities':{'drop':['ALL']}},
                      'volumeMounts':[{'name':'config','mountPath':'/config','readOnly':True},{'name':'tmp','mountPath':'/tmp'}]}
         if voter:container['command'] += ['--voter-id',voter]
+        if component == 'publisher' and config.get('witness'):
+            container['volumeMounts'].append({'name':'witness-token','mountPath':'/var/run/public-dns-witness','readOnly':True})
         for probe,file,age in [('readinessProbe','last-success',30),('livenessProbe','loop-progress',120)]:
             container[probe] = {'exec':{'command':['python3','-c',f"import os,time; assert time.time()-os.stat('/tmp/{file}').st_mtime < {age}"]},'periodSeconds':10,'timeoutSeconds':3,'failureThreshold':3}
         container['livenessProbe']['initialDelaySeconds']=30
@@ -46,6 +48,8 @@ def objects(config):
                     'tolerations':[{'key':'node-role.kubernetes.io/control-plane','operator':'Exists','effect':'NoSchedule'}],
                     'securityContext':{'runAsNonRoot':True,'runAsUser':65532,'runAsGroup':65532,'seccompProfile':{'type':'RuntimeDefault'}},
                     'containers':[container],'volumes':[{'name':'config','configMap':{'name':'public-dns-quorum-runtime','defaultMode':292}},{'name':'tmp','emptyDir':{'medium':'Memory','sizeLimit':'4Mi'}}]}}}
+        if component == 'publisher' and config.get('witness'):
+            spec['template']['spec']['volumes'].append({'name':'witness-token','secret':{'secretName':'public-dns-witness-token','defaultMode':292}})
         return obj('Deployment',name,spec,'apps/v1')
     result=[]
     for member in config['members']:
@@ -59,6 +63,21 @@ def objects(config):
     egress=[{'to':[{'ipBlock':{'cidr':'10.96.0.1/32'}},{'ipBlock':{'cidr':'10.250.0.0/24'}}],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':6443}]},
             {'to':[{'ipBlock':{'cidr':x['address']+('/32' if ':' not in x['address'] else '/128')}} for x in config['origins']],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':80}]}]
     result += [obj('NetworkPolicy',APP,{'podSelector':{'matchLabels':{'app.kubernetes.io/name':APP}},'policyTypes':['Ingress','Egress'],'ingress':[],'egress':egress},'networking.k8s.io/v1')]
+    if config.get('witness'):
+        # Standard Kubernetes NetworkPolicy cannot express an FQDN. Only the
+        # publishers may reach public TCP/443; exclude private address ranges.
+        # DNS permits the cluster resolver and its backing pods, not arbitrary
+        # destinations. Voters retain their original narrower egress policy.
+        resolver = {'to':[{'ipBlock':{'cidr':'10.96.0.10/32'}},
+                          {'namespaceSelector':{'matchLabels':{'kubernetes.io/metadata.name':'kube-system'}},
+                           'podSelector':{'matchLabels':{'k8s-app':'kube-dns'}}}],
+                    'ports':[{'protocol':'UDP','port':53},{'protocol':'TCP','port':53}]}
+        public = {'to':[{'ipBlock':{'cidr':'0.0.0.0/0','except':['0.0.0.0/8','10.0.0.0/8','100.64.0.0/10',
+                    '127.0.0.0/8','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','224.0.0.0/4','240.0.0.0/4']}}],
+                  'ports':[{'protocol':'TCP','port':443}]}
+        result += [obj('NetworkPolicy',APP+'-witness',{'podSelector':{'matchLabels':{
+            'app.kubernetes.io/name':APP,'app.kubernetes.io/component':'publisher'}},
+            'policyTypes':['Egress'],'egress':[resolver,public]},'networking.k8s.io/v1')]
     return result
 
 
