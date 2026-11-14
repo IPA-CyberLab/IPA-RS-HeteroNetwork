@@ -1,0 +1,7 @@
+name = "heteronetwork-public-dns-witness"
+main = "worker.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+WITNESS_ORIGINS = '[{"id":"uc-k8sp5","host":"probe-uc-k8sp5.flash.heterocloud.mizuame.app"},{"id":"ichikawap1","host":"probe-ichikawap1.flash.heterocloud.mizuame.app"}]'
