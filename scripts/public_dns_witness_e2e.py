@@ -249,6 +249,26 @@ def main():
             policies({})
             wait(lambda: targets() == both and status().get('witness', {}).get('available') is True)
             check('one_surviving_voter_and_external_witness_restore_recovered_origin')
+        stage = 'publisher_shutdown'
+        policies({})
+        kube('-n', namespace, 'scale', 'deployment/public-dns-voter-' + first['id'], '--replicas=1')
+        wait(lambda: status().get('fresh_voters') >= 2 and
+             all(x['decision'] == 'healthy' for x in status().get('origins', {}).values()))
+        state = get('configmap', config['state_resource'])['data']
+        owner = json.loads(state['lease.json'])['owner']
+        pods = json.loads(kube('-n',namespace,'get','pods','-o','json').stdout)['items']
+        leader = next(p for p in pods if p['metadata']['uid'] == owner and
+                      p['metadata']['labels'].get('app.kubernetes.io/component') == 'publisher')
+        assert owned()
+        started = time.monotonic()
+        kube('-n', namespace, 'delete', 'pod', leader['metadata']['name'], '--wait=false')
+        def new_leader():
+            state = get('configmap', config['state_resource']).get('data', {})
+            return json.loads(state.get('lease.json','{}')).get('owner') not in (None, owner)
+        wait(new_leader, seconds=30)
+        assert targets() == both
+        report['publisher_failover_ms'] = round((time.monotonic()-started)*1000)
+        check('publisher_shutdown_releases_lease_for_fast_safe_takeover')
         report['passed'] = True
         save()
     except Exception:

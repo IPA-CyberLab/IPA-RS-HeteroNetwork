@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import ssl
 import struct
@@ -538,6 +539,10 @@ def vote_once(config, voter_id, api):
         vote['overlay_dns'] = {target['id']:result for target,result in zip(targets,dns_results)}
         vote['overlay_dns_counters'] = {}
         for target,result in zip(targets,dns_results):
+            if not result['healthy']:
+                print(json.dumps({'component':'voter','event':'overlay_dns_probe_failed',
+                                  'voter_id':voter_id,'server':target['id'],
+                                  'reason':result['reason'],'latency_seconds':result.get('latency_seconds')}), flush=True)
             old = previous.get(target['id'], {'attempts':0,'failures':0})
             # Saturate rather than produce an invalid vote on eventual overflow.
             attempts = min(10**12, old['attempts'] + 1)
@@ -603,6 +608,21 @@ def publish_once(config, api):
     return {"component": "publisher", "enabled": config["enabled"], "fresh_voters": report["fresh_voters"],
             "majority_required": report["majority_required"], "published_targets": desired,
             "all_down": report["all_down"], "dns_changed": patch is not None}
+
+
+def release_lease(config, api, identity):
+    """Release only our own lease after the current reconciliation has finished."""
+    require(re.fullmatch(r"[a-f0-9-]{36}", identity), "invalid publisher identity")
+    path = cm_path(config['namespace'], config['state_resource'])
+    document = api.call('GET', path)
+    raw = document.get('data', {}).get('lease.json', '')
+    lease = parse_document(raw) if raw else {}
+    if lease.get('owner') != identity:
+        return False
+    lease['expires_at'] = 0
+    api.call('PATCH', path, cm_patch(document, {'lease.json':json.dumps(lease,separators=(',',':'))}),
+             'application/json-patch+json')
+    return True
 
 
 def metrics(config, api, now):
@@ -700,7 +720,13 @@ def main():
     else:
         serve_metrics(config)
     api = Kubernetes()
-    while True:
+    stop_requested = False
+    def request_stop(_signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    while not stop_requested:
         started = time.monotonic()
         Path("/tmp/loop-progress").touch()
         try:
@@ -712,7 +738,15 @@ def main():
         except Exception:
             # Exception text may include request headers; never log it.
             print(json.dumps({"component": args.role, "error": "reconciliation_failed"}), flush=True)
-        time.sleep(max(0.2, config["interval_seconds"] - (time.monotonic() - started)))
+        if not stop_requested:
+            time.sleep(max(0.2, config["interval_seconds"] - (time.monotonic() - started)))
+    if args.role == 'publisher':
+        try:
+            released = release_lease(config, api, os.environ['POD_UID'])
+            print(json.dumps({'component':'publisher','lease_released':released}), flush=True)
+        except Exception:
+            # On failure the ordinary lease timeout remains the safe fallback.
+            print(json.dumps({'component':'publisher','lease_released':False}), flush=True)
 
 
 if __name__ == "__main__":

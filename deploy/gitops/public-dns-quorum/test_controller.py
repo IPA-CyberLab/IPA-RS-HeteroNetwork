@@ -339,7 +339,7 @@ class MajorityTests(unittest.TestCase):
             return {'healthy':good,'reason':'ok' if good else 'timeout','latency_seconds':0.1}
         with patch.dict(os.environ,{'NODE_NAME':member['node']}),\
              patch.object(q,'timed_probe',return_value={'healthy':True,'reason':'ok'}),\
-             patch.object(q,'probe_overlay_dns',side_effect=dns):
+             patch.object(q,'probe_overlay_dns',side_effect=dns), patch('builtins.print'):
             q.vote_once(self.config,member['id'],api)
             q.vote_once(self.config,member['id'],api)
             stored=json.loads(api.doc['data']['vote.json'])
@@ -349,6 +349,29 @@ class MajorityTests(unittest.TestCase):
             q.vote_once(self.config,member['id'],api)
             stored=json.loads(api.doc['data']['vote.json'])
             self.assertEqual(stored['overlay_dns_counters']['uc-k8sp5'],{'attempts':1,'failures':1})
+
+    def test_shutdown_releases_only_own_uid_fenced_lease(self):
+        identity='11111111-1111-4111-8111-111111111111'
+        other='22222222-2222-4222-8222-222222222222'
+        class Api:
+            def __init__(self,owner):
+                self.doc={'metadata':{'uid':'cm-uid','resourceVersion':'42'},
+                          'data':{'lease.json':json.dumps({'owner':owner,'expires_at':1000}),
+                                  'state.json':'unchanged'}}
+                self.patches=[]
+            def call(self,method,path,value=None,content_type=None):
+                if method=='GET':return self.doc
+                self.patches.append(value)
+        api=Api(identity)
+        self.assertTrue(q.release_lease(self.config,api,identity))
+        self.assertEqual(api.patches[0][0]['path'],'/metadata/resourceVersion')
+        self.assertEqual(api.patches[0][1]['path'],'/metadata/uid')
+        data=api.patches[0][-1]['value']
+        self.assertEqual(json.loads(data['lease.json']),{'owner':identity,'expires_at':0})
+        self.assertEqual(data['state.json'],'unchanged')
+        api=Api(other)
+        self.assertFalse(q.release_lease(self.config,api,identity))
+        self.assertEqual(api.patches,[])
 
 
 if __name__=='__main__':unittest.main()

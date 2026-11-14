@@ -86,7 +86,9 @@ private, annotated Service. The probe duration is the total time for the HTTPS
 health check and HTTP redirect check from each voter; failed/stale votes are not
 reported as healthy. `witness_available` is emitted only when it was actually
 polled, so normal on-demand silence is not represented as a failed witness. The
-status timestamp lets queries detect stale quorum data. Scraping access is limited
+status timestamp lets queries detect stale quorum data. Graceful publisher shutdown
+releases its lease after any in-flight DNS update; if release fails, the ordinary
+45-second lease expiry remains the safe fallback. Scraping access is limited
 to the Prometheus namespace and the two host-network monitoring nodes.
 The voter-only overlay DNS monitor also records per-voter, per-server query
 attempts, failures and last latency. Its results are advisory: a DNS probe
