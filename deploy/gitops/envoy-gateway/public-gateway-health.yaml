@@ -14,6 +14,8 @@ spec:
       sectionName: http
   hostnames:
     - gateway-health.flash.heterocloud.mizuame.app
+    - probe-uc-k8sp5.flash.heterocloud.mizuame.app
+    - probe-ichikawap1.flash.heterocloud.mizuame.app
   rules:
     - matches:
         - path:

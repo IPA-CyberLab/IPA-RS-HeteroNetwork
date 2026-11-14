@@ -54,3 +54,30 @@ spec:
     providerSpecific:
     - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
       value: 'false'
+---
+# Fixed, DNS-only observer names are deliberately outside the failover pool.
+# Each points at exactly one gateway so an external witness can distinguish
+# an origin failure from a healthy answer from the other gateway.
+apiVersion: externaldns.k8s.io/v1alpha1
+kind: DNSEndpoint
+metadata:
+  name: heterocloud-gateway-observer-addresses
+  namespace: heterocloud-dns
+  labels:
+    dns.heterocloud.io/publish: 'true'
+spec:
+  endpoints:
+  - dnsName: probe-uc-k8sp5.flash.heterocloud.mizuame.app
+    recordType: A
+    recordTTL: 60
+    targets: [163.220.236.45]
+    providerSpecific:
+    - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
+      value: 'false'
+  - dnsName: probe-ichikawap1.flash.heterocloud.mizuame.app
+    recordType: A
+    recordTTL: 60
+    targets: [163.220.236.61]
+    providerSpecific:
+    - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
+      value: 'false'

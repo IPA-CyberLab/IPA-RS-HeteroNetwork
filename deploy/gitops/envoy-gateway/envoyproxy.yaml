@@ -11,7 +11,7 @@ spec:
         replicas: 5
         pod:
           annotations:
-            networking.heteronetwork.io/placement-revision: "two-gateway-v1"
+            networking.heteronetwork.io/placement-revision: "two-gateway-v2"
           nodeSelector:
             kubernetes.io/os: linux
           tolerations:
@@ -48,7 +48,13 @@ spec:
           topologySpreadConstraints:
             - maxSkew: 1
               topologyKey: kubernetes.io/hostname
-              whenUnsatisfiable: ScheduleAnyway
+              # A soft preference concentrated all five replicas on the new
+              # node during a rolling update. Enforce per-host spread, while
+              # excluding tainted/unavailable nodes from eligible domains so
+              # the survivor can still run replicas after a failure.
+              whenUnsatisfiable: DoNotSchedule
+              nodeAffinityPolicy: Honor
+              nodeTaintsPolicy: Honor
               labelSelector:
                 matchLabels:
                   app.kubernetes.io/name: envoy
