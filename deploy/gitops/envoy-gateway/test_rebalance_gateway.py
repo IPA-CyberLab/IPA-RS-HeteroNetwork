@@ -1,8 +1,12 @@
 import copy
 import datetime
 import importlib.util
+import io
+import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+from contextlib import redirect_stdout
 
 spec=importlib.util.spec_from_file_location('rebalance',Path(__file__).with_name('rebalance-gateway.py'))
 rebal=importlib.util.module_from_spec(spec)
@@ -79,6 +83,31 @@ class RebalanceTests(unittest.TestCase):
         self.assertIsNone(self.select())
         self.deploy['spec']['template']['spec']['topologySpreadConstraints'][0]['whenUnsatisfiable']='DoNotSchedule'
         self.pods[0]['metadata']['ownerReferences'][0]['name']='unrelated'
+        self.assertIsNone(self.select())
+
+    def test_reconciler_evicts_only_one_uid_fenced_pod(self):
+        parent=self
+        class Api:
+            def __init__(self):self.posts=[]
+            def call(self,method,path,data=None):
+                if method=='POST':self.posts.append((path,data));return {}
+                if '/deployments/' in path:return parent.deploy
+                if '/poddisruptionbudgets/' in path:return parent.pdb
+                if '/pods?' in path:return {'items':parent.pods}
+                if '/nodes/' in path:return parent.nodes[path.rsplit('/',1)[-1]]
+                if '/leases/' in path:return parent.leases[path.rsplit('/',1)[-1]]
+                if '/configmaps/' in path:return {'data':{'status.json':json.dumps(parent.quorum)}}
+                raise AssertionError(path)
+        api=Api()
+        with patch.object(rebal,'Kubernetes',return_value=api),patch.object(rebal.time,'time',return_value=self.now),redirect_stdout(io.StringIO()):
+            self.assertEqual(rebal.main(),0)
+        self.assertEqual(len(api.posts),1)
+        path,body=api.posts[0]
+        self.assertTrue(path.endswith('/pods/'+rebal.DEPLOYMENT+'-pod-0/eviction'))
+        self.assertEqual(body['deleteOptions']['preconditions']['uid'],'0')
+
+    def test_reconciler_never_evicts_when_the_quorum_is_missing(self):
+        self.quorum['fresh_voters']=1
         self.assertIsNone(self.select())
 
 

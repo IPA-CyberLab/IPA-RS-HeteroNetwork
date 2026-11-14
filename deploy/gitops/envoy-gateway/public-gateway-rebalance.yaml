@@ -149,7 +149,7 @@ metadata:
 spec:
   schedule: '*/10 * * * *'
   timeZone: Etc/UTC
-  suspend: true
+  suspend: false
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
