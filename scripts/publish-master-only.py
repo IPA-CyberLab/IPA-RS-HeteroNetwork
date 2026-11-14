@@ -79,6 +79,7 @@ def files():
            'docs/onboarding-e2e-gate-2026-09-15.md',
            'docs/flash-gpu-iac-2026-09-16.md',
            'docs/github-actions-vpn-console-e2e.md',
+           'docs/heterogeneous-resilience-2026-11-14.md',
            'docs/encrypted-etcd-offsite.md',
            '.github/workflows/infrastructure-validation.yml',
            'deploy/systemd/heteronetwork-agent-overlay-proxy.conf',

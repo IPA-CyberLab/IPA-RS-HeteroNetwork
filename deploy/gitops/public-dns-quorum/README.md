@@ -77,6 +77,9 @@ removes the namespace. It verifies disagreement, majority withdrawal, recovery,
 one local voter lost, and loss of both the witness and one local voter. It uses
 the actual authenticated external witness and production health endpoints, but
 does not switch production DNS or stop production Pods.
+Add `--simulate-remote-failure` when Wrangler is authenticated to create a
+separate temporary Worker and token. It verifies withdrawal and restoration with
+one local voter and the external witness, then deletes the temporary Worker.
 
 The publishers expose `heteronetwork_public_dns_*` Prometheus metrics through a
 private, annotated Service. The probe duration is the total time for the HTTPS

@@ -49,6 +49,6 @@
   "interval_seconds": 5,
   "down_samples": 3,
   "up_samples": 2,
-  "enabled": false,
+  "enabled": true,
   "all_down_policy": "retain"
 }
