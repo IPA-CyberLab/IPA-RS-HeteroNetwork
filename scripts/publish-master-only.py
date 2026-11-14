@@ -99,6 +99,8 @@ def files():
               'deploy/gitops/flash-web/tls-sync-daemonset.yaml','deploy/gitops/envoy-gateway/redis-primary-proxy.yaml',
               'deploy/gitops/envoy-gateway/kustomization.yaml','deploy/gitops/envoy-gateway/public-web-dns.yaml',
               'deploy/gitops/envoy-gateway/envoyproxy.yaml','deploy/gitops/envoy-gateway/heterocloud-edge-local-proxy-service.yaml',
+              'deploy/gitops/envoy-gateway/public-gateway-rebalance.yaml','deploy/gitops/envoy-gateway/rebalance-gateway.py',
+              'deploy/gitops/envoy-gateway/test_rebalance_gateway.py',
               'deploy/gitops/envoy-gateway/public-gateway-health.yaml',
               'deploy/gitops/envoy-gateway/README.md','deploy/gitops/envoy-gateway/heterocloud-flash-ssh-route.yaml',
               'deploy/gitops/envoy-gateway/flash-ssh-backend-traffic-policy.yaml']

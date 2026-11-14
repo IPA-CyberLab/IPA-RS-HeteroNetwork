@@ -14,10 +14,15 @@ geographic independence from hostnames or IP addresses.
   both workers. The public legacy Secret Manager hostname returns 403 on both.
 - Five Envoy replicas use a per-host spread constraint. On `uc-k8sp5`, Caddy
   prefers a local Envoy endpoint and falls back to the cluster-wide endpoint.
-  A topology constraint affects new scheduling: Kubernetes does not rebalance
-  already-running Pods when a previously unavailable worker returns. Check
-  the actual replica distribution after recovery; do not call a one-node
-  placement geographically redundant.
+  A topology constraint affects new scheduling. A separate ten-minute
+  reconciler corrects existing placement after a worker returns: it evicts at
+  most one gateway Pod per run through the PodDisruptionBudget and a UID
+  precondition. It acts only when both workers have stable Ready status and
+  fresh leases, both public gateways have a healthy fresh quorum, all five
+  replicas are available, and the rollout is complete. During an outage or a
+  partition it leaves the running replicas alone. An admission policy limits
+  its eviction privilege to this gateway's Pods. Do not call host-level spread
+  geographically redundant without verified site information.
 - Two on-node voters and a separately hosted, authenticated Cloudflare Worker
   form a fixed three-member DNS electorate. The external witness is queried only
   when it can complete a missing majority. No database credentials, user data,

@@ -5,9 +5,14 @@ configMapGenerator:
     namespace: envoy-gateway-system
     files:
       - haproxy.cfg=haproxy.cfg
+  - name: public-gateway-rebalance
+    namespace: envoy-gateway-system
+    files:
+      - rebalance-gateway.py
 resources:
   - public-web-dns.yaml
   - public-gateway-health.yaml
+  - public-gateway-rebalance.yaml
   - gatewayclass.yaml
   - envoyproxy.yaml
   - openbao-vpn-envoyproxy.yaml

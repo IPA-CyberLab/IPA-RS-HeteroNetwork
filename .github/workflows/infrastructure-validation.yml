@@ -28,6 +28,7 @@ on:
       - 'deploy/public-dns-witness/**'
       - 'deploy/gitops/envoy-gateway/envoyproxy.yaml'
       - 'deploy/gitops/envoy-gateway/heterocloud-edge-local-proxy-service.yaml'
+      - 'deploy/gitops/envoy-gateway/*rebalance*'
       - 'scripts/*public*gateway*base.py'
       - 'scripts/public_dns_witness_e2e.py'
       - 'deploy/gitops/custom-domains/**'
@@ -133,6 +134,7 @@ on:
       - 'deploy/public-dns-witness/**'
       - 'deploy/gitops/envoy-gateway/envoyproxy.yaml'
       - 'deploy/gitops/envoy-gateway/heterocloud-edge-local-proxy-service.yaml'
+      - 'deploy/gitops/envoy-gateway/*rebalance*'
       - 'scripts/*public*gateway*base.py'
       - 'scripts/public_dns_witness_e2e.py'
       - 'deploy/gitops/custom-domains/**'
@@ -261,6 +263,7 @@ jobs:
           python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py -v
           python3 -B -m unittest discover -s deploy/gitops/public-dns-quorum -p 'test_*.py' -v
           python3 -B -m unittest discover -s deploy/gitops/longhorn-prerequisites -p 'test_*.py' -v
+          python3 -B -m unittest discover -s deploy/gitops/envoy-gateway -p 'test_rebalance*.py' -v
           node --test deploy/public-dns-witness/worker.test.mjs
           sudo python3 -B -m unittest discover -s scripts -p test_install_public_gateway_base.py -v
           python3 -B -m unittest discover -s deploy/gitops/custom-domains -p 'test_*.py' -v

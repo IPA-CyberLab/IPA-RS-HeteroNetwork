@@ -1,0 +1,210 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: public-gateway-rebalance
+  namespace: envoy-gateway-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: public-gateway-rebalance
+  namespace: envoy-gateway-system
+rules:
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: ['']
+    resources: [pods/eviction]
+    verbs: [create]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [envoy-heterocloud-edge-heterocloud-edge-dd522bfb]
+    verbs: [get]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    resourceNames: [envoy-heterocloud-edge-heterocloud-edge-dd522bfb]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: public-gateway-rebalance
+  namespace: envoy-gateway-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: public-gateway-rebalance
+subjects:
+  - kind: ServiceAccount
+    name: public-gateway-rebalance
+    namespace: envoy-gateway-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: public-gateway-rebalance-nodes
+rules:
+  - apiGroups: ['']
+    resources: [nodes]
+    resourceNames: [ichikawap1, uc-k8sp5]
+    verbs: [get]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [ichikawap1, uc-k8sp5]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: public-gateway-rebalance-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: public-gateway-rebalance-nodes
+subjects:
+  - kind: ServiceAccount
+    name: public-gateway-rebalance
+    namespace: envoy-gateway-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: public-gateway-rebalance-status
+  namespace: heterocloud-dns
+rules:
+  - apiGroups: ['']
+    resources: [configmaps]
+    resourceNames: [public-dns-quorum-state]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: public-gateway-rebalance-status
+  namespace: heterocloud-dns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: public-gateway-rebalance-status
+subjects:
+  - kind: ServiceAccount
+    name: public-gateway-rebalance
+    namespace: envoy-gateway-system
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: public-gateway-rebalance-evictions
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods/eviction]
+  matchConditions:
+    - name: rebalancer-only
+      expression: "request.userInfo.username == 'system:serviceaccount:envoy-gateway-system:public-gateway-rebalance'"
+  validations:
+    - expression: "request.namespace == 'envoy-gateway-system' && object.metadata.name.startsWith('envoy-heterocloud-edge-heterocloud-edge-dd522bfb-') && has(object.deleteOptions) && has(object.deleteOptions.preconditions) && has(object.deleteOptions.preconditions.uid)"
+      message: The gateway rebalancer may evict only UID-fenced public gateway Pods.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: public-gateway-rebalance-evictions
+spec:
+  policyName: public-gateway-rebalance-evictions
+  validationActions: [Deny]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: public-gateway-rebalance
+  namespace: envoy-gateway-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: public-gateway-rebalance
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+        - ipBlock:
+            cidr: 10.250.0.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: public-gateway-rebalance
+  namespace: envoy-gateway-system
+spec:
+  schedule: '*/10 * * * *'
+  timeZone: Etc/UTC
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 3600
+      activeDeadlineSeconds: 90
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: public-gateway-rebalance
+        spec:
+          serviceAccountName: public-gateway-rebalance
+          restartPolicy: Never
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: heteronetwork.io/control-plane-only
+                        operator: NotIn
+                        values: ['true']
+                      - key: kubernetes.io/hostname
+                        operator: In
+                        values: [ichikawap1, uc-k8sp5]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: reconcile
+              image: python:3.13.7-bookworm@sha256:c900d35aba5fe4c1dc1cd358408baae2902ff2a2926a1d15cc5002c6061ddb2e
+              imagePullPolicy: IfNotPresent
+              command: [python3, -B, /code/rebalance-gateway.py]
+              resources:
+                requests:
+                  cpu: 5m
+                  memory: 24Mi
+                limits:
+                  cpu: 100m
+                  memory: 96Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: code
+                  mountPath: /code
+                  readOnly: true
+          volumes:
+            - name: code
+              configMap:
+                name: public-gateway-rebalance
+                defaultMode: 292
