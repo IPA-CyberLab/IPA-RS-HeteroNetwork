@@ -15,6 +15,7 @@ resources:
   - openbao-vpn-gateway.yaml
   - openbao-vpn-proxy-service.yaml
   - heterocloud-edge-proxy-service.yaml
+  - heterocloud-edge-local-proxy-service.yaml
   - gateway.yaml
   - client-traffic-policy.yaml
   - backend-traffic-policy.yaml

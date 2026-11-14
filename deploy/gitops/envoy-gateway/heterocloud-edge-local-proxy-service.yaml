@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: heterocloud-edge-local-proxy
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/part-of: heterocloud-edge
+spec:
+  # Prefer an Envoy on the same physical node during a site partition. The
+  # host gateway can fall back to the cluster-wide Service if none is ready.
+  internalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: envoy-gateway
+    app.kubernetes.io/name: envoy
+    gateway.envoyproxy.io/owning-gateway-name: heterocloud-edge
+    gateway.envoyproxy.io/owning-gateway-namespace: heterocloud-edge
+  ports:
+    - name: http-18081
+      port: 18081
+      targetPort: 18081
+      protocol: TCP
