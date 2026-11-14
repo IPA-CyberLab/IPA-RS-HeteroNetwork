@@ -77,6 +77,11 @@ def objects(config):
     egress=[{'to':[{'ipBlock':{'cidr':'10.96.0.1/32'}},{'ipBlock':{'cidr':'10.250.0.0/24'}}],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':6443}]},
             {'to':[{'ipBlock':{'cidr':x['address']+('/32' if ':' not in x['address'] else '/128')}} for x in config['origins']],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':80}]}]
     result += [obj('NetworkPolicy',APP,{'podSelector':{'matchLabels':{'app.kubernetes.io/name':APP}},'policyTypes':['Ingress','Egress'],'ingress':[],'egress':egress},'networking.k8s.io/v1')]
+    if config.get('overlay_dns'):
+        targets = [{'ipBlock':{'cidr':x['address']+'/32'}} for x in config['overlay_dns']['targets']]
+        result += [obj('NetworkPolicy',APP+'-overlay-dns',{'podSelector':{'matchLabels':{
+            'app.kubernetes.io/name':APP,'app.kubernetes.io/component':'voter'}},'policyTypes':['Egress'],
+            'egress':[{'to':targets,'ports':[{'protocol':'UDP','port':53}]}]},'networking.k8s.io/v1')]
     if config.get('witness'):
         # Standard Kubernetes NetworkPolicy cannot express an FQDN. Only the
         # publishers may reach public TCP/443; exclude private address ranges.

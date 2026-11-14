@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import struct
 import threading
 import time
 import urllib.error
@@ -48,7 +49,8 @@ def validate_config(raw):
     allowed = {"schema_version", "namespace", "dns_namespace", "dns_resource", "state_resource",
                "members", "origins", "records", "probe", "fresh_seconds", "interval_seconds",
                "down_samples", "up_samples", "enabled", "all_down_policy"}
-    require(set(raw) in (allowed, allowed | {"witness"}), "invalid configuration fields")
+    require(allowed <= set(raw) and set(raw) <= allowed | {"witness", "overlay_dns"},
+            "invalid configuration fields")
     for key in ("namespace", "dns_namespace", "dns_resource", "state_resource"):
         require(isinstance(raw[key], str) and LABEL.fullmatch(raw[key]), "invalid resource name")
     members, origins = raw["members"], raw["origins"]
@@ -87,6 +89,23 @@ def validate_config(raw):
         require(str(address) == origin["address"] and address.is_global, "origin must be a canonical public IP")
     for key in ("id", "address"):
         require(len({x[key] for x in origins}) == len(origins), "duplicate origin")
+    if "overlay_dns" in raw:
+        monitor = raw["overlay_dns"]
+        require(isinstance(monitor, dict) and set(monitor) == {"hostname", "timeout_seconds", "targets"},
+                "invalid overlay DNS monitor")
+        require(not dns_name(monitor["hostname"]).startswith("*."), "invalid overlay DNS hostname")
+        require(type(monitor["timeout_seconds"]) in (int, float) and 0.2 <= monitor["timeout_seconds"] <= 2,
+                "invalid overlay DNS timeout")
+        targets = monitor["targets"]
+        require(isinstance(targets, list) and 1 <= len(targets) <= 9, "invalid overlay DNS targets")
+        for target in targets:
+            require(isinstance(target, dict) and set(target) == {"id", "address"} and
+                    isinstance(target["id"], str) and LABEL.fullmatch(target["id"]), "invalid overlay DNS target")
+            address = ipaddress.ip_address(target["address"])
+            require(address.version == 4 and address.is_private and not address.is_loopback and
+                    not address.is_link_local and str(address) == target["address"], "invalid overlay DNS address")
+        for key in ("id", "address"):
+            require(len({target[key] for target in targets}) == len(targets), "duplicate overlay DNS target")
     require(isinstance(raw["records"], list) and 1 <= len(raw["records"]) <= 32, "invalid managed DNS names")
     for name in raw["records"]:
         dns_name(name)
@@ -116,6 +135,26 @@ def parse_document(raw):
     return json.loads(raw)
 
 
+def validate_probe_result(result):
+    require(isinstance(result, dict) and set(result) in ({"healthy", "reason"},
+            {"healthy", "reason", "latency_seconds"}), "invalid result")
+    require(type(result["healthy"]) is bool and result["reason"] in ERROR_KINDS, "invalid health result")
+    require(result["healthy"] == (result["reason"] == "ok"), "inconsistent health result")
+    if "latency_seconds" in result:
+        require(type(result["latency_seconds"]) in (int, float) and
+                math.isfinite(result["latency_seconds"]) and 0 <= result["latency_seconds"] <= 30,
+                "invalid probe latency")
+
+
+def validate_overlay_counters(config, counters):
+    require('overlay_dns' in config and isinstance(counters, dict) and
+            set(counters) == {x['id'] for x in config['overlay_dns']['targets']}, 'invalid DNS counters')
+    for item in counters.values():
+        require(isinstance(item, dict) and set(item) == {'attempts','failures'} and
+                type(item['attempts']) is int and type(item['failures']) is int and
+                0 <= item['failures'] <= item['attempts'] <= 10**12, 'invalid DNS counters')
+
+
 def electorate(config):
     members = list(config["members"])
     if config.get("witness"):
@@ -125,7 +164,9 @@ def electorate(config):
 
 def usable_vote(config, member, document, now):
     try:
-        require(isinstance(document, dict) and set(document) == {"schema_version", "config_digest", "voter_id", "node", "sample_id", "observed_at", "origins"}, "invalid vote fields")
+        fields = {"schema_version", "config_digest", "voter_id", "node", "sample_id", "observed_at", "origins"}
+        require(isinstance(document, dict) and fields <= set(document) and
+                set(document) <= fields | {"overlay_dns", "overlay_dns_counters"}, "invalid vote fields")
         require(document["schema_version"] == 1 and document["config_digest"] == digest(config), "vote configuration differs")
         require(document["voter_id"] == member["id"] and document["node"] == member["node"], "vote identity differs")
         require(isinstance(document["sample_id"], str) and re.fullmatch(r"[0-9a-f]{32}", document["sample_id"]), "invalid sample identity")
@@ -133,14 +174,25 @@ def usable_vote(config, member, document, now):
         require(type(stamp) in (int, float) and math.isfinite(stamp) and now - config["fresh_seconds"] <= stamp <= now + 3, "stale or future vote")
         require(isinstance(document["origins"], dict) and set(document["origins"]) == {x["id"] for x in config["origins"]}, "vote origin inventory differs")
         for result in document["origins"].values():
-            require(isinstance(result, dict) and set(result) in ({"healthy", "reason"},
-                    {"healthy", "reason", "latency_seconds"}), "invalid result")
-            require(type(result["healthy"]) is bool and result["reason"] in ERROR_KINDS, "invalid health result")
-            require(result["healthy"] == (result["reason"] == "ok"), "inconsistent health result")
-            if "latency_seconds" in result:
-                require(type(result["latency_seconds"]) in (int, float) and
-                        math.isfinite(result["latency_seconds"]) and 0 <= result["latency_seconds"] <= 30,
-                        "invalid probe latency")
+            validate_probe_result(result)
+        if "overlay_dns" in document:
+            try:
+                require("overlay_dns" in config and isinstance(document["overlay_dns"], dict) and
+                        set(document["overlay_dns"]) == {x["id"] for x in config["overlay_dns"]["targets"]},
+                        "overlay DNS inventory differs")
+                for result in document["overlay_dns"].values():
+                    validate_probe_result(result)
+            except (ValueError, KeyError, TypeError):
+                # Monitoring is advisory and must not invalidate a correct
+                # public gateway vote, even if its telemetry is malformed.
+                document = dict(document)
+                document.pop("overlay_dns", None)
+        if 'overlay_dns_counters' in document:
+            try:
+                validate_overlay_counters(config, document['overlay_dns_counters'])
+            except (ValueError, KeyError, TypeError):
+                document = dict(document)
+                document.pop('overlay_dns_counters', None)
         return document
     except (ValueError, KeyError, TypeError):
         return None
@@ -385,16 +437,112 @@ def timed_probe(origin, probe):
     return result
 
 
+def overlay_dns_query(hostname, query_id):
+    name = b''.join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b'\0'
+    return struct.pack('!HHHHHH', query_id, 0x0100, 1, 0, 0, 0) + name + struct.pack('!HH', 1, 1)
+
+
+def skip_dns_name(message, offset):
+    for _ in range(128):
+        require(offset < len(message), 'truncated DNS name')
+        length = message[offset]
+        if length & 0xC0 == 0xC0:
+            require(offset + 1 < len(message), 'truncated DNS pointer')
+            return offset + 2
+        require(length & 0xC0 == 0, 'invalid DNS label')
+        offset += 1
+        if length == 0:
+            return offset
+        require(length <= 63 and offset + length <= len(message), 'truncated DNS label')
+        offset += length
+    raise ValueError('DNS name is too long')
+
+
+def overlay_dns_answer(message, query, expected_ip):
+    require(len(message) >= 12, 'truncated DNS response')
+    query_id, flags, questions, answers, _, _ = struct.unpack('!HHHHHH', message[:12])
+    require(query_id == struct.unpack('!H', query[:2])[0] and flags & 0x8000 and
+            not flags & 0x0200 and not flags & 0x000F and questions == 1, 'invalid DNS response')
+    offset = 12 + len(query) - 12
+    require(message[12:offset] == query[12:], 'DNS question differs')
+    addresses = []
+    for _ in range(answers):
+        offset = skip_dns_name(message, offset)
+        require(offset + 10 <= len(message), 'truncated DNS record')
+        record_type, record_class, _, length = struct.unpack('!HHIH', message[offset:offset+10])
+        offset += 10
+        require(offset + length <= len(message), 'truncated DNS record data')
+        if record_type == 1 and record_class == 1 and length == 4:
+            addresses.append(socket.inet_ntoa(message[offset:offset+length]))
+        offset += length
+    return addresses == [expected_ip]
+
+
+def probe_overlay_dns(target, hostname, timeout, port=53):
+    started = time.monotonic()
+    result = {'healthy':False, 'reason':'network'}
+    try:
+        query = overlay_dns_query(hostname, int.from_bytes(os.urandom(2), 'big'))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(timeout)
+            client.sendto(query, (target['address'], port))
+            message, peer = client.recvfrom(4096)
+        require(peer == (target['address'], port), 'DNS response source differs')
+        if overlay_dns_answer(message, query, target['address']):
+            result = {'healthy':True, 'reason':'ok'}
+        else:
+            result = {'healthy':False, 'reason':'body'}
+    except (TimeoutError, socket.timeout):
+        result = {'healthy':False, 'reason':'timeout'}
+    except ValueError:
+        result = {'healthy':False, 'reason':'body'}
+    except OSError:
+        pass
+    result['latency_seconds'] = round(min(30, max(0, time.monotonic()-started)), 4)
+    return result
+
+
 def vote_once(config, voter_id, api):
     member = next(x for x in config["members"] if x["id"] == voter_id)
     require(os.environ["NODE_NAME"] == member["node"], "voter is running on an unexpected node")
-    with ThreadPoolExecutor(max_workers=min(8, len(config["origins"]))) as executor:
-        results = list(executor.map(lambda x: timed_probe(x, config["probe"]), config["origins"]))
+    monitor = config.get('overlay_dns')
+    targets = monitor['targets'] if monitor else []
+    with ThreadPoolExecutor(max_workers=min(8, len(config["origins"]) + len(targets))) as executor:
+        origin_jobs = [executor.submit(timed_probe, origin, config['probe']) for origin in config['origins']]
+        dns_jobs = [executor.submit(probe_overlay_dns, target, monitor['hostname'], monitor['timeout_seconds'])
+                    for target in targets]
+        results = [job.result() for job in origin_jobs]
+        dns_results = []
+        for job in dns_jobs:
+            try:
+                dns_results.append(job.result())
+            except Exception:
+                # The auxiliary DNS sensor cannot suppress gateway voting.
+                dns_results.append({'healthy':False, 'reason':'network'})
+    path = cm_path(config["namespace"], member["vote_resource"])
+    document = api.call("GET", path)
+    previous = {}
+    if monitor:
+        try:
+            old = parse_document(document.get('data', {}).get('vote.json', ''))
+            require(isinstance(old, dict) and old.get('config_digest') == digest(config) and old.get('voter_id') == voter_id and
+                    old.get('node') == member['node'], 'previous counter identity differs')
+            previous = old.get('overlay_dns_counters', {})
+            validate_overlay_counters(config, previous)
+        except (ValueError, KeyError, TypeError):
+            previous = {}
     vote = {"schema_version": 1, "config_digest": digest(config), "voter_id": voter_id,
             "node": member["node"], "sample_id": uuid.uuid4().hex, "observed_at": time.time(),
             "origins": {x["id"]: result for x, result in zip(config["origins"], results)}}
-    path = cm_path(config["namespace"], member["vote_resource"])
-    document = api.call("GET", path)
+    if monitor:
+        vote['overlay_dns'] = {target['id']:result for target,result in zip(targets,dns_results)}
+        vote['overlay_dns_counters'] = {}
+        for target,result in zip(targets,dns_results):
+            old = previous.get(target['id'], {'attempts':0,'failures':0})
+            # Saturate rather than produce an invalid vote on eventual overflow.
+            attempts = min(10**12, old['attempts'] + 1)
+            failures = min(attempts, old['failures'] + int(not result['healthy']))
+            vote['overlay_dns_counters'][target['id']] = {'attempts':attempts,'failures':failures}
     api.call("PATCH", path, cm_patch(document, {"vote.json": json.dumps(vote, separators=(",", ":"))}), "application/json-patch+json")
     return {"component": "voter", "voter_id": voter_id, "healthy_origins": sum(x["healthy"] for x in results), "origin_count": len(results)}
 
@@ -503,6 +651,18 @@ def metrics(config, api, now):
             lines.append(f"heteronetwork_public_dns_probe_healthy{{{labels}}} {int(result['healthy'])}")
             if "latency_seconds" in result:
                 lines.append(f"heteronetwork_public_dns_probe_duration_seconds{{{labels}}} {result['latency_seconds']}")
+        for target in config.get('overlay_dns', {}).get('targets', []):
+            result = vote.get('overlay_dns', {}).get(target['id'])
+            if not result:
+                continue
+            labels = f'voter="{member["id"]}",server="{target["id"]}"'
+            lines.append(f"heteronetwork_overlay_dns_probe_healthy{{{labels}}} {int(result['healthy'])}")
+            if 'latency_seconds' in result:
+                lines.append(f"heteronetwork_overlay_dns_probe_duration_seconds{{{labels}}} {result['latency_seconds']}")
+            counts = vote.get('overlay_dns_counters', {}).get(target['id'])
+            if counts:
+                lines.append(f"heteronetwork_overlay_dns_probe_attempts_total{{{labels}}} {counts['attempts']}")
+                lines.append(f"heteronetwork_overlay_dns_probe_failures_total{{{labels}}} {counts['failures']}")
     return ("\n".join(lines) + "\n").encode()
 
 

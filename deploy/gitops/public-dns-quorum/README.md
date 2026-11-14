@@ -88,3 +88,6 @@ reported as healthy. `witness_available` is emitted only when it was actually
 polled, so normal on-demand silence is not represented as a failed witness. The
 status timestamp lets queries detect stale quorum data. Scraping access is limited
 to the Prometheus namespace and the two host-network monitoring nodes.
+The voter-only overlay DNS monitor also records per-voter, per-server query
+attempts, failures and last latency. Its results are advisory: a DNS probe
+failure or malformed monitoring data never removes a public gateway vote.

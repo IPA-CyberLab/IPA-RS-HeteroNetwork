@@ -30,6 +30,14 @@
     "id": "cloudflare-witness",
     "url": "https://heteronetwork-public-dns-witness.fasutotesuto.workers.dev/v1/probe"
   },
+  "overlay_dns": {
+    "hostname": "console.heteronetwork.internal",
+    "timeout_seconds": 1,
+    "targets": [
+      {"id": "ichikawap1", "address": "10.250.0.10"},
+      {"id": "uc-k8sp5", "address": "10.250.0.2"}
+    ]
+  },
   "records": [
     "heterocloud.mizuame.app",
     "flow.heterocloud.mizuame.app",

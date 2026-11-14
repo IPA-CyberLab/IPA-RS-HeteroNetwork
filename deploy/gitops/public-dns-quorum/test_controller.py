@@ -2,7 +2,10 @@ import copy
 import json
 import os
 from pathlib import Path
+import socket
+import struct
 import tempfile
+import threading
 import tomllib
 import urllib.parse
 import unittest
@@ -269,6 +272,10 @@ class MajorityTests(unittest.TestCase):
         votes=self.votes()
         for vote in votes.values():
             for result in vote['origins'].values():result['latency_seconds']=0.125
+            vote['overlay_dns']={x['id']:{'healthy':True,'reason':'ok','latency_seconds':0.01}
+                                  for x in self.config['overlay_dns']['targets']}
+            vote['overlay_dns_counters']={x['id']:{'attempts':8,'failures':1}
+                                           for x in self.config['overlay_dns']['targets']}
         _,_,status=q.decide(self.config,votes,None,self.published,self.now)
         status['witness']={'polled':False,'available':False}
         class Api:
@@ -280,10 +287,68 @@ class MajorityTests(unittest.TestCase):
         output=q.metrics(self.config,Api(),self.now).decode()
         self.assertIn('heteronetwork_public_dns_majority_required 3',output)
         self.assertIn('heteronetwork_public_dns_probe_duration_seconds{voter="ichikawap1",origin="ichikawap1"} 0.125',output)
+        self.assertIn('heteronetwork_overlay_dns_probe_healthy{voter="ichikawap1",server="uc-k8sp5"} 1',output)
+        self.assertIn('heteronetwork_overlay_dns_probe_failures_total{voter="ichikawap1",server="uc-k8sp5"} 1',output)
         self.assertNotIn('heteronetwork_public_dns_witness_available',output)
         self.assertNotIn('Bearer',output)
         status['config_digest']='stale'
         with self.assertRaises(ValueError):q.metrics(self.config,Api(),self.now)
+
+    def test_overlay_dns_probe_checks_real_udp_response_and_rejects_wrong_id(self):
+        server=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        server.bind(('127.0.0.1',0));port=server.getsockname()[1]
+        def reply():
+            request,peer=server.recvfrom(1024)
+            answer=(b'\xc0\x0c'+struct.pack('!HHIH',1,1,5,4)+socket.inet_aton('127.0.0.1'))
+            server.sendto(request[:2]+struct.pack('!HHHHH',0x8180,1,1,0,0)+request[12:]+answer,peer)
+        thread=threading.Thread(target=reply,daemon=True);thread.start()
+        try:
+            result=q.probe_overlay_dns({'address':'127.0.0.1'},'console.heteronetwork.internal',1,port=port)
+            self.assertTrue(result['healthy'])
+            self.assertEqual(result['reason'],'ok')
+            query=q.overlay_dns_query('console.heteronetwork.internal',123)
+            malformed=struct.pack('!HHHHHH',124,0x8180,1,0,0,0)+query[12:]
+            with self.assertRaises(ValueError):q.overlay_dns_answer(malformed,query,'127.0.0.1')
+        finally:
+            thread.join(timeout=2);server.close()
+
+    def test_overlay_dns_health_does_not_change_public_dns_vote(self):
+        votes=self.votes()
+        for vote in votes.values():
+            vote['overlay_dns']={x['id']:{'healthy':False,'reason':'timeout','latency_seconds':1}
+                                  for x in self.config['overlay_dns']['targets']}
+        _,_,status=q.decide(self.config,votes,None,self.published,self.now)
+        self.assertTrue(all(x['decision']=='healthy' for x in status['origins'].values()))
+        for vote in votes.values():vote['overlay_dns']={'bad':'malformed'}
+        _,_,status=q.decide(self.config,votes,None,self.published,self.now)
+        self.assertTrue(all(x['decision']=='healthy' for x in status['origins'].values()))
+        docs=render.objects(self.config)
+        policy=next(x for x in docs if x['kind']=='NetworkPolicy' and x['metadata']['name']=='public-dns-quorum-overlay-dns')
+        self.assertEqual(policy['spec']['podSelector']['matchLabels']['app.kubernetes.io/component'],'voter')
+
+    def test_overlay_dns_counters_survive_each_vote_and_ignore_bad_history(self):
+        member=self.config['members'][0]
+        class Api:
+            def __init__(self):self.doc={'metadata':{'uid':'u','resourceVersion':'1'},'data':{}}
+            def call(self,method,path,value=None,content_type=None):
+                if method=='GET':return self.doc
+                self.doc['data']=value[-1]['value']
+        api=Api()
+        def dns(target,*_):
+            good=target['id']=='ichikawap1'
+            return {'healthy':good,'reason':'ok' if good else 'timeout','latency_seconds':0.1}
+        with patch.dict(os.environ,{'NODE_NAME':member['node']}),\
+             patch.object(q,'timed_probe',return_value={'healthy':True,'reason':'ok'}),\
+             patch.object(q,'probe_overlay_dns',side_effect=dns):
+            q.vote_once(self.config,member['id'],api)
+            q.vote_once(self.config,member['id'],api)
+            stored=json.loads(api.doc['data']['vote.json'])
+            self.assertEqual(stored['overlay_dns_counters']['ichikawap1'],{'attempts':2,'failures':0})
+            self.assertEqual(stored['overlay_dns_counters']['uc-k8sp5'],{'attempts':2,'failures':2})
+            api.doc['data']['vote.json']='[]'
+            q.vote_once(self.config,member['id'],api)
+            stored=json.loads(api.doc['data']['vote.json'])
+            self.assertEqual(stored['overlay_dns_counters']['uc-k8sp5'],{'attempts':1,'failures':1})
 
 
 if __name__=='__main__':unittest.main()

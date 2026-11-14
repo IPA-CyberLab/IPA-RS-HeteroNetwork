@@ -52,6 +52,16 @@ is the combined HTTPS health and HTTP redirect check, not an ICMP RTT or an
 application request latency. Slow observations, missing metrics, stale status,
 unknown origin status and loss of quorum have separate alerts.
 
+Each worker also probes each worker's internal DNS over UDP. Per-path attempted
+and failed query counters are exposed as `heteronetwork_overlay_dns_probe_*`;
+these observations do not participate in public DNS voting. The failure alert
+requires more than 10% failed queries over five minutes and enough samples.
+On this date one run from `uc-k8sp5` to `ichikawap1` timed out twice in 30
+queries; later measurements succeeded for 100/100 UDP and 100/100 TCP queries,
+and a short ICMP check succeeded for 30/30. No cause was established from those
+samples. A timeout can be caused by the DNS service, either direction of the
+network path or host scheduling; this probe alone does not distinguish them.
+
 ## Remaining physical limits
 
 - The application database has only the two current worker-host voting domains.

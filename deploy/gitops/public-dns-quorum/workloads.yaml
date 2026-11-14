@@ -658,6 +658,30 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: public-dns-quorum-overlay-dns
+  namespace: heterocloud-dns
+  labels:
+    app.kubernetes.io/name: public-dns-quorum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: public-dns-quorum
+      app.kubernetes.io/component: voter
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 10.250.0.10/32
+    - ipBlock:
+        cidr: 10.250.0.2/32
+    ports:
+    - protocol: UDP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
   name: public-dns-quorum-witness
   namespace: heterocloud-dns
   labels:
