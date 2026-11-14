@@ -56,11 +56,15 @@ unknown origin status and loss of quorum have separate alerts.
   below its two-of-three quorum. The individual Garage Longhorn PVCs have one
   copy each; those PVC counts must not be mistaken for the Garage object-copy
   count.
-- The Longhorn audit on this date found 16 volumes, seven with fewer than two
-  healthy host copies: six Garage PVCs and the `openbao/openbao-snapshots` PVC.
-  The latter was detached and configured for three replicas, but only one
-  healthy host copy was observed. This is a backup availability risk, not proof
-  that the active secret store has lost its own quorum.
+- The Longhorn audit on this date found 16 volumes, including six Garage PVCs
+  with one Longhorn copy each. The `openbao/openbao-snapshots` PVC initially
+  had only one healthy host copy; a read-only attachment let the existing
+  Longhorn controller rebuild a second copy on the other worker. It now has two
+  healthy host copies against its configured three, so it is still below its
+  desired replica count. A daily, worker-only check keeps that encrypted backup
+  volume attached read-only until two host copies are running or a bounded
+  timeout fails the job. This is backup availability, not the active secret
+  store's own quorum or a substitute for an offsite backup.
 - Two workers and no additional failure domain cannot simultaneously provide
   a genuine independent three-way quorum and tolerate either worker's loss.
   Backups to an actually independent S3-compatible destination, and restore

@@ -260,6 +260,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_verify_overlay_client_console.py -v
           python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py -v
           python3 -B -m unittest discover -s deploy/gitops/public-dns-quorum -p 'test_*.py' -v
+          python3 -B -m unittest discover -s deploy/gitops/longhorn-prerequisites -p 'test_*.py' -v
           node --test deploy/public-dns-witness/worker.test.mjs
           sudo python3 -B -m unittest discover -s scripts -p test_install_public_gateway_base.py -v
           python3 -B -m unittest discover -s deploy/gitops/custom-domains -p 'test_*.py' -v
