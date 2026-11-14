@@ -7,19 +7,22 @@
     ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
   tasks:
-    - name: Install the declarative base, separate from generated certificates
+    - name: Stage the declarative base, separate from generated certificates
       ansible.builtin.template:
         src: templates/public-gateway-secondary.Caddyfile.j2
-        dest: /etc/heteronetwork/public-gateway-base.Caddyfile
+        dest: /etc/heteronetwork/public-gateway-base.candidate.Caddyfile
         owner: root
         group: root
         mode: '0644'
-    - name: Create the effective file only on initial provisioning
+    - name: Install the locked base-file validator
       ansible.builtin.copy:
-        src: /etc/heteronetwork/public-gateway-base.Caddyfile
-        dest: /etc/heteronetwork/public-gateway-extra.Caddyfile
-        remote_src: true
-        force: false
+        src: "{{ hnn_repo_root }}/scripts/install-public-gateway-base.py"
+        dest: /opt/heteronetwork/libexec/install-public-gateway-base.py
         owner: root
         group: root
-        mode: '0644'
+        mode: '0755'
+    - name: Validate with current certificate blocks before publishing the base
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /opt/heteronetwork/libexec/install-public-gateway-base.py]
+      register: public_gateway_base
+      changed_when: (public_gateway_base.stdout | from_json).changed

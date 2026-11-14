@@ -2,6 +2,7 @@ resource "terraform_data" "public_gateway_stage" {
   triggers_replace = [
     filesha256("${path.module}/ansible/public-gateway-stage.yaml"),
     filesha256("${path.module}/ansible/templates/public-gateway-secondary.Caddyfile.j2"),
+    filesha256("${local.repo_root}/scripts/install-public-gateway-base.py"),
     sha256(jsonencode(local.bootstrap)),
   ]
 
