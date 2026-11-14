@@ -68,6 +68,10 @@ spec:
             evaluationInterval: 30s
             retentionTime: 24h
             retentionSize: 1GB
+            additionalScrapeNamespaces:
+              - argocd
+              - envoy-gateway-system
+              - heterocloud-dns
             nodeSelector:
               monitoring.heteronetwork.io/ha: "true"
             allowedNodes:

@@ -10,6 +10,7 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
+import http.server
 import ipaddress
 import json
 import math
@@ -18,6 +19,7 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -131,9 +133,14 @@ def usable_vote(config, member, document, now):
         require(type(stamp) in (int, float) and math.isfinite(stamp) and now - config["fresh_seconds"] <= stamp <= now + 3, "stale or future vote")
         require(isinstance(document["origins"], dict) and set(document["origins"]) == {x["id"] for x in config["origins"]}, "vote origin inventory differs")
         for result in document["origins"].values():
-            require(isinstance(result, dict) and set(result) == {"healthy", "reason"}, "invalid result")
+            require(isinstance(result, dict) and set(result) in ({"healthy", "reason"},
+                    {"healthy", "reason", "latency_seconds"}), "invalid result")
             require(type(result["healthy"]) is bool and result["reason"] in ERROR_KINDS, "invalid health result")
             require(result["healthy"] == (result["reason"] == "ok"), "inconsistent health result")
+            if "latency_seconds" in result:
+                require(type(result["latency_seconds"]) in (int, float) and
+                        math.isfinite(result["latency_seconds"]) and 0 <= result["latency_seconds"] <= 30,
+                        "invalid probe latency")
         return document
     except (ValueError, KeyError, TypeError):
         return None
@@ -371,11 +378,18 @@ def probe_origin(origin, probe):
             client.close()
 
 
+def timed_probe(origin, probe):
+    started = time.monotonic()
+    result = probe_origin(origin, probe)
+    result["latency_seconds"] = round(min(30, max(0, time.monotonic() - started)), 4)
+    return result
+
+
 def vote_once(config, voter_id, api):
     member = next(x for x in config["members"] if x["id"] == voter_id)
     require(os.environ["NODE_NAME"] == member["node"], "voter is running on an unexpected node")
     with ThreadPoolExecutor(max_workers=min(8, len(config["origins"]))) as executor:
-        results = list(executor.map(lambda x: probe_origin(x, config["probe"]), config["origins"]))
+        results = list(executor.map(lambda x: timed_probe(x, config["probe"]), config["origins"]))
     vote = {"schema_version": 1, "config_digest": digest(config), "voter_id": voter_id,
             "node": member["node"], "sample_id": uuid.uuid4().hex, "observed_at": time.time(),
             "origins": {x["id"]: result for x, result in zip(config["origins"], results)}}
@@ -443,6 +457,77 @@ def publish_once(config, api):
             "all_down": report["all_down"], "dns_changed": patch is not None}
 
 
+def metrics(config, api, now):
+    """Expose bounded status and fresh per-voter probe timings, without credentials."""
+    document = api.call("GET", cm_path(config["namespace"], config["state_resource"]))
+    status = parse_document(document.get("data", {}).get("status.json", ""))
+    require(status.get("config_digest") == digest(config), "monitoring status is stale")
+    lines = []
+    for field, metric in (("observed_at", "observed_timestamp_seconds"),
+                          ("fresh_voters", "fresh_voters"),
+                          ("majority_required", "majority_required"),
+                          ("membership_size", "membership_size")):
+        value = status.get(field)
+        require(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 10**12,
+                "invalid monitoring value")
+        lines.append(f"heteronetwork_public_dns_{metric} {value}")
+    lines.append(f"heteronetwork_public_dns_enabled {int(status.get('enabled') is True)}")
+    lines.append(f"heteronetwork_public_dns_all_down_retained {int(status.get('all_down_retained') is True)}")
+    for origin in config["origins"]:
+        item = status["origins"][origin["id"]]
+        require(item.get("decision") in ("healthy", "unhealthy", "unknown"), "invalid decision")
+        label = f'origin="{origin["id"]}"'
+        for field in ("healthy_votes", "unhealthy_votes"):
+            value = item.get(field)
+            require(type(value) is int and 0 <= value <= len(electorate(config)), "invalid vote count")
+            lines.append(f"heteronetwork_public_dns_{field}{{{label}}} {value}")
+        lines.append(f"heteronetwork_public_dns_origin_active{{{label}}} {int(item.get('active') is True)}")
+        lines.append(f"heteronetwork_public_dns_origin_published{{{label}}} {int(origin['address'] in status.get('published_targets', []))}")
+        for decision in ("healthy", "unhealthy", "unknown"):
+            lines.append(f'heteronetwork_public_dns_origin_decision{{{label},decision="{decision}"}} {int(item["decision"] == decision)}')
+    witness = status.get("witness", {})
+    lines.append(f"heteronetwork_public_dns_witness_polled {int(witness.get('polled') is True)}")
+    if witness.get("polled") is True:
+        lines.append(f"heteronetwork_public_dns_witness_available {int(witness.get('available') is True)}")
+    for member in config["members"]:
+        try:
+            vote_doc = api.call("GET", cm_path(config["namespace"], member["vote_resource"]))
+            vote = usable_vote(config, member, parse_document(vote_doc.get("data", {}).get("vote.json", "")), now)
+        except (ApiError, ValueError, KeyError, TypeError):
+            vote = None
+        if not vote:
+            continue
+        for origin in config["origins"]:
+            result = vote["origins"][origin["id"]]
+            labels = f'voter="{member["id"]}",origin="{origin["id"]}"'
+            lines.append(f"heteronetwork_public_dns_probe_healthy{{{labels}}} {int(result['healthy'])}")
+            if "latency_seconds" in result:
+                lines.append(f"heteronetwork_public_dns_probe_duration_seconds{{{labels}}} {result['latency_seconds']}")
+    return ("\n".join(lines) + "\n").encode()
+
+
+def serve_metrics(config):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/metrics":
+                self.send_error(404)
+                return
+            try:
+                body = metrics(config, Kubernetes(), time.time())
+            except Exception:
+                self.send_error(503)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *_):
+            pass
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", 9468), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=("voter", "publisher"))
@@ -452,6 +537,8 @@ def main():
     config = validate_config(parse_document(Path(args.config).read_bytes()))
     if args.role == "voter":
         require(args.voter_id in {x["id"] for x in config["members"]}, "unknown voter")
+    else:
+        serve_metrics(config)
     api = Kubernetes()
     while True:
         started = time.monotonic()

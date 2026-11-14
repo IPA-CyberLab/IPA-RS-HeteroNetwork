@@ -29,6 +29,7 @@ on:
       - 'deploy/gitops/envoy-gateway/envoyproxy.yaml'
       - 'deploy/gitops/envoy-gateway/heterocloud-edge-local-proxy-service.yaml'
       - 'scripts/*public*gateway*base.py'
+      - 'scripts/public_dns_witness_e2e.py'
       - 'deploy/gitops/custom-domains/**'
       - 'deploy/gitops/flash-web/**'
       - 'deploy/gitops/longhorn-prerequisites/**'
@@ -133,6 +134,7 @@ on:
       - 'deploy/gitops/envoy-gateway/envoyproxy.yaml'
       - 'deploy/gitops/envoy-gateway/heterocloud-edge-local-proxy-service.yaml'
       - 'scripts/*public*gateway*base.py'
+      - 'scripts/public_dns_witness_e2e.py'
       - 'deploy/gitops/custom-domains/**'
       - 'deploy/gitops/flash-web/**'
       - 'deploy/gitops/longhorn-prerequisites/**'
@@ -275,6 +277,7 @@ jobs:
       - name: Check verifier syntax
         run: |
           python3 -m py_compile scripts/overlay_power_recovery_e2e.py scripts/reconcile-dns-boot-recovery.py
+          python3 -m py_compile scripts/public_dns_witness_e2e.py
           node --check scripts/flash_operations_live_e2e.mjs
           python3 -m py_compile scripts/flash_capacity_live_e2e.py scripts/flash_offsite_s3_e2e.py scripts/configure-flash-offsite.py scripts/provision-flash-operations.py
           python3 -m py_compile scripts/flash_backup_targets_e2e.py scripts/flash_backup_controller_e2e.py

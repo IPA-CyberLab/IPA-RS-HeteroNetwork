@@ -264,5 +264,26 @@ class MajorityTests(unittest.TestCase):
             self.assertEqual(targets[names[origin['id']]],[origin['address']])
             self.assertIn(names[origin['id']],route['spec']['hostnames'])
 
+    def test_metrics_show_fresh_probe_latency_and_do_not_invent_witness_health(self):
+        self.config['witness']={'id':'external-witness','url':'https://witness.example.org/v1/probe'}
+        votes=self.votes()
+        for vote in votes.values():
+            for result in vote['origins'].values():result['latency_seconds']=0.125
+        _,_,status=q.decide(self.config,votes,None,self.published,self.now)
+        status['witness']={'polled':False,'available':False}
+        class Api:
+            def call(_,method,path):
+                if path.endswith('/'+self.config['state_resource']):
+                    return {'data':{'status.json':json.dumps(status)}}
+                member=next(x for x in self.config['members'] if path.endswith('/'+x['vote_resource']))
+                return {'data':{'vote.json':json.dumps(votes[member['id']])}}
+        output=q.metrics(self.config,Api(),self.now).decode()
+        self.assertIn('heteronetwork_public_dns_majority_required 3',output)
+        self.assertIn('heteronetwork_public_dns_probe_duration_seconds{voter="ichikawap1",origin="ichikawap1"} 0.125',output)
+        self.assertNotIn('heteronetwork_public_dns_witness_available',output)
+        self.assertNotIn('Bearer',output)
+        status['config_digest']='stale'
+        with self.assertRaises(ValueError):q.metrics(self.config,Api(),self.now)
+
 
 if __name__=='__main__':unittest.main()

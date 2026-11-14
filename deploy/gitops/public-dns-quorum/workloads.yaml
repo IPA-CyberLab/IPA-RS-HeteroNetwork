@@ -477,6 +477,10 @@ spec:
         - name: witness-token
           mountPath: /var/run/public-dns-witness
           readOnly: true
+        ports:
+        - name: metrics
+          containerPort: 9468
+          protocol: TCP
         readinessProbe:
           exec:
             command:
@@ -559,6 +563,56 @@ subjects:
 - kind: ServiceAccount
   name: public-dns-publisher
   namespace: heterocloud-dns
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: public-dns-quorum-metrics
+  namespace: heterocloud-dns
+  labels:
+    app.kubernetes.io/name: public-dns-quorum
+  annotations:
+    prometheus.io/scrape: 'true'
+    prometheus.io/path: /metrics
+spec:
+  selector:
+    app.kubernetes.io/name: public-dns-quorum
+    app.kubernetes.io/component: publisher
+  ports:
+  - name: metrics
+    port: 9468
+    targetPort: metrics
+    protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: public-dns-quorum-metrics
+  namespace: heterocloud-dns
+  labels:
+    app.kubernetes.io/name: public-dns-quorum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: public-dns-quorum
+      app.kubernetes.io/component: publisher
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: heterocloud-flow
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: prometheus
+    - ipBlock:
+        cidr: 10.250.0.2/32
+    - ipBlock:
+        cidr: 10.250.0.10/32
+    ports:
+    - protocol: TCP
+      port: 9468
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

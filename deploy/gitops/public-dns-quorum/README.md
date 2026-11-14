@@ -69,3 +69,19 @@ least-privilege RBAC and placement outside Secret Manager's dedicated nodes.
 The live verifier uses its own namespace/DNS record and blocks only its own
 observer Pods' egress to simulate failure. It does not stop a production gateway,
 alter a tenant container or require a paid load-balancer subscription.
+
+`scripts/public_dns_witness_e2e.py --output <private-report.json>` exercises the
+current two-node plus external-witness configuration in a temporary namespace.
+It only changes fixture NetworkPolicies and an `.invalid` DNSEndpoint, then
+removes the namespace. It verifies disagreement, majority withdrawal, recovery,
+one local voter lost, and loss of both the witness and one local voter. It uses
+the actual authenticated external witness and production health endpoints, but
+does not switch production DNS or stop production Pods.
+
+The publishers expose `heteronetwork_public_dns_*` Prometheus metrics through a
+private, annotated Service. The probe duration is the total time for the HTTPS
+health check and HTTP redirect check from each voter; failed/stale votes are not
+reported as healthy. `witness_available` is emitted only when it was actually
+polled, so normal on-demand silence is not represented as a failed witness. The
+status timestamp lets queries detect stale quorum data. Scraping access is limited
+to the Prometheus namespace and the two host-network monitoring nodes.

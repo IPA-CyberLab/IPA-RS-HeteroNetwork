@@ -20,6 +20,7 @@ def files():
            'scripts/publish-master-only.py','scripts/reconcile-dns-boot-recovery.py','scripts/ensure-flash-ssh-host-key.py','scripts/test_ensure_flash_ssh_host_key.py',
            'scripts/verify-storage-redundancy.py','scripts/test_verify_storage_redundancy.py',
            'scripts/install-public-gateway-base.py','scripts/test_install_public_gateway_base.py',
+           'scripts/public_dns_witness_e2e.py',
            'scripts/reconcile-overlay-boot.py','scripts/test_reconcile_overlay_boot.py','scripts/overlay_power_recovery_e2e.py',
            'scripts/node_lifecycle.py','scripts/node_test_fixtures.py','scripts/test_node_lifecycle.py','scripts/reconcile-node-lifecycle.py',
            'scripts/retire_hn_registration.py','scripts/test_retire_hn_registration.py',

@@ -33,6 +33,8 @@ def objects(config):
                      'securityContext':{'allowPrivilegeEscalation':False,'readOnlyRootFilesystem':True,'capabilities':{'drop':['ALL']}},
                      'volumeMounts':[{'name':'config','mountPath':'/config','readOnly':True},{'name':'tmp','mountPath':'/tmp'}]}
         if voter:container['command'] += ['--voter-id',voter]
+        if component == 'publisher':
+            container['ports'] = [{'name':'metrics','containerPort':9468,'protocol':'TCP'}]
         if component == 'publisher' and config.get('witness'):
             container['volumeMounts'].append({'name':'witness-token','mountPath':'/var/run/public-dns-witness','readOnly':True})
         for probe,file,age in [('readinessProbe','last-success',30),('livenessProbe','loop-progress',120)]:
@@ -60,6 +62,15 @@ def objects(config):
     dnsrole=role(name+'-dns',[rule('externaldns.k8s.io','dnsendpoints',[config['dns_resource']],['get','patch'])]);dnsrole['metadata']['namespace']=config['dns_namespace']
     dnsbinding=obj('RoleBinding',name+'-dns',group='rbac.authorization.k8s.io/v1');dnsbinding['metadata']['namespace']=config['dns_namespace'];dnsbinding.update(roleRef={'apiGroup':'rbac.authorization.k8s.io','kind':'Role','name':name+'-dns'},subjects=[{'kind':'ServiceAccount','name':name,'namespace':namespace}])
     result += [dnsrole,dnsbinding]
+    metrics = obj('Service', APP+'-metrics', {'selector':{'app.kubernetes.io/name':APP,
+        'app.kubernetes.io/component':'publisher'}, 'ports':[{'name':'metrics','port':9468,'targetPort':'metrics','protocol':'TCP'}]})
+    metrics['metadata']['annotations'] = {'prometheus.io/scrape':'true','prometheus.io/path':'/metrics'}
+    result += [metrics, obj('NetworkPolicy',APP+'-metrics',{'podSelector':{'matchLabels':{
+        'app.kubernetes.io/name':APP,'app.kubernetes.io/component':'publisher'}},'policyTypes':['Ingress'],
+        'ingress':[{'from':[{'namespaceSelector':{'matchLabels':{'kubernetes.io/metadata.name':'heterocloud-flow'}},
+                            'podSelector':{'matchLabels':{'app.kubernetes.io/component':'prometheus'}}},
+                           {'ipBlock':{'cidr':'10.250.0.2/32'}},{'ipBlock':{'cidr':'10.250.0.10/32'}}],
+                    'ports':[{'protocol':'TCP','port':9468}]}]},'networking.k8s.io/v1')]
     egress=[{'to':[{'ipBlock':{'cidr':'10.96.0.1/32'}},{'ipBlock':{'cidr':'10.250.0.0/24'}}],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':6443}]},
             {'to':[{'ipBlock':{'cidr':x['address']+('/32' if ':' not in x['address'] else '/128')}} for x in config['origins']],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':80}]}]
     result += [obj('NetworkPolicy',APP,{'podSelector':{'matchLabels':{'app.kubernetes.io/name':APP}},'policyTypes':['Ingress','Egress'],'ingress':[],'egress':egress},'networking.k8s.io/v1')]
