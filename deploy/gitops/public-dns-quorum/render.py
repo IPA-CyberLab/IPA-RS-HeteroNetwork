@@ -69,7 +69,10 @@ def objects(config):
         'app.kubernetes.io/name':APP,'app.kubernetes.io/component':'publisher'}},'policyTypes':['Ingress'],
         'ingress':[{'from':[{'namespaceSelector':{'matchLabels':{'kubernetes.io/metadata.name':'heterocloud-flow'}},
                             'podSelector':{'matchLabels':{'app.kubernetes.io/component':'prometheus'}}},
-                           {'ipBlock':{'cidr':'10.250.0.2/32'}},{'ipBlock':{'cidr':'10.250.0.10/32'}}],
+                           {'ipBlock':{'cidr':'10.250.0.2/32'}},{'ipBlock':{'cidr':'10.250.0.10/32'}},
+                           # Host-network Prometheus uses each Flannel tunnel
+                           # address as its source for cross-node Pod traffic.
+                           {'ipBlock':{'cidr':'10.244.4.0/32'}},{'ipBlock':{'cidr':'10.244.6.0/32'}}],
                     'ports':[{'protocol':'TCP','port':9468}]}]},'networking.k8s.io/v1')]
     egress=[{'to':[{'ipBlock':{'cidr':'10.96.0.1/32'}},{'ipBlock':{'cidr':'10.250.0.0/24'}}],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':6443}]},
             {'to':[{'ipBlock':{'cidr':x['address']+('/32' if ':' not in x['address'] else '/128')}} for x in config['origins']],'ports':[{'protocol':'TCP','port':443},{'protocol':'TCP','port':80}]}]

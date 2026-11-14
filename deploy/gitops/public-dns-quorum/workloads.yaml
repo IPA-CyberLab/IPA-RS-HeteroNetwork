@@ -610,6 +610,10 @@ spec:
         cidr: 10.250.0.2/32
     - ipBlock:
         cidr: 10.250.0.10/32
+    - ipBlock:
+        cidr: 10.244.4.0/32
+    - ipBlock:
+        cidr: 10.244.6.0/32
     ports:
     - protocol: TCP
       port: 9468
