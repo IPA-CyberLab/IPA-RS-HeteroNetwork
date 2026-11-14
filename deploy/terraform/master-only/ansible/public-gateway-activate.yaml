@@ -1,0 +1,35 @@
+- name: Activate the already staged secondary public gateway
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Require the synchronized certificate and validate the complete configuration
+      ansible.builtin.command:
+        argv:
+          - /opt/heteronetwork/bin/caddy
+          - validate
+          - --config
+          - /etc/heteronetwork/public-gateway-extra.Caddyfile
+          - --adapter
+          - caddyfile
+      changed_when: false
+    - name: Configure the agent to load the synchronized gateway
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/heteronetwork-agent.service.d/94-public-web-gateway.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Service]
+          Environment=HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE=/etc/heteronetwork/public-gateway-extra.Caddyfile
+      register: public_gateway_dropin
+    - name: Reload the agent only when its configuration changed
+      ansible.builtin.systemd_service:
+        name: heteronetwork-agent.service
+        daemon_reload: true
+        state: restarted
+      when: public_gateway_dropin.changed

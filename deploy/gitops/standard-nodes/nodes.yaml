@@ -7,6 +7,7 @@ metadata:
     networking.heteronetwork.io/turn-ingress: 'true'
     dns.heteronetwork.io/discovery: 'true'
     networking.heteronetwork.io/overlay-dns-sync: 'true'
+    networking.heteronetwork.io/public-ingress-candidate: 'true'
     heteronetwork.io/lifecycle: active
   annotations:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false

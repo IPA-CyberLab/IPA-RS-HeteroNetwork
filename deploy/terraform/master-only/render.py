@@ -23,7 +23,7 @@ def apply_lifecycle(resources):
         if resource['apiVersion'] == 'v1' and resource['kind'] == 'Node':
             labels = resource['metadata'].setdefault('labels', {})
             labels['heteronetwork.io/lifecycle'] = 'stopped'
-            for key in ['networking.heteronetwork.io/public-ingress', 'database.heteronetwork.io/proxy-ready',
+            for key in ['networking.heteronetwork.io/public-ingress', 'networking.heteronetwork.io/public-ingress-candidate', 'database.heteronetwork.io/proxy-ready',
                         'monitoring.heteronetwork.io/ha', 'networking.heteronetwork.io/overlay-dns-sync',
                         'networking.heteronetwork.io/turn-ingress', 'dns.heteronetwork.io/discovery',
                         'flash.heterocloud.io/gvisor-ready']:
@@ -89,11 +89,13 @@ for name in standard:
             'evictionRequested':False,'storageReserved':68719476736,'tags':[]}}}})
 for edge in ('bootstrap', 'enrollment_issuer'):
     name=edge_nodes[edge]['name']
+    candidate = ({'networking.heteronetwork.io/public-ingress-candidate': 'true'}
+                 if edge == 'bootstrap' else {})
     standard_resources.append({'apiVersion':'v1','kind':'Node','metadata':{'name':name,
         'labels':{'monitoring.heteronetwork.io/ha':'true',
                   'networking.heteronetwork.io/turn-ingress':'true',
                   'dns.heteronetwork.io/discovery':'true',
-                  'networking.heteronetwork.io/overlay-dns-sync':'true'},
+                  'networking.heteronetwork.io/overlay-dns-sync':'true', **candidate},
         'annotations':{'argocd.argoproj.io/sync-options':'Prune=false,Delete=false',
                        'argocd.argoproj.io/sync-wave':'0'}}})
 (standard_dest/'nodes.yaml').write_text(yaml.safe_dump_all(apply_lifecycle(standard_resources),sort_keys=False))

@@ -110,6 +110,29 @@ class SyncTests(unittest.TestCase):
             self.project(pair)
             self.assert_rejected()
 
+    def test_declarative_base_updates_without_losing_certificates(self):
+        base = self.host / sync.BASE
+        base.write_bytes(self.original + b"\n# first base\n")
+        self.assertTrue(self.run_sync())
+        self.assertIn(b"# first base", self.extra.read_bytes())
+        self.assertIn(sync.BEGIN, self.extra.read_bytes())
+        base.write_bytes(self.original + b"\n# updated base\n")
+        self.assertTrue(self.run_sync())
+        result = self.extra.read_bytes()
+        self.assertIn(b"# updated base", result)
+        self.assertNotIn(b"# first base", result)
+        self.assertEqual(result.count(sync.BEGIN), 1)
+        self.assertFalse(self.run_sync())
+
+    def test_untrusted_or_generated_base_fails_closed(self):
+        self.run_sync()
+        base = self.host / sync.BASE
+        base.write_bytes(self.original + sync.BEGIN)
+        self.assert_rejected()
+        base.unlink()
+        base.symlink_to(self.extra)
+        self.assert_rejected()
+
     def test_expired_and_not_yet_valid(self):
         now = sync.time.time()
         for when in (now + 3 * 86400, now - 86400, now + 2 * 86400 - 1800):

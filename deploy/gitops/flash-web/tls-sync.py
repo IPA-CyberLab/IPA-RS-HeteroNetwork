@@ -27,6 +27,7 @@ _health_spec.loader.exec_module(gateway_health)
 
 
 EXTRA = "public-gateway-extra.Caddyfile"
+BASE = "public-gateway-base.Caddyfile"
 CERTDIR = "flash-web-certs"
 HOST = "*.flash.heterocloud.mizuame.app"
 PUBLIC_HOSTS = (
@@ -306,7 +307,19 @@ def sync(host="/etc/heteronetwork", secret="/var/run/flash-web-tls",
             secure(os.fstat(lock))
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             old, st = read_file(root, EXTRA)
-            new = gateway_health.update(old, "gateway-health." + HOST.removeprefix("*."))
+            # New gateways have a declarative, root-owned base.  Keep the
+            # synchronizer as the sole writer of the effective Caddyfile so
+            # updates cannot erase certificates or race certificate rotation.
+            # Existing gateways without a base retain their previous behavior.
+            try:
+                base, _ = read_file(root, BASE)
+            except FileNotFoundError:
+                base = old
+            else:
+                require(BEGIN not in base and END not in base and
+                        custom_tls.BEGIN not in base and custom_tls.END not in base,
+                        "base file must not contain generated certificate blocks")
+            new = gateway_health.update(base, "gateway-health." + HOST.removeprefix("*."))
             new = update_content(new, generation)
             custom = custom_tls.bundle(custom_bundle, types.SimpleNamespace(**globals()))
             new = custom_tls.update(types.SimpleNamespace(**globals()), root, new, custom, gid)

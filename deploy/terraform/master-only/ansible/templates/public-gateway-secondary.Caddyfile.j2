@@ -1,0 +1,112 @@
+# Declarative base. Certificate and verified custom-domain blocks are added by
+# flash-web-tls-sync; do not write those generated blocks into this file.
+(heterocloud_keycloak) {
+    reverse_proxy {{ vpn_ip }}:18079 10.250.0.10:18079 {
+        lb_policy first
+        lb_try_duration 5s
+        lb_try_interval 100ms
+        fail_duration 10s
+        max_fails 1
+        unhealthy_status 5xx
+        health_uri /health/ready
+        health_interval 2s
+        health_timeout 2s
+        health_status 2xx
+        header_up Host {host}
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-Host {host}
+        header_up X-Forwarded-Port 443
+    }
+}
+
+(heterocloud_envoy) {
+    reverse_proxy {{ vpn_ip }}:18082 10.250.0.10:18082 {
+        lb_policy first
+        lb_try_duration 5s
+        lb_try_interval 100ms
+        fail_duration 10s
+        max_fails 1
+        health_uri /healthz
+        health_headers {
+            Host gateway-health.flash.heterocloud.mizuame.app
+        }
+        health_interval 2s
+        health_timeout 2s
+        health_status 200
+        health_fails 3
+        health_passes 2
+    }
+}
+
+(heterocloud_frontend) {
+    @realm path /id/realms/heterocloud /id/realms/heterocloud/*
+    @resources path /id/resources/* /id/robots.txt /resources/* /robots.txt
+    handle @realm {
+        uri strip_prefix /id
+        import heterocloud_keycloak
+    }
+    handle @resources {
+        uri strip_prefix /id
+        import heterocloud_keycloak
+    }
+    handle {
+        import heterocloud_envoy /api/v1/health/live heterocloud.mizuame.app
+    }
+}
+
+http://heterocloud.mizuame.app {
+    import heterocloud_frontend
+}
+heterocloud.mizuame.app {
+    import heterocloud_public_tls
+    import heterocloud_frontend
+}
+http://flow.heterocloud.mizuame.app {
+    redir https://flow.heterocloud.mizuame.app{uri} 308
+}
+flow.heterocloud.mizuame.app {
+    import heterocloud_public_tls
+    @internal path /internal /internal/*
+    handle @internal {
+        respond 404
+    }
+    handle {
+        import heterocloud_envoy /health/live flow.heterocloud.mizuame.app
+    }
+}
+http://registry.heterocloud.mizuame.app {
+    redir https://registry.heterocloud.mizuame.app{uri} 308
+}
+registry.heterocloud.mizuame.app {
+    import heterocloud_public_tls
+    import heterocloud_envoy /api/v2.0/health registry.heterocloud.mizuame.app
+}
+http://s3.heterocloud.mizuame.app {
+    redir https://s3.heterocloud.mizuame.app{uri} 308
+}
+s3.heterocloud.mizuame.app {
+    import heterocloud_public_tls
+    import heterocloud_envoy /api/v1/health/live heterocloud.mizuame.app
+}
+# Secret Manager stays private even if an old public DNS record exists.
+http://secrets.heterocloud.mizuame.app {
+    respond 403
+}
+secrets.heterocloud.mizuame.app {
+    import heterocloud_public_tls
+    respond 403
+}
+http://:18082 {
+    bind {{ vpn_ip }}
+    @vpn remote_ip 10.250.0.0/16 127.0.0.0/8
+    handle @vpn {
+        reverse_proxy http://heterocloud-edge-proxy.envoy-gateway-system.svc.cluster.local:18081 {
+            transport http {
+                resolvers 10.96.0.10
+            }
+        }
+    }
+    handle {
+        respond 403
+    }
+}

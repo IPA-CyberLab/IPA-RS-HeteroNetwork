@@ -25,10 +25,22 @@ spec:
                 operator: NotIn
                 values:
                 - 'true'
+              - key: networking.heteronetwork.io/public-ingress
+                operator: In
+                values:
+                - 'true'
+            - matchExpressions:
+              - key: heteronetwork.io/control-plane-only
+                operator: NotIn
+                values:
+                - 'true'
+              - key: networking.heteronetwork.io/public-ingress-candidate
+                operator: In
+                values:
+                - 'true'
       automountServiceAccountToken: false
       nodeSelector:
         kubernetes.io/os: linux
-        networking.heteronetwork.io/public-ingress: 'true'
       tolerations:
       - key: node-role.kubernetes.io/control-plane
         operator: Exists
