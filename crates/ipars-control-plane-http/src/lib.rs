@@ -391,6 +391,12 @@ impl NodeEnrollmentConfig {
         self.issuer.public_key_b64()
     }
 
+    pub fn public_services_oidc_issuer_url(&self) -> Option<&str> {
+        self.public_services
+            .as_ref()
+            .map(|config| config.oidc_issuer_url.as_str())
+    }
+
     pub fn max_ttl_seconds(&self) -> u64 {
         self.max_ttl_seconds
     }

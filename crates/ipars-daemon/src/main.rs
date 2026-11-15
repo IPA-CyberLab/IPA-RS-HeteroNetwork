@@ -5416,10 +5416,9 @@ fn control_plane_node_enrollment_config(
                 )
             })
             .collect(),
-        oidc_issuer_url: ipars_control_plane_http::managed_keycloak_overlay_issuer_url(
-            &args.web_oidc_issuer_url,
-        )
-        .unwrap_or_else(|| args.web_oidc_issuer_url.clone()),
+        // The issuer is the public identity asserted by tokens. Internal
+        // backchannel and authorization routes are configured separately.
+        oidc_issuer_url: args.web_oidc_issuer_url.clone(),
         oidc_client_id: args.web_oidc_client_id.clone(),
         oidc_auth_base_url: args.web_oidc_auth_base_url.clone(),
         oidc_backchannel_base_url: args.web_oidc_backchannel_base_url.clone(),
@@ -26429,6 +26428,8 @@ mod tests {
             root_public_key.as_str(),
             "--web-public-url",
             "http://100.64.0.10:8443",
+            "--web-oidc-issuer-url",
+            "https://sso.example/id/realms/demo",
             "--node-enrollment-enabled",
             "true",
             "--node-enrollment-issuer-private-key-path",
@@ -26456,6 +26457,10 @@ mod tests {
             .context("node enrollment config should be enabled")?;
         assert_eq!(enrollment.issuer_node_id(), enrollment_issuer.node_id());
         assert_eq!(enrollment.issuer_key_id().as_str(), "web-enrollment");
+        assert_eq!(
+            enrollment.public_services_oidc_issuer_url(),
+            Some("https://sso.example/id/realms/demo")
+        );
         assert_eq!(
             enrollment.issuer_public_key_b64(),
             enrollment_issuer.public_key_b64()
