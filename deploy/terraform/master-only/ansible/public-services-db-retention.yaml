@@ -10,7 +10,9 @@
     helper_path: /opt/heteronetwork/libexec/public-services-autopilot.sh
     legacy_original: b571093d6ec8aa0f5e0b1a071f73db4bc02d2bc5af8ad3eb6998a4ea4e3d87a6
     legacy_patched: e47db39acfa9258cf6fb483281e7f4097ba8e09ad1054c8e57b1f154683febd8
+    legacy_deduped: 45de7141c1fcfb8c44f90a810be9f17693ce57f213e7ab76d12ac954aa5f0e66
     current_original: ddd319ce6adc602fdec3935cef38fb549bae57dcff6824d457a573ca33ab047f
+    current_previous: 6e64283a08cc0f70eafa22a18129f5c362bd601bdbdd8e32c67ec9e427bcc23a
   tasks:
     - name: Require one of the explicitly reviewed hosts
       ansible.builtin.assert:
@@ -37,10 +39,10 @@
           - installed_public_services.stat.pw_name == 'root'
           - >-
             (inventory_hostname == 'uc-k8sp5' and
-             installed_public_services.stat.checksum in [legacy_original, legacy_patched]) or
+             installed_public_services.stat.checksum in [legacy_original, legacy_patched, legacy_deduped]) or
             (inventory_hostname == 'ichikawap1' and
              installed_public_services.stat.checksum in
-             [current_original, lookup('file', hnn_repo_root ~ '/scripts/public-services-autopilot.sh', rstrip=False) | hash('sha256')])
+             [current_original, current_previous, lookup('file', hnn_repo_root ~ '/scripts/public-services-autopilot.sh', rstrip=False) | hash('sha256')])
         fail_msg: The installed helper differs from the reviewed version; no Agent was restarted
 
     - name: Create the protected legacy rollback directory

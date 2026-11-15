@@ -643,6 +643,34 @@ valid_url_csv() {
   done
 }
 
+# Signal rejects duplicate Control Plane URLs after trimming trailing slashes.
+# The bootstrap directory can already contain this node's local endpoint, so
+# normalize and deduplicate the combined list while keeping the local URL first.
+dedupe_control_plane_urls() {
+  dedupe_csv_value=$1
+  dedupe_csv_result=
+  dedupe_csv_old_ifs=$IFS
+  IFS=,
+  set -- $dedupe_csv_value
+  IFS=$dedupe_csv_old_ifs
+  for dedupe_csv_entry do
+    while [ "${dedupe_csv_entry%/}" != "$dedupe_csv_entry" ]; do
+      dedupe_csv_entry=${dedupe_csv_entry%/}
+    done
+    [ -n "$dedupe_csv_entry" ] || return 1
+    case ",$dedupe_csv_result," in
+      *,"$dedupe_csv_entry",*) continue ;;
+    esac
+    if [ -n "$dedupe_csv_result" ]; then
+      dedupe_csv_result="$dedupe_csv_result,$dedupe_csv_entry"
+    else
+      dedupe_csv_result=$dedupe_csv_entry
+    fi
+  done
+  [ -n "$dedupe_csv_result" ] || return 1
+  printf '%s' "$dedupe_csv_result"
+}
+
 valid_trusted_issuer_keys() {
   valid_trusted_value=$1
   [ -z "$valid_trusted_value" ] && return 0
@@ -1474,7 +1502,8 @@ relay_admission_url="http://$vpn_ip:18447"
 relay_status_url="$relay_admission_url/v1/status"
 
 if unit_is_loaded "$signal_service" && load_signal_bootstrap; then
-  signal_control_plane_urls="http://$vpn_ip:19088,$signal_control_plane_seed_urls"
+  signal_control_plane_urls=$(dedupe_control_plane_urls "http://$vpn_ip:19088,$signal_control_plane_seed_urls") ||
+    demote_and_exit "unable to normalize Signal Control Plane URLs"
   signal_services_enabled=1
 else
   log "Signal bootstrap or systemd unit is unavailable; STUN and Relay remain independent"
@@ -1544,7 +1573,8 @@ if [ "${#database_password}" -gt 512 ]; then
   demote_control_and_exit "PostgreSQL HA application credential is too large"
 fi
 
-signal_control_plane_urls="http://$vpn_ip:19088,$bootstrap_control_plane_urls"
+signal_control_plane_urls=$(dedupe_control_plane_urls "http://$vpn_ip:19088,$bootstrap_control_plane_urls") ||
+  demote_control_and_exit "unable to normalize Signal Control Plane URLs"
 
 if ! detect_node_enrollment_credentials; then
   demote_control_and_exit "unable to validate optional node-enrollment credentials"

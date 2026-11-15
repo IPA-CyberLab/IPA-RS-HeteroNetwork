@@ -30,10 +30,31 @@ class LegacyPatchTests(unittest.TestCase):
             backup.mkdir(mode=0o700)
             result = module.apply(script, backup)
             self.assertTrue(result['changed'])
-            self.assertEqual(module.digest(script.read_bytes()), module.PATCHED)
+            self.assertEqual(module.digest(script.read_bytes()), module.DEDUPED)
             self.assertEqual((backup / ('public-services-autopilot.' + module.ORIGINAL + '.sh')).read_bytes(), self.original)
             self.assertEqual(script.stat().st_mode & 0o777, 0o755)
             self.assertFalse(module.apply(script, backup)['changed'])
+
+    def test_backport_upgrades_existing_db_patch_and_deduplicates_signal_urls(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            script = directory / 'autopilot.sh'
+            previous = module.transform(self.original)
+            script.write_bytes(previous)
+            script.chmod(0o755)
+            backup = directory / 'backup'
+            backup.mkdir(mode=0o700)
+            self.assertTrue(module.apply(script, backup)['changed'])
+            self.assertEqual(module.digest(script.read_bytes()), module.DEDUPED)
+            self.assertEqual((backup / ('public-services-autopilot.' + module.PATCHED + '.sh')).read_bytes(), previous)
+            self.assertFalse(module.apply(script, backup)['changed'])
+
+            current = (ROOT / 'scripts/public-services-autopilot.sh').read_text()
+            helper = current.split('dedupe_control_plane_urls() {', 1)[1].split('\n}\n', 1)[0]
+            self.assertEqual(module.URL_DEDUPE_HELPER, 'dedupe_control_plane_urls() {' + helper + '\n}\n')
+            probe = module.URL_DEDUPE_HELPER + '''\ndedupe_control_plane_urls "http://10.250.0.10:19088,http://10.250.0.10:19088/,https://a.example,https://a.example/"\n'''
+            result = subprocess.check_output(['/bin/sh', '-c', probe], text=True)
+            self.assertEqual(result, 'http://10.250.0.10:19088,https://a.example')
 
     def test_unknown_source_and_unsafe_file_are_refused(self):
         with self.assertRaises(ValueError):
@@ -53,7 +74,7 @@ class LegacyPatchTests(unittest.TestCase):
     def test_legacy_backport_keeps_vpn_during_db_outage_and_recovery(self):
         with tempfile.TemporaryDirectory() as root:
             script = Path(root) / 'autopilot.sh'
-            script.write_bytes(module.transform(self.original))
+            script.write_bytes(module.transform_signal_urls(module.transform(self.original)))
             script.chmod(0o755)
             env = os.environ.copy()
             env['HETERONETWORK_PUBLIC_SERVICES_SMOKE_AUTOPILOT'] = str(script)
