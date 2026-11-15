@@ -7165,11 +7165,21 @@ fn wireguard_private_key_command(
 }
 
 fn validated_wireguard_private_key(value: &str) -> Result<Vec<u8>, AgentError> {
-    let trimmed = value.trim();
-    decode_wireguard_private_key_b64(trimmed).map_err(|error| {
+    Ok(encode_bytes(&canonical_wireguard_private_key(value)?).into_bytes())
+}
+
+fn canonical_wireguard_private_key(value: &str) -> Result<[u8; 32], AgentError> {
+    let mut key = decode_wireguard_private_key_b64(value.trim()).map_err(|error| {
         AgentError::WireGuard(format!("invalid WireGuard private key: {error}"))
     })?;
-    Ok(trimmed.as_bytes().to_vec())
+    // Linux stores a clamped X25519 scalar but compares it with each supplied
+    // private key before clamping. Re-supplying equivalent unclamped bytes on
+    // every peer-map refresh otherwise expires all established session keys.
+    // Clamping does not change the corresponding X25519 public key.
+    key[0] &= 248;
+    key[31] &= 127;
+    key[31] |= 64;
+    Ok(key)
 }
 
 fn wireguard_remove_peer_command(interface: &str, public_key: &str) -> LinuxCommand {
@@ -7653,8 +7663,7 @@ fn parse_wireguard_public_key(value: &str) -> Result<[u8; 32], AgentError> {
 
 #[cfg(target_os = "linux")]
 fn parse_wireguard_private_key(value: &str) -> Result<[u8; 32], AgentError> {
-    decode_wireguard_private_key_b64(value.trim())
-        .map_err(|error| AgentError::WireGuard(format!("invalid WireGuard private key: {error}")))
+    canonical_wireguard_private_key(value)
 }
 
 #[cfg(target_os = "linux")]
@@ -12644,12 +12653,35 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn canonical_wireguard_key_preserves_identity_and_is_idempotent() -> Result<(), AgentError> {
+        let original = encode_bytes(&[0xff; 32]);
+        let expected = "+P///////////////////////////////////////38=";
+        let normalized = encode_bytes(&canonical_wireguard_private_key(&original)?);
+        assert_eq!(normalized, expected);
+        assert_eq!(
+            WireGuardKeyPair::from_private_key_b64(&original)?.public_key_b64,
+            WireGuardKeyPair::from_private_key_b64(&normalized)?.public_key_b64,
+        );
+        assert_eq!(
+            encode_bytes(&canonical_wireguard_private_key(&normalized)?),
+            normalized,
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            parse_wireguard_private_key(&original)?,
+            decode_wireguard_private_key_b64(expected)?,
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn linux_wireguard_backend_configures_private_key_without_argv_leakage(
     ) -> Result<(), AgentError> {
         let runner = RecordingRunner::default();
         let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
         let private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let expected_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA=";
 
         backend.configure_interface_private_key(private_key).await?;
         backend.configure_interface_listen_port(51820).await?;
@@ -12658,7 +12690,7 @@ mod tests {
             runner.commands().await,
             vec![
                 LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"],)
-                    .with_stdin(format!("{private_key}\n").into_bytes()),
+                    .with_stdin(format!("{expected_key}\n").into_bytes()),
                 LinuxCommand::new("wg", ["set", "ipars0", "listen-port", "51820"]),
             ]
         );
@@ -12713,6 +12745,8 @@ mod tests {
     async fn peer_map_application_refreshes_rotated_local_private_key() -> Result<(), AgentError> {
         let first_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let second_private_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let expected_first_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA=";
+        let expected_second_key = "AAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAUE=";
         let first_keypair = WireGuardKeyPair::from_private_key_b64(first_private_key)?;
         let second_keypair = WireGuardKeyPair::from_private_key_b64(second_private_key)?;
         let mut state = AgentNodeState::generate(Utc::now());
@@ -12749,9 +12783,9 @@ mod tests {
             runner.commands().await,
             vec![
                 LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
-                    .with_stdin(format!("{first_private_key}\n").into_bytes()),
+                    .with_stdin(format!("{expected_first_key}\n").into_bytes()),
                 LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
-                    .with_stdin(format!("{second_private_key}\n").into_bytes()),
+                    .with_stdin(format!("{expected_second_key}\n").into_bytes()),
             ]
         );
         Ok(())
@@ -12761,7 +12795,9 @@ mod tests {
     async fn peer_map_application_recovers_a_missing_wireguard_interface() -> Result<(), AgentError>
     {
         let state = AgentNodeState::generate(Utc::now());
-        let private_key = state.wireguard_private_key_b64.clone();
+        let private_key = encode_bytes(&canonical_wireguard_private_key(
+            &state.wireguard_private_key_b64,
+        )?);
         let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
         let runner = RecordingRunner::with_missing_interface();
         let applier = PeerMapApplier::new(

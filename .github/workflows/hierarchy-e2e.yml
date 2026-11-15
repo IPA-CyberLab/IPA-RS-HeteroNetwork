@@ -62,9 +62,19 @@ jobs:
           cargo test --locked -p ipars-control-plane --lib missing_locality_is_not_treated_as_a_shared_failure_domain
           cargo test --locked -p ipars-control-plane --lib measured_cost_prefers_a_faster_route_and_preserves_an_alternate
           cargo test --locked -p ipars-agent --lib strict_hierarchy
+          cargo test --locked -p ipars-agent --lib canonical_wireguard_key_preserves_identity_and_is_idempotent
+          cargo test --locked -p ipars-agent --lib peer_map_application_
           cargo test --locked -p ipars-daemon --bin iparsd overlay_dns_continues_serving_after_a_reply_send_failure
           cargo test --locked -p ipars-daemon --bin iparsd signal_node_upsert_
           cargo test --locked -p ipars-daemon --bin iparsd signal_path_request_fails_over_to_available_signal_service
+      - name: Reproduce and prevent Linux WireGuard session resets
+        run: |
+          set -euo pipefail
+          cargo test --locked -p ipars-agent --test netns_wireguard_backend --no-run
+          mapfile -t tests < <(find target/debug/deps -maxdepth 1 -type f -name 'netns_wireguard_backend-*' -executable)
+          [[ ${#tests[@]} == 1 ]]
+          sudo env HETERONETWORK_RUN_WG_NETNS_TESTS=1 "${tests[0]}" \
+            reapplying_unclamped_key_preserves_kernel_wireguard_session --exact --nocapture
       - name: Build real agents and control plane
         run: cargo build --locked --release -p ipars-cli -p ipars-daemon
       - name: Package candidate native binaries

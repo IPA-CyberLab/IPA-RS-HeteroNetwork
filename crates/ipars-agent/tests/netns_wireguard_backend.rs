@@ -1,17 +1,214 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ipars_agent::{
     BoringTunWireGuardBackend, KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource,
+    LinuxWireGuardBackend, NamespacedLinuxCommandRunner, TimedSystemCommandRunner,
     WireGuardBackend, WireGuardPeerConfig, WireGuardPeerInventorySource,
     WireGuardPeerTelemetrySource,
 };
-use ipars_crypto::WireGuardKeyPair;
+use ipars_crypto::{encode_bytes, WireGuardKeyPair};
 use ipars_route_manager::{with_linux_network_namespace, LinuxNetworkNamespace};
 use ipars_types::{NodeId, VpnIp};
+
+#[tokio::test]
+async fn reapplying_unclamped_key_preserves_kernel_wireguard_session(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("HETERONETWORK_RUN_WG_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!("skipping kernel WireGuard key stability test without netns opt-in");
+        return Ok(());
+    }
+    for name in ["ip", "wg", "ping"] {
+        require_command(name)?;
+    }
+    let suffix = unique_suffix()?;
+    let namespace_a = format!("ipars-key-a-{suffix}");
+    let namespace_b = format!("ipars-key-b-{suffix}");
+    let _guard_a = NamespaceGuard::create(namespace_a.clone())?;
+    let _guard_b = NamespaceGuard::create(namespace_b.clone())?;
+    let veth_a = format!("ka{suffix}");
+    let veth_b = format!("kb{suffix}");
+    let _veth_guard = VethGuard::create(&veth_a, &veth_b)?;
+    command("ip", ["link", "set", &veth_a, "netns", &namespace_a])?;
+    command("ip", ["link", "set", &veth_b, "netns", &namespace_b])?;
+    configure_namespace_interface(&namespace_a, &veth_a, "10.241.98.1/30")?;
+    configure_namespace_interface(&namespace_b, &veth_b, "10.241.98.2/30")?;
+
+    let ns_a = LinuxNetworkNamespace::from_name(&namespace_a)?;
+    let ns_b = LinuxNetworkNamespace::from_name(&namespace_b)?;
+    let backend_a = KernelWireGuardBackend::new_in_namespace("iparswg0", ns_a.clone());
+    let backend_b = KernelWireGuardBackend::new_in_namespace("iparswg0", ns_b.clone());
+    let telemetry = KernelWireGuardPeerTelemetrySource::new_in_namespace("iparswg0", ns_a.clone());
+    // These deterministic test-only values are deliberately not clamped.
+    let key_a = WireGuardKeyPair::from_private_key_b64(&encode_bytes(&[7; 32]))?;
+    let key_b = WireGuardKeyPair::from_private_key_b64(&encode_bytes(&[9; 32]))?;
+    backend_a.ensure_interface().await?;
+    backend_b.ensure_interface().await?;
+    backend_a
+        .configure_interface_private_key(&key_a.private_key_b64)
+        .await?;
+    backend_b
+        .configure_interface_private_key(&key_b.private_key_b64)
+        .await?;
+    backend_a.configure_interface_listen_port(51940).await?;
+    backend_b.configure_interface_listen_port(51940).await?;
+    backend_a
+        .configure_interface_address(VpnIp("100.64.98.1".parse()?))
+        .await?;
+    backend_b
+        .configure_interface_address(VpnIp("100.64.98.2".parse()?))
+        .await?;
+    backend_a
+        .upsert_peer(WireGuardPeerConfig {
+            peer: NodeId::from_string("test-b"),
+            public_key: key_b.public_key_b64.clone(),
+            endpoint: Some("10.241.98.2:51940".to_string()),
+            allowed_ips: vec!["100.64.98.2/32".to_string()],
+            persistent_keepalive_seconds: None,
+        })
+        .await?;
+    backend_b
+        .upsert_peer(WireGuardPeerConfig {
+            peer: NodeId::from_string("test-a"),
+            public_key: key_a.public_key_b64.clone(),
+            endpoint: Some("10.241.98.1:51940".to_string()),
+            allowed_ips: vec!["100.64.98.1/32".to_string()],
+            persistent_keepalive_seconds: None,
+        })
+        .await?;
+    command(
+        "ip",
+        [
+            "-n",
+            &namespace_a,
+            "route",
+            "replace",
+            "100.64.98.2/32",
+            "dev",
+            "iparswg0",
+        ],
+    )?;
+    command(
+        "ip",
+        [
+            "-n",
+            &namespace_b,
+            "route",
+            "replace",
+            "100.64.98.1/32",
+            "dev",
+            "iparswg0",
+        ],
+    )?;
+    let ping = || {
+        command(
+            "ip",
+            [
+                "netns",
+                "exec",
+                &namespace_a,
+                "ping",
+                "-n",
+                "-q",
+                "-c",
+                "3",
+                "-W",
+                "2",
+                "100.64.98.2",
+            ],
+        )
+    };
+    ping()?;
+    let first = telemetry
+        .snapshot()
+        .await?
+        .get(&key_b.public_key_b64)
+        .and_then(|peer| peer.latest_handshake_at)
+        .ok_or("initial handshake missing")?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Reproduce the old behavior against the actual Linux kernel without
+    // exposing even test keys in command arguments or logs.
+    let mut raw_refresh = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &namespace_a,
+            "wg",
+            "set",
+            "iparswg0",
+            "private-key",
+            "/dev/stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        let mut input = raw_refresh.stdin.take().ok_or("missing key stdin")?;
+        writeln!(input, "{}", key_a.private_key_b64)?;
+    }
+    let raw_output = raw_refresh.wait_with_output()?;
+    if !raw_output.status.success() {
+        return Err(command_error("wg raw refresh", raw_output).into());
+    }
+    ping()?;
+    let after_raw = telemetry
+        .snapshot()
+        .await?
+        .get(&key_b.public_key_b64)
+        .and_then(|peer| peer.latest_handshake_at)
+        .ok_or("handshake after raw refresh missing")?;
+    assert!(
+        after_raw > first,
+        "the unclamped-key regression did not reproduce"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Both production Linux backends must preserve the established keypair.
+    backend_a
+        .configure_interface_private_key(&key_a.private_key_b64)
+        .await?;
+    ping()?;
+    let after_netlink = telemetry
+        .snapshot()
+        .await?
+        .get(&key_b.public_key_b64)
+        .and_then(|peer| peer.latest_handshake_at)
+        .ok_or("netlink handshake missing")?;
+    assert_eq!(
+        after_netlink, after_raw,
+        "netlink key refresh restarted the session"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let command_backend = LinuxWireGuardBackend::new(
+        "iparswg0",
+        NamespacedLinuxCommandRunner::new(ns_a, TimedSystemCommandRunner::default()),
+    );
+    command_backend
+        .configure_interface_private_key(&key_a.private_key_b64)
+        .await?;
+    ping()?;
+    let after_command = telemetry
+        .snapshot()
+        .await?
+        .get(&key_b.public_key_b64)
+        .and_then(|peer| peer.latest_handshake_at)
+        .ok_or("command handshake missing")?;
+    assert_eq!(
+        after_command, after_raw,
+        "command key refresh restarted the session"
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
@@ -528,6 +725,8 @@ impl Drop for VethGuard {
     fn drop(&mut self) {
         let _ = Command::new("ip")
             .args(["link", "del", self.first.as_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
 }

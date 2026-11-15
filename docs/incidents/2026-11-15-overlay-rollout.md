@@ -51,6 +51,20 @@ does not itself enable it.
   Agents, each of which reported a synchronized peer map. No corresponding
   listener restart was observed during the intermittent timeout below, so this
   defect is not asserted to be its cause.
+- Packet traces on `uc-k8sp5` showed repeated WireGuard handshakes during
+  peer-map application. The Agent's stored X25519 private-key bytes were not
+  clamped, whereas Linux stored the equivalent clamped scalar. The Agent sent
+  the unmodified stored bytes on every peer-map application. Linux compared
+  the bytes before clamping and expired the peer session keys on each apparent
+  change. The kernel key was confirmed to equal the clamped stored key; no key
+  material was logged. The fix clamps the supplied value at both Linux backend
+  boundaries without changing the stored key or its public identity. In two
+  isolated network namespaces on the production kernel, a regression test
+  reproduced a new handshake using the old raw setting and verified that both
+  fixed backends preserve the established session. The same test is required
+  in GitHub Actions before rollout. See the Linux 6.8 [key comparison and peer
+  keypair expiration](https://github.com/torvalds/linux/blob/v6.8/drivers/net/wireguard/netlink.c)
+  and [private-key clamping](https://github.com/torvalds/linux/blob/v6.8/drivers/net/wireguard/noise.c).
 - On `uc-k8sp1`, the four-core HDD host had load above five and elevated disk
   I/O pressure. `etcd` accounted for much of the sampled write activity. This
   establishes contention, not that it caused the browser timeouts below.
@@ -88,7 +102,12 @@ a third arrived about 480 ms late. This localizes the observed loss before
 delivery to the receiver's overlay DNS listener, but does not distinguish
 WireGuard encryption, the public underlay, and receiver-side decryption. The
 sender was also repeatedly reapplying peer maps and re-verifying direct paths.
-Their temporal correlation is not proof that they caused the lost packets.
+After the DNS send-error fix was deployed, a fresh comparison still had one
+timeout and an 861 ms response in 200 queries from `uc-k8sp5` to `uc-k8sp1`;
+200 concurrent local queries on `uc-k8sp1` all succeeded within 2 ms. The
+transport loss persisted before the key-normalization fix. The live browser run passed:
+the canonical page loaded in 932 ms after the route-readiness phase, which
+itself took 18.5 seconds for all five gateways.
 
 The hierarchy CI uses real WireGuard agents in network namespaces on one
 GitHub-hosted VM, including latency, first-hop loss, a new node and a failed
