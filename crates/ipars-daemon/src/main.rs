@@ -16219,6 +16219,7 @@ async fn run_signal_registration_loop(
                 match send_signal_node_upsert_to_signal_services(
                     &client,
                     &active_signal_urls,
+                    &identity,
                     request,
                 )
                 .await
@@ -16245,6 +16246,7 @@ async fn run_signal_registration_loop(
 async fn send_signal_node_upsert_to_signal_services(
     client: &reqwest::Client,
     signal_urls: &[String],
+    identity: &IdentityKeyPair,
     request: SignalNodeUpsertRequest,
 ) -> anyhow::Result<usize> {
     let mut successes = 0_usize;
@@ -16253,9 +16255,21 @@ async fn send_signal_node_upsert_to_signal_services(
     let results = stream::iter(signal_urls.iter().cloned())
         .map(|signal_url| {
             let client = client.clone();
-            let request = request.clone();
+            let identity = identity.clone();
+            let mut request = request.clone();
             async move {
-                let result = send_signal_node_upsert(&client, &signal_url, request).await;
+                // Different URLs can reach the same Signal instance. Sign each
+                // request separately so the replay guard sees a fresh nonce.
+                let result = async {
+                    request.request_signature = None;
+                    request.request_signature = Some(
+                        identity
+                            .sign_signal_node_upsert_request(&request, chrono::Utc::now())
+                            .context("failed to sign signal node upsert")?,
+                    );
+                    send_signal_node_upsert(&client, &signal_url, request).await
+                }
+                .await;
                 (signal_url, result)
             }
         })
@@ -45449,6 +45463,7 @@ exec sleep 60
         let successes = send_signal_node_upsert_to_signal_services(
             &client,
             &[unavailable, base_a.clone(), base_b.clone()],
+            &identity,
             request,
         )
         .await?;
@@ -45458,6 +45473,36 @@ exec sleep 60
         assert!(registry_b.get_node(&node_id).await.is_some());
         task_a.abort();
         task_b.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_node_upsert_accepts_aliases_without_replaying_nonce() -> anyhow::Result<()> {
+        let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let (base, task) = spawn_test_signal_service(registry).await?;
+        let identity = IdentityKeyPair::generate();
+        let mut node = node_record("node-a");
+        node.identity_public_key = identity.public_key_b64();
+        let mut request = SignalNodeUpsertRequest {
+            node,
+            nat_classification: None,
+            health: None,
+            request_signature: None,
+        };
+        request.request_signature =
+            Some(identity.sign_signal_node_upsert_request(&request, Utc::now())?);
+        let successes = send_signal_node_upsert_to_signal_services(
+            &reqwest::Client::new(),
+            &[base.clone(), format!("{base}/")],
+            &identity,
+            request,
+        )
+        .await?;
+        task.abort();
+        assert_eq!(
+            successes, 2,
+            "both aliases must receive a freshly signed request"
+        );
         Ok(())
     }
 
