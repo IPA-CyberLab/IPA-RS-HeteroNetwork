@@ -764,6 +764,10 @@ For the conntrack event detector, an unsuccessful table snapshot no longer
 stops multicast event consumption. The Agent logs the failed snapshot and
 retries it with a 30-second backoff. Events missed while the snapshot is
 unavailable cannot be recovered until a later successful snapshot.
+Signal registration uses a freshly signed nonce for each advertised URL:
+the internal and public URLs can resolve to the same Signal instance. The
+server still rejects an actual replay; a 409 is not treated as a successful
+registration.
 
 Run `scripts/strict-hierarchy-netns-e2e.sh` as root in an isolated Linux test
 environment with the built `ipars` and `iparsd` binaries. It starts five real
