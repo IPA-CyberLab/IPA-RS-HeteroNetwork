@@ -206,9 +206,13 @@ def main():
             forward = root / "forward.conf"
             one, two = node("one", ADDRESSES[0]), node("two", ADDRESSES[1])
             write_forward(forward, [one])
-            command("docker", "run", "-d", "--rm", "--name", container, "--network", "host",
+            command("docker", "run", "-d", "--name", container, "--network", "host",
                     "-v", f"{root}:/config:ro", IMAGE, "-conf", "/config/Corefile", timeout=240)
             started = True
+            time.sleep(0.5)
+            running = command("docker", "inspect", "--format", "{{.State.Running}}", container).stdout.strip()
+            if running != "true":
+                raise RuntimeError("CoreDNS exited before accepting DNS requests")
             wait_for(lambda: query(port) == "192.0.2.11", timeout=30)
             write_forward(forward, [one, two])
             wait_for(lambda: query(port) == "192.0.2.12", timeout=30)
