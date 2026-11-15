@@ -56,6 +56,7 @@ def main():
     git_drift=args.reconcile_all or not inventory.exists()
     console_drift=args.reconcile_all or not inventory.exists()
     onboarding_drift=args.reconcile_all or not inventory.exists()
+    kubelet_dns_drift=args.reconcile_all or not inventory.exists()
     if inventory.exists() and not args.reconcile_all:
         inventory_api=subprocess.run(
             ['kubectl','get','crd','flashgpudevices.flash.heterocloud.io','-o','name'],
@@ -68,7 +69,7 @@ def main():
             gpu_inventory_acceptance_drift=True
         else:
             raise RuntimeError('Unable to inspect the Flash GPU inventory API: '+inventory_api.stderr.strip())
-        for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('database-ha.yaml','database-ha-check.log'),('database-proxy.yaml','database-proxy-check.log'),('openbao-storage.yaml','openbao-storage-check.log'),('gpu.yaml','gpu-check.log'),*inventory_playbooks,('console/configure.yaml','console-check.log'),('git-source.yaml','git-check.log')]:
+        for playbook,logname in [('masters.yaml','host-check.log'),('standard.yaml','standard-check.log'),('database-ha.yaml','database-ha-check.log'),('database-proxy.yaml','database-proxy-check.log'),('openbao-storage.yaml','openbao-storage-check.log'),('gpu.yaml','gpu-check.log'),*inventory_playbooks,('console/configure.yaml','console-check.log'),('git-source.yaml','git-check.log'),('kubelet-dns.yaml','kubelet-dns-check.log')]:
             command=['ansible-playbook','-i',str(inventory),'--check',str(MODULE/'ansible'/playbook)]
             result=subprocess.run(command,env=env,text=True,capture_output=True)
             log=work/logname
@@ -85,6 +86,8 @@ def main():
                 drift=[name for name,stats in report['hosts'].items() if name in nodes and stats['changed']]
             elif playbook=='standard.yaml':
                 standard_drift=[name for name,stats in report['hosts'].items() if name in standard_nodes and stats['changed']]
+            elif playbook=='kubelet-dns.yaml':
+                kubelet_dns_drift=any(stats['changed'] for stats in report['hosts'].values())
             elif playbook=='database-ha.yaml':
                 database_drift=any(stats['changed'] for stats in report['hosts'].values())
             elif playbook=='database-proxy.yaml':
@@ -137,9 +140,9 @@ def main():
         if result.returncode not in [0,2]:
             raise RuntimeError('Flash CRD acceptance check failed; see private flash-crd-acceptance-check.log')
         flash_crd_acceptance_drift=result.returncode==2
-        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'database_ha_drift':database_drift,'database_proxy_drift':database_proxy_drift,'openbao_storage_drift':openbao_storage_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'flash_crd_acceptance_drift':flash_crd_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
+        print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'database_ha_drift':database_drift,'database_proxy_drift':database_proxy_drift,'openbao_storage_drift':openbao_storage_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'flash_crd_acceptance_drift':flash_crd_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift,'kubelet_dns_drift':kubelet_dns_drift}))
     if args.action=='check':
-        return 2 if hierarchy_drift is not False or drift or standard_drift or database_drift or database_proxy_drift or openbao_storage_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or flash_crd_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
+        return 2 if hierarchy_drift is not False or drift or standard_drift or database_drift or database_proxy_drift or openbao_storage_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or flash_crd_acceptance_drift or console_drift or onboarding_drift or git_drift or kubelet_dns_drift else 0
     tf=[args.terraform,'-chdir='+str(MODULE)]
     subprocess.run(tf+['init','-input=false'],env=env,check=True)
     replace=['-replace=terraform_data.host_configuration['+json.dumps(name)+']' for name in drift]
@@ -168,6 +171,8 @@ def main():
         replace.append('-replace=terraform_data.onboarding_acceptance')
     if hierarchy_drift:
         replace.append('-replace=terraform_data.overlay_hierarchy_policy')
+    if kubelet_dns_drift:
+        replace.append('-replace=terraform_data.kubelet_dns')
     plan=work/'master-only.tfplan'
     result=subprocess.run(tf+['plan','-input=false','-parallelism=1','-detailed-exitcode','-out='+str(plan),*replace],env=env)
     if plan.exists():

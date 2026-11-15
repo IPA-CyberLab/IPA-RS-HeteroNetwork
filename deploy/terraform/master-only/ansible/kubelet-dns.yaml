@@ -1,0 +1,114 @@
+- name: Reconcile the kubelet resolver one node at a time
+  hosts: master_only:bootstrap:enrollment_issuer:standard
+  serial: 1
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Check the active resolver source and kubelet configuration
+      ansible.builtin.shell: |
+        set -eu
+        test -r /run/systemd/resolve/resolv.conf
+        test -f /var/lib/kubelet/config.yaml
+        expected="$(awk '
+          $1 == "nameserver" && $2 != "" && $2 != "127.0.0.53" && $2 != "::1" && !seen[$2]++ && count < 3 {
+            print "nameserver " $2
+            count++
+          }
+        ' /run/systemd/resolve/resolv.conf)"
+        test -n "$expected"
+        actual="$(cat /etc/kubernetes/resolv.conf 2>/dev/null || true)"
+        if [ "$expected" != "$actual" ] || ! grep -Fxq 'resolvConf: /etc/kubernetes/resolv.conf' /var/lib/kubelet/config.yaml; then
+          exit 3
+        fi
+      args:
+        executable: /bin/sh
+      register: hnn_kubelet_dns_check
+      check_mode: false
+      changed_when: hnn_kubelet_dns_check.rc == 3
+      failed_when: hnn_kubelet_dns_check.rc not in [0, 3]
+
+    - name: Create the helper directory
+      ansible.builtin.file:
+        path: /opt/heteronetwork/libexec
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the reviewed resolver reconciler
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/reconcile-kubelet-dns.sh"
+        dest: /opt/heteronetwork/libexec/reconcile-kubelet-dns.sh
+        owner: root
+        group: root
+        mode: '0755'
+        validate: /bin/bash -n %s
+
+    - name: Create a protected kubelet resolver backup directory
+      ansible.builtin.file:
+        path: /var/backups/heteronetwork/kubelet-dns
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: hnn_kubelet_dns_check.rc == 3
+
+    - name: Preserve the kubelet configuration before its first repair
+      ansible.builtin.copy:
+        src: /var/lib/kubelet/config.yaml
+        dest: /var/backups/heteronetwork/kubelet-dns/config-before-iac.yaml
+        remote_src: true
+        force: false
+        mode: '0600'
+      when:
+        - hnn_kubelet_dns_check.rc == 3
+        - not ansible_check_mode
+
+    - name: Inspect the existing resolver file
+      ansible.builtin.stat:
+        path: /etc/kubernetes/resolv.conf
+      register: hnn_existing_kubelet_resolver
+
+    - name: Preserve the resolver file before its first repair
+      ansible.builtin.copy:
+        src: /etc/kubernetes/resolv.conf
+        dest: /var/backups/heteronetwork/kubelet-dns/resolv-before-iac.conf
+        remote_src: true
+        force: false
+        mode: '0600'
+      when:
+        - hnn_kubelet_dns_check.rc == 3
+        - hnn_existing_kubelet_resolver.stat.exists
+        - not ansible_check_mode
+
+    - name: Repair the kubelet resolver without touching workloads
+      ansible.builtin.command:
+        argv: [/opt/heteronetwork/libexec/reconcile-kubelet-dns.sh]
+      when:
+        - hnn_kubelet_dns_check.rc == 3
+        - not ansible_check_mode
+      changed_when: true
+
+    - name: Wait for the kubelet to be active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, kubelet.service]
+      register: hnn_kubelet_active
+      retries: 30
+      delay: 2
+      until: hnn_kubelet_active.rc == 0
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Wait until the node is Ready before touching the next node
+      ansible.builtin.command:
+        argv: [kubectl, wait, --for=condition=Ready, "node/{{ inventory_hostname }}", --timeout=90s]
+      environment:
+        KUBECONFIG: "{{ lookup('env', 'KUBE_CONFIG_PATH') }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when: not ansible_check_mode
