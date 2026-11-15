@@ -1,0 +1,39 @@
+- name: Restore the configured public console issuer
+  hosts: bootstrap:enrollment_issuer
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+  tasks:
+    - name: Install the reviewed issuer reconciliation helper
+      ansible.builtin.copy:
+        src: '{{ hnn_repo_root }}/scripts/reconcile-console-issuer.py'
+        dest: /opt/heteronetwork/libexec/reconcile-console-issuer.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Restore the public issuer while preserving all other settings
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/libexec/reconcile-console-issuer.py]
+      register: hnn_issuer_repair
+      changed_when: hnn_issuer_repair.stdout | trim == 'updated'
+      when: not ansible_check_mode
+    - name: Wait for the corrected issuer to be served
+      ansible.builtin.uri:
+        url: 'http://{{ vpn_ip }}:19088/ui/config'
+        status_code: 200
+        return_content: true
+        use_proxy: false
+        timeout: 3
+      register: hnn_issuer_config
+      until: >-
+        hnn_issuer_config.status | default(0) == 200 and
+        (hnn_issuer_config.json.issuer_url | default('')).startswith('https://')
+      retries: 45
+      delay: 2
+      when:
+        - not ansible_check_mode
+        - hnn_issuer_repair.stdout | default('') | trim == 'updated'
