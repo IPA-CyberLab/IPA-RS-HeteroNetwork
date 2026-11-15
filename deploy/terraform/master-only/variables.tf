@@ -30,9 +30,9 @@ variable "control_planes" {
 
 variable "native_binary_sha256" {
   type = map(string)
-  # Hierarchy candidate, GitHub Actions 43687667849, source 2731c612e143b791e0087908f7000c495f20c545.
+  # Hierarchy candidate, GitHub Actions 43690664637, source 92f5cd876ac0d3476487d4ebd33dbd8a59609bcc.
   default = {
-    ipars  = "4e4b490433780309309341d0359df1c09e096fa77b57a65cf4bafa792ed655c0"
-    iparsd = "22238a17d23c15ea4b3a5fe5b2b869b8cf36f0d4f1591c5768f50979cdca8fa2"
+    ipars  = "0e6bfb1a0ec10fc6b70059129942df2864ee582480a5b2997ca74c3d8c41e8da"
+    iparsd = "5e2296dd34b3d61acf874feacd74d36a222be89e6fad99632f87447914194c92"
   }
 }
