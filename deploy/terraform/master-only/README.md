@@ -131,6 +131,23 @@ waits for the enrollment Control Plane and Keycloak edge to recover.
 
 ## Apply
 
+`overlay-hierarchy.json` declares strict hierarchical routing. Terraform
+reconciles only that field through the normal management API after the
+control-plane and Agent rollouts; unrelated policy values are retained. The
+API rejects activation until every active native Agent has reported a
+compatible signed build. Supply a short-lived owner OIDC access token in a
+private file owned by the operator (`0600`) as `HNN_HIERARCHY_TOKEN_FILE`.
+Use `HNN_HIERARCHY_API_URL` for the management origin; cleartext HTTP is
+accepted only on loopback, for example via an authenticated SSH tunnel.
+Tokens are not put in Terraform state or process arguments. A management
+quorum, if enabled, is never bypassed by this reconciler.
+
+The `master-only-iac.py` wrapper checks the live hierarchy policy and schedules
+reconciliation for drift when that token is supplied. Its `check` action
+reports a null hierarchy result and exits 2 if no token was supplied, rather
+than reporting the policy as verified. An apply that needs to change the
+hierarchy fails closed if the credential or required quorum is unavailable.
+
 Install Terraform >=1.16.4, ansible-core 2.19.5, Python with PyYAML and kubectl.
 The lockfile pins the Terraform providers. Use an operator kubeconfig that can
 reach the existing cluster, the authorized SSH key, and a private work directory:

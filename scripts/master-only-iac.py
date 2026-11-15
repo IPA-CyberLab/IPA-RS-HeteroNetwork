@@ -31,6 +31,16 @@ def main():
     inventory=work/'inventory.json'
     env['ANSIBLE_CALLBACK_PLUGINS']=str(MODULE/'ansible/callback_plugins')
     env['ANSIBLE_STDOUT_CALLBACK']='hnn_json'
+    hierarchy_drift = None
+    if env.get('HNN_HIERARCHY_TOKEN_FILE'):
+        result = subprocess.run(
+            ['python3', str(ROOT/'scripts/reconcile-overlay-hierarchy.py'), '--check',
+             '--config', str(MODULE/'overlay-hierarchy.json')],
+            env=env, text=True, capture_output=True)
+        if result.returncode not in (0, 2):
+            raise RuntimeError('Hierarchy policy check failed: '+result.stderr.strip())
+        hierarchy_drift = result.returncode == 2
+    print(json.dumps({'hierarchy_policy_drift': hierarchy_drift}))
     nodes=json.loads((MODULE/'nodes.json').read_text())
     standard_nodes=json.loads((MODULE/'standard-nodes.json').read_text())
     drift=list(nodes) if args.reconcile_all or not inventory.exists() else []
@@ -129,7 +139,7 @@ def main():
         flash_crd_acceptance_drift=result.returncode==2
         print(json.dumps({'host_drift':drift,'standard_host_drift':standard_drift,'database_ha_drift':database_drift,'database_proxy_drift':database_proxy_drift,'openbao_storage_drift':openbao_storage_drift,'gpu_host_drift':gpu_host_drift,'gpu_acceptance_drift':gpu_acceptance_drift,'gpu_inventory_drift':gpu_inventory_drift,'gpu_inventory_acceptance_drift':gpu_inventory_acceptance_drift,'flash_crd_acceptance_drift':flash_crd_acceptance_drift,'console_drift':console_drift,'onboarding_drift':onboarding_drift,'git_source_drift':git_drift}))
     if args.action=='check':
-        return 2 if drift or standard_drift or database_drift or database_proxy_drift or openbao_storage_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or flash_crd_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
+        return 2 if hierarchy_drift is not False or drift or standard_drift or database_drift or database_proxy_drift or openbao_storage_drift or gpu_host_drift or gpu_acceptance_drift or gpu_inventory_drift or gpu_inventory_acceptance_drift or flash_crd_acceptance_drift or console_drift or onboarding_drift or git_drift else 0
     tf=[args.terraform,'-chdir='+str(MODULE)]
     subprocess.run(tf+['init','-input=false'],env=env,check=True)
     replace=['-replace=terraform_data.host_configuration['+json.dumps(name)+']' for name in drift]
@@ -156,6 +166,8 @@ def main():
         replace.append('-replace=terraform_data.console_configuration')
     if onboarding_drift:
         replace.append('-replace=terraform_data.onboarding_acceptance')
+    if hierarchy_drift:
+        replace.append('-replace=terraform_data.overlay_hierarchy_policy')
     plan=work/'master-only.tfplan'
     result=subprocess.run(tf+['plan','-input=false','-parallelism=1','-detailed-exitcode','-out='+str(plan),*replace],env=env)
     if plan.exists():

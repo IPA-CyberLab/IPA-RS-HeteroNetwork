@@ -66,6 +66,9 @@ on:
       - 'scripts/publish-master-only.py'
       - 'scripts/*database*.py'
       - 'scripts/reconcile-overlay-boot.py'
+      - 'scripts/reconcile-overlay-hierarchy.py'
+      - 'scripts/test_reconcile_overlay_hierarchy.py'
+      - 'scripts/master-only-iac.py'
       - 'scripts/test_reconcile_overlay_boot.py'
       - 'scripts/node_lifecycle.py'
       - 'scripts/reconcile-node-lifecycle.py'
@@ -172,6 +175,9 @@ on:
       - 'scripts/publish-master-only.py'
       - 'scripts/*database*.py'
       - 'scripts/reconcile-overlay-boot.py'
+      - 'scripts/reconcile-overlay-hierarchy.py'
+      - 'scripts/test_reconcile_overlay_hierarchy.py'
+      - 'scripts/master-only-iac.py'
       - 'scripts/test_reconcile_overlay_boot.py'
       - 'scripts/node_lifecycle.py'
       - 'scripts/reconcile-node-lifecycle.py'
@@ -238,6 +244,7 @@ jobs:
           python3 -B -m unittest discover -s scripts -p test_ensure_flash_ssh_host_key.py -v
           python3 -B -m unittest discover -s scripts -p test_verify_storage_redundancy.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_overlay_boot.py -v
+          python3 -B -m unittest discover -s scripts -p test_reconcile_overlay_hierarchy.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_coder_workspace_readiness.py -v
           python3 -B -m unittest discover -s scripts -p test_reconcile_coder_template_scheduling.py -v
           python3 -B -m unittest discover -s scripts -p test_heterocloud_gateway_health_policy.py -v
