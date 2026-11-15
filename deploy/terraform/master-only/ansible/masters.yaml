@@ -46,6 +46,7 @@
         mode: '0755'
       loop: '{{ hnn_binaries.results }}'
       when: item.stat.checksum | default('') != item.item.value
+      notify: Restart networking agent
 
     - name: Verify pinned native binary checksums
       ansible.builtin.stat:

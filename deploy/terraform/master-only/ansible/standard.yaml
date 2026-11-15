@@ -79,6 +79,7 @@
         group: root
         mode: '0755'
       when: not ansible_check_mode and hnn_standard_binaries.results | selectattr('stat.checksum', 'defined') | map(attribute='stat.checksum') | list | sort != hnn_native_binary_sha256.values() | list | sort
+      notify: Restart standard Agent
     - name: Verify installed networking binaries
       ansible.builtin.stat:
         path: '/opt/heteronetwork/bin/{{ item.key }}'
