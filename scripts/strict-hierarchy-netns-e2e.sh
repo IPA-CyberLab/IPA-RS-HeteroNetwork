@@ -433,5 +433,25 @@ for _ in $(seq 1 90); do
   fi
   sleep 1
 done
-[[ "$ready" == 1 ]] || { echo "new Agent did not join with a bounded initial map" >&2; exit 1; }
+if [[ "$ready" != 1 ]]; then
+  echo "new Agent did not join with a bounded initial map; non-secret diagnostics:" >&2
+  if kill -0 "${agents[5]}" 2>/dev/null; then echo "agent process: running" >&2; else echo "agent process: exited" >&2; fi
+  if [[ -s "$work/metrics-6.json" ]]; then
+    jq -c '{peer_map_synced,peer_map_peer_count,peer_map_route_count}' "$work/metrics-6.json" >&2 || true
+  else
+    echo "agent metrics endpoint: unavailable" >&2
+  fi
+  python3 - "$work/agent-6.log" <<'PY'
+import pathlib, re, sys
+lines = pathlib.Path(sys.argv[1]).read_text(errors='replace').splitlines()
+registered = [line for line in lines if 'registered agent with control plane' in line]
+print(f'registration log entries: {len(registered)}', file=sys.stderr)
+if registered:
+    match = re.search(r'peer_count=(\d+)', registered[-1])
+    print(f'initial peer count: {match.group(1) if match else "unavailable"}', file=sys.stderr)
+for phrase in ('failed to register agent', 'failed to apply peer map', 'failed to fetch peer map'):
+    print(f'{phrase}: {sum(phrase in line for line in lines)} occurrence(s)', file=sys.stderr)
+PY
+  exit 1
+fi
 echo "strict hierarchy E2E passed: real WireGuard, on-demand path, first-hop failure and bounded new-node join"

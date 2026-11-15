@@ -44,6 +44,24 @@ type replicaPool struct {
 	marker      []byte
 }
 
+// Classify disposable fixture failures without printing stderr, which can
+// contain database connection information or enrollment credentials.
+func fixtureFailureClass(stderr string) string {
+	message := strings.ToLower(stderr)
+	switch {
+	case strings.Contains(message, "address already in use"):
+		return "listen address already in use"
+	case strings.Contains(message, "too many clients"), strings.Contains(message, "too many connections"), strings.Contains(message, "remaining connection slots"):
+		return "database connection limit reached"
+	case strings.Contains(message, "connection refused"), strings.Contains(message, "database system is starting up"):
+		return "database or local service unavailable"
+	case strings.Contains(message, "permission denied"):
+		return "permission denied"
+	default:
+		return "details withheld because they may contain credentials"
+	}
+}
+
 func (pool *replicaPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Query  query  `json:"query"`
@@ -138,8 +156,9 @@ func startFixture(t *testing.T, database, issuer, at, operator string, index int
 	if err = command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	finished := make(chan error, 1)
-	go func() { finished <- command.Wait() }()
+	finished := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = command.Wait(); close(finished) }()
 	t.Cleanup(func() {
 		command.Process.Kill()
 		select {
@@ -159,8 +178,8 @@ func startFixture(t *testing.T, database, issuer, at, operator string, index int
 			}
 		}
 		select {
-		case err := <-finished:
-			t.Fatalf("fixture %d exited: %v", index, err)
+		case <-finished:
+			t.Fatalf("fixture %d exited: %v (%s)", index, waitErr, fixtureFailureClass(stderr.String()))
 		default:
 		}
 		if time.Now().After(until) {

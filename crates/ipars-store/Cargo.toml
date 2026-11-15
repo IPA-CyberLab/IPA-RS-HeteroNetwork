@@ -22,5 +22,8 @@ rand_core.workspace = true
 ipnet.workspace = true
 tokio.workspace = true
 
+[build-dependencies]
+sha2.workspace = true
+
 [lints]
 workspace = true

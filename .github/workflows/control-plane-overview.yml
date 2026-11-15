@@ -58,6 +58,10 @@ jobs:
         env:
           IPARS_TEST_POSTGRES_URL: postgresql://ipars:test-only@127.0.0.1:5432/ipars_admin_ledger_test
         run: cargo test --locked -p ipars-store postgres_token_metrics_ -- --ignored
+      - name: Verify restarting a replica does not lock live mesh tables
+        env:
+          IPARS_TEST_POSTGRES_URL: postgresql://ipars:test-only@127.0.0.1:5432/ipars_admin_ledger_test
+        run: cargo test --locked -p ipars-store postgres_replica_restart_ -- --ignored
       - name: Verify authenticated overview and node details
         run: cargo test --locked -p ipars-control-plane-http http_admin_overview_updates_for_three_node_nat_discovery
 

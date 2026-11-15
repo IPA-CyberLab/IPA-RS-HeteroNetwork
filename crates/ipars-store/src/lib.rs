@@ -2122,6 +2122,9 @@ pub struct PostgresControlPlaneStore {
 
 // PostgreSQL can race internally even for concurrent `IF NOT EXISTS` DDL.
 const POSTGRES_MIGRATION_ADVISORY_LOCK_ID: i64 = 0x4950_4152_534d_4947;
+// build.rs fingerprints the migration and both shared schema sections, so a
+// schema change cannot silently reuse a completed migration marker.
+const POSTGRES_SCHEMA_VERSION: &str = env!("HETERONETWORK_POSTGRES_SCHEMA_VERSION");
 
 impl PostgresControlPlaneStore {
     pub async fn connect(database_url: &str) -> Result<Self, ControlPlaneError> {
@@ -2146,14 +2149,64 @@ impl PostgresControlPlaneStore {
     }
 
     async fn migrate(&self) -> Result<(), ControlPlaneError> {
-        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        // A legacy replica may still run DDL during a rolling upgrade. Retry
+        // transient transaction conflicts without masking permanent failures.
+        for attempt in 0..5 {
+            match self.migrate_once().await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let retryable = error
+                        .as_database_error()
+                        .and_then(|database| database.code())
+                        .is_some_and(|code| matches!(code.as_ref(), "40P01" | "40001" | "55P03"));
+                    if !retryable || attempt == 4 {
+                        return Err(sql_error(error));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
+                }
+            }
+        }
+        unreachable!("migration either succeeds or returns its final error")
+    }
+
+    async fn postgres_schema_current(
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+    ) -> Result<bool, sqlx::Error> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('heteronetwork_schema_migrations') IS NOT NULL",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !exists {
+            return Ok(false);
+        }
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM heteronetwork_schema_migrations WHERE version = $1)",
+        )
+        .bind(POSTGRES_SCHEMA_VERSION)
+        .fetch_one(&mut **transaction)
+        .await
+    }
+
+    async fn migrate_once(&self) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        // A completed schema needs only reads: even IF NOT EXISTS DDL holds
+        // table locks until commit and can deadlock with concurrent mesh traffic.
+        if Self::postgres_schema_current(&mut transaction).await? {
+            transaction.commit().await?;
+            return Ok(());
+        }
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(POSTGRES_MIGRATION_ADVISORY_LOCK_ID)
             .execute(&mut *transaction)
-            .await
-            .map_err(sql_error)?;
+            .await?;
+        // Another replica may have finished while this transaction waited.
+        if Self::postgres_schema_current(&mut transaction).await? {
+            transaction.commit().await?;
+            return Ok(());
+        }
         for statement in ADMIN_CAPABILITY_SCHEMA {
-            transaction.execute(statement).await.map_err(sql_error)?;
+            transaction.execute(statement).await?;
         }
         transaction
             .execute(
@@ -2164,8 +2217,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2175,8 +2227,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2186,8 +2237,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2195,8 +2245,7 @@ impl PostgresControlPlaneStore {
                 ON nodes ((record_json->>'vpn_ip'));
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2208,8 +2257,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2219,13 +2267,11 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         let heartbeat_signature_table_existed =
             sqlx::query_scalar::<_, bool>("SELECT to_regclass('heartbeat_signatures') IS NOT NULL")
                 .fetch_one(&mut *transaction)
-                .await
-                .map_err(sql_error)?;
+                .await?;
         transaction
             .execute(
                 r#"
@@ -2235,8 +2281,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         if !heartbeat_signature_table_existed {
             transaction
                 .execute(
@@ -2248,8 +2293,7 @@ impl PostgresControlPlaneStore {
                 ON CONFLICT (node_id) DO NOTHING;
                 "#,
                 )
-                .await
-                .map_err(sql_error)?;
+                .await?;
         }
         transaction
             .execute(
@@ -2260,8 +2304,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2273,8 +2316,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2286,8 +2328,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2299,8 +2340,7 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2310,7 +2350,7 @@ impl PostgresControlPlaneStore {
                 "#,
             )
             .await
-            .map_err(sql_error)?;
+            ?;
         transaction
             .execute(
                 r#"
@@ -2319,8 +2359,7 @@ impl PostgresControlPlaneStore {
                 WHERE NOT (record_json ? 'owner_node_id');
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2335,20 +2374,19 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 "ALTER TABLE keycloak_candidate_leases ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0",
             )
             .await
-            .map_err(sql_error)?;
+            ?;
         transaction
             .execute(
                 "ALTER TABLE keycloak_candidate_leases ADD COLUMN IF NOT EXISTS eligible BOOLEAN NOT NULL DEFAULT TRUE",
             )
             .await
-            .map_err(sql_error)?;
+            ?;
         transaction
             .execute(
                 r#"
@@ -2356,8 +2394,7 @@ impl PostgresControlPlaneStore {
                 ON keycloak_candidate_leases(cluster_id, lease_expires_at);
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
+            .await?;
         transaction
             .execute(
                 r#"
@@ -2368,13 +2405,17 @@ impl PostgresControlPlaneStore {
                 );
                 "#,
             )
-            .await
-            .map_err(sql_error)?;
-        transaction.execute("CREATE TABLE IF NOT EXISTS node_transport_snapshots (node_id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE, observed_at BIGINT NOT NULL, record_json TEXT NOT NULL)").await.map_err(sql_error)?;
+            .await?;
+        transaction.execute("CREATE TABLE IF NOT EXISTS node_transport_snapshots (node_id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE, observed_at BIGINT NOT NULL, record_json TEXT NOT NULL)").await?;
         for statement in http_mesh::SCHEMA {
-            transaction.execute(*statement).await.map_err(sql_error)?;
+            transaction.execute(*statement).await?;
         }
-        transaction.commit().await.map_err(sql_error)?;
+        transaction.execute("CREATE TABLE IF NOT EXISTS heteronetwork_schema_migrations (version TEXT PRIMARY KEY NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())").await?;
+        sqlx::query("INSERT INTO heteronetwork_schema_migrations(version) VALUES ($1) ON CONFLICT(version) DO NOTHING")
+            .bind(POSTGRES_SCHEMA_VERSION)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         Ok(())
     }
 }
@@ -5268,6 +5309,38 @@ mod tests {
         first.pool.close().await;
         second.pool.close().await;
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable ipars_admin_ledger_test PostgreSQL database"]
+    async fn postgres_replica_restart_avoids_ddl_on_live_mesh_tables(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("IPARS_TEST_POSTGRES_URL")?;
+        let pool = PgPool::connect(&url).await?;
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            database, "ipars_admin_ledger_test",
+            "test refuses other databases"
+        );
+        let first = PostgresControlPlaneStore::from_pool(pool).await?;
+
+        // A restarting replica must not wait for a lock held by live traffic
+        // once its exact schema migration has already completed.
+        let mut live_traffic = first.pool.begin().await?;
+        sqlx::query("LOCK TABLE http_mesh_batches IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *live_traffic)
+            .await?;
+        let reopened = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            PostgresControlPlaneStore::connect(&url),
+        )
+        .await??;
+        live_traffic.rollback().await?;
+        reopened.pool.close().await;
+        first.pool.close().await;
         Ok(())
     }
 
