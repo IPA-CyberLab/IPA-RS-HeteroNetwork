@@ -12,12 +12,7 @@ data:
     heteronetwork.internal:53 {
         errors
         cache 30
-        forward . 10.250.0.2 10.250.0.4 10.250.0.5 10.250.0.6 10.250.0.10 {
-           policy random
-           health_check 2s
-           max_fails 1
-           max_concurrent 1000
-        }
+        import /etc/heteronetwork/overlay-dns-upstreams/forward.conf
         reload
         loadbalance
     }
@@ -193,6 +188,11 @@ spec:
             - name: config-volume
               mountPath: /etc/coredns
               readOnly: true
+            # Mount the directory, not subPath, so projected ConfigMap updates
+            # reach the reload plugin without restarting the DNS pods.
+            - name: overlay-dns-upstreams
+              mountPath: /etc/heteronetwork/overlay-dns-upstreams
+              readOnly: true
       dnsPolicy: Default
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
@@ -207,6 +207,12 @@ spec:
             items:
               - key: Corefile
                 path: Corefile
+        - name: overlay-dns-upstreams
+          configMap:
+            name: heteronetwork-overlay-dns-effective
+            items:
+              - key: forward.conf
+                path: forward.conf
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
