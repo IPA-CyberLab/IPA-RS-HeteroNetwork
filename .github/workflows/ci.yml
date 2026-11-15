@@ -402,6 +402,8 @@ jobs:
             sudo modprobe wireguard
           fi
           sudo modprobe sch_netem
+          sudo modprobe nf_conntrack_netlink
+          sudo modprobe xt_conntrack
           sudo modprobe tun
           sudo test -c /dev/net/tun
           if ! sudo test -r /sys/kernel/tracing/events/syscalls/sys_enter_sendto/id \

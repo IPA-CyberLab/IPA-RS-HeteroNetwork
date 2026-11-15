@@ -76,7 +76,10 @@ for i in 1 2 3 4 5; do
   ip -n "$ns" link set "$peer_if" up
   ip -n "$ns" route replace default via "$control_ip" dev "$peer_if"
   ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=0
-  ip netns exec "$ns" iptables -A OUTPUT -j ACCEPT
+  # Conntrack hooks are enabled per network namespace when a stateful rule is
+  # installed. An unconditional ACCEPT does not activate tracking on a clean
+  # Actions VM, so the detector would receive no workload events at all.
+  ip netns exec "$ns" iptables -A OUTPUT -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 done
 
 wireguard_backend=command
@@ -235,7 +238,27 @@ for _ in $(seq 1 90); do
   fi
   sleep 1
 done
-[[ "$reachable" == 1 ]] || { echo "on-demand multi-hop WireGuard traffic failed" >&2; exit 1; }
+if [[ "$reachable" != 1 ]]; then
+  echo "on-demand multi-hop WireGuard traffic failed; collecting non-secret detector diagnostics" >&2
+  ip -n "${namespaces[source - 1]}" route get "$target_vpn" >&2 || true
+  ip netns exec "${namespaces[source - 1]}" curl -fsS --max-time 3 \
+    http://127.0.0.1:9780/v1/metrics 2>/dev/null | jq -c \
+    '{peer_map_synced,packet_flow_observation_count,packet_flow_match_count,packet_flow_unmatched_count,packet_flow_filtered_count,packet_flow_filtered_reason_counts}' >&2 || true
+  python3 - "$work/agent-${source}.log" <<'PY'
+import pathlib, re, sys
+lines = pathlib.Path(sys.argv[1]).read_text(errors='replace').splitlines()
+for phrase in ('failed to open conntrack netlink event socket',
+               'conntrack netlink event detector failed',
+               'failed to apply peer map'):
+    matching = [line for line in lines if phrase in line]
+    print(f'{phrase}: {len(matching)} occurrence(s)', file=sys.stderr)
+    if matching:
+        # Netlink errors contain only OS error details; do not print arbitrary logs.
+        match = re.search(r'(?:Operation not permitted|Invalid argument|No such file or directory|Permission denied)', matching[-1])
+        if match: print(f'  OS error: {match.group(0)}', file=sys.stderr)
+PY
+  exit 1
+fi
 
 target_key="$(jq -r '.wireguard_public_key' "$work/status-${target}.json")"
 source_interface="hw$((suffix % 100000))${source}"

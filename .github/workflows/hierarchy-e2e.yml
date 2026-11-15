@@ -49,6 +49,8 @@ jobs:
           sudo apt-get install --yes --no-install-recommends iproute2 iptables iputils-ping jq kmod procps python3-cryptography wireguard-tools
           sudo modprobe wireguard
           sudo modprobe nf_conntrack
+          sudo modprobe nf_conntrack_netlink
+          sudo modprobe xt_conntrack
           sudo modprobe sch_netem
       - name: Install pinned Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
@@ -60,25 +62,25 @@ jobs:
           cargo test --locked -p ipars-agent --lib strict_hierarchy
       - name: Build real agents and control plane
         run: cargo build --locked --release -p ipars-cli -p ipars-daemon
+      - name: Package candidate native binaries
+        run: |
+          tar -C target/release -czf "$RUNNER_TEMP/native-bin.tar.gz" ipars iparsd
+          (cd target/release && sha256sum ipars iparsd) > "$RUNNER_TEMP/native-bin.sha256"
+      - name: Retain candidate native binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hierarchy-native-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/native-bin.tar.gz
+            ${{ runner.temp }}/native-bin.sha256
+          if-no-files-found: error
+          retention-days: 7
       - name: Exercise automatic flow detection, latency and failover
         run: |
           sudo env PATH="/usr/sbin:/usr/bin:/sbin:/bin" \
             HETERONETWORK_E2E_IPARS="$PWD/target/release/ipars" \
             HETERONETWORK_E2E_IPARSD="$PWD/target/release/iparsd" \
             scripts/strict-hierarchy-netns-e2e.sh
-      - name: Package the tested native binaries
-        run: |
-          tar -C target/release -czf "$RUNNER_TEMP/native-bin.tar.gz" ipars iparsd
-          (cd target/release && sha256sum ipars iparsd) > "$RUNNER_TEMP/native-bin.sha256"
-      - name: Retain tested native binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: hierarchy-native-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/native-bin.tar.gz
-            ${{ runner.temp }}/native-bin.sha256
-          if-no-files-found: error
-          retention-days: 7
 
   console:
     runs-on: ubuntu-24.04
