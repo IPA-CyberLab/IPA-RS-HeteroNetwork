@@ -200,7 +200,7 @@ def main():
             root.chmod(0o755)
             (root / "Corefile").write_text(
                 f"heteronetwork.internal:{port} {{\n    errors\n"
-                "    import /config/forward.conf\n    reload 1s 0s\n}\n"
+                "    import /config/forward.conf\n    reload 2s 0s\n}\n"
             )
             (root / "Corefile").chmod(0o644)
             forward = root / "forward.conf"
