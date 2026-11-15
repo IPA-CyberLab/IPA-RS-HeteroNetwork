@@ -729,6 +729,10 @@ resolved over the backbone and the receiving Agent is awakened through the
 existing signed connection-intent mechanism. The configured on-demand limit
 still applies. Client-to-gateway sessions are a separate class and are not
 included in the backbone degree bound.
+Following a topology change, Agents retain previous backbone neighbors for up
+to 120 seconds so existing traffic can migrate. During that interval the
+total peer count can exceed the degree of the new topology. This grace period
+is bounded; it is not a promise of uninterrupted traffic in every partition.
 For clients without an existing selected gateway, strict mode uses stable
 rendezvous hashing across up to four eligible gateways. Existing valid
 selections are retained. If a gateway disappears, only clients assigned to it
@@ -764,9 +768,13 @@ unavailable cannot be recovered until a later successful snapshot.
 Run `scripts/strict-hierarchy-netns-e2e.sh` as root in an isolated Linux test
 environment with the built `ipars` and `iparsd` binaries. It starts five real
 Agents and WireGuard devices in disposable network namespaces, enables strict
-mode, tests a non-neighbor path, and blocks a physical first hop. This is a
-logical-node test on one host, not a test of 1,000 physical machines or of
-independent regional power and connectivity.
+mode, tests a non-neighbor path, blocks a physical first hop, and registers a
+sixth Agent. CI also exercises automatic flow detection after a conntrack
+snapshot failure. This is a logical-node test on one host, not a test of 1,000
+physical machines or of independent regional power and connectivity.
+The backbone degree bound does not apply to client-gateway sessions, and the
+control-plane database and aggregate client routes still require their own
+capacity and availability planning.
 
 `ClusterPolicy.overlay_block_size` controls the maximum leaf membership and
 child-group fanout in the recursive topology. Valid values are 4 through 64.
