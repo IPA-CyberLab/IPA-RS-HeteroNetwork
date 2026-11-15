@@ -1501,6 +1501,22 @@ impl ControlPlaneStore for InMemoryStore {
         Ok(self.health.read().await.get(node_id).cloned())
     }
 
+    async fn get_health_by_node_ids(
+        &self,
+        node_ids: &BTreeSet<NodeId>,
+    ) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        let health = self.health.read().await;
+        Ok(node_ids
+            .iter()
+            .filter_map(|node_id| {
+                health
+                    .get(node_id)
+                    .cloned()
+                    .map(|value| (node_id.clone(), value))
+            })
+            .collect())
+    }
+
     async fn get_heartbeat_signature_timestamp(
         &self,
         node_id: &NodeId,

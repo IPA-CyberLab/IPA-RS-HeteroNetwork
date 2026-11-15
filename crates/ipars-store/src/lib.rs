@@ -20,6 +20,8 @@ use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
 mod http_mesh;
 
 const PATH_PAIR_QUERY_CHUNK_SIZE: usize = 200;
+// Stay below SQLite's traditional 999-variable limit even on older hosts.
+const HEALTH_ID_QUERY_CHUNK_SIZE: usize = 500;
 const MAX_KEYCLOAK_CANDIDATE_QUERY_LIMIT: usize = 64;
 // Separate from membership and migration locks. Serializes the global capacity/GC gate.
 const ADMIN_CAPABILITY_LEDGER_LOCK_ID: i64 = 0x4950_4152_5341_444d;
@@ -1270,6 +1272,36 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .await
             .map_err(sql_error)?;
         row.map(row_to_health).transpose()
+    }
+
+    async fn get_health_by_node_ids(
+        &self,
+        node_ids: &BTreeSet<NodeId>,
+    ) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        let node_ids = node_ids.iter().collect::<Vec<_>>();
+        let mut health = BTreeMap::new();
+        for chunk in node_ids.chunks(HEALTH_ID_QUERY_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT node_id, record_json FROM health WHERE node_id IN (",
+            );
+            {
+                let mut values = query.separated(", ");
+                for node_id in chunk {
+                    values.push_bind(node_id.as_str());
+                }
+            }
+            query.push(")");
+            for row in query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(sql_error)?
+            {
+                let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+                health.insert(node_id, row_to_health(row)?);
+            }
+        }
+        Ok(health)
     }
 
     async fn get_heartbeat_signature_timestamp(
@@ -3316,6 +3348,27 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .await
             .map_err(sql_error)?;
         row.map(pg_row_to_health).transpose()
+    }
+
+    async fn get_health_by_node_ids(
+        &self,
+        node_ids: &BTreeSet<NodeId>,
+    ) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        if node_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids = node_ids.iter().map(NodeId::as_str).collect::<Vec<_>>();
+        let rows = sqlx::query("SELECT node_id, record_json FROM health WHERE node_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        let mut health = BTreeMap::new();
+        for row in rows {
+            let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+            health.insert(node_id, pg_row_to_health(row)?);
+        }
+        Ok(health)
     }
 
     async fn get_heartbeat_signature_timestamp(
@@ -6102,6 +6155,67 @@ mod tests {
         assert_eq!(token_metrics.exhausted_count, 1);
         assert_eq!(token_metrics.use_count, 1);
         Ok(())
+    }
+
+    async fn exercise_batch_health_by_node_ids<S: ControlPlaneStore>(
+        store: &S,
+        prefix: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(store
+            .get_health_by_node_ids(&BTreeSet::new())
+            .await?
+            .is_empty());
+        let ids = (0..1100)
+            .map(|index| NodeId::from_string(format!("{prefix}{index:04}")))
+            .collect::<BTreeSet<_>>();
+        let health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: Utc::now(),
+            latency_ms: Some(12.0),
+            relay_load: None,
+            message: None,
+        };
+        let mut expected = BTreeMap::new();
+        for index in [0, 500, 1099] {
+            let id = NodeId::from_string(format!("{prefix}{index:04}"));
+            store.upsert_health(id.clone(), health.clone()).await?;
+            expected.insert(id, health.clone());
+        }
+        // A healthy record outside the requested set must not be returned.
+        store
+            .upsert_health(NodeId::from_string(format!("{prefix}excluded")), health)
+            .await?;
+        assert_eq!(store.get_health_by_node_ids(&ids).await?, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_batch_health_by_node_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteControlPlaneStore::connect("sqlite::memory:").await?;
+        exercise_batch_health_by_node_ids(&store, "sqlite-batch-").await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable ipars_admin_ledger_test PostgreSQL database"]
+    async fn postgres_batch_health_by_node_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("IPARS_TEST_POSTGRES_URL")?;
+        let pool = PgPool::connect(&url).await?;
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            database, "ipars_admin_ledger_test",
+            "test refuses other databases"
+        );
+        let store = PostgresControlPlaneStore::from_pool(pool).await?;
+        let prefix = format!("health-batch-{}-", NodeId::new());
+        let result = exercise_batch_health_by_node_ids(&store, &prefix).await;
+        sqlx::query("DELETE FROM health WHERE node_id LIKE $1")
+            .bind(format!("{prefix}%"))
+            .execute(&store.pool)
+            .await?;
+        store.pool.close().await;
+        result
     }
 
     #[tokio::test]

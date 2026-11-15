@@ -62,6 +62,12 @@ jobs:
         env:
           IPARS_TEST_POSTGRES_URL: postgresql://ipars:test-only@127.0.0.1:5432/ipars_admin_ledger_test
         run: cargo test --locked -p ipars-store postgres_replica_restart_ -- --ignored
+      - name: Verify bounded database queries for node health
+        env:
+          IPARS_TEST_POSTGRES_URL: postgresql://ipars:test-only@127.0.0.1:5432/ipars_admin_ledger_test
+        run: |
+          cargo test --locked -p ipars-store sqlite_batch_health_by_node_ids
+          cargo test --locked -p ipars-store postgres_batch_health_by_node_ids -- --ignored
       - name: Verify authenticated overview and node details
         run: cargo test --locked -p ipars-control-plane-http http_admin_overview_updates_for_three_node_nat_discovery
 
