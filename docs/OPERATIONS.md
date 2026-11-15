@@ -712,6 +712,10 @@ enabling it. Older Agents do not understand the strict mode. Verify the native
 builds and health of every node, update the policy once all nodes are ready,
 and confirm signed neighbor maps plus multi-hop connectivity. Disabling the
 policy restores the legacy projection; it does not upgrade old Agents.
+Registration, legacy peer-map reads, and key rotation also return a bounded
+native peer projection in strict mode. A newly registered Agent initially
+receives no native peers until its first compatible signed heartbeat; it then
+obtains its backbone neighbors through the normal neighbor-map poll.
 The new control plane rejects enabling strict mode unless every non-stopped
 native node has reported a compatible signed Agent build within 90 seconds.
 After activation, a native node without a current compatible heartbeat is

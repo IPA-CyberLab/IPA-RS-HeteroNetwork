@@ -6419,38 +6419,61 @@ where
         bootstrap_endpoints: Vec<BootstrapEndpoint>,
         generated_at: chrono::DateTime<Utc>,
     ) -> Result<PeerMap, ControlPlaneError> {
-        let ready_peers;
-        let peers = if policy.overlay_strict_hierarchy {
-            let snapshot = self.current_overlay_snapshot().await?.1;
-            ready_peers = peers
-                .iter()
-                .filter(|peer| {
-                    peer.role.is_client() || snapshot.eligible_node_ids.contains(&peer.node_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            ready_peers.as_slice()
+        let strict_snapshot = if policy.overlay_strict_hierarchy {
+            Some(self.current_overlay_snapshot().await?.1)
         } else {
-            peers
+            None
         };
-        let visible_peers = if source.role.is_client() {
-            client_gateway_peer_map(
-                source,
-                peers,
-                gateway_routing.health_by_node,
-                gateway_routing.selections,
-                policy,
-                generated_at,
-            )
+        let visible_peers = if policy.overlay_strict_hierarchy
+            && !source.role.is_client()
+            && !source.is_http_only()
+        {
+            if strict_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.eligible_node_ids.contains(&source.node_id))
+            {
+                // Registration, legacy peer-map queries and key rotation must
+                // not return the full native directory in strict mode. A new
+                // Agent receives no peers until its first signed compatible
+                // heartbeat, then discovers its bounded neighbors normally.
+                let map = self.neighbor_map_for(&source.node_id).await?;
+                strict_peer_map_projection(map)
+            } else {
+                Vec::new()
+            }
         } else {
-            node_peer_map_with_clients(
-                source,
-                peers,
-                gateway_routing.health_by_node,
-                gateway_routing.selections,
-                policy,
-                generated_at,
-            )
+            let ready_peers;
+            let peers = if let Some(snapshot) = strict_snapshot.as_ref() {
+                ready_peers = peers
+                    .iter()
+                    .filter(|peer| {
+                        peer.role.is_client() || snapshot.eligible_node_ids.contains(&peer.node_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                ready_peers.as_slice()
+            } else {
+                peers
+            };
+            if source.role.is_client() {
+                client_gateway_peer_map(
+                    source,
+                    peers,
+                    gateway_routing.health_by_node,
+                    gateway_routing.selections,
+                    policy,
+                    generated_at,
+                )
+            } else {
+                node_peer_map_with_clients(
+                    source,
+                    peers,
+                    gateway_routing.health_by_node,
+                    gateway_routing.selections,
+                    policy,
+                    generated_at,
+                )
+            }
         };
         let peer_ids = visible_peers
             .iter()
@@ -6539,6 +6562,26 @@ where
             generated_at,
         }
     }
+}
+
+fn strict_peer_map_projection(map: NeighborMap) -> Vec<NodeRecord> {
+    let mut peers = map
+        .neighbors
+        .into_iter()
+        .map(|neighbor| (neighbor.node.node_id.clone(), neighbor.node))
+        .collect::<BTreeMap<_, _>>();
+    for projected in map.client_route_peers {
+        if let Some(existing) = peers.get_mut(&projected.node_id) {
+            for route in projected.routes {
+                existing.routes.retain(|current| current.cidr != route.cidr);
+                existing.routes.push(route);
+            }
+            existing.routes.sort_by_key(|route| route.cidr.to_string());
+        } else {
+            peers.insert(projected.node_id.clone(), projected);
+        }
+    }
+    peers.into_values().collect()
 }
 
 #[derive(Clone)]
@@ -9738,7 +9781,25 @@ mod tests {
             assert!(map.pinned_peers.is_empty());
             assert!(map.neighbors.len() <= usize::from(map.max_degree));
             map.validate()?;
+            let initial_map = plane.peer_map_for(source).await?;
+            assert!(initial_map.peers.len() <= usize::from(map.max_degree));
         }
+        let mut joining = node_record("strict-new-node");
+        joining.vpn_ip = VpnIp("100.64.5.1".parse()?);
+        store.insert_node(joining.clone()).await?;
+        assert!(plane.peer_map_for(&joining.node_id).await?.peers.is_empty());
+        store
+            .upsert_transport_snapshot(ipars_types::api::TransportNodeSnapshot {
+                node_id: joining.node_id.clone(),
+                observed_at: Utc::now(),
+                snapshot: ipars_types::api::NodeTransportSnapshot {
+                    strict_hierarchy_ready: true,
+                    ..Default::default()
+                },
+            })
+            .await?;
+        plane.invalidate_overlay_node_snapshot().await;
+        assert!(plane.peer_map_for(&joining.node_id).await?.peers.len() <= 4);
         Ok(())
     }
 
@@ -11051,6 +11112,32 @@ mod tests {
         assert!(projection
             .iter()
             .all(|peer| !worker_ids.contains(&peer.node_id)));
+        let projected_map = strict_peer_map_projection(NeighborMap {
+            strict_hierarchy: true,
+            cluster_id: gateway_a.cluster_id.clone(),
+            node_id: gateway_a.node_id.clone(),
+            topology_epoch: 1,
+            routing_epoch: 1,
+            max_degree: 4,
+            on_demand_peer_limit: 4,
+            vpn_cidr: "100.64.0.0/16".parse()?,
+            neighbors: vec![OverlayNeighbor {
+                node: gateway_b.clone(),
+                kind: OverlayNeighborKind::BackbonePrimary,
+            }],
+            pinned_peers: Vec::new(),
+            aggregate_routes: Vec::new(),
+            client_route_peers: projection,
+            bootstrap_endpoints: Vec::new(),
+            generated_at: now,
+        });
+        assert_eq!(projected_map.len(), 2);
+        let merged = projected_map
+            .iter()
+            .find(|peer| peer.node_id == gateway_b.node_id)
+            .ok_or("backbone gateway disappeared during projection")?;
+        assert_eq!(merged.routes.len(), 1);
+        assert_eq!(merged.routes[0].cidr, "100.64.1.11/32".parse()?);
         Ok(())
     }
 

@@ -376,4 +376,62 @@ for _ in $(seq 1 45); do
   sleep 1
 done
 [[ "$reachable" == 1 ]] || { echo "alternate route failed or the selected hop did not receive any packets" >&2; exit 1; }
-echo "strict hierarchy E2E passed: real WireGuard, on-demand path and first-hop failure"
+ip netns exec "${namespaces[source - 1]}" iptables -D OUTPUT \
+  -d "${subnet}.$((next_index + 1))" -p udp --dport 51820 \
+  -m comment --comment hns-failover-e2e -j DROP
+
+# A native Agent joining after strict mode is active must bootstrap without
+# downloading every existing native peer, then acquire bounded neighbors.
+i=6
+ns="hn-strict-${suffix}-${i}"
+host_if="hs$((suffix % 100000))${i}"
+peer_if="hp$((suffix % 100000))${i}"
+interface="hw$((suffix % 100000))${i}"
+agent_ip="${subnet}.$((i + 1))"
+ip netns add "$ns"
+namespaces+=("$ns")
+ip link add "$host_if" type veth peer name "$peer_if"
+ip link set "$host_if" master "$bridge"
+ip link set "$host_if" up
+ip link set "$peer_if" netns "$ns"
+ip -n "$ns" link set lo up
+ip -n "$ns" addr add "${agent_ip}/24" dev "$peer_if"
+ip -n "$ns" link set "$peer_if" up
+ip -n "$ns" route replace default via "$control_ip" dev "$peer_if"
+ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=0
+ip netns exec "$ns" iptables -A OUTPUT -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+backend_args=(--wireguard-backend "$wireguard_backend" --wireguard-interface "$interface")
+if [[ "$wireguard_backend" == userspace-command ]]; then
+  backend_args+=(--userspace-wireguard-command "$(command -v wireguard-go)" \
+    --userspace-wireguard-arg=-f --userspace-wireguard-arg "$interface")
+fi
+ip netns exec "$ns" env "${agent_preload[@]}" HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ENABLED=false "$iparsd" agent \
+  --listen 127.0.0.1:9780 --state-path "$work/agent-${i}.json" --join-token-path "$work/join-token" \
+  --control-plane-url "$control_url" --signal-url "http://${control_ip}:$((port_base + 1))" \
+  --stun-server "${control_ip}:$((port_base + 2)),${control_ip}:$((port_base + 3))" \
+  --stun-bind "${agent_ip}:51820" --wireguard-listen-port 51820 \
+  "${backend_args[@]}" --route-backend command --runtime-backend linux-command \
+  --disable-public-services-autopromotion --apply-peer-map --peer-map-poll-interval-seconds 2 \
+  --heartbeat-interval-seconds 2 --signal-registration-interval-seconds 2 --signal-path-interval-seconds 2 \
+  --peer-probe-sample-count 3 --peer-probe-response-timeout-millis 500 --peer-probe-sample-interval-millis 100 \
+  --packet-flow-detector "${HETERONETWORK_E2E_PACKET_FLOW_DETECTOR:-conntrack-netlink-events}" \
+  --packet-flow-poll-interval-seconds 1 >"$work/agent-${i}.log" 2>&1 &
+agents+=("$!")
+if [[ "$wireguard_backend" == userspace-command ]]; then
+  for _ in $(seq 1 30); do
+    if ip -n "$ns" link set "$interface" up 2>/dev/null; then break; fi
+    sleep 1
+  done
+fi
+ready=0
+for _ in $(seq 1 90); do
+  if ip netns exec "$ns" curl -fsS --max-time 2 http://127.0.0.1:9780/v1/metrics >"$work/metrics-6.json" 2>/dev/null \
+      && jq -e '.peer_map_synced and .peer_map_peer_count <= 4' "$work/metrics-6.json" >/dev/null \
+      && grep -q 'peer_count=0' "$work/agent-6.log"; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+[[ "$ready" == 1 ]] || { echo "new Agent did not join with a bounded initial map" >&2; exit 1; }
+echo "strict hierarchy E2E passed: real WireGuard, on-demand path, first-hop failure and bounded new-node join"
