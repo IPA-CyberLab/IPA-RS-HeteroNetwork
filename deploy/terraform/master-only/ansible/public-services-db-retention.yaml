@@ -39,7 +39,9 @@
           - installed_public_services.stat.pw_name == 'root'
           - >-
             (inventory_hostname == 'uc-k8sp5' and
-             installed_public_services.stat.checksum in [legacy_original, legacy_patched, legacy_deduped]) or
+             installed_public_services.stat.checksum in
+             [legacy_original, legacy_patched, legacy_deduped, current_original, current_previous,
+              lookup('file', hnn_repo_root ~ '/scripts/public-services-autopilot.sh', rstrip=False) | hash('sha256')]) or
             (inventory_hostname == 'ichikawap1' and
              installed_public_services.stat.checksum in
              [current_original, current_previous, lookup('file', hnn_repo_root ~ '/scripts/public-services-autopilot.sh', rstrip=False) | hash('sha256')])
@@ -74,7 +76,10 @@
           - /var/backups/heteronetwork/public-services-db-retention
       register: legacy_result
       changed_when: (legacy_result.stdout | from_json).changed
-      when: inventory_hostname == 'uc-k8sp5' and not ansible_check_mode
+      when:
+        - inventory_hostname == 'uc-k8sp5'
+        - installed_public_services.stat.checksum in [legacy_original, legacy_patched, legacy_deduped]
+        - not ansible_check_mode
 
     - name: Install the reviewed current helper without restarting its timer or Agent
       ansible.builtin.copy:
@@ -85,7 +90,12 @@
         mode: '0755'
         backup: true
         validate: /bin/sh -n %s
-      when: inventory_hostname == 'ichikawap1'
+      when: >-
+        inventory_hostname == 'ichikawap1' or
+        (inventory_hostname == 'uc-k8sp5' and
+         installed_public_services.stat.checksum in
+         [current_original, current_previous,
+          lookup('file', hnn_repo_root ~ '/scripts/public-services-autopilot.sh', rstrip=False) | hash('sha256')])
 
     - name: Require the Agent and reconciler timer to remain active
       ansible.builtin.command:
