@@ -151,10 +151,20 @@ def query(port):
 def write_forward(path, nodes):
     upstreams = discovery.ready_overlay_dns_upstreams(nodes, "10.254.0.0/16")
     assert upstreams
-    temporary = path.with_suffix(".new")
-    temporary.write_text(discovery.render_coredns_forward(upstreams))
-    temporary.chmod(0o644)
-    os.replace(temporary, path)
+    # Kubernetes projects ConfigMaps through a stable file symlink and swaps
+    # its ..data directory symlink atomically. Exercise that actual mechanism,
+    # not just an ordinary file replacement.
+    revision = ".." + secrets.token_hex(8)
+    directory = path.parent / revision
+    directory.mkdir(mode=0o755)
+    projected = directory / path.name
+    projected.write_text(discovery.render_coredns_forward(upstreams))
+    projected.chmod(0o644)
+    next_link = path.parent / "..data_next"
+    next_link.symlink_to(revision, target_is_directory=True)
+    os.replace(next_link, path.parent / "..data")
+    if not path.is_symlink():
+        path.symlink_to("..data/" + path.name)
 
 
 def node(name, address, ready=True):
