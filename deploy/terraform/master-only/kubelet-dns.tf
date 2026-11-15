@@ -1,7 +1,9 @@
 resource "terraform_data" "kubelet_dns" {
   triggers_replace = [
     filesha256("${path.module}/ansible/kubelet-dns.yaml"),
-    filesha256("${local.repo_root}/scripts/reconcile-kubelet-dns.sh")
+    filesha256("${local.repo_root}/scripts/reconcile-kubelet-dns.sh"),
+    filesha256("${path.module}/nodes.json"),
+    filesha256("${path.module}/standard-nodes.json")
   ]
   provisioner "local-exec" {
     working_dir = abspath(path.module)
