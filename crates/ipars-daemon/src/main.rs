@@ -5797,6 +5797,26 @@ async fn serve_overlay_dns_udp(
     answer_ip: IpAddr,
     zone: Arc<StdRwLock<OverlayDnsZone>>,
 ) -> anyhow::Result<()> {
+    serve_overlay_dns_udp_with_sender(
+        socket,
+        answer_ip,
+        zone,
+        |socket, response, peer| async move { socket.send_to(&response, peer).await },
+    )
+    .await
+}
+
+async fn serve_overlay_dns_udp_with_sender<F, Fut>(
+    socket: tokio::net::UdpSocket,
+    answer_ip: IpAddr,
+    zone: Arc<StdRwLock<OverlayDnsZone>>,
+    mut send: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(Arc<tokio::net::UdpSocket>, Vec<u8>, SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<usize>>,
+{
+    let socket = Arc::new(socket);
     let mut buffer = [0_u8; MAX_OVERLAY_DNS_MESSAGE_BYTES];
     loop {
         let (length, peer) = socket.recv_from(&mut buffer).await?;
@@ -5808,7 +5828,12 @@ async fn serve_overlay_dns_udp(
         };
         match response {
             Ok(response) => {
-                socket.send_to(&response, peer).await?;
+                // A single client can disappear or become unreachable between
+                // receive and reply. Do not stop both UDP and TCP DNS for the
+                // five-second listener retry interval because of that client.
+                if let Err(error) = send(socket.clone(), response, peer).await {
+                    tracing::debug!(%error, %peer, "failed to send overlay DNS response");
+                }
             }
             Err(error) => {
                 tracing::debug!(%error, %peer, "rejected overlay DNS datagram");
@@ -24076,6 +24101,52 @@ mod tests {
         let response = DnsMessage::from_vec(&response)?;
         assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
         assert!(response.answers.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_dns_continues_serving_after_a_reply_send_failure() -> anyhow::Result<()> {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let destination = server.local_addr()?;
+        let failed = Arc::new(tokio::sync::Notify::new());
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let service = tokio::spawn(serve_overlay_dns_udp_with_sender(
+            server,
+            destination.ip(),
+            Arc::new(StdRwLock::new(OverlayDnsZone::default())),
+            {
+                let failed = failed.clone();
+                move |socket, response, peer| {
+                    let failed = failed.clone();
+                    let fail_once = fail_once.clone();
+                    async move {
+                        if fail_once.swap(false, Ordering::SeqCst) {
+                            failed.notify_one();
+                            Err(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable))
+                        } else {
+                            socket.send_to(&response, peer).await
+                        }
+                    }
+                }
+            },
+        ));
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let mut request = DnsMessage::query();
+        request.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii(OVERLAY_WEB_UI_DNS_NAME)?,
+            RecordType::A,
+        ));
+        let request = request.to_vec()?;
+        client.send_to(&request, destination).await?;
+        tokio::time::timeout(Duration::from_secs(2), failed.notified()).await?;
+        client.send_to(&request, destination).await?;
+        let mut response = [0; MAX_OVERLAY_DNS_MESSAGE_BYTES];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut response)).await??;
+        let response = DnsMessage::from_vec(&response[..length])?;
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 1);
+        service.abort();
         Ok(())
     }
 

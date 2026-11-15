@@ -34,9 +34,22 @@ does not itself enable it.
   repair.
 - The GitOps CoreDNS configuration still listed the retired `10.250.0.8`
   node as an overlay DNS forwarder. The internal Git mirror and Argo CD were
-  updated to remove it and include the active bootstrap node. This explains
-  probes toward the retired address, but does not establish that it caused the
-  separate client-to-gateway DNS timeout.
+  updated to remove it and include the active bootstrap node. CoreDNS now
+  imports a controller-generated list of Ready, non-stopped Kubernetes nodes
+  on the declared overlay CIDR, bounded to the forward plugin's 15-upstream
+  limit. A missing healthy list retains the last known list. The controller is
+  running on two hosts and the three CoreDNS replicas consume its ConfigMap.
+  An isolated GitHub runner tested the production CoreDNS image, including
+  Kubernetes-style ConfigMap symlink swaps, addition and removal of an upstream.
+  This explains probes toward the retired address, but does not establish that
+  it caused the separate client-to-gateway DNS timeout.
+- The Agent's UDP DNS loop previously terminated both DNS listeners for five
+  seconds after any individual response-send error. The source fix drops that
+  response and continues serving other clients; a regression test injects such
+  an error and verifies the next real UDP query succeeds. Deployment of this
+  fix requires a separately tested Agent rollout. No corresponding listener
+  restart was observed during the intermittent timeout below, so this defect
+  is not asserted to be its cause.
 - On `uc-k8sp1`, the four-core HDD host had load above five and elevated disk
   I/O pressure. `etcd` accounted for much of the sampled write activity. This
   establishes contention, not that it caused the browser timeouts below.
@@ -62,6 +75,10 @@ A further live run timed out on the first Prometheus DNS query to `10.250.0.5`;
 three immediate follow-up queries succeeded in 565, 125 and 123 ms. That run
 remained failed. These observations do not identify where the datagram or
 response was delayed or lost.
+Another post-rollout run timed out twice on Grafana DNS through `10.250.0.4`
+before succeeding twice. A later run after the CoreDNS change succeeded with
+authenticated Chromium, a 793 ms canonical console load and 2,642 ms maximum
+gateway load; the transient DNS failure remains under investigation.
 
 The hierarchy CI uses real WireGuard agents in network namespaces on one
 GitHub-hosted VM, including latency, first-hop loss, a new node and a failed
