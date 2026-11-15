@@ -59,7 +59,25 @@ clusters:
             with admin.kube_tunnel(self.args):
                 self.assertFalse(process.stopped)
             self.assertTrue(process.stopped)
-        self.assertIn("127.0.0.1:17443:127.0.0.1:6443", start.call_args.args[0])
+        self.assertIn("127.0.0.1:17443:127.0.0.1:7443", start.call_args.args[0])
+
+    def test_local_api_tunnel_accepts_a_custom_ha_proxy_port(self):
+        self.args.kubeconfig.write_text('''current-context: test
+contexts:
+  - name: test
+    context: {cluster: local}
+clusters:
+  - name: local
+    cluster: {server: "https://127.0.0.1:17443"}
+''')
+        self.args.kube_api_proxy_port = 8443
+        process = SimpleNamespace(stderr=None, poll=lambda: None, terminate=lambda: None, wait=lambda timeout=None: 0)
+        with patch.object(admin, "port_open", side_effect=[False, False, True, True]), \
+             patch.object(admin.time, "sleep"), \
+             patch.object(admin.subprocess, "Popen", return_value=process) as start:
+            with admin.kube_tunnel(self.args):
+                pass
+        self.assertIn("127.0.0.1:17443:127.0.0.1:8443", start.call_args.args[0])
 
     def test_dry_run_is_read_only(self):
         remote = SimpleNamespace(database_absent=lambda identity: {"result": "absent"},

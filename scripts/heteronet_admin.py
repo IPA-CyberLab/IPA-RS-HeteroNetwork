@@ -76,11 +76,14 @@ def kube_tunnel(args):
     known_hosts = args.work_dir / "known_hosts"
     require(known_hosts.is_file(), "the operator known_hosts file is required")
     bootstrap = json.loads((MODULE / "edge-nodes.json").read_text())["bootstrap"]
+    proxy_port = getattr(args, "kube_api_proxy_port", 7443)
+    require(isinstance(proxy_port, int) and not isinstance(proxy_port, bool) and 1 <= proxy_port <= 65535,
+            "Kubernetes API HA proxy port must be between 1 and 65535")
     command = ["ssh", "-N", "-T", "-i", str(args.ssh_key), "-o", "IdentitiesOnly=yes",
                "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
                "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes",
                "-o", "UserKnownHostsFile=" + str(known_hosts), "-L",
-               f"127.0.0.1:{url.port}:127.0.0.1:6443", args.ssh_user + "@" + bootstrap["ssh_host"]]
+               f"127.0.0.1:{url.port}:127.0.0.1:{proxy_port}", args.ssh_user + "@" + bootstrap["ssh_host"]]
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 15
@@ -586,6 +589,8 @@ def main():
     remove.add_argument("--kubeconfig", type=Path)
     remove.add_argument("--ssh-key", type=Path, default=Path(os.environ.get("TF_VAR_ssh_private_key_path", str(ROOT / ".key"))).expanduser())
     remove.add_argument("--ssh-user", default=os.environ.get("HNN_IAC_SSH_USER", "mizuame"))
+    remove.add_argument("--kube-api-proxy-port", type=int, default=os.environ.get("HNN_KUBE_API_PROXY_PORT", "7443"),
+                        help="bootstrap host's local Kubernetes HA proxy port (default: 7443)")
     remove.add_argument("--kubectl", default="kubectl")
     remove.add_argument("--terraform", default="terraform")
     remove.add_argument("--state-dir", type=Path)

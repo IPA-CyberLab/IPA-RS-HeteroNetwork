@@ -1,5 +1,10 @@
 # HeteroNetwork host infrastructure
 
+When the node-retirement CLI creates a Kubernetes API SSH tunnel, it forwards
+to the bootstrap host's HA proxy on port 7443. Use `--kube-api-proxy-port` or
+`HNN_KUBE_API_PROXY_PORT` when that proxy uses another port. A pre-existing
+tunnel is reused as-is and must itself target the HA proxy.
+
 `overlay-boot-peers.json` also declares operator lifecycle flags in `node_states`.
 Terraform and native release deployment skip stopped hosts, cold VPN recovery
 excludes them, and live E2E derives its expected gateways from the same roster.
