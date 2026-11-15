@@ -212,6 +212,7 @@ jq -e '.node_count == 5' "$work/topology.json" >/dev/null
 
 curl --config "$work/curl.conf" -fsS "$control_url/v1/admin/policy" \
   | jq '.cluster_policy.overlay_strict_hierarchy = true | {cluster_policy}' >"$work/policy.json"
+python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())' >"$work/strict-started-at"
 enabled=0
 for _ in $(seq 1 45); do
   if curl --config "$work/curl.conf" -fsS -X PUT -H 'Content-Type: application/json' \
@@ -232,17 +233,43 @@ for i in 1 2 3 4 5; do
   node_id="$(jq -r '.node_id' "$work/status-${i}.json")"
   degree="$(jq -r --arg id "$node_id" '.nodes[] | select(.node_id == $id) | .degree' "$work/topology.json")"
   [[ "$degree" =~ ^[0-9]+$ ]]
+  python3 - "$work/agent-${i}.json" "$work/neighbor-query.json" <<'PY'
+import base64, datetime, json, os, pathlib, sys
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+nonce = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip('=')
+now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+payload = {'kind': 'neighbor_map', 'node_id': state['node_id'], 'signed_at': now, 'nonce': nonce}
+key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(state['identity_private_key_b64']))
+signature = base64.b64encode(key.sign(json.dumps(payload, separators=(',', ':')).encode())).decode()
+request = {'node_id': state['node_id'], 'request_signature': {'signed_at': now, 'nonce': nonce, 'signature': signature}}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(request))
+PY
+  chmod 600 "$work/neighbor-query.json"
+  curl -fsS -H 'Content-Type: application/json' --data-binary @"$work/neighbor-query.json" \
+    "$control_url/v1/neighbors/query" >"$work/neighbor-${i}.json"
+  jq -e --argjson degree "$degree" \
+    '.strict_hierarchy and (.neighbors | length) == $degree and (.neighbors | length) <= .max_degree and (.pinned_peers | length) == 0' \
+    "$work/neighbor-${i}.json" >/dev/null
   for _ in $(seq 1 60); do
     if ip netns exec "${namespaces[i - 1]}" curl -fsS --max-time 2 \
       http://127.0.0.1:9780/v1/metrics >"$work/metrics-${i}.json" 2>/dev/null \
-      && jq -e --argjson degree "$degree" '.peer_map_synced and .peer_map_peer_count <= $degree' "$work/metrics-${i}.json" >/dev/null; then
+      && jq -e '.peer_map_synced and .peer_map_peer_count <= 4 and .peer_map_generated_at != null' "$work/metrics-${i}.json" >/dev/null \
+      && python3 - "$work/metrics-${i}.json" "$work/strict-started-at" <<'PY'
+import datetime, json, pathlib, sys
+metrics = json.loads(pathlib.Path(sys.argv[1]).read_text())
+generated = datetime.datetime.fromisoformat(metrics['peer_map_generated_at'].replace('Z', '+00:00'))
+started = datetime.datetime.fromisoformat(pathlib.Path(sys.argv[2]).read_text().strip())
+raise SystemExit(0 if generated > started else 1)
+PY
+    then
       ready=1
       break
     fi
     sleep 1
   done
   if [[ "$ready" != 1 ]]; then
-    echo "agent $i did not converge to bounded peers (expected degree: $degree)" >&2
+    echo "agent $i did not synchronize its bounded peer map" >&2
     if [[ -s "$work/metrics-${i}.json" ]]; then
       jq -c '{peer_map_synced,peer_map_peer_count,peer_map_route_count}' "$work/metrics-${i}.json" >&2 || true
     fi
