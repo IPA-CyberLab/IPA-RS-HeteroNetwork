@@ -12,7 +12,7 @@ data:
     heteronetwork.internal:53 {
         errors
         cache 30
-        forward . 10.250.0.4 10.250.0.5 10.250.0.6 10.250.0.8 10.250.0.10 {
+        forward . 10.250.0.2 10.250.0.4 10.250.0.5 10.250.0.6 10.250.0.10 {
            policy random
            health_check 2s
            max_fails 1
