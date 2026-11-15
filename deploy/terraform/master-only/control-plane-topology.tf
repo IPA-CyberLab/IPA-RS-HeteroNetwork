@@ -1,8 +1,8 @@
 variable "control_plane_topology_binary_sha256" {
   type        = string
   description = "SHA-256 of the tested control-plane binary staged in work_dir; empty disables this rollout."
-  # GitHub Actions 42819826220, source 8f85ea5a3a130f97986cee19522f3eae024e65a0.
-  default = "88589e69c3199db9a0f13a1909b888247b2895c5c8450ee3d00bb508125c0eb9"
+  # Hierarchy candidate, GitHub Actions 43676701205, source 9b68a2baf9b47ee20b2356c61a43de560a1c4a42.
+  default = "761e171657aef9c65b5b96761c4f37ce4aaab609ad606045f7378d5c9de64529"
   validation {
     condition     = var.control_plane_topology_binary_sha256 == "" || can(regex("^[a-f0-9]{64}$", var.control_plane_topology_binary_sha256))
     error_message = "The control-plane binary digest must be a lowercase SHA-256."
