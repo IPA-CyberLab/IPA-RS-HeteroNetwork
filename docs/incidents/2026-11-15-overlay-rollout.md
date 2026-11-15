@@ -46,6 +46,10 @@ failures was not established. Direct node-to-node probes and subsequent real
 VPN/browser runs succeeded; they do not prove the earlier failure is fixed.
 Failure diagnostics now record the endpoint and subsequent probe results while
 preserving the original failure and the three-second gate.
+A further live run timed out on the first Prometheus DNS query to `10.250.0.5`;
+three immediate follow-up queries succeeded in 565, 125 and 123 ms. That run
+remained failed. These observations do not identify where the datagram or
+response was delayed or lost.
 
 The hierarchy CI uses real WireGuard agents in network namespaces on one
 GitHub-hosted VM, including latency, first-hop loss, a new node and a failed
