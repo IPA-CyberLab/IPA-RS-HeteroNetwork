@@ -61,8 +61,10 @@ does not itself enable it.
   boundaries without changing the stored key or its public identity. In two
   isolated network namespaces on the production kernel, a regression test
   reproduced a new handshake using the old raw setting and verified that both
-  fixed backends preserve the established session. The same test is required
-  in GitHub Actions before rollout. See the Linux 6.8 [key comparison and peer
+  fixed backends preserve the established session. The same test passed on a
+  GitHub-hosted Linux VM before the fix was rolled out serially to all five
+  Agents; all reported the new build and a synchronized peer map. See the
+  Linux 6.8 [key comparison and peer
   keypair expiration](https://github.com/torvalds/linux/blob/v6.8/drivers/net/wireguard/netlink.c)
   and [private-key clamping](https://github.com/torvalds/linux/blob/v6.8/drivers/net/wireguard/noise.c).
 - On `uc-k8sp1`, the four-core HDD host had load above five and elevated disk
@@ -105,9 +107,24 @@ sender was also repeatedly reapplying peer maps and re-verifying direct paths.
 After the DNS send-error fix was deployed, a fresh comparison still had one
 timeout and an 861 ms response in 200 queries from `uc-k8sp5` to `uc-k8sp1`;
 200 concurrent local queries on `uc-k8sp1` all succeeded within 2 ms. The
-transport loss persisted before the key-normalization fix. The live browser run passed:
-the canonical page loaded in 932 ms after the route-readiness phase, which
-itself took 18.5 seconds for all five gateways.
+transport loss persisted before the key-normalization fix. The live browser run
+passed: the canonical page loaded in 932 ms after the route-readiness phase,
+which itself took 18.5 seconds for all five gateways.
+
+After the key-normalization fix was installed on all five nodes, 600 successive
+queries from `uc-k8sp5` to `uc-k8sp1` succeeded, with a maximum response time
+of 12.41 ms; another 600 concurrent queries local to `uc-k8sp1` succeeded, with
+a maximum of 4.64 ms. A subsequent 200 inter-node queries also succeeded.
+Packet capture counted 49 initiations from `uc-k8sp5` to `uc-k8sp1` during a
+57.92-second observation before the fix, and zero during a 21.84-second
+observation after the fix, while 7,888 outbound WireGuard packets were seen.
+This supports the diagnosis and improvement on that path; it does not prove
+that loss is impossible on other paths or under different conditions.
+The subsequent [live GitHub Actions run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/43692329617)
+joined the production overlay from its hosted VM, exercised the canonical
+console and every gateway in Chromium with the three-second page-open budget,
+and completed the authenticated-console and isolated control-plane-unavailable
+VPN recovery checks. These checks ran before strict hierarchy was enabled.
 
 The hierarchy CI uses real WireGuard agents in network namespaces on one
 GitHub-hosted VM, including latency, first-hop loss, a new node and a failed
