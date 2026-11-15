@@ -2982,9 +2982,29 @@ where
         lease_cutoff: chrono::DateTime<Utc>,
     ) -> Result<ServiceDirectory, ControlPlaneError> {
         let policy = self.current_cluster_policy().await?;
-        let nodes = self.store.list_nodes().await?;
-        let health_by_node = self.health_by_node(&nodes).await?;
-        let nat_by_node = self.store.list_nat_classifications().await?;
+        let mut instances = self
+            .store
+            .list_service_instances(&self.config.cluster_id)
+            .await?
+            .into_iter()
+            .filter(|instance| instance.lease_expires_at > lease_cutoff)
+            .collect::<Vec<_>>();
+        // Only registered service owners can contribute bootstrap endpoints.
+        // Looking up every node and its health on every neighbor-map poll makes
+        // a bounded overlay perform quadratic control-plane/database work.
+        let owner_ids = instances
+            .iter()
+            .filter_map(service_instance_owner_node_id)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let nodes = self.store.get_nodes_by_ids(&owner_ids).await?;
+        let health_by_node = self.store.get_health_by_node_ids(&owner_ids).await?;
+        let mut nat_by_node = BTreeMap::new();
+        for owner_id in &owner_ids {
+            if let Some(classification) = self.store.get_nat_classification(owner_id).await? {
+                nat_by_node.insert(owner_id.clone(), classification);
+            }
+        }
         let eligible_owner_node_ids = eligible_service_owner_node_ids(
             &nodes,
             &health_by_node,
@@ -2993,17 +3013,10 @@ where
             now,
             &policy,
         );
-        let mut instances = self
-            .store
-            .list_service_instances(&self.config.cluster_id)
-            .await?
-            .into_iter()
-            .filter(|instance| instance.lease_expires_at > lease_cutoff)
-            .filter(|instance| {
-                service_instance_owner_node_id(instance)
-                    .is_some_and(|node_id| eligible_owner_node_ids.contains(node_id))
-            })
-            .collect::<Vec<_>>();
+        instances.retain(|instance| {
+            service_instance_owner_node_id(instance)
+                .is_some_and(|node_id| eligible_owner_node_ids.contains(node_id))
+        });
         instances.sort_by(|left, right| {
             let left_has_core = bootstrap_endpoints_include_core_services(&left.endpoints);
             let right_has_core = bootstrap_endpoints_include_core_services(&right.endpoints);
@@ -4192,6 +4205,24 @@ where
             .get_node(node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        let policy = self.current_cluster_policy().await?;
+        let now = Utc::now();
+        if policy.overlay_strict_hierarchy && !source.role.is_client() && !source.is_http_only() {
+            let directory = self.service_directory_at(now).await?;
+            return self
+                .filtered_peer_map_for_node(
+                    &source,
+                    &[],
+                    ClientGatewayRoutingState {
+                        health_by_node: &BTreeMap::new(),
+                        selections: &BTreeMap::new(),
+                    },
+                    &policy,
+                    directory.bootstrap_endpoints,
+                    now,
+                )
+                .await;
+        }
         let peers = self
             .store
             .list_nodes()
@@ -4199,8 +4230,6 @@ where
             .into_iter()
             .collect::<Vec<_>>();
 
-        let policy = self.current_cluster_policy().await?;
-        let now = Utc::now();
         let health_by_node = self.health_by_node(&peers).await?;
         let client_gateway_selections = self.store.list_client_gateway_selections().await?;
         let directory = self.service_directory_at(now).await?;
@@ -8932,7 +8961,7 @@ fn vpn_pool_contains_usable_host(pool: Ipv4Net, ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use chrono::{Duration, Utc};
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
@@ -11197,6 +11226,10 @@ mod tests {
     struct RacingVpnIpStore {
         inner: InMemoryStore,
         race_once: AtomicBool,
+        node_scans: AtomicUsize,
+        node_lookups: AtomicUsize,
+        health_lookups: AtomicUsize,
+        nat_lookups: AtomicUsize,
     }
 
     #[async_trait]
@@ -11289,10 +11322,12 @@ mod tests {
             &self,
             node_id: &NodeId,
         ) -> Result<Option<NodeRecord>, ControlPlaneError> {
+            self.node_lookups.fetch_add(1, Ordering::Relaxed);
             self.inner.get_node(node_id).await
         }
 
         async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
+            self.node_scans.fetch_add(1, Ordering::Relaxed);
             self.inner.list_nodes().await
         }
 
@@ -11389,6 +11424,7 @@ mod tests {
             &self,
             node_id: &NodeId,
         ) -> Result<Option<NodeHealth>, ControlPlaneError> {
+            self.health_lookups.fetch_add(1, Ordering::Relaxed);
             self.inner.get_health(node_id).await
         }
 
@@ -11413,6 +11449,7 @@ mod tests {
             &self,
             node_id: &NodeId,
         ) -> Result<Option<NatClassification>, ControlPlaneError> {
+            self.nat_lookups.fetch_add(1, Ordering::Relaxed);
             self.inner.get_nat_classification(node_id).await
         }
 
@@ -11730,6 +11767,53 @@ mod tests {
         };
         request.issuer_signature = Some(issuer.sign_token_revocation_request(&request, signed_at)?);
         Ok(request)
+    }
+
+    #[tokio::test]
+    async fn service_directory_queries_only_owners_with_live_service_leases(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-directory-scale");
+        let store = Arc::new(RacingVpnIpStore::default());
+        for index in 0..1000_u16 {
+            let mut node = node_record(&format!("unrelated-{index}"));
+            node.cluster_id = cluster_id.clone();
+            node.vpn_ip = VpnIp(
+                Ipv4Addr::new(100, 64, (index / 250 + 1) as u8, (index % 250 + 1) as u8).into(),
+            );
+            store.inner.insert_node(node).await?;
+        }
+        let now = Utc::now();
+        insert_eligible_service_node(
+            &store.inner,
+            &cluster_id,
+            "public-a",
+            Ipv4Addr::new(8, 8, 8, 10),
+            now,
+        )
+        .await?;
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 16)?,
+            ),
+            store.clone(),
+        );
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "public-a",
+                "public-a.example",
+                now,
+                now + Duration::seconds(30),
+            ))
+            .await?;
+        let directory = plane.service_directory().await?;
+        assert_eq!(directory.instances.len(), 1);
+        assert_eq!(store.node_scans.load(Ordering::Relaxed), 0);
+        assert_eq!(store.node_lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(store.health_lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(store.nat_lookups.load(Ordering::Relaxed), 1);
+        Ok(())
     }
 
     #[tokio::test]

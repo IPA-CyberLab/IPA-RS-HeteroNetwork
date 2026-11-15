@@ -223,6 +223,10 @@ for _ in $(seq 1 45); do
 done
 [[ "$enabled" == 1 ]] || { echo "compatible Agent heartbeats did not arrive" >&2; exit 1; }
 
+# Strict mode can choose different edges from the topology captured before
+# the policy change. Compare peers against the new, active topology.
+curl --config "$work/curl.conf" -fsS "$control_url/v1/admin/topology" >"$work/topology.json"
+jq -e '.node_count == 5 and .max_observed_degree <= .max_degree' "$work/topology.json" >/dev/null
 for i in 1 2 3 4 5; do
   ready=0
   node_id="$(jq -r '.node_id' "$work/status-${i}.json")"
@@ -237,7 +241,13 @@ for i in 1 2 3 4 5; do
     fi
     sleep 1
   done
-  [[ "$ready" == 1 ]] || { echo "agent $i did not converge to bounded peers" >&2; exit 1; }
+  if [[ "$ready" != 1 ]]; then
+    echo "agent $i did not converge to bounded peers (expected degree: $degree)" >&2
+    if [[ -s "$work/metrics-${i}.json" ]]; then
+      jq -c '{peer_map_synced,peer_map_peer_count,peer_map_route_count}' "$work/metrics-${i}.json" >&2 || true
+    fi
+    exit 1
+  fi
 done
 
 curl --config "$work/curl.conf" -fsS "$control_url/v1/admin/topology" >"$work/topology.json"
@@ -423,11 +433,24 @@ if [[ "$wireguard_backend" == userspace-command ]]; then
     sleep 1
   done
 fi
+registration_peer_count() {
+  python3 - "$work/agent-6.log" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(errors='replace')
+text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+for line in reversed(text.splitlines()):
+    if 'registered agent with control plane' in line:
+        match = re.search(r'\bpeer_count\s*=\s*(\d+)', line)
+        if match:
+            print(match.group(1))
+        break
+PY
+}
 ready=0
 for _ in $(seq 1 90); do
   if ip netns exec "$ns" curl -fsS --max-time 2 http://127.0.0.1:9780/v1/metrics >"$work/metrics-6.json" 2>/dev/null \
       && jq -e '.peer_map_synced and .peer_map_peer_count <= 4' "$work/metrics-6.json" >/dev/null \
-      && grep -q 'peer_count=0' "$work/agent-6.log"; then
+      && [[ "$(registration_peer_count)" == 0 ]]; then
     ready=1
     break
   fi
@@ -443,7 +466,8 @@ if [[ "$ready" != 1 ]]; then
   fi
   python3 - "$work/agent-6.log" <<'PY'
 import pathlib, re, sys
-lines = pathlib.Path(sys.argv[1]).read_text(errors='replace').splitlines()
+text = pathlib.Path(sys.argv[1]).read_text(errors='replace')
+lines = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text).splitlines()
 registered = [line for line in lines if 'registered agent with control plane' in line]
 print(f'registration log entries: {len(registered)}', file=sys.stderr)
 if registered:
