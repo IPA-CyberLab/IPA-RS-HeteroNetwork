@@ -61,6 +61,18 @@ fn overlay_acknowledgement_timeout(
     base_timeout.saturating_mul(multiplier)
 }
 
+fn overlay_acknowledgement_timeout_with_hint(
+    base_timeout: std::time::Duration,
+    selected_path_node_count: usize,
+    recommended_timeout_ms: Option<u32>,
+) -> std::time::Duration {
+    overlay_acknowledgement_timeout(base_timeout, selected_path_node_count).max(
+        std::time::Duration::from_millis(u64::from(
+            recommended_timeout_ms.unwrap_or(0).min(30_000),
+        )),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayNeighborEndpoint {
     pub node_id: NodeId,
@@ -767,7 +779,12 @@ impl OverlayTransitClient {
             remote: path.target.node_id.clone(),
         };
         match self
-            .send_action_with_acknowledgement(primary, acknowledgement, &path.ordered_nodes)
+            .send_action_with_acknowledgement(
+                primary,
+                acknowledgement,
+                &path.ordered_nodes,
+                path.acknowledgement_timeout_ms,
+            )
             .await
         {
             Ok(()) => {
@@ -824,7 +841,12 @@ impl OverlayTransitClient {
                     remote: path.target.node_id.clone(),
                 };
                 match self
-                    .send_action_with_acknowledgement(secondary, acknowledgement, secondary_path)
+                    .send_action_with_acknowledgement(
+                        secondary,
+                        acknowledgement,
+                        secondary_path,
+                        path.acknowledgement_timeout_ms,
+                    )
                     .await
                 {
                     Ok(()) => Ok(OverlaySendOutcome {
@@ -896,13 +918,18 @@ impl OverlayTransitClient {
             sequence,
             remote: path.target.node_id.clone(),
         };
-        self.send_action_with_acknowledgement(secondary, acknowledgement, secondary_path)
-            .await
-            .map(|()| OverlaySendOutcome {
-                selection: OverlayPathSelection::Secondary,
-                sequence,
-            })
-            .map_err(|error| OverlayTransitError::SuppressedSecondaryFailed(Box::new(error)))
+        self.send_action_with_acknowledgement(
+            secondary,
+            acknowledgement,
+            secondary_path,
+            path.acknowledgement_timeout_ms,
+        )
+        .await
+        .map(|()| OverlaySendOutcome {
+            selection: OverlayPathSelection::Secondary,
+            sequence,
+        })
+        .map_err(|error| OverlayTransitError::SuppressedSecondaryFailed(Box::new(error)))
     }
 
     async fn send_action(&self, action: OverlayForwardAction) -> Result<(), OverlayTransitError> {
@@ -924,6 +951,7 @@ impl OverlayTransitClient {
         action: OverlayForwardAction,
         acknowledgement: OverlayAcknowledgementKey,
         selected_path: &[NodeId],
+        recommended_timeout_ms: Option<u32>,
     ) -> Result<(), OverlayPathAttemptError> {
         let (next_hop, datagram) = match forwarding_action_parts(action) {
             Ok(parts) => parts,
@@ -944,7 +972,11 @@ impl OverlayTransitClient {
                 })?;
             return Ok(());
         };
-        let timeout = overlay_acknowledgement_timeout(base_timeout, selected_path.len());
+        let timeout = overlay_acknowledgement_timeout_with_hint(
+            base_timeout,
+            selected_path.len(),
+            recommended_timeout_ms,
+        );
 
         let remote = acknowledgement.remote.clone();
         let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
@@ -1766,6 +1798,7 @@ mod tests {
 
     fn neighbor_map(local: &str, neighbors: &[&str], epoch: u64) -> NeighborMap {
         NeighborMap {
+            strict_hierarchy: false,
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: node(local),
             topology_epoch: epoch,
@@ -1805,6 +1838,7 @@ mod tests {
     fn path(primary: &[&str], secondary: Option<&[&str]>, epoch: u64) -> OverlayPath {
         let target = node_record(primary[primary.len() - 1]);
         OverlayPath {
+            acknowledgement_timeout_ms: None,
             topology_epoch: epoch,
             routing_epoch: epoch,
             source: node(primary[0]),
@@ -1935,6 +1969,23 @@ mod tests {
         assert_eq!(
             overlay_acknowledgement_timeout(base_timeout, usize::MAX),
             maximum_timeout
+        );
+    }
+
+    #[test]
+    fn measured_acknowledgement_hint_is_bounded_and_never_shortens_the_timeout() {
+        let base = Duration::from_millis(250);
+        assert_eq!(
+            overlay_acknowledgement_timeout_with_hint(base, 3, Some(50)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            overlay_acknowledgement_timeout_with_hint(base, 3, Some(2_000)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            overlay_acknowledgement_timeout_with_hint(base, 3, Some(u32::MAX)),
+            Duration::from_secs(30)
         );
     }
 

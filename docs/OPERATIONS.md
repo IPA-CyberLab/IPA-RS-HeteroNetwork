@@ -705,6 +705,61 @@ cluster idle timeout and resolved again on later traffic.
 
 #### Dynamic group fanout and topology inspection
 
+`ClusterPolicy.overlay_strict_hierarchy` enables bounded handling of policy
+pins. It defaults to `false` for rolling-upgrade compatibility: deploy the
+new control plane and Agent binaries to **every** eligible backbone node before
+enabling it. Older Agents do not understand the strict mode. Verify the native
+builds and health of every node, update the policy once all nodes are ready,
+and confirm signed neighbor maps plus multi-hop connectivity. Disabling the
+policy restores the legacy projection; it does not upgrade old Agents.
+The new control plane rejects enabling strict mode unless every non-stopped
+native node has reported a compatible signed Agent build within 90 seconds.
+After activation, a native node without a current compatible heartbeat is
+excluded from the backbone and gateway selection until it reports again.
+This Agent check does not verify other control-plane replicas: upgrade and
+verify every control-plane replica before changing the policy.
+
+In strict mode, a policy pin gives an on-demand path retention priority; it
+does not add an unbounded direct physical link. Traffic to a non-neighbor is
+resolved over the backbone and the receiving Agent is awakened through the
+existing signed connection-intent mechanism. The configured on-demand limit
+still applies. Client-to-gateway sessions are a separate class and are not
+included in the backbone degree bound.
+For clients without an existing selected gateway, strict mode uses stable
+rendezvous hashing across up to four eligible gateways. Existing valid
+selections are retained. If a gateway disappears, only clients assigned to it
+need a new default. This reduces concentration but does not make a gateway's
+client-session count independent of the number of clients.
+
+The topology page permits operators to set a region and zone for each existing
+node. The same settings are available through the full policy object as
+`overlay_node_localities`, keyed by node ID, for example:
+
+```json
+{
+  "node-0123456789abcdef": {"region": "east", "zone": "site-a"},
+  "node-fedcba9876543210": {"region": "west", "zone": "site-b"}
+}
+```
+
+An enrollment token may instead include `topology-region-east` and
+`topology-zone-site-a` tags. Explicit per-node policy overrides take precedence
+over tags. These are operator-provided hints, not verified geographic or power
+separation. Unspecified nodes remain unknown; do not infer a failure domain
+from an IP address. In strict mode the hierarchy groups matching hints and
+prefers representatives in different known domains where capacity permits.
+The routing path also uses fresh observed backbone RTT, jitter and loss, with
+bounded cost quantization, a conservative cost for missing measurements, and
+an alternate path. If metrics cannot be read, routing falls back to hop count.
+Acknowledgement timeouts include a bounded estimate for long paths.
+
+Run `scripts/strict-hierarchy-netns-e2e.sh` as root in an isolated Linux test
+environment with the built `ipars` and `iparsd` binaries. It starts five real
+Agents and WireGuard devices in disposable network namespaces, enables strict
+mode, tests a non-neighbor path, and blocks a physical first hop. This is a
+logical-node test on one host, not a test of 1,000 physical machines or of
+independent regional power and connectivity.
+
 `ClusterPolicy.overlay_block_size` controls the maximum leaf membership and
 child-group fanout in the recursive topology. Valid values are 4 through 64.
 `overlay_max_degree` remains independently restricted to 4 or 6. The policy

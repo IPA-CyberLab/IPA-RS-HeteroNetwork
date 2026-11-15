@@ -847,6 +847,7 @@ mod tests {
 
     fn neighbor_map(local: &str, neighbors: &[&str], topology_epoch: u64) -> NeighborMap {
         NeighborMap {
+            strict_hierarchy: false,
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: node(local),
             topology_epoch,
@@ -891,6 +892,7 @@ mod tests {
     ) -> OverlayPath {
         let target = node_record(primary[primary.len() - 1]);
         OverlayPath {
+            acknowledgement_timeout_ms: None,
             topology_epoch,
             routing_epoch: topology_epoch,
             source: node(primary[0]),

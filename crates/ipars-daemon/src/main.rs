@@ -24701,6 +24701,7 @@ mod tests {
         let (stalled_url, stalled_task) = spawn_stalled_http_service().await?;
         let identity = IdentityKeyPair::generate();
         let expected = NeighborMap {
+            strict_hierarchy: false,
             cluster_id: ClusterId::from_string("cluster-timeout-failover"),
             node_id: identity.node_id(),
             topology_epoch: 1,
@@ -24775,6 +24776,7 @@ mod tests {
         let generated_at = Utc::now();
         runtime
             .record_neighbor_map_snapshot(NeighborMap {
+                strict_hierarchy: false,
                 cluster_id: ClusterId::from_string("cluster-a"),
                 node_id: local_node.clone(),
                 topology_epoch: 6,
@@ -24794,6 +24796,7 @@ mod tests {
             })
             .await?;
         let neighbor_map = NeighborMap {
+            strict_hierarchy: false,
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: local_node.clone(),
             topology_epoch: 7,
@@ -25339,6 +25342,7 @@ mod tests {
         peer.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)));
         runtime
             .record_neighbor_map_snapshot(NeighborMap {
+                strict_hierarchy: false,
                 cluster_id: ClusterId::from_string("cluster-a"),
                 node_id: local_node.clone(),
                 topology_epoch: 7,
@@ -25364,6 +25368,7 @@ mod tests {
             runtime
                 .record_resolved_overlay_path(
                     OverlayPath {
+                        acknowledgement_timeout_ms: None,
                         topology_epoch: 7,
                         routing_epoch: 7,
                         source: local_node.clone(),
@@ -39808,6 +39813,7 @@ exec sleep 60
 
         fn overlay_map(local: &NodeRecord, neighbors: &[NodeRecord]) -> NeighborMap {
             NeighborMap {
+                strict_hierarchy: false,
                 cluster_id: local.cluster_id.clone(),
                 node_id: local.node_id.clone(),
                 topology_epoch: 7,
@@ -39839,6 +39845,7 @@ exec sleep 60
             target: &NodeRecord,
         ) -> OverlayPath {
             OverlayPath {
+                acknowledgement_timeout_ms: None,
                 topology_epoch: 7,
                 routing_epoch: 7,
                 source: source.node_id.clone(),

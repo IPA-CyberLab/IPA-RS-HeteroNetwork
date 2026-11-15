@@ -88,6 +88,8 @@ const REQUIRED_HA_SERVICE_KINDS: [BootstrapEndpointKind; 5] = [
 const MAX_CLIENT_GATEWAYS: usize = 4;
 const CLIENT_GATEWAY_SELECTION_ANNOUNCE_WINDOW: Duration = Duration::from_secs(60);
 const OVERLAY_NODE_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(1);
+const STRICT_HIERARCHY_CAPABILITY_TTL: chrono::Duration = chrono::Duration::seconds(90);
+const OVERLAY_EDGE_COST_CACHE_TTL: Duration = Duration::from_secs(10);
 const MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES: usize = 4;
 const MAX_ROUTE_CATALOG_UPDATE_RETRIES: usize = 8;
 const KEYCLOAK_CANDIDATE_PAGE_SIZE: usize = 64;
@@ -2299,6 +2301,8 @@ type OverlayTopologyCache = BTreeMap<OverlayTopologyCacheKey, OverlayTopologyCac
 #[derive(Debug)]
 struct OverlayNodeSnapshot {
     backbone_nodes: Vec<NodeRecord>,
+    eligible_nodes: Vec<NodeRecord>,
+    eligible_node_ids: BTreeSet<NodeId>,
     loaded_at: Instant,
     generated_at: chrono::DateTime<Utc>,
     nodes: Vec<NodeRecord>,
@@ -2482,6 +2486,7 @@ pub struct ControlPlane<S> {
     cluster_policy: StdRwLock<ClusterPolicy>,
     overlay_node_snapshot_cache: Mutex<Option<Arc<OverlayNodeSnapshot>>>,
     overlay_topology_cache: Mutex<OverlayTopologyCache>,
+    overlay_edge_cost_cache: Mutex<Option<OverlayEdgeCostSnapshot>>,
     allocator: RwLock<VpnAllocator>,
     accepted_node_query_nonces: Mutex<BTreeMap<(NodeId, String), chrono::DateTime<Utc>>>,
     operation_metrics: ControlPlaneOperationMetrics,
@@ -2493,10 +2498,21 @@ pub struct ControlPlane<S> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct OverlayTopologyCacheKey {
     membership_epoch: u64,
+    locality_epoch: u64,
+    strict_hierarchy: bool,
     node_count: usize,
     block_size: u16,
     max_degree: u16,
     permutation_seed: String,
+}
+
+#[derive(Debug)]
+struct OverlayEdgeCostSnapshot {
+    topology_epoch: u64,
+    path_ttl_seconds: u64,
+    loaded_at: Instant,
+    earliest_expiry: Option<chrono::DateTime<Utc>>,
+    costs: Arc<BTreeMap<TopologyEdge, u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -2646,6 +2662,7 @@ where
             cluster_policy: StdRwLock::new(cluster_policy),
             overlay_node_snapshot_cache: Mutex::new(None),
             overlay_topology_cache: Mutex::new(BTreeMap::new()),
+            overlay_edge_cost_cache: Mutex::new(None),
             admin_path_pins: RwLock::new(BTreeMap::new()),
             connection_intent_notifiers: Mutex::new(BTreeMap::new()),
             agent_builds: RwLock::new(BTreeMap::new()),
@@ -3057,6 +3074,21 @@ where
                 .filter(|node| node.cluster_id == self.config.cluster_id)
                 .filter(|node| !node.role.is_client())
                 .collect::<Vec<_>>();
+            if policy.overlay_strict_hierarchy {
+                let ready = self.strict_hierarchy_ready_nodes(Utc::now()).await?;
+                let unsupported = nodes
+                    .iter()
+                    .filter(|node| !node.is_administratively_stopped() && !node.is_http_only())
+                    .filter(|node| !ready.contains(&node.node_id))
+                    .map(|node| node.node_id.as_str())
+                    .collect::<Vec<_>>();
+                if !unsupported.is_empty() {
+                    return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                        "strict hierarchy requires a recent compatible heartbeat from every active native node; missing: {}",
+                        unsupported.join(", ")
+                    )));
+                }
+            }
             if !policy.overlay_route_scopes.is_empty() {
                 for node in &nodes {
                     validate_routes_within_overlay_scopes(&node.routes, &policy).map_err(
@@ -4081,12 +4113,31 @@ where
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
         let policy = self.current_cluster_policy().await?;
+        let snapshot = if policy.overlay_strict_hierarchy {
+            Some(self.current_overlay_snapshot().await?.1)
+        } else {
+            None
+        };
         let visible_nodes = peers
             .iter()
             .filter(|peer| peer.node_id != client.node_id && !peer.role.is_client())
+            .filter(|peer| {
+                snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.eligible_node_ids.contains(&peer.node_id))
+            })
             .filter_map(|peer| acl_filter_peer(client, peer, &policy))
             .collect::<Vec<_>>();
         let gateways = select_client_gateways(&visible_nodes, &health_by_node, now, &policy);
+        let previous = self
+            .store
+            .list_client_gateway_selections()
+            .await?
+            .remove(&client.node_id);
+        let gateway_ids = gateways
+            .iter()
+            .map(|gateway| gateway.node_id.clone())
+            .collect::<Vec<_>>();
         let desired_gateway = requested_gateway
             .filter(|requested| {
                 gateways
@@ -4094,12 +4145,16 @@ where
                     .any(|gateway| &gateway.node_id == *requested)
             })
             .cloned()
-            .or_else(|| gateways.first().map(|gateway| gateway.node_id.clone()));
-        let previous = self
-            .store
-            .list_client_gateway_selections()
-            .await?
-            .remove(&client.node_id);
+            .or_else(|| {
+                policy
+                    .overlay_strict_hierarchy
+                    .then_some(previous.as_ref())
+                    .flatten()
+                    .map(|selection| &selection.gateway_node_id)
+                    .filter(|gateway| gateway_ids.contains(gateway))
+                    .cloned()
+            })
+            .or_else(|| preferred_client_gateway(&client.node_id, &gateway_ids, &policy).cloned());
         let changed = match desired_gateway {
             Some(gateway_node_id)
                 if previous
@@ -4245,36 +4300,45 @@ where
                 .tags
                 .iter()
                 .any(|tag| policy.pinned_tags.contains(tag));
-        let pinned_peers = snapshot
-            .nodes
-            .iter()
-            .filter(|peer| peer.node_id != source.node_id && !neighbor_ids.contains(&peer.node_id))
-            .filter_map(|peer| {
-                let peer_is_policy_pinned = policy.pinned_roles.contains(&peer.role)
-                    || peer.tags.iter().any(|tag| policy.pinned_tags.contains(tag));
-                if peer_is_policy_pinned {
-                    return acl_filter_peer(&source, peer, &policy);
-                }
-                // A policy-pinned peer must also retain the remote endpoint that
-                // connects to it. WireGuard validates the inner source address
-                // against the receiving peer's AllowedIPs, so projecting only
-                // the initiating side creates an unusable asymmetric tunnel.
-                if source_is_policy_pinned && acl_filter_peer(&source, peer, &policy).is_some() {
-                    let mut reciprocal = peer.clone();
-                    reciprocal.routes.clear();
-                    return Some(reciprocal);
-                }
-                None
-            })
-            .map(|peer| filter_served_endpoint_candidates(peer, now, &policy))
-            .collect::<Vec<_>>();
+        let pinned_peers = if policy.overlay_strict_hierarchy {
+            // Non-neighbors are resolved on demand through the backbone. In
+            // particular, a pinned source must not project every visible node.
+            Vec::new()
+        } else {
+            snapshot
+                .nodes
+                .iter()
+                .filter(|peer| {
+                    peer.node_id != source.node_id && !neighbor_ids.contains(&peer.node_id)
+                })
+                .filter_map(|peer| {
+                    let peer_is_policy_pinned = policy.pinned_roles.contains(&peer.role)
+                        || peer.tags.iter().any(|tag| policy.pinned_tags.contains(tag));
+                    if peer_is_policy_pinned {
+                        return acl_filter_peer(&source, peer, &policy);
+                    }
+                    // A policy-pinned peer must also retain the remote endpoint that
+                    // connects to it. WireGuard validates the inner source address
+                    // against the receiving peer's AllowedIPs, so projecting only
+                    // the initiating side creates an unusable asymmetric tunnel.
+                    if source_is_policy_pinned && acl_filter_peer(&source, peer, &policy).is_some()
+                    {
+                        let mut reciprocal = peer.clone();
+                        reciprocal.routes.clear();
+                        return Some(reciprocal);
+                    }
+                    None
+                })
+                .map(|peer| filter_served_endpoint_candidates(peer, now, &policy))
+                .collect::<Vec<_>>()
+        };
         let client_route_peers = if snapshot.clients.is_empty() {
             Vec::new()
         } else {
             let client_gateway_selections = self.store.list_client_gateway_selections().await?;
             node_client_route_projection(
                 &source,
-                &snapshot.nodes,
+                &snapshot.eligible_nodes,
                 &snapshot.clients,
                 &snapshot.health_by_node,
                 &client_gateway_selections,
@@ -4284,6 +4348,7 @@ where
         };
         let directory = self.service_directory_at(now).await?;
         let response = NeighborMap {
+            strict_hierarchy: policy.overlay_strict_hierarchy,
             cluster_id: self.config.cluster_id.clone(),
             node_id: source.node_id,
             topology_epoch: topology.topology_epoch(),
@@ -4388,6 +4453,22 @@ where
                 generated_at,
                 policy.path_state_ttl_seconds,
             );
+            let observed_cost_us = paths_by_edge
+                .get(edge)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|path| {
+                    path_is_fresh(
+                        path,
+                        generated_at,
+                        policy
+                            .path_state_ttl_seconds
+                            .min(policy.path_quality_observation_ttl_seconds),
+                    )
+                })
+                .filter_map(observed_overlay_edge_cost)
+                .max();
             let placements = topology_placements
                 .iter()
                 .map(|placement| {
@@ -4414,6 +4495,7 @@ where
                 placements,
                 observed_status,
                 path_states,
+                observed_cost_us,
                 last_observed_at,
             });
         }
@@ -4546,6 +4628,72 @@ where
         })
     }
 
+    async fn overlay_edge_costs(
+        &self,
+        topology: &BoundedTopology,
+        policy: &ClusterPolicy,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Arc<BTreeMap<TopologyEdge, u64>>, ControlPlaneError> {
+        let mut cache = self.overlay_edge_cost_cache.lock().await;
+        let quality_ttl = policy
+            .path_state_ttl_seconds
+            .min(policy.path_quality_observation_ttl_seconds);
+        if let Some(cached) = cache.as_ref().filter(|cached| {
+            cached.topology_epoch == topology.topology_epoch()
+                && cached.path_ttl_seconds == quality_ttl
+                && cached.loaded_at.elapsed() < OVERLAY_EDGE_COST_CACHE_TTL
+                && cached.earliest_expiry.is_none_or(|expiry| now <= expiry)
+        }) {
+            return Ok(Arc::clone(&cached.costs));
+        }
+        let pairs = topology
+            .edge_placements()
+            .keys()
+            .flat_map(|edge| {
+                [
+                    (edge.first().clone(), edge.second().clone()),
+                    (edge.second().clone(), edge.first().clone()),
+                ]
+            })
+            .collect::<BTreeSet<_>>();
+        let paths = self.store.list_paths_for_pairs(&pairs).await?;
+        let mut costs = BTreeMap::<TopologyEdge, u64>::new();
+        let mut earliest_expiry: Option<chrono::DateTime<Utc>> = None;
+        for path in paths {
+            if !path_is_fresh(&path, now, quality_ttl) {
+                continue;
+            }
+            let Some(cost) = observed_overlay_edge_cost(&path) else {
+                continue;
+            };
+            let Some(edge) = TopologyEdge::new(path.key.local, path.key.remote) else {
+                continue;
+            };
+            if let Some(expiry) = i64::try_from(quality_ttl)
+                .ok()
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|duration| path.updated_at.checked_add_signed(duration))
+            {
+                earliest_expiry =
+                    Some(earliest_expiry.map_or(expiry, |previous| previous.min(expiry)));
+            }
+            // A slow direction should not be hidden by a fast reverse path.
+            costs
+                .entry(edge)
+                .and_modify(|old| *old = (*old).max(cost))
+                .or_insert(cost);
+        }
+        let costs = Arc::new(costs);
+        *cache = Some(OverlayEdgeCostSnapshot {
+            topology_epoch: topology.topology_epoch(),
+            path_ttl_seconds: quality_ttl,
+            loaded_at: Instant::now(),
+            earliest_expiry,
+            costs: Arc::clone(&costs),
+        });
+        Ok(costs)
+    }
+
     pub async fn overlay_path_for(
         &self,
         request: &OverlayPathQuery,
@@ -4578,13 +4726,39 @@ where
             .filter(|node| !snapshot.active_nodes_by_id.contains_key(&node.node_id))
             .map(|node| node.node_id.clone())
             .collect::<BTreeSet<_>>();
+        let costs = if policy.overlay_strict_hierarchy {
+            match self.overlay_edge_costs(&topology, &policy, now).await {
+                Ok(costs) => costs,
+                Err(error) => {
+                    tracing::warn!(%error, "overlay edge observations unavailable; using hop count");
+                    Arc::new(BTreeMap::new())
+                }
+            }
+        } else {
+            Arc::new(BTreeMap::new())
+        };
         let paths = topology
-            .paths_avoiding(&source.node_id, &target.node_id, &unavailable_nodes)
+            .paths_avoiding_with_costs(&source.node_id, &target.node_id, &unavailable_nodes, &costs)
             .ok_or_else(|| ControlPlaneError::OverlayPathUnavailable {
                 source_node: source.node_id.clone(),
                 destination_node: target.node_id.clone(),
             })?;
+        let acknowledgement_timeout_ms = policy.overlay_strict_hierarchy.then(|| {
+            let primary_cost = overlay_path_cost(&paths.primary, &costs);
+            let secondary_cost = paths
+                .secondary
+                .as_ref()
+                .map_or(0, |path| overlay_path_cost(&path.nodes, &costs));
+            let milliseconds = primary_cost
+                .max(secondary_cost)
+                .saturating_mul(2)
+                .saturating_add(999)
+                / 1_000
+                + 500;
+            milliseconds.clamp(1_000, 30_000) as u32
+        });
         let response = OverlayPath {
+            acknowledgement_timeout_ms,
             topology_epoch: topology.topology_epoch(),
             routing_epoch: snapshot.routing_epoch,
             source: source.node_id.clone(),
@@ -4652,13 +4826,25 @@ where
             .map(|node| node.node_id.clone())
             .collect::<BTreeSet<_>>();
         health_by_node.retain(|node_id, _| node_ids.contains(node_id));
+        let ready = if policy.overlay_strict_hierarchy {
+            Some(self.strict_hierarchy_ready_nodes(generated_at).await?)
+        } else {
+            None
+        };
         // A stopped node remains registered for an operator to resume later,
         // but must never be used as a backbone hop or path destination.
         let eligible_nodes = nodes
             .iter()
             .filter(|node| !node.is_administratively_stopped())
+            .filter(|node| {
+                node.is_http_only() || ready.as_ref().is_none_or(|ids| ids.contains(&node.node_id))
+            })
             .cloned()
             .collect::<Vec<_>>();
+        let eligible_node_ids = eligible_nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect();
         let active_nodes = eligible_nodes
             .iter()
             .filter(|node| {
@@ -4687,6 +4873,11 @@ where
             overlay_membership_epoch(backbone_nodes.iter().map(|node| node.node_id.as_str()));
         let topology_cache_key = Arc::new(OverlayTopologyCacheKey {
             membership_epoch,
+            locality_epoch: overlay_locality_epoch(
+                &backbone_nodes,
+                &policy.overlay_node_localities,
+            ),
+            strict_hierarchy: policy.overlay_strict_hierarchy,
             node_count: backbone_nodes.len(),
             block_size: policy.overlay_block_size,
             max_degree: policy.overlay_max_degree,
@@ -4704,6 +4895,8 @@ where
         }
         let snapshot = Arc::new(OverlayNodeSnapshot {
             backbone_nodes,
+            eligible_nodes,
+            eligible_node_ids,
             loaded_at,
             generated_at,
             nodes,
@@ -4753,6 +4946,8 @@ where
         self.overlay_topology_cached(
             Arc::new(OverlayTopologyCacheKey {
                 membership_epoch: overlay_membership_epoch(node_ids),
+                locality_epoch: overlay_locality_epoch(nodes, &policy.overlay_node_localities),
+                strict_hierarchy: policy.overlay_strict_hierarchy,
                 node_count: nodes.len(),
                 block_size: policy.overlay_block_size,
                 max_degree: policy.overlay_max_degree,
@@ -4801,6 +4996,8 @@ where
         };
         let config = BoundedTopologyConfig::new(usize::from(policy.overlay_max_degree))
             .with_block_size(usize::from(policy.overlay_block_size))
+            .with_locality_aware(policy.overlay_strict_hierarchy)
+            .with_locality_overrides(policy.overlay_node_localities.clone())
             .with_permutation_seed(self.config.cluster_id.as_str());
         let topology = cell
             .get_or_init(|| async move {
@@ -5048,6 +5245,31 @@ where
             .as_ref()
             .and_then(|ad| ad.transport.clone());
         self.validate_heartbeat_request(&request, &node, &policy, previous_signature_at, now)?;
+        let strict_hierarchy_ready = agent_build.as_ref().is_some_and(|build| {
+            build.version.split_once('+').is_some_and(|(_, metadata)| {
+                metadata
+                    .split('.')
+                    .any(|part| part == ipars_types::STRICT_HIERARCHY_BUILD_CAPABILITY)
+            })
+        });
+        if policy.overlay_strict_hierarchy && !node.is_http_only() && !strict_hierarchy_ready {
+            let _ = self
+                .store
+                .upsert_transport_snapshot(ipars_types::api::TransportNodeSnapshot {
+                    node_id: node.node_id.clone(),
+                    observed_at: request
+                        .node_signature
+                        .as_ref()
+                        .map_or(now, |signature| signature.signed_at),
+                    snapshot: ipars_types::api::NodeTransportSnapshot::default(),
+                })
+                .await;
+            self.invalidate_overlay_node_snapshot().await;
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: "this cluster requires an Agent that supports strict hierarchy".to_string(),
+            });
+        }
         let heartbeat_service_instance =
             heartbeat_service_instance(&request, &node, &self.config.cluster_id, now)?;
         let route_catalog_update_requested = request
@@ -5181,7 +5403,11 @@ where
                 .await
                 .insert(request_node_id.clone(), agent_build);
         }
-        if let Some(snapshot) = transport {
+        {
+            let mut snapshot = transport.unwrap_or_default();
+            // Never trust this persisted marker from the wire. It is derived
+            // from metadata covered by the already verified heartbeat.
+            snapshot.strict_hierarchy_ready = strict_hierarchy_ready;
             if let Err(error) = self
                 .store
                 .upsert_transport_snapshot(ipars_types::api::TransportNodeSnapshot {
@@ -6166,6 +6392,24 @@ where
         self.store.get_health_by_node_ids(&node_ids).await
     }
 
+    async fn strict_hierarchy_ready_nodes(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<BTreeSet<NodeId>, ControlPlaneError> {
+        Ok(self
+            .store
+            .list_transport_snapshots(None)
+            .await?
+            .into_iter()
+            .filter(|record| record.snapshot.strict_hierarchy_ready)
+            .filter(|record| record.observed_at <= now + chrono::Duration::seconds(300))
+            .filter(|record| {
+                now.signed_duration_since(record.observed_at) <= STRICT_HIERARCHY_CAPABILITY_TTL
+            })
+            .map(|record| record.node_id)
+            .collect())
+    }
+
     async fn filtered_peer_map_for_node(
         &self,
         source: &NodeRecord,
@@ -6175,6 +6419,20 @@ where
         bootstrap_endpoints: Vec<BootstrapEndpoint>,
         generated_at: chrono::DateTime<Utc>,
     ) -> Result<PeerMap, ControlPlaneError> {
+        let ready_peers;
+        let peers = if policy.overlay_strict_hierarchy {
+            let snapshot = self.current_overlay_snapshot().await?.1;
+            ready_peers = peers
+                .iter()
+                .filter(|peer| {
+                    peer.role.is_client() || snapshot.eligible_node_ids.contains(&peer.node_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            ready_peers.as_slice()
+        } else {
+            peers
+        };
         let visible_peers = if source.role.is_client() {
             client_gateway_peer_map(
                 source,
@@ -6297,6 +6555,58 @@ struct ClientGatewayRoutingState<'a> {
     selections: &'a BTreeMap<NodeId, ClientGatewaySelection>,
 }
 
+fn preferred_client_gateway<'a>(
+    client: &NodeId,
+    gateways: &'a [NodeId],
+    policy: &ClusterPolicy,
+) -> Option<&'a NodeId> {
+    if !policy.overlay_strict_hierarchy {
+        return gateways.first();
+    }
+    gateways.iter().max_by_key(|gateway| {
+        let mut digest = Sha256::new();
+        digest.update(b"HeteroNetwork client gateway rendezvous v1\0");
+        digest.update((client.as_str().len() as u64).to_be_bytes());
+        digest.update(client.as_str().as_bytes());
+        digest.update((gateway.as_str().len() as u64).to_be_bytes());
+        digest.update(gateway.as_str().as_bytes());
+        (digest.finalize(), (*gateway).clone())
+    })
+}
+
+// Gateway visibility is evaluated from the client's perspective, just as it
+// is when the client receives its peer map. Cache by ACL selector class so
+// a large population of similarly configured clients does not rescan the
+// backbone once per client.
+fn client_gateway_ids_for_visibility(
+    client: &NodeRecord,
+    backbone: &[NodeRecord],
+    health_by_node: &BTreeMap<NodeId, NodeHealth>,
+    policy: &ClusterPolicy,
+    generated_at: chrono::DateTime<Utc>,
+    default_gateway_ids: &[NodeId],
+    by_acl_class: &mut BTreeMap<(Role, BTreeSet<ipars_types::Tag>), Vec<NodeId>>,
+) -> Vec<NodeId> {
+    if !policy.overlay_strict_hierarchy || policy.acl_rules.is_empty() {
+        return default_gateway_ids.to_vec();
+    }
+    let class = (client.role.clone(), client.tags.clone());
+    by_acl_class
+        .entry(class)
+        .or_insert_with(|| {
+            let visible = backbone
+                .iter()
+                .filter(|peer| !peer.role.is_client() && peer.node_id != client.node_id)
+                .filter_map(|peer| acl_filter_peer(client, peer, policy))
+                .collect::<Vec<_>>();
+            select_client_gateways(&visible, health_by_node, generated_at, policy)
+                .into_iter()
+                .map(|gateway| gateway.node_id.clone())
+                .collect()
+        })
+        .clone()
+}
+
 fn client_gateway_peer_map(
     source: &NodeRecord,
     peers: &[NodeRecord],
@@ -6311,13 +6621,19 @@ fn client_gateway_peer_map(
         .filter_map(|peer| acl_filter_peer(source, peer, policy))
         .collect::<Vec<_>>();
     let mut gateways = select_client_gateways(&visible_nodes, health_by_node, generated_at, policy);
-    if let Some(selected) = client_gateway_selections.get(&source.node_id) {
-        if let Some(index) = gateways
-            .iter()
-            .position(|gateway| gateway.node_id == selected.gateway_node_id)
-        {
-            gateways.rotate_left(index);
-        }
+    let gateway_ids = gateways
+        .iter()
+        .map(|gateway| gateway.node_id.clone())
+        .collect::<Vec<_>>();
+    let selected = client_gateway_selections
+        .get(&source.node_id)
+        .map(|selection| &selection.gateway_node_id)
+        .filter(|gateway| gateway_ids.contains(gateway))
+        .or_else(|| preferred_client_gateway(&source.node_id, &gateway_ids, policy));
+    if let Some(index) =
+        selected.and_then(|id| gateways.iter().position(|gateway| &gateway.node_id == id))
+    {
+        gateways.rotate_left(index);
     }
     gateways
         .into_iter()
@@ -6384,14 +6700,24 @@ fn node_peer_map_with_clients(
                 .map(|visible| (visible.node_id.clone(), visible))
         })
         .collect::<BTreeMap<_, _>>();
+    let mut gateways_by_acl_class = BTreeMap::new();
     let selected_gateway_by_client = visible_clients
         .values()
         .filter_map(|client| {
+            let gateway_ids = client_gateway_ids_for_visibility(
+                client,
+                peers,
+                health_by_node,
+                policy,
+                generated_at,
+                &gateway_ids,
+                &mut gateways_by_acl_class,
+            );
             client_gateway_selections
                 .get(&client.node_id)
                 .map(|selection| &selection.gateway_node_id)
                 .filter(|gateway| gateway_ids.contains(gateway))
-                .or_else(|| gateway_ids.first())
+                .or_else(|| preferred_client_gateway(&client.node_id, &gateway_ids, policy))
                 .cloned()
                 .map(|gateway| (client.node_id.clone(), gateway))
         })
@@ -6464,8 +6790,8 @@ fn node_client_route_projection(
         .iter()
         .map(|gateway| gateway.node_id.clone())
         .collect::<Vec<_>>();
-    let gateways_by_id = gateways
-        .into_iter()
+    let gateways_by_id = backbone_nodes
+        .iter()
         .map(|gateway| (gateway.node_id.clone(), gateway))
         .collect::<BTreeMap<_, _>>();
     let visible_clients = clients
@@ -6474,14 +6800,24 @@ fn node_client_route_projection(
         .collect::<Vec<_>>();
     let mut direct_clients = Vec::new();
     let mut routes_by_gateway = BTreeMap::<NodeId, BTreeMap<IpNet, Route>>::new();
+    let mut gateways_by_acl_class = BTreeMap::new();
 
     for client in visible_clients {
+        let gateway_ids = client_gateway_ids_for_visibility(
+            &client,
+            backbone_nodes,
+            health_by_node,
+            policy,
+            generated_at,
+            &gateway_ids,
+            &mut gateways_by_acl_class,
+        );
         let selected_gateway = client_gateway_selections
             .get(&client.node_id)
             .map(|selection| &selection.gateway_node_id)
             .filter(|gateway| gateway_ids.contains(gateway))
             .cloned()
-            .or_else(|| gateway_ids.first().cloned());
+            .or_else(|| preferred_client_gateway(&client.node_id, &gateway_ids, policy).cloned());
         let Some(selected_gateway) = selected_gateway else {
             continue;
         };
@@ -7173,6 +7509,42 @@ fn full_service_owner_node_count(instances: &[ServiceInstance]) -> usize {
 }
 
 fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneError> {
+    if policy.overlay_node_localities.len() > 10_000 {
+        return Err(ControlPlaneError::InvalidClusterPolicy(
+            "overlay_node_localities must contain at most 10000 nodes".to_string(),
+        ));
+    }
+    for (node, locality) in &policy.overlay_node_localities {
+        if node.as_str().is_empty()
+            || node.as_str().len() > 128
+            || !node
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || (locality.region.is_none() && locality.zone.is_none())
+        {
+            return Err(ControlPlaneError::InvalidClusterPolicy(
+                "invalid node or empty overlay locality".to_string(),
+            ));
+        }
+        for label in [locality.region.as_deref(), locality.zone.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                return Err(ControlPlaneError::InvalidClusterPolicy(
+                    "overlay locality labels must use 1 to 63 lowercase letters, digits or internal hyphens".to_string(),
+                ));
+            }
+        }
+    }
     if !(MIN_OVERLAY_BLOCK_SIZE..=MAX_OVERLAY_BLOCK_SIZE).contains(&policy.overlay_block_size) {
         return Err(ControlPlaneError::InvalidClusterPolicy(format!(
             "overlay_block_size must be between {MIN_OVERLAY_BLOCK_SIZE} and {MAX_OVERLAY_BLOCK_SIZE}"
@@ -7443,6 +7815,36 @@ fn path_is_fresh(path: &PathRecord, now: chrono::DateTime<Utc>, ttl_seconds: u64
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
+}
+
+/// Quantized microsecond routing cost from the existing signed path-quality
+/// report. Unknown measurements are omitted so the topology can apply its
+/// conservative default. Unreachable links are penalized, not removed.
+fn observed_overlay_edge_cost(path: &PathRecord) -> Option<u64> {
+    if path.selected_state == PathState::Unreachable {
+        return Some(30_000_000);
+    }
+    let metric = |prefix: &str| {
+        path.score
+            .reasons
+            .iter()
+            .find_map(|reason| reason.strip_prefix(prefix)?.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    let latency_ms = metric("latency_ms=")?.min(10_000.0);
+    let jitter_ms = metric("jitter_ms=").unwrap_or(0.0).min(10_000.0);
+    let loss_ppm = metric("loss_ppm=").unwrap_or(0.0).min(1_000_000.0);
+    let micros = (latency_ms * 1_000.0 + jitter_ms * 1_000.0 + loss_ppm) as u64;
+    Some(micros.saturating_add(4_999) / 5_000 * 5_000 + 1_000)
+}
+
+fn overlay_path_cost(nodes: &[NodeId], costs: &BTreeMap<TopologyEdge, u64>) -> u64 {
+    nodes.windows(2).fold(0_u64, |sum, pair| {
+        let cost = TopologyEdge::new(pair[0].clone(), pair[1].clone())
+            .and_then(|edge| costs.get(&edge).copied())
+            .unwrap_or(100_000);
+        sum.saturating_add(cost)
+    })
 }
 
 fn timestamp_is_fresh(
@@ -7735,6 +8137,39 @@ fn overlay_membership_epoch<'a>(node_ids: impl IntoIterator<Item = &'a str>) -> 
         material.extend_from_slice(node_id.as_bytes());
     }
     overlay_epoch_digest(b"HeteroNetwork overlay membership v1", &material)
+}
+
+fn overlay_locality_epoch(
+    nodes: &[NodeRecord],
+    overrides: &BTreeMap<NodeId, ipars_types::OverlayNodeLocality>,
+) -> u64 {
+    let mut ordered = nodes.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let mut material = Vec::new();
+    for node in ordered {
+        let id = node.node_id.as_str().as_bytes();
+        material.extend_from_slice(&(id.len() as u64).to_be_bytes());
+        material.extend_from_slice(id);
+        for tag in &node.tags {
+            let value = tag.as_str();
+            if value.starts_with("topology-region-") || value.starts_with("topology-zone-") {
+                material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+                material.extend_from_slice(value.as_bytes());
+            }
+        }
+        material.extend_from_slice(&0_u64.to_be_bytes());
+    }
+    for (node, locality) in overrides {
+        for value in [
+            node.as_str(),
+            locality.region.as_deref().unwrap_or(""),
+            locality.zone.as_deref().unwrap_or(""),
+        ] {
+            material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            material.extend_from_slice(value.as_bytes());
+        }
+    }
+    overlay_epoch_digest(b"HeteroNetwork overlay locality v1", &material)
 }
 
 fn overlay_epoch_digest(domain: &[u8], material: &[u8]) -> u64 {
@@ -9260,6 +9695,264 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_hierarchy_keeps_policy_pinned_sources_bounded_at_1000_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 16)?;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+        let mut ids = Vec::new();
+        for index in 0..1_000_u32 {
+            let mut node = node_record(&format!("strict-policy-pin-{index:04}"));
+            node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::from(
+                u32::from(Ipv4Addr::new(100, 64, 0, 0)) + index + 1,
+            )));
+            node.tags.insert(Tag::kubernetes_control_plane());
+            ids.push(node.node_id.clone());
+            let id = node.node_id.clone();
+            store.insert_node(node).await?;
+            store
+                .upsert_transport_snapshot(ipars_types::api::TransportNodeSnapshot {
+                    node_id: id,
+                    observed_at: Utc::now(),
+                    snapshot: ipars_types::api::NodeTransportSnapshot {
+                        strict_hierarchy_ready: true,
+                        ..Default::default()
+                    },
+                })
+                .await?;
+        }
+        assert!(matches!(
+            plane.neighbor_map_for(&ids[0]).await,
+            Err(ControlPlaneError::BoundedTopology(_))
+        ));
+        let mut policy = plane.current_cluster_policy().await?;
+        policy.overlay_strict_hierarchy = true;
+        plane.set_cluster_policy(policy).await?;
+        for source in [&ids[0], &ids[500], &ids[999]] {
+            let map = plane.neighbor_map_for(source).await?;
+            assert!(map.strict_hierarchy);
+            assert!(map.pinned_peers.is_empty());
+            assert!(map.neighbors.len() <= usize::from(map.max_degree));
+            map.validate()?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_hierarchy_rejects_missing_stale_and_downgraded_agents(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster = ClusterId::from_string("strict-readiness");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster.clone(), "100.64.0.0/24".parse()?),
+            store.clone(),
+        );
+        let mut node = node_record("readiness-node");
+        node.cluster_id = cluster;
+        store.insert_node(node.clone()).await?;
+        let mut policy = plane.current_cluster_policy().await?;
+        policy.overlay_strict_hierarchy = true;
+        assert!(matches!(
+            plane.set_cluster_policy(policy.clone()).await,
+            Err(ControlPlaneError::InvalidClusterPolicy(_))
+        ));
+        let snapshot = |at, ready| ipars_types::api::TransportNodeSnapshot {
+            node_id: node.node_id.clone(),
+            observed_at: at,
+            snapshot: ipars_types::api::NodeTransportSnapshot {
+                strict_hierarchy_ready: ready,
+                ..Default::default()
+            },
+        };
+        store
+            .upsert_transport_snapshot(snapshot(Utc::now() - chrono::Duration::seconds(91), true))
+            .await?;
+        assert!(matches!(
+            plane.set_cluster_policy(policy.clone()).await,
+            Err(ControlPlaneError::InvalidClusterPolicy(_))
+        ));
+        store
+            .upsert_transport_snapshot(snapshot(Utc::now(), true))
+            .await?;
+        plane.set_cluster_policy(policy).await?;
+        assert!(plane
+            .overlay_nodes()
+            .await?
+            .iter()
+            .any(|n| n.node_id == node.node_id));
+        store
+            .upsert_transport_snapshot(snapshot(
+                Utc::now() + chrono::Duration::milliseconds(1),
+                false,
+            ))
+            .await?;
+        plane.invalidate_overlay_node_snapshot().await;
+        assert!(!plane
+            .overlay_nodes()
+            .await?
+            .iter()
+            .any(|n| n.node_id == node.node_id));
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_quality_costs_are_bounded_and_ignore_unmeasured_paths() {
+        let mut path = PathRecord {
+            key: ipars_types::PeerPathKey::new(node_id("cost-a"), node_id("cost-b")),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: None,
+            relay_node: None,
+            score: ipars_types::PathScore {
+                value: 0.0,
+                reasons: Vec::new(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+        assert_eq!(observed_overlay_edge_cost(&path), None);
+        path.score.reasons = vec![
+            "latency_ms=21.3".into(),
+            "jitter_ms=2.0".into(),
+            "loss_ppm=10000".into(),
+        ];
+        assert_eq!(observed_overlay_edge_cost(&path), Some(36_000));
+        path.score.reasons = vec!["latency_ms=NaN".into()];
+        assert_eq!(observed_overlay_edge_cost(&path), None);
+        path.selected_state = PathState::Unreachable;
+        assert_eq!(observed_overlay_edge_cost(&path), Some(30_000_000));
+    }
+
+    #[test]
+    fn overlay_locality_policy_rejects_invalid_labels() {
+        let mut policy = ClusterPolicy::default();
+        policy.overlay_node_localities.insert(
+            node_id("locality-node"),
+            ipars_types::OverlayNodeLocality {
+                region: Some("Tokyo West".into()),
+                zone: None,
+            },
+        );
+        assert!(validate_cluster_policy(&policy).is_err());
+        policy
+            .overlay_node_localities
+            .get_mut(&node_id("locality-node"))
+            .unwrap_or_else(|| panic!("locality was inserted"))
+            .region = Some("tokyo-west".into());
+        assert!(validate_cluster_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn strict_client_gateway_selection_distributes_and_only_moves_failed_gateway_clients() {
+        let gateways = (0..4)
+            .map(|index| NodeId::from_string(format!("gateway-{index}")))
+            .collect::<Vec<_>>();
+        let surviving = gateways[..3].to_vec();
+        let policy = ClusterPolicy {
+            overlay_strict_hierarchy: true,
+            ..ClusterPolicy::default()
+        };
+        let mut counts = BTreeMap::<NodeId, usize>::new();
+        for index in 0..1_000 {
+            let client = NodeId::from_string(format!("client-{index:04}"));
+            let chosen = preferred_client_gateway(&client, &gateways, &policy)
+                .unwrap_or_else(|| panic!("gateway must exist"));
+            *counts.entry(chosen.clone()).or_default() += 1;
+            let after_failure = preferred_client_gateway(&client, &surviving, &policy)
+                .unwrap_or_else(|| panic!("surviving gateway must exist"));
+            if *chosen != gateways[3] {
+                assert_eq!(chosen, after_failure);
+            }
+        }
+        assert_eq!(counts.len(), 4);
+        assert!(
+            counts.values().all(|count| (170..=330).contains(count)),
+            "{counts:?}"
+        );
+    }
+
+    #[test]
+    fn strict_gateway_projection_uses_the_clients_acl_filtered_candidates(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let mut gateways = Vec::new();
+        for index in 0..5_u8 {
+            let label = format!("acl-gateway-{index}");
+            let mut gateway = node_record(&label);
+            gateway.role = Role::gateway();
+            gateway.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, index + 10)));
+            let mut endpoint = candidate(&label);
+            endpoint.kind = EndpointCandidateKind::PublicUdp;
+            endpoint.addr = format!("8.8.4.{}:51820", index + 1).parse()?;
+            gateway.endpoint_candidates = vec![endpoint];
+            if index < 4 {
+                gateway.tags.insert(Tag::from_string("client-denied"));
+            }
+            gateways.push(gateway);
+        }
+        let mut client = node_record("restricted-client");
+        client.role = Role::client();
+        client.vpn_ip = VpnIp("100.64.0.100".parse()?);
+        let policy = ClusterPolicy {
+            overlay_strict_hierarchy: true,
+            acl_rules: vec![
+                AclRule {
+                    id: "deny-hidden-gateways".into(),
+                    from_roles: BTreeSet::from([Role::client()]),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::from([Tag::from_string("client-denied")]),
+                    routes: Vec::new(),
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Deny,
+                },
+                AclRule {
+                    id: "allow-rest".into(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::new(),
+                    routes: Vec::new(),
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Allow,
+                },
+            ],
+            ..ClusterPolicy::default()
+        };
+        let mut peers = gateways.clone();
+        peers.push(client.clone());
+        let health = BTreeMap::new();
+        let selections = BTreeMap::new();
+        let client_map =
+            client_gateway_peer_map(&client, &peers, &health, &selections, &policy, now);
+        assert_eq!(client_map.len(), 1);
+        assert_eq!(client_map[0].node_id, gateways[4].node_id);
+        for gateway in &gateways {
+            let projected = node_client_route_projection(
+                gateway,
+                &gateways,
+                std::slice::from_ref(&client),
+                &health,
+                &selections,
+                &policy,
+                now,
+            );
+            let direct = projected.iter().any(|peer| peer.node_id == client.node_id);
+            assert_eq!(direct, gateway.node_id == gateways[4].node_id);
+            let full_map =
+                node_peer_map_with_clients(gateway, &peers, &health, &selections, &policy, now);
+            assert_eq!(
+                full_map.iter().any(|peer| peer.node_id == client.node_id),
+                direct
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn overlay_topology_cache_reuses_membership_and_rebuilds_for_membership_or_policy(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::from_string("cluster-a");
@@ -10378,6 +11071,8 @@ mod tests {
                 cache.insert(
                     OverlayTopologyCacheKey {
                         membership_epoch: index,
+                        locality_epoch: 0,
+                        strict_hierarchy: false,
                         node_count: 1,
                         block_size: DEFAULT_OVERLAY_BLOCK_SIZE,
                         max_degree: ClusterPolicy::default().overlay_max_degree,
@@ -17365,6 +18060,7 @@ mod tests {
                 node_id: peer.node_id.clone(),
                 observed_at: Utc::now(),
                 snapshot: NodeTransportSnapshot {
+                    strict_hierarchy_ready: false,
                     public_transport_urls: named_urls.clone(),
                     relay_transport_urls: relay_urls.clone(),
                     tcp_tunnel_endpoints: Vec::new(),

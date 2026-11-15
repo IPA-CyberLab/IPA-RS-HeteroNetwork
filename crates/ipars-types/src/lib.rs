@@ -160,6 +160,9 @@ impl Display for Role {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Tag(String);
 
+/// Signed build metadata token advertised by Agents supporting strict hierarchy.
+pub const STRICT_HIERARCHY_BUILD_CAPABILITY: &str = "hn-hierarchy-v1";
+
 impl Tag {
     pub fn from_string(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -1458,6 +1461,18 @@ impl Default for TokenPolicy {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayNodeLocality {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterPolicy {
     pub allow_ipv6_direct: bool,
@@ -1472,6 +1487,12 @@ pub struct ClusterPolicy {
     pub overlay_direct_shortcut_limit: u16,
     #[serde(default = "default_overlay_on_demand_peer_limit")]
     pub overlay_on_demand_peer_limit: u16,
+    /// Opt in only after every backbone agent supports bounded policy pins.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overlay_strict_hierarchy: bool,
+    /// Operator-specified failure domains, keyed by node ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overlay_node_localities: BTreeMap<NodeId, OverlayNodeLocality>,
     #[serde(default)]
     pub overlay_route_scopes: Vec<IpNet>,
     #[serde(default = "default_relay_health_ttl_seconds")]
@@ -1508,6 +1529,8 @@ impl Default for ClusterPolicy {
             overlay_max_degree: default_overlay_max_degree(),
             overlay_direct_shortcut_limit: default_overlay_direct_shortcut_limit(),
             overlay_on_demand_peer_limit: default_overlay_on_demand_peer_limit(),
+            overlay_strict_hierarchy: false,
+            overlay_node_localities: BTreeMap::new(),
             overlay_route_scopes: Vec::new(),
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
@@ -1738,6 +1761,10 @@ impl AggregateOverlayRoute {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NeighborMap {
+    /// Policy pins use bounded on-demand paths rather than direct links.
+    /// Older control planes omit this field during a staged rollout.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict_hierarchy: bool,
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub topology_epoch: u64,
@@ -1810,6 +1837,12 @@ impl NeighborMap {
                     "pinned peer count {} exceeds maximum {MAX_OVERLAY_PINNED_PEERS}",
                     self.pinned_peers.len()
                 ),
+            ));
+        }
+        if self.strict_hierarchy && !self.pinned_peers.is_empty() {
+            return Err(OverlayValidationError::new(
+                "pinned_peers",
+                "strict hierarchy must not contain direct policy-pinned peers".to_string(),
             ));
         }
         if self.aggregate_routes.len() > MAX_AGGREGATE_OVERLAY_ROUTES {
@@ -2135,6 +2168,9 @@ impl OverlayPathQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverlayPath {
+    /// A bounded, conservative acknowledgement timeout from measured links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledgement_timeout_ms: Option<u32>,
     pub topology_epoch: u64,
     pub routing_epoch: u64,
     pub source: NodeId,
@@ -2148,6 +2184,15 @@ pub struct OverlayPath {
 
 impl OverlayPath {
     pub fn validate(&self) -> Result<(), OverlayValidationError> {
+        if self
+            .acknowledgement_timeout_ms
+            .is_some_and(|value| value == 0 || value > 30_000)
+        {
+            return Err(OverlayValidationError::new(
+                "acknowledgement_timeout_ms",
+                "acknowledgement timeout must be between 1 and 30000 milliseconds".to_string(),
+            ));
+        }
         validate_overlay_identifier(self.source.as_str(), "source node ID", "source")?;
         validate_overlay_destination(self.destination)?;
         validate_overlay_node_record(&self.target, "target")?;
@@ -3272,6 +3317,10 @@ pub mod api {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct NodeTransportSnapshot {
+        // Set by a new control plane only after verifying signed build metadata.
+        // Agents leave it false on the wire for compatibility with old servers.
+        #[serde(default, skip_serializing_if = "crate::is_false")]
+        pub strict_hierarchy_ready: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub public_transport_urls: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3575,6 +3624,9 @@ pub mod api {
         pub observed_status: ControlPlaneTopologyEdgeStatus,
         #[serde(default)]
         pub path_states: Vec<PathState>,
+        /// Quantized routing cost; includes latency, jitter and loss penalties.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub observed_cost_us: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_observed_at: Option<DateTime<Utc>>,
     }
@@ -20438,6 +20490,7 @@ mod tests {
         let mut client = overlay_test_node("client-a", "cluster-a", "10.250.0.4".parse()?);
         client.role = Role::client();
         Ok(NeighborMap {
+            strict_hierarchy: false,
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: NodeId::from_string("node-a"),
             topology_epoch: 42,
@@ -20769,6 +20822,7 @@ mod tests {
     fn overlay_path_validates_ordered_primary_and_secondary_nodes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut path = OverlayPath {
+            acknowledgement_timeout_ms: None,
             topology_epoch: 42,
             routing_epoch: 42,
             source: NodeId::from_string("node-a"),

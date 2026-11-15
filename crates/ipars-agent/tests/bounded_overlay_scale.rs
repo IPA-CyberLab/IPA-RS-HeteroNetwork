@@ -71,6 +71,7 @@ fn neighbor_indices(index: usize) -> [(usize, OverlayNeighborKind); 4] {
 
 fn neighbor_map(index: usize, topology_epoch: u64) -> NeighborMap {
     NeighborMap {
+        strict_hierarchy: false,
         cluster_id: ClusterId::from_string("bounded-overlay-scale"),
         node_id: node_id(index),
         topology_epoch,
@@ -135,6 +136,7 @@ fn secondary_indices() -> Vec<usize> {
 
 fn overlay_path(epoch: u64) -> OverlayPath {
     OverlayPath {
+        acknowledgement_timeout_ms: None,
         topology_epoch: epoch,
         routing_epoch: epoch,
         source: node_id(SOURCE_INDEX),

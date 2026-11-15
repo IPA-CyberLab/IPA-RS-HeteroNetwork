@@ -44,7 +44,9 @@ export function TopologyPage({
   const [fanout, setFanout] = useState("4");
   const [maxDegree, setMaxDegree] = useState(degreeOptions[0]);
   const [onDemandPeerLimit, setOnDemandPeerLimit] = useState("4");
+  const [localities, setLocalities] = useState({});
   const [validationError, setValidationError] = useState(null);
+  const configuredLocalities = JSON.stringify(policy?.overlay_node_localities || {});
 
   useEffect(() => {
     setFanout(String(policy?.overlay_block_size ?? topology?.fanout ?? 4));
@@ -61,7 +63,16 @@ export function TopologyPage({
           4,
       ),
     );
-  }, [policy, topology]);
+    setLocalities(JSON.parse(configuredLocalities));
+  }, [
+    policy?.overlay_block_size,
+    policy?.overlay_max_degree,
+    policy?.overlay_on_demand_peer_limit,
+    topology?.fanout,
+    topology?.max_degree,
+    topology?.on_demand_peer_limit,
+    configuredLocalities,
+  ]);
 
   const mermaid = useMemo(
     () => (topology ? topologyMermaid(topology) : ""),
@@ -93,11 +104,23 @@ export function TopologyPage({
       setValidationError(new Error("オンデマンド論理ピア数は0から64の整数で指定してください。"));
       return;
     }
+    const localityValues = {};
+    const labelPattern = /^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?$/;
+    for (const [nodeId, locality] of Object.entries(localities)) {
+      const region = String(locality?.region || "").trim();
+      const zone = String(locality?.zone || "").trim();
+      if ([region, zone].some((value) => value && (value.length > 63 || !labelPattern.test(value)))) {
+        setValidationError(new Error("リージョンとゾーンは英小文字・数字・ハイフンで指定してください。"));
+        return;
+      }
+      if (region || zone) localityValues[nodeId] = { ...(region ? { region } : {}), ...(zone ? { zone } : {}) };
+    }
     setValidationError(null);
     await onSaveSettings({
       overlay_block_size: fanoutValue,
       overlay_max_degree: Number(maxDegree.value),
       overlay_on_demand_peer_limit: onDemandPeerValue,
+      overlay_node_localities: localityValues,
     });
   };
 
@@ -166,6 +189,11 @@ export function TopologyPage({
       id: "observed",
       header: "最終観測",
       cell: (edge) => formatDateTime(edge.last_observed_at),
+    },
+    {
+      id: "cost",
+      header: "経路コスト",
+      cell: (edge) => edge.observed_cost_us == null ? "未計測" : `${edge.observed_cost_us / 1000} ms相当`,
     },
   ];
 
@@ -251,6 +279,35 @@ export function TopologyPage({
               />
             </FormField>
           </ColumnLayout>
+          <Box>
+            階層経由の固定ピア: {policy?.overlay_strict_hierarchy ? "有効" : "無効"}
+          </Box>
+          <Header variant="h3" description="分かっている場所のみ指定してください。空欄の場所は不明として扱います。">
+            ノードの場所
+          </Header>
+          {nodes.map((node) => (
+            <ColumnLayout columns={3} key={node.node_id}>
+              <Box>{nodeName(node.node_id)}</Box>
+              <FormField label="リージョン">
+                <Input
+                  value={localities[node.node_id]?.region || ""}
+                  onChange={({ detail }) => setLocalities((current) => ({
+                    ...current,
+                    [node.node_id]: { ...current[node.node_id], region: detail.value },
+                  }))}
+                />
+              </FormField>
+              <FormField label="ゾーン">
+                <Input
+                  value={localities[node.node_id]?.zone || ""}
+                  onChange={({ detail }) => setLocalities((current) => ({
+                    ...current,
+                    [node.node_id]: { ...current[node.node_id], zone: detail.value },
+                  }))}
+                />
+              </FormField>
+            </ColumnLayout>
+          ))}
         </SpaceBetween>
       </Container>
 

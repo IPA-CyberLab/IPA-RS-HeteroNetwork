@@ -8055,6 +8055,7 @@ mod tests {
         let destination = IpAddr::V4(Ipv4Addr::new(10, 44, 3, 10));
         runtime
             .record_neighbor_map_snapshot(NeighborMap {
+                strict_hierarchy: false,
                 cluster_id: ClusterId::from_string("cluster-a"),
                 node_id: local_node,
                 topology_epoch: 1,
@@ -8113,6 +8114,7 @@ mod tests {
         );
         runtime
             .record_neighbor_map_snapshot(NeighborMap {
+                strict_hierarchy: false,
                 cluster_id: ClusterId::from_string("cluster-a"),
                 node_id: local_node,
                 topology_epoch: 1,

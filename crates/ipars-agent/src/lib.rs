@@ -80,7 +80,16 @@ const AGENT_BUILD_HASH: &str = match option_env!("HETERONETWORK_BUILD_HASH") {
 
 fn current_agent_build_info() -> AgentBuildInfo {
     AgentBuildInfo {
-        version: AGENT_BUILD_VERSION.to_string(),
+        version: format!(
+            "{}{}{}",
+            AGENT_BUILD_VERSION,
+            if AGENT_BUILD_VERSION.contains('+') {
+                "."
+            } else {
+                "+"
+            },
+            ipars_types::STRICT_HIERARCHY_BUILD_CAPABILITY,
+        ),
         commit: AGENT_BUILD_HASH.chars().take(7).collect(),
     }
 }
@@ -2348,6 +2357,7 @@ impl AgentRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         ipars_types::api::NodeTransportSnapshot {
+            strict_hierarchy_ready: false,
             public_transport_urls,
             relay_transport_urls: self.relay_transport_urls.read().await.clone(),
             tcp_tunnel_endpoints,
@@ -4294,6 +4304,7 @@ impl AgentRuntime {
                         neighbor_map
                             .pinned_peers
                             .iter()
+                            .filter(|_| !neighbor_map.strict_hierarchy)
                             .map(|peer| peer.node_id.clone()),
                     )
                     .collect::<BTreeSet<_>>()
@@ -4417,6 +4428,7 @@ impl AgentRuntime {
                 neighbor_map
                     .pinned_peers
                     .iter()
+                    .filter(|_| !neighbor_map.strict_hierarchy)
                     .map(|peer| peer.node_id.clone()),
             )
             .chain(retained_topology_pins)
@@ -4509,6 +4521,7 @@ impl AgentRuntime {
                         neighbor_map
                             .pinned_peers
                             .iter()
+                            .filter(|_| !neighbor_map.strict_hierarchy)
                             .map(|peer| peer.node_id.clone()),
                     )
                     .collect::<BTreeSet<_>>()
@@ -4912,8 +4925,16 @@ impl AgentRuntime {
             let snapshot = {
                 let active_epochs = self.active_overlay_topology_epochs().await;
                 let mut active_direct_peer_ids = self.active_overlay_neighbor_ids().await;
-                active_direct_peer_ids
-                    .extend(self.lazy_connect.read().await.direct_pinned_peer_ids());
+                let strict_hierarchy = self
+                    .latest_neighbor_map
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|map| map.strict_hierarchy);
+                if !strict_hierarchy {
+                    active_direct_peer_ids
+                        .extend(self.lazy_connect.read().await.direct_pinned_peer_ids());
+                }
                 let current_routing_epoch = self.current_overlay_routing_epoch().await;
                 let resolved = self.resolved_overlay_paths.read().await;
                 let resolved_overlay_peers = resolved
@@ -5075,6 +5096,35 @@ impl AgentRuntime {
     }
 
     pub async fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
+        let neighbor_map = self.latest_neighbor_map.read().await.clone();
+        if let Some(map) = neighbor_map.as_ref().filter(|map| map.strict_hierarchy) {
+            // Client sessions terminate at their assigned gateway; native
+            // nodes only connect directly to authoritative neighbors.
+            if peer.role.is_client()
+                || map
+                    .neighbors
+                    .iter()
+                    .any(|neighbor| neighbor.node.node_id == peer.node_id)
+                || self
+                    .retained_overlay_neighbors()
+                    .await
+                    .iter()
+                    .any(|neighbor| neighbor.node_id == peer.node_id)
+            {
+                return true;
+            }
+            let active_epochs = self.active_overlay_topology_epochs().await;
+            return self
+                .resolved_overlay_paths
+                .read()
+                .await
+                .paths
+                .get(&peer.node_id)
+                .is_some_and(|lease| {
+                    active_epochs.contains(&lease.path.topology_epoch)
+                        && lease.path.routing_epoch == map.routing_epoch
+                });
+        }
         let lazy_connect = self.lazy_connect.read().await;
         let non_topology_pinned = lazy_connect.is_non_topology_pinned(&peer.node_id);
         let topology_pinned = lazy_connect.is_topology_pinned(&peer.node_id);
@@ -5089,7 +5139,7 @@ impl AgentRuntime {
             return true;
         }
         drop(lazy_connect);
-        let Some(neighbor_map) = self.latest_neighbor_map.read().await.clone() else {
+        let Some(neighbor_map) = neighbor_map else {
             return true;
         };
         if neighbor_map
@@ -10233,6 +10283,7 @@ mod tests {
         topology_epoch: u64,
     ) -> NeighborMap {
         NeighborMap {
+            strict_hierarchy: false,
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: local_node,
             topology_epoch,
@@ -10269,6 +10320,7 @@ mod tests {
         topology_epoch: u64,
     ) -> OverlayPath {
         OverlayPath {
+            acknowledgement_timeout_ms: None,
             topology_epoch,
             routing_epoch: topology_epoch,
             source: local_node.clone(),
@@ -14766,6 +14818,49 @@ mod tests {
             .take_pending_overlay_destinations(8)
             .await
             .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_hierarchy_resolves_policy_pins_through_the_backbone(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        state.vpn_ip = Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 8, 8))));
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+        let neighbor = peer_record(
+            NodeId::from_string("strict-backbone-neighbor"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 10)),
+            "wg-backbone-neighbor",
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut map = bounded_neighbor_map(local_node.clone(), vec![neighbor], 7);
+        map.strict_hierarchy = true;
+        runtime.record_neighbor_map_snapshot(map).await?;
+        let mut target = peer_record(
+            NodeId::from_string("strict-pinned-non-neighbor"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 11)),
+            "wg-pinned-non-neighbor",
+            Vec::new(),
+            Vec::new(),
+        );
+        target.tags.insert(Tag::kubernetes_control_plane());
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&target))
+            .await;
+        assert!(!runtime.should_connect_peer(&target).await);
+        runtime
+            .record_resolved_overlay_path(
+                bounded_overlay_path(local_node, target.clone(), target.vpn_ip.0, 7),
+                Utc::now(),
+            )
+            .await?;
+        assert!(runtime.should_connect_peer(&target).await);
+        assert!(runtime
+            .overlay_shortcut_snapshot()
+            .await
+            .requires_overlay_forwarder(&target.node_id));
         Ok(())
     }
 

@@ -1,0 +1,96 @@
+name: Hierarchical overlay E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths: &overlay_paths
+      - '.github/workflows/hierarchy-e2e.yml'
+      - 'scripts/strict-hierarchy-netns-e2e.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/ipars-agent/**'
+      - 'crates/ipars-agent-http/**'
+      - 'crates/ipars-control-plane/**'
+      - 'crates/ipars-daemon/**'
+      - 'crates/ipars-types/**'
+      - 'crates/ipars-store/**'
+      - 'webui/**'
+      - 'package.json'
+      - 'package-lock.json'
+  pull_request:
+    paths: *overlay_paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hierarchy-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wireguard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.96.1
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      HETERONETWORK_BUILD_VERSION: 0.1.15-dev.hierarchy
+      HETERONETWORK_BUILD_HASH: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Linux networking prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends iproute2 iptables iputils-ping jq kmod procps python3-cryptography wireguard-tools
+          sudo modprobe wireguard
+          sudo modprobe nf_conntrack
+          sudo modprobe sch_netem
+      - name: Install pinned Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Test compatibility, bounded topology, and latency routing
+        run: |
+          cargo test --locked -p ipars-control-plane --lib strict_
+          cargo test --locked -p ipars-control-plane --lib missing_locality_is_not_treated_as_a_shared_failure_domain
+          cargo test --locked -p ipars-control-plane --lib measured_cost_prefers_a_faster_route_and_preserves_an_alternate
+          cargo test --locked -p ipars-agent --lib strict_hierarchy
+      - name: Build real agents and control plane
+        run: cargo build --locked --release -p ipars-cli -p ipars-daemon
+      - name: Exercise automatic flow detection, latency and failover
+        run: |
+          sudo env PATH="/usr/sbin:/usr/bin:/sbin:/bin" \
+            HETERONETWORK_E2E_IPARS="$PWD/target/release/ipars" \
+            HETERONETWORK_E2E_IPARSD="$PWD/target/release/iparsd" \
+            scripts/strict-hierarchy-netns-e2e.sh
+      - name: Package the tested native binaries
+        run: |
+          tar -C target/release -czf "$RUNNER_TEMP/native-bin.tar.gz" ipars iparsd
+          (cd target/release && sha256sum ipars iparsd) > "$RUNNER_TEMP/native-bin.sha256"
+      - name: Retain tested native binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hierarchy-native-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/native-bin.tar.gz
+            ${{ runner.temp }}/native-bin.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  console:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build console and install Chromium
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:webui
+          npx playwright install --with-deps chromium
+      - name: Verify topology configuration in Chromium
+        run: npx playwright test --config webui/e2e/playwright.config.mjs --workers=1 --grep 'operators can configure node locality'
