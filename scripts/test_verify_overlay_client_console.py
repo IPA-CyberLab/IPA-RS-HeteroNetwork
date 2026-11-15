@@ -269,6 +269,16 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
         ):
             verify.verify_monitoring_gateways("10.250.0.2")
 
+    def test_later_dns_recovery_does_not_hide_the_first_failure(self):
+        with (
+            patch.object(verify, "overlay_dns_answers", side_effect=[
+                TimeoutError(), ["10.250.0.2"], ["10.250.0.2"], ["10.250.0.2"],
+            ]) as dns,
+            self.assertRaisesRegex(RuntimeError, r"DNS probe failed.*follow-up diagnostics"),
+        ):
+            verify.verify_monitoring_gateways("10.250.0.2")
+        self.assertEqual(dns.call_count, 4)
+
     def test_monitoring_http_failure_identifies_endpoint(self):
         opener = unittest.mock.Mock()
         opener.open.side_effect = TimeoutError()

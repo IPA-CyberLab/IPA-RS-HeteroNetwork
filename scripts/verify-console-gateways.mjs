@@ -138,9 +138,35 @@ try {
           page.setDefaultTimeout(15_000);
           page.on('pageerror', error => report.errors.push(error.message));
           const openedAt = performance.now();
-          const main = await page.goto(`${origin}/ui/`, {
-            waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
-          });
+          let main;
+          try {
+            main = await page.goto(`${origin}/ui/`, {
+              waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+            });
+          } catch (error) {
+            // Preserve the original failure and three-second gate. Follow-up
+            // probes only record whether the listener recovered afterwards.
+            const diagnosis = { gateway, port, elapsed_ms: Math.ceil(performance.now() - openedAt),
+              failure: String(error.message), probes: [] };
+            for (const path of ['/v1/web-ui/healthz', '/ui/']) {
+              const probe = await context.newPage();
+              const startedAt = performance.now();
+              try {
+                const response = await probe.goto(`${origin}${path}`, {
+                  waitUntil: 'domcontentloaded', timeout: UI_OPEN_BUDGET_MS,
+                });
+                diagnosis.probes.push({ path, http: response?.status() ?? null,
+                  elapsed_ms: Math.ceil(performance.now() - startedAt) });
+              } catch (probeError) {
+                diagnosis.probes.push({ path, error: String(probeError.message),
+                  elapsed_ms: Math.ceil(performance.now() - startedAt) });
+              } finally {
+                await probe.close();
+              }
+            }
+            report.gateway_failure = diagnosis;
+            throw error;
+          }
           if (main.status() !== 200) throw new Error(`${gateway}:${port} UI HTTP ${main.status()}`);
           const remaining = Math.max(1, UI_OPEN_BUDGET_MS - (performance.now() - openedAt));
           await page.getByRole('button', { name: 'Keycloakでログイン' }).waitFor({ timeout: remaining });

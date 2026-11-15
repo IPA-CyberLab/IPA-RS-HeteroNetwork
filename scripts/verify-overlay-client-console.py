@@ -375,7 +375,8 @@ def browser_check(work, gateway, gateways, output):
                     for key in (
                         "failure", "canonical", "canonical_request_failure",
                         "canonical_diagnostic", "canonical_page",
-                        "no_proxy_diagnostic", "keycloak_failure", "configuration_failure", "gateways",
+                        "no_proxy_diagnostic", "keycloak_failure", "configuration_failure",
+                        "gateway_failure", "gateways",
                         "errors",
                     )
                     if key in browser_report
@@ -632,8 +633,19 @@ def verify_monitoring_gateways(gateways):
             try:
                 return overlay_dns_answers(gateway, name)
             except (OSError, ValueError) as error:
+                # Diagnose recovery without turning a failed first probe into
+                # a pass or changing the DNS/console acceptance deadlines.
+                diagnostics = []
+                for _ in range(3):
+                    started = time.monotonic()
+                    try:
+                        addresses = overlay_dns_answers(gateway, name)
+                        diagnostics.append({"answers": addresses, "ms": round((time.monotonic() - started) * 1000)})
+                    except (OSError, ValueError) as retry_error:
+                        diagnostics.append({"error": type(retry_error).__name__, "ms": round((time.monotonic() - started) * 1000)})
                 raise RuntimeError(
-                    f"{name} DNS probe failed at {gateway} ({type(error).__name__})"
+                    f"{name} DNS probe failed at {gateway} ({type(error).__name__}); "
+                    f"follow-up diagnostics: {json.dumps(diagnostics)}"
                 ) from error
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as executor:
