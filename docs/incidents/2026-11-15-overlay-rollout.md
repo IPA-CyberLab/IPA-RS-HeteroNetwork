@@ -46,10 +46,11 @@ does not itself enable it.
 - The Agent's UDP DNS loop previously terminated both DNS listeners for five
   seconds after any individual response-send error. The source fix drops that
   response and continues serving other clients; a regression test injects such
-  an error and verifies the next real UDP query succeeds. Deployment of this
-  fix requires a separately tested Agent rollout. No corresponding listener
-  restart was observed during the intermittent timeout below, so this defect
-  is not asserted to be its cause.
+  an error and verifies the next real UDP query succeeds. The hierarchy and
+  transport CI passed before the fix was rolled out serially to all five
+  Agents, each of which reported a synchronized peer map. No corresponding
+  listener restart was observed during the intermittent timeout below, so this
+  defect is not asserted to be its cause.
 - On `uc-k8sp1`, the four-core HDD host had load above five and elevated disk
   I/O pressure. `etcd` accounted for much of the sampled write activity. This
   establishes contention, not that it caused the browser timeouts below.
@@ -79,6 +80,15 @@ Another post-rollout run timed out twice on Grafana DNS through `10.250.0.4`
 before succeeding twice. A later run after the CoreDNS change succeeded with
 authenticated Chromium, a 793 ms canonical console load and 2,642 ms maximum
 gateway load; the transient DNS failure remains under investigation.
+Separate probes from `uc-k8sp5` to `uc-k8sp1` then failed 3 of 150 times,
+while 150 concurrent DNS queries local to `uc-k8sp1` all completed within
+3 ms. Captures filtered to dedicated test ports showed two failed requests on
+the sender's WireGuard interface but not on the receiver's WireGuard interface;
+a third arrived about 480 ms late. This localizes the observed loss before
+delivery to the receiver's overlay DNS listener, but does not distinguish
+WireGuard encryption, the public underlay, and receiver-side decryption. The
+sender was also repeatedly reapplying peer maps and re-verifying direct paths.
+Their temporal correlation is not proof that they caused the lost packets.
 
 The hierarchy CI uses real WireGuard agents in network namespaces on one
 GitHub-hosted VM, including latency, first-hop loss, a new node and a failed
