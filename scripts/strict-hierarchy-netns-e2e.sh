@@ -209,6 +209,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 jq -e '.node_count == 5' "$work/topology.json" >/dev/null
+cp "$work/topology.json" "$work/topology-before.json"
 
 curl --config "$work/curl.conf" -fsS "$control_url/v1/admin/policy" \
   | jq '.cluster_policy.overlay_strict_hierarchy = true | {cluster_policy}' >"$work/policy.json"
@@ -284,16 +285,25 @@ root = pathlib.Path(sys.argv[1])
 nodes = [json.loads((root / f'status-{i}.json').read_text()) for i in range(1, 6)]
 topology = json.loads((root / 'topology.json').read_text())
 edges = {frozenset((edge['source'], edge['target'])) for edge in topology['edges']}
+previous = json.loads((root / 'topology-before.json').read_text())
+old_edges = {frozenset((edge['source'], edge['target'])) for edge in previous['edges']}
+candidates = []
 for a, source in enumerate(nodes):
     for b, target in enumerate(nodes):
         if a != b and frozenset((source['node_id'], target['node_id'])) not in edges:
-            print(a + 1); print(b + 1); print(target['vpn_ip']); sys.exit(0)
-raise SystemExit('no non-neighbor pair')
+            pair = frozenset((source['node_id'], target['node_id']))
+            candidates.append((pair in old_edges, a + 1, b + 1, target['vpn_ip']))
+if not candidates:
+    raise SystemExit('no non-neighbor pair')
+_, source, target, address = min(candidates)
+print(source); print(target); print(address)
 PY
 )
 source="${pair[0]}"
 target="${pair[1]}"
 target_vpn="${pair[2]}"
+target_key="$(jq -r '.wireguard_public_key' "$work/status-${target}.json")"
+source_interface="hw$((suffix % 100000))${source}"
 echo "testing on-demand traffic between non-neighbor Agents"
 if [[ "${HETERONETWORK_E2E_MANUAL_FLOW:-0}" == 1 ]]; then
   echo "injecting a flow observation because this kernel lacks conntrack events"
@@ -303,10 +313,16 @@ if [[ "${HETERONETWORK_E2E_MANUAL_FLOW:-0}" == 1 ]]; then
     http://127.0.0.1:9780/v1/packet-flow >/dev/null
 fi
 reachable=0
-for _ in $(seq 1 90); do
+# During a topology transition the old physical neighbor can remain for up to
+# 120 seconds, so require both successful traffic and the eventual proxy path.
+for _ in $(seq 1 150); do
   if ip netns exec "${namespaces[source - 1]}" ping -n -q -c 1 -W 1 "$target_vpn" >/dev/null 2>&1; then
-    reachable=1
-    break
+    endpoint="$(ip netns exec "${namespaces[source - 1]}" wg show "$source_interface" endpoints \
+      | awk -v key="$target_key" '$1 == key { print $2 }')"
+    if [[ "$endpoint" == 127.* ]]; then
+      reachable=1
+      break
+    fi
   fi
   sleep 1
 done
@@ -343,12 +359,6 @@ if [[ "${HETERONETWORK_E2E_REJECT_CONNTRACK_DUMPS:-0}" == 1 ]]; then
     echo "verified automatic flow detection while conntrack snapshots fail"
   fi
 fi
-
-target_key="$(jq -r '.wireguard_public_key' "$work/status-${target}.json")"
-source_interface="hw$((suffix % 100000))${source}"
-endpoint="$(ip netns exec "${namespaces[source - 1]}" wg show "$source_interface" endpoints \
-  | awk -v key="$target_key" '$1 == key { print $2 }')"
-[[ "$endpoint" == 127.* ]] || { echo "non-neighbor endpoint bypassed the overlay" >&2; exit 1; }
 
 if [[ "${HETERONETWORK_E2E_SKIP_NETEM:-0}" != 1 ]]; then
   command -v tc >/dev/null
@@ -500,6 +510,8 @@ print(f'registration log entries: {len(registered)}', file=sys.stderr)
 if registered:
     match = re.search(r'peer_count=(\d+)', registered[-1])
     print(f'initial peer count: {match.group(1) if match else "unavailable"}', file=sys.stderr)
+    if not match:
+        print('registration field names: ' + ', '.join(sorted(set(re.findall(r'\b([a-z_]+)\s*=', registered[-1])))), file=sys.stderr)
 for phrase in ('failed to register agent', 'failed to apply peer map', 'failed to fetch peer map'):
     print(f'{phrase}: {sum(phrase in line for line in lines)} occurrence(s)', file=sys.stderr)
 PY
