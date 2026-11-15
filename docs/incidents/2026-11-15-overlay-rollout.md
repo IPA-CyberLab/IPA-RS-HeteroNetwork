@@ -59,3 +59,6 @@ write quorum. Region and zone are currently unspecified; measured path quality
 is available, but geographic separation has not been inferred from addresses.
 The policy change requires an authenticated HeteroNetwork owner and is not
 complete until that change and the post-activation connectivity test succeed.
+The full, non-targeted Terraform plan also contains other pending resource
+changes. The overlay, issuer and kubelet repairs were applied with individually
+reviewed targets; this does not establish that the entire plan is drift-free.
