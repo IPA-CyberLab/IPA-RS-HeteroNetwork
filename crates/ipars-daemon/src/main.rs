@@ -16226,8 +16226,8 @@ async fn run_signal_registration_loop(
                 {
                     Ok(successes) => tracing::info!(
                         node_id = %node.node_id,
-                        signal_services = successes,
-                        "registered agent node with signal services"
+                        signal_endpoints = successes,
+                        "registered agent node with signal endpoints"
                     ),
                     Err(error) => tracing::warn!(
                         %error,
@@ -16301,7 +16301,7 @@ async fn send_signal_node_upsert_to_signal_services(
             successes,
             failures = errors.len(),
             errors = ?errors,
-            "registered agent node with a subset of signal services"
+            "registered agent node with a subset of signal endpoints"
         );
     }
     Ok(successes)
@@ -17307,18 +17307,24 @@ async fn negotiate_signal_paths(
             signal_path_request(&status, &peer),
             path_observation,
         )?;
-        let (signal_url, response) =
-            match send_signal_path_request_to_signal_services(client, signal_urls, request).await {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        peer = %peer.node_id,
-                        "failed to negotiate signal path for peer; continuing with remaining peers"
-                    );
-                    continue;
-                }
-            };
+        let (signal_url, response) = match send_signal_path_request_to_signal_services(
+            client,
+            signal_urls,
+            &identity,
+            request,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    peer = %peer.node_id,
+                    "failed to negotiate signal path for peer; continuing with remaining peers"
+                );
+                continue;
+            }
+        };
         let mut relay_candidates = selected_relay_candidates(&response);
         if let Some(failed_relay_node) = failed_relay_node.as_ref() {
             let previous_count = relay_candidates.len();
@@ -19426,11 +19432,21 @@ async fn send_signal_path_request(
 async fn send_signal_path_request_to_signal_services(
     client: &reqwest::Client,
     signal_urls: &[String],
+    identity: &IdentityKeyPair,
     request: AuthenticatedSignalPathRequest,
 ) -> anyhow::Result<(String, SignalPathResponse)> {
     let mut errors = Vec::new();
     for signal_url in signal_urls {
-        match send_signal_path_request(client, signal_url, request.clone()).await {
+        // The prior endpoint may have processed the request before its reply
+        // was lost, and another URL may address that same endpoint.
+        let mut attempt = request.clone();
+        attempt.request_signature = None;
+        attempt.request_signature = Some(
+            identity
+                .sign_authenticated_signal_path_request(&attempt, chrono::Utc::now())
+                .context("failed to sign signal path request")?,
+        );
+        match send_signal_path_request(client, signal_url, attempt).await {
             Ok(response) => return Ok((signal_url.clone(), response)),
             Err(error) => errors.push(format!("{signal_url}: {error:#}")),
         }
@@ -45637,16 +45653,20 @@ exec sleep 60
             None,
         )?;
 
+        // The first endpoint may process a request whose response is lost.
+        // Retrying through an alias must not reuse its consumed nonce.
+        send_signal_path_request(&client, &base, request.clone()).await?;
         let (selected_signal, response) = send_signal_path_request_to_signal_services(
             &client,
             &[unavailable, base.clone()],
+            &identity,
             request,
         )
         .await?;
 
         assert_eq!(selected_signal, base);
         assert_eq!(response.key, PeerPathKey::new(source, target));
-        assert_eq!(registry.metrics().await.path_negotiation_count, 1);
+        assert_eq!(registry.metrics().await.path_negotiation_count, 2);
         task.abort();
         Ok(())
     }
