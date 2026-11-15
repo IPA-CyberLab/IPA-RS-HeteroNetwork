@@ -90,6 +90,41 @@ else
   wireguard_backend=userspace-command
 fi
 
+agent_preload=()
+if [[ "${HETERONETWORK_E2E_REJECT_CONNTRACK_DUMPS:-0}" == 1 ]]; then
+  command -v cc >/dev/null
+  cat >"$work/reject-conntrack-dump.c" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <linux/netlink.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+ssize_t send(int fd, const void *buffer, size_t size, int flags) {
+  static ssize_t (*actual_send)(int, const void *, size_t, int);
+  if (!actual_send) actual_send = dlsym(RTLD_NEXT, "send");
+  if (size >= sizeof(struct nlmsghdr)) {
+    struct nlmsghdr header;
+    int domain = 0, protocol = 0;
+    socklen_t length = sizeof(int);
+    memcpy(&header, buffer, sizeof(header));
+    if (header.nlmsg_type == 0x101 && (header.nlmsg_flags & NLM_F_DUMP) == NLM_F_DUMP &&
+        getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &length) == 0 &&
+        getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &length) == 0 &&
+        domain == AF_NETLINK && protocol == NETLINK_NETFILTER) {
+      errno = EINVAL;
+      return -1;
+    }
+  }
+  return actual_send(fd, buffer, size, flags);
+}
+C
+  cc -shared -fPIC -O2 -o "$work/reject-conntrack-dump.so" "$work/reject-conntrack-dump.c" -ldl
+  agent_preload=("LD_PRELOAD=$work/reject-conntrack-dump.so")
+fi
+
 mkdir -m 700 "$work/bootstrap"
 token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 printf '%s\n' "$token" >"$work/operator-token"
@@ -122,7 +157,7 @@ for i in 1 2 3 4 5; do
     backend_args+=(--userspace-wireguard-command "$(command -v wireguard-go)" \
       --userspace-wireguard-arg=-f --userspace-wireguard-arg "$interface")
   fi
-  ip netns exec "$ns" env HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ENABLED=false "$iparsd" agent \
+  ip netns exec "$ns" env "${agent_preload[@]}" HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ENABLED=false "$iparsd" agent \
     --listen 127.0.0.1:9780 --state-path "$work/agent-${i}.json" \
     --join-token-path "$work/join-token" \
     --control-plane-url "http://${control_ip}:${port_base}" \
@@ -249,6 +284,7 @@ import pathlib, re, sys
 lines = pathlib.Path(sys.argv[1]).read_text(errors='replace').splitlines()
 for phrase in ('failed to open conntrack netlink event socket',
                'conntrack netlink event detector failed',
+               'conntrack snapshot unavailable',
                'failed to apply peer map'):
     matching = [line for line in lines if phrase in line]
     print(f'{phrase}: {len(matching)} occurrence(s)', file=sys.stderr)
@@ -258,6 +294,17 @@ for phrase in ('failed to open conntrack netlink event socket',
         if match: print(f'  OS error: {match.group(0)}', file=sys.stderr)
 PY
   exit 1
+fi
+if [[ "${HETERONETWORK_E2E_REJECT_CONNTRACK_DUMPS:-0}" == 1 ]]; then
+  grep -q 'conntrack snapshot unavailable.*failed to send conntrack netlink dump request' "$work/agent-${source}.log" || {
+    echo "the injected conntrack dump failure was not observed" >&2
+    exit 1
+  }
+  if [[ "${HETERONETWORK_E2E_MANUAL_FLOW:-0}" == 1 ]]; then
+    echo "verified injected snapshot failure with manually observed traffic"
+  else
+    echo "verified automatic flow detection while conntrack snapshots fail"
+  fi
 fi
 
 target_key="$(jq -r '.wireguard_public_key' "$work/status-${target}.json")"

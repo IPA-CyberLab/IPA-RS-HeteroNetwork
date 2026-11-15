@@ -81,6 +81,14 @@ jobs:
             HETERONETWORK_E2E_IPARS="$PWD/target/release/ipars" \
             HETERONETWORK_E2E_IPARSD="$PWD/target/release/iparsd" \
             scripts/strict-hierarchy-netns-e2e.sh
+      - name: Verify event detection when conntrack snapshots fail
+        run: |
+          sudo env PATH="/usr/sbin:/usr/bin:/sbin:/bin" \
+            HETERONETWORK_E2E_IPARS="$PWD/target/release/ipars" \
+            HETERONETWORK_E2E_IPARSD="$PWD/target/release/iparsd" \
+            HETERONETWORK_E2E_REJECT_CONNTRACK_DUMPS=1 \
+            HETERONETWORK_E2E_SKIP_NETEM=1 \
+            scripts/strict-hierarchy-netns-e2e.sh
 
   console:
     runs-on: ubuntu-24.04

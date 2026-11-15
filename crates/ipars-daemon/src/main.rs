@@ -20204,8 +20204,17 @@ async fn run_conntrack_netlink_event_detector_once(
     pin: bool,
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
-    reconcile_conntrack_netlink_event_snapshot(runtime, deduper, snapshot_tracker, limits, pin)
-        .await?;
+    // A failed snapshot must not tear down the independently working event
+    // subscription. Some kernels or restricted runtimes support multicast
+    // events while rejecting a conntrack table dump.
+    let mut snapshot_retry_at = None;
+    if let Err(error) =
+        reconcile_conntrack_netlink_event_snapshot(runtime, deduper, snapshot_tracker, limits, pin)
+            .await
+    {
+        tracing::warn!(%error, "conntrack snapshot unavailable; continuing to receive events");
+        snapshot_retry_at = Some(Instant::now() + Duration::from_secs(30));
+    }
     let mut reconciliation = tokio::time::interval(idle_poll_interval);
     reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     reconciliation.reset();
@@ -20247,14 +20256,22 @@ async fn run_conntrack_netlink_event_detector_once(
                 .await;
             }
             _ = reconciliation.tick() => {
-                reconcile_conntrack_netlink_event_snapshot(
+                if snapshot_retry_at.is_some_and(|retry_at| Instant::now() < retry_at) {
+                    continue;
+                }
+                if let Err(error) = reconcile_conntrack_netlink_event_snapshot(
                     runtime,
                     deduper,
                     snapshot_tracker,
                     limits,
                     pin,
                 )
-                .await?;
+                .await {
+                    tracing::warn!(%error, "conntrack snapshot unavailable; continuing to receive events");
+                    snapshot_retry_at = Some(Instant::now() + Duration::from_secs(30));
+                } else if snapshot_retry_at.take().is_some() {
+                    tracing::info!("conntrack snapshot reconciliation recovered");
+                }
             }
         }
     }

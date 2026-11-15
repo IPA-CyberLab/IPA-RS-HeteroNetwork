@@ -752,6 +752,10 @@ The routing path also uses fresh observed backbone RTT, jitter and loss, with
 bounded cost quantization, a conservative cost for missing measurements, and
 an alternate path. If metrics cannot be read, routing falls back to hop count.
 Acknowledgement timeouts include a bounded estimate for long paths.
+For the conntrack event detector, an unsuccessful table snapshot no longer
+stops multicast event consumption. The Agent logs the failed snapshot and
+retries it with a 30-second backoff. Events missed while the snapshot is
+unavailable cannot be recovered until a later successful snapshot.
 
 Run `scripts/strict-hierarchy-netns-e2e.sh` as root in an isolated Linux test
 environment with the built `ipars` and `iparsd` binaries. It starts five real

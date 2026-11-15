@@ -250,6 +250,18 @@
         enabled: true
         state: started
       loop: [heteronetwork-agent.service, heteronetwork-console-proxy.service]
+    - name: Wait for the Agent to synchronize peers before updating another host
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9780/v1/metrics
+        status_code: 200
+        return_content: true
+        timeout: 3
+        use_proxy: false
+      register: hnn_console_agent_health
+      until: hnn_console_agent_health.status | default(0) == 200 and hnn_console_agent_health.json.peer_map_synced | default(false)
+      retries: 60
+      delay: 2
+      when: not ansible_check_mode
     - name: Check both canonical listeners after applying configuration
       ansible.builtin.uri:
         url: 'http://{{ hnn_console_ip }}:{{ item }}/ui/'

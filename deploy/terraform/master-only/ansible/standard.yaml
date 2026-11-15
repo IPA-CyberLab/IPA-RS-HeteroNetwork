@@ -469,11 +469,25 @@
       ansible.builtin.systemd_service:
         name: heteronetwork-keycloak-prepare.service
         state: restarted
-    - name: Restart standard Agent
+    - name: Restart managed standard Agent
+      listen: Restart standard Agent
       ansible.builtin.systemd_service:
         name: heteronetwork-agent.service
         state: restarted
         daemon_reload: true
+    - name: Wait for the standard Agent to synchronize peers
+      listen: Restart standard Agent
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9780/v1/metrics
+        status_code: 200
+        return_content: true
+        timeout: 3
+        use_proxy: false
+      register: hnn_standard_agent_health
+      until: hnn_standard_agent_health.status | default(0) == 200 and hnn_standard_agent_health.json.peer_map_synced | default(false)
+      retries: 60
+      delay: 2
+      when: not ansible_check_mode
     - name: Restart standard kubelet
       ansible.builtin.systemd_service:
         name: kubelet.service

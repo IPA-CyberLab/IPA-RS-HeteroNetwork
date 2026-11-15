@@ -271,11 +271,25 @@
       loop: "{{ hnn_units.stdout_lines | select('match', '^heteronetwork-(control-plane|gateway|signal|stun|relay|keycloak|postgres|console|public-services|kubeadm-autopilot)') | reject('match', '^heteronetwork-console-proxy[.]service\\s') | list }}"
 
   handlers:
-    - name: Restart networking agent
+    - name: Restart managed networking agent
+      listen: Restart networking agent
       ansible.builtin.systemd_service:
         name: heteronetwork-agent.service
         daemon_reload: true
         state: restarted
+    - name: Wait for the managed Agent to synchronize peers
+      listen: Restart networking agent
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9780/v1/metrics
+        status_code: 200
+        return_content: true
+        timeout: 3
+        use_proxy: false
+      register: hnn_master_agent_health
+      until: hnn_master_agent_health.status | default(0) == 200 and hnn_master_agent_health.json.peer_map_synced | default(false)
+      retries: 60
+      delay: 2
+      when: not ansible_check_mode
     - name: Restart kubelet
       ansible.builtin.systemd_service:
         name: kubelet.service
