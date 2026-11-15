@@ -22,8 +22,8 @@ does not itself enable it.
   replay affected path negotiation if the first response was lost; a second
   real-server regression test reproduced and fixed that case. A true replay is
   still rejected, and logs describe endpoint counts rather than server counts.
-  The Agent fix has passed its local regression tests; rollout is pending the
-  tested release candidate.
+  The tested Agent fix was deployed to all five declared nodes, each of which
+  reported the new build and a synchronized peer map.
 - Kubelets on all five hosts read the system resolver file instead of the
   managed resolver file. On several hosts that file had more than three
   nameservers. Repeated `DNSConfigForming`
@@ -32,9 +32,21 @@ does not itself enable it.
   All nodes returned Ready; cluster, public and overlay DNS queries succeeded.
   No existing warning count increased during the two-minute observation after
   repair.
+- The GitOps CoreDNS configuration still listed the retired `10.250.0.8`
+  node as an overlay DNS forwarder. The internal Git mirror and Argo CD were
+  updated to remove it and include the active bootstrap node. This explains
+  probes toward the retired address, but does not establish that it caused the
+  separate client-to-gateway DNS timeout.
 - On `uc-k8sp1`, the four-core HDD host had load above five and elevated disk
   I/O pressure. `etcd` accounted for much of the sampled write activity. This
   establishes contention, not that it caused the browser timeouts below.
+- During the Agent rollout, a Kubernetes API server was restarted by its
+  etcd-backend reconciler. A local administrative SSH tunnel pointed directly
+  to that one API server and a Terraform read received HTTP 403. All five API
+  servers subsequently authorized direct checks. The remaining rollout used
+  the existing HA proxy; the node-retirement CLI now targets that proxy when
+  it creates its own tunnel. The timing is established, while the precise
+  reason for the transient 403 was not conclusively determined.
 
 ## Acceptance and remaining uncertainty
 

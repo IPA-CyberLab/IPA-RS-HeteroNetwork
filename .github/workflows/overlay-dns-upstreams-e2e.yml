@@ -1,0 +1,29 @@
+name: CoreDNS upstream discovery E2E
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'deploy/gitops/cluster-dns/**'
+      - 'scripts/verify-coredns-upstream-reload.py'
+      - '.github/workflows/overlay-dns-upstreams-e2e.yml'
+  pull_request:
+    paths:
+      - 'deploy/gitops/cluster-dns/**'
+      - 'scripts/verify-coredns-upstream-reload.py'
+      - '.github/workflows/overlay-dns-upstreams-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Verify actual CoreDNS reloads added and removed upstreams
+        run: sudo python3 -B scripts/verify-coredns-upstream-reload.py
