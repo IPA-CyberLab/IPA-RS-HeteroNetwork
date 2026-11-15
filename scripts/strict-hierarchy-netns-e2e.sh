@@ -213,7 +213,6 @@ cp "$work/topology.json" "$work/topology-before.json"
 
 curl --config "$work/curl.conf" -fsS "$control_url/v1/admin/policy" \
   | jq '.cluster_policy.overlay_strict_hierarchy = true | {cluster_policy}' >"$work/policy.json"
-python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())' >"$work/strict-started-at"
 enabled=0
 for _ in $(seq 1 45); do
   if curl --config "$work/curl.conf" -fsS -X PUT -H 'Content-Type: application/json' \
@@ -224,6 +223,7 @@ for _ in $(seq 1 45); do
   sleep 1
 done
 [[ "$enabled" == 1 ]] || { echo "compatible Agent heartbeats did not arrive" >&2; exit 1; }
+python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())' >"$work/strict-started-at"
 
 # Strict mode can choose different edges from the topology captured before
 # the policy change. Compare peers against the new, active topology.
