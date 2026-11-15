@@ -142,6 +142,8 @@ spec:
               value: /config/services.json
             - name: RECONCILE_INTERVAL_SECONDS
               value: "5"
+            - name: OVERLAY_VPN_CIDR
+              value: 10.250.0.0/16
           readinessProbe:
             exec:
               command:

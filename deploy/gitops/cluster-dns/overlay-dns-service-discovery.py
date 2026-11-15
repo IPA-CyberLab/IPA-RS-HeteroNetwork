@@ -2,6 +2,7 @@
 """Reconcile Kubernetes service endpoints into the HeteroNetwork DNS zone."""
 
 import ipaddress
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ SERVICE_NAME_LABEL = "kubernetes.io/service-name"
 MAX_DNS_NAMES = 256
 MAX_ADDRESSES_PER_NAME = 16
 MAX_DOCUMENT_BYTES = 64 * 1024
+MAX_COREDNS_UPSTREAMS = 15
 
 
 def normalize_dns_name(value):
@@ -184,6 +186,61 @@ def ready_node_vpn_ips(nodes):
             continue
         result[name] = normalize_ip(raw_address)
     return result
+
+
+def ready_overlay_dns_upstreams(nodes, vpn_cidr):
+    """Select a bounded, stable set of ready nodes on the declared VPN."""
+    network = ipaddress.ip_network(vpn_cidr, strict=True)
+    if network.version != 4:
+        raise ValueError("overlay DNS upstream discovery requires an IPv4 VPN CIDR")
+    addresses = set()
+    for node in nodes:
+        if not object_name(node) or not node_is_ready(node):
+            continue
+        annotation = ((node.get("metadata") or {}).get("annotations") or {}).get(
+            VPN_IP_ANNOTATION
+        )
+        candidates = ([annotation] if annotation else [
+            address.get("address")
+            for address in ((node.get("status") or {}).get("addresses") or [])
+            if address.get("type") == "InternalIP"
+        ])
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            try:
+                address = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if address.version == 4 and address in network and not (
+                    address.is_unspecified or address.is_loopback or address.is_multicast):
+                addresses.add(str(address))
+                break
+    # CoreDNS's forward plugin accepts at most 15 upstreams. Rendezvous-style
+    # stable ranking avoids replacing the whole set as nodes join or leave.
+    selected = sorted(
+        addresses,
+        key=lambda address: (hashlib.sha256(
+            b"heteronetwork-coredns-upstream-v1\0" + address.encode("ascii")
+        ).digest(), address),
+    )[:MAX_COREDNS_UPSTREAMS]
+    return sorted(selected, key=ip_sort_key)
+
+
+def render_coredns_forward(upstreams):
+    if not upstreams or len(upstreams) > MAX_COREDNS_UPSTREAMS:
+        raise ValueError("CoreDNS requires 1-15 overlay DNS upstreams")
+    normalized = normalize_addresses(upstreams, "CoreDNS upstreams")
+    if any(ipaddress.ip_address(value).version != 4 for value in normalized):
+        raise ValueError("CoreDNS overlay upstreams must be IPv4")
+    return (
+        "forward . " + " ".join(normalized) + " {\n"
+        "    policy random\n"
+        "    health_check 2s\n"
+        "    max_fails 1\n"
+        "    max_concurrent 1000\n"
+        "}\n"
+    )
 
 
 def register_name(registrations, managed_names, dns_name, service_key):
@@ -427,10 +484,19 @@ def controller_once(api, rules_path):
     effective, status = build_effective_zone(
         base, services, endpoint_slices, nodes, rules
     )
+    vpn_cidr = os.environ.get("OVERLAY_VPN_CIDR")
+    if not vpn_cidr:
+        raise RuntimeError("OVERLAY_VPN_CIDR is required for DNS upstream discovery")
+    upstreams = ready_overlay_dns_upstreams(nodes, vpn_cidr)
+    status["upstreams"] = {"addresses": upstreams, "state": "ready" if upstreams else "no_ready_nodes"}
     desired = {
         "records.json": canonical_json(effective),
         "status.json": canonical_json(status),
     }
+    # Preserve the last known forwarder list if API connectivity or all node
+    # health reports are lost; never publish an empty CoreDNS forward stanza.
+    if upstreams:
+        desired["forward.conf"] = render_coredns_forward(upstreams)
     current = api.config_map(effective_namespace, effective_name)
     current_data = current.get("data") or {}
     changed = any(current_data.get(key) != value for key, value in desired.items())

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 import yaml
 
 
@@ -147,6 +150,69 @@ class OverlayDnsServiceDiscoveryTests(unittest.TestCase):
         stopped = node("node-stopped", "10.250.0.11")
         stopped["metadata"]["labels"] = {"heteronetwork.io/lifecycle": "stopped"}
         self.assertFalse(discovery.node_is_ready(stopped))
+
+    def test_dns_upstreams_follow_ready_nodes_and_overlay_addresses(self):
+        unannotated = node("node-with-internal-ip", "10.250.0.4")
+        unannotated["metadata"]["annotations"] = {}
+        unannotated["status"]["addresses"] = [
+            {"type": "InternalIP", "address": "192.0.2.1"},
+            {"type": "InternalIP", "address": "10.250.0.4"},
+        ]
+        stopped = node("node-stopped", "10.250.0.8")
+        stopped["metadata"]["labels"] = {"heteronetwork.io/lifecycle": "stopped"}
+        nodes = [self.nodes[0], unannotated, stopped,
+                 node("unready", "10.250.0.5", ready=False),
+                 node("other-network", "192.0.2.2")]
+        self.assertEqual(discovery.ready_overlay_dns_upstreams(nodes, "10.250.0.0/16"),
+                         ["10.250.0.2", "10.250.0.4"])
+        with self.assertRaises(ValueError):
+            discovery.ready_overlay_dns_upstreams(nodes, "not-a-cidr")
+
+    def test_dns_upstream_selection_is_bounded_and_stable_at_1000_nodes(self):
+        nodes = [node(f"node-{index}", f"10.250.{index // 250}.{index % 250 + 1}")
+                 for index in range(1000)]
+        selected = discovery.ready_overlay_dns_upstreams(nodes, "10.250.0.0/16")
+        self.assertEqual(len(selected), 15)
+        self.assertEqual(selected, discovery.ready_overlay_dns_upstreams(list(reversed(nodes)), "10.250.0.0/16"))
+        after = discovery.ready_overlay_dns_upstreams(
+            [item for item in nodes if item["metadata"]["annotations"][discovery.VPN_IP_ANNOTATION] != selected[0]],
+            "10.250.0.0/16",
+        )
+        self.assertEqual(len(after), 15)
+        self.assertEqual(len(set(selected) & set(after)), 14)
+
+    def test_controller_updates_forwarders_and_preserves_them_when_none_are_ready(self):
+        class FakeApi:
+            def __init__(self, nodes):
+                self.nodes = nodes
+                self.data = {}
+            def config_map(self, namespace, name):
+                if namespace == "heteronetwork-system":
+                    return {"data": {"records.json": json.dumps({"schema_version": 1, "records": {}})}}
+                return {"data": self.data}
+            def list_items(self, path):
+                return self.nodes if path == "/api/v1/nodes" else []
+            def patch_config_map_data(self, namespace, name, data):
+                self.data.update(data)
+
+        api = FakeApi(self.nodes[:2])
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(discovery.os.environ, {"OVERLAY_VPN_CIDR": "10.250.0.0/16"}), \
+             patch.object(Path, "touch"):
+            rules = Path(directory) / "rules.json"
+            rules.write_text('{"services": []}')
+            changed, status = discovery.controller_once(api, rules)
+            self.assertTrue(changed)
+            self.assertEqual(status["upstreams"]["addresses"], ["10.250.0.2", "10.250.0.10"])
+            self.assertIn("10.250.0.10", api.data["forward.conf"])
+            api.nodes = [self.nodes[0]]
+            discovery.controller_once(api, rules)
+            self.assertNotIn("10.250.0.10", api.data["forward.conf"])
+            previous = api.data["forward.conf"]
+            api.nodes = []
+            _, status = discovery.controller_once(api, rules)
+            self.assertEqual(status["upstreams"]["state"], "no_ready_nodes")
+            self.assertEqual(api.data["forward.conf"], previous)
 
     def test_missing_service_removes_managed_record(self):
         effective, status = discovery.build_effective_zone(
