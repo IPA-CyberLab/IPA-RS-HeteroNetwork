@@ -529,8 +529,13 @@ def refresh_client_peers(identity, client_id, peer):
                 for marker, label in (
                     ("management proxy request failed", "proxy_transport"),
                     ("no web ui endpoint is cached", "no_cached_endpoint"),
+                    ("no cached web ui endpoint is reachable", "cached_endpoints_unreachable"),
                     ("all cached web ui endpoints failed", "cached_endpoints_failed"),
                     ("no healthy web ui", "no_healthy_endpoint"),
+                    ("bounded overlay topology failed", "overlay_topology"),
+                    ("node request replay cache is full", "request_replay_capacity"),
+                    ("no available vpn ip in pool", "vpn_pool_exhausted"),
+                    ("store error:", "control_plane_store"),
                 ):
                     if marker in lowered:
                         category = label

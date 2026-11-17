@@ -47,6 +47,17 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
         self.assertNotIn("secret-value", str(raised.exception))
         self.assertEqual(opener.open.call_count, 1)
 
+    def test_peer_map_failure_reports_unreachable_cached_control_planes(self):
+        identity = type("Identity", (), {"sign": lambda _, body: b"s" * 64})()
+        opener = unittest.mock.Mock()
+        body = b'{"error":"control-plane client error: no cached Web UI endpoint is reachable: secret-value"}'
+        opener.open.side_effect = verify.urllib.error.HTTPError(
+            "http://10.250.0.5/v1/clients/peers/query", 503, "Unavailable", {}, io.BytesIO(body))
+        with (patch.object(verify.urllib.request, "build_opener", return_value=opener),
+              self.assertRaisesRegex(RuntimeError, "cached_endpoints_unreachable") as raised):
+            verify.refresh_client_peers(identity, "node-a", {"node_id": "node-b", "vpn_ip": "10.250.0.5"})
+        self.assertNotIn("secret-value", str(raised.exception))
+
     def test_generated_identity_exercises_a_non_sponsor_gateway(self):
         gateways = ["node-a", "node-b", "node-c", "node-d"]
         _, _, _, client_id = verify.generate_registration("node-a", gateways)

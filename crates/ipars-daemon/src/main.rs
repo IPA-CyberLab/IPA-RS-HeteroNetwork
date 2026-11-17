@@ -25557,7 +25557,7 @@ mod tests {
             resolve_pending_overlay_paths(
                 &reqwest::Client::new(),
                 &runtime,
-                &[url.clone()],
+                std::slice::from_ref(&url),
                 &mut retries,
             )
             .await;
