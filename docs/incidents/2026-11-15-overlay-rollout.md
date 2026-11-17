@@ -126,6 +126,21 @@ console and every gateway in Chromium with the three-second page-open budget,
 and completed the authenticated-console and isolated control-plane-unavailable
 VPN recovery checks. These checks ran before strict hierarchy was enabled.
 
+On 2026-11-17, an authenticated owner applied the strict hierarchy policy
+through the management API and Terraform. The API confirmed
+`overlay_strict_hierarchy=true`; all five Agents reported a synchronized peer
+map. Another 200 DNS queries from `uc-k8sp5` to `uc-k8sp1` succeeded, with a
+maximum response time of 17.52 ms. A subsequent [live GitHub Actions run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/43999111363)
+passed the hosted-VM VPN, authenticated Chromium, three-second console and
+isolated VPN recovery checks with strict hierarchy enabled.
+
+During the post-activation Terraform check, the local backend was found to
+still reference a tunnel to the bootstrap node's individual API server. It
+returned an HTTP 403 on the Terraform backend state read. The local backend was
+reconfigured to use the existing HA proxy tunnel. Its first state refresh
+returned a timeout; a subsequent targeted plan succeeded and reported no
+changes. The precise causes of those transient API errors remain unconfirmed.
+
 The hierarchy CI uses real WireGuard agents in network namespaces on one
 GitHub-hosted VM, including latency, first-hop loss, a new node and a failed
 conntrack snapshot. The 1,000-node native topology test is an in-memory test;
@@ -136,8 +151,6 @@ Only two existing control-plane/database voters are available. Without another
 independent voter, loss or partition of one side cannot be claimed to preserve
 write quorum. Region and zone are currently unspecified; measured path quality
 is available, but geographic separation has not been inferred from addresses.
-The policy change requires an authenticated HeteroNetwork owner and is not
-complete until that change and the post-activation connectivity test succeed.
 The full, non-targeted Terraform plan also contains other pending resource
 changes. The overlay, issuer and kubelet repairs were applied with individually
 reviewed targets; this does not establish that the entire plan is drift-free.
