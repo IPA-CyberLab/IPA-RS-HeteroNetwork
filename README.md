@@ -53,6 +53,9 @@ private Terraform work directory configured, run:
 ./heteronet-admin node retire NODE_NAME
 ```
 
+Configure independent physical and network failure domains with
+`./heteronet-admin topology`; see the [infrastructure guide](deploy/terraform/master-only/README.md#apply).
+
 The command verifies the offline node's identity and quorum, cordons it, backs
 up Kubernetes etcd before removing its voter, removes network and DNS
 registrations, publishes the inventory through Terraform and Argo CD, and

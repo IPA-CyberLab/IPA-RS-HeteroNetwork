@@ -1,4 +1,10 @@
 {
-  "nodes": {},
+  "nodes": {
+    "uc-k8sp1": {"region": "shared-site", "zone": "shared-room", "network": "main-uplink"},
+    "uc-k8sp2": {"region": "shared-site", "zone": "shared-room", "network": "main-uplink"},
+    "uc-k8s3p": {"region": "shared-site", "zone": "shared-room", "network": "main-uplink"},
+    "uc-k8sp5": {"region": "shared-site", "zone": "shared-room", "network": "main-uplink"},
+    "ichikawap1": {"region": "shared-site", "zone": "shared-room", "network": "ichikawa-uplink"}
+  },
   "remove": []
 }

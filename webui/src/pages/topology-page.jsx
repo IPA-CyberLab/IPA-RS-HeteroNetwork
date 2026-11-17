@@ -109,11 +109,12 @@ export function TopologyPage({
     for (const [nodeId, locality] of Object.entries(localities)) {
       const region = String(locality?.region || "").trim();
       const zone = String(locality?.zone || "").trim();
-      if ([region, zone].some((value) => value && (value.length > 63 || !labelPattern.test(value)))) {
-        setValidationError(new Error("リージョンとゾーンは英小文字・数字・ハイフンで指定してください。"));
+      const network = String(locality?.network || "").trim();
+      if ([region, zone, network].some((value) => value && (value.length > 63 || !labelPattern.test(value)))) {
+        setValidationError(new Error("リージョン・ゾーン・回線は英小文字・数字・ハイフンで指定してください。"));
         return;
       }
-      if (region || zone) localityValues[nodeId] = { ...(region ? { region } : {}), ...(zone ? { zone } : {}) };
+      if (region || zone || network) localityValues[nodeId] = { ...(region ? { region } : {}), ...(zone ? { zone } : {}), ...(network ? { network } : {}) };
     }
     setValidationError(null);
     await onSaveSettings({
@@ -282,11 +283,11 @@ export function TopologyPage({
           <Box>
             階層経由の固定ピア: {policy?.overlay_strict_hierarchy ? "有効" : "無効"}
           </Box>
-          <Header variant="h3" description="分かっている場所のみ指定してください。空欄の場所は不明として扱います。">
+          <Header variant="h3" description="分かっている場所のみ指定してください。回線ドメインは CLI または Terraform で変更します。">
             ノードの場所
           </Header>
           {nodes.map((node) => (
-            <ColumnLayout columns={3} key={node.node_id}>
+            <ColumnLayout columns={4} key={node.node_id}>
               <Box>{nodeName(node.node_id)}</Box>
               <FormField label="リージョン">
                 <Input
@@ -305,6 +306,9 @@ export function TopologyPage({
                     [node.node_id]: { ...current[node.node_id], zone: detail.value },
                   }))}
                 />
+              </FormField>
+              <FormField label="回線ドメイン">
+                <Box>{localities[node.node_id]?.network || "未設定"}</Box>
               </FormField>
             </ColumnLayout>
           ))}

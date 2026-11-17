@@ -34,15 +34,20 @@ resource "kubernetes_labels" "overlay_node_locality" {
   }
   field_manager = "heteronetwork-node-locality"
   force         = false
-  labels = {
-    "topology.kubernetes.io/region" = each.value.region
-    "topology.kubernetes.io/zone"   = each.value.zone
-  }
+  labels = merge(
+    {
+      "topology.kubernetes.io/region" = each.value.region
+      "topology.kubernetes.io/zone"   = each.value.zone
+    },
+    try(each.value.network, null) == null ? {} : {
+      "heteronetwork.io/network-domain" = each.value.network
+    }
+  )
   depends_on = [terraform_data.overlay_locality_validation]
   lifecycle {
     precondition {
       condition = contains(keys(local.overlay_locality_roster), each.key) && alltrue([
-        for label in [each.value.region, each.value.zone] :
+        for label in concat([each.value.region, each.value.zone], try(each.value.network, null) == null ? [] : [each.value.network]) :
         can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", label))
       ])
       error_message = "Each locality must reference an existing overlay host and valid region/zone labels."

@@ -60,8 +60,9 @@ def load_localities(config_path, roster_path):
     desired = {}
     zone_regions = {}
     for name, locality in nodes.items():
-        if not isinstance(locality, dict) or set(locality) != {"region", "zone"}:
-            raise ValueError("each managed locality requires a region and zone")
+        if (not isinstance(locality, dict) or not {"region", "zone"} <= set(locality)
+                or set(locality) - {"region", "zone", "network"}):
+            raise ValueError("each managed locality requires a region and zone and may specify a network domain")
         if any(not isinstance(value, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value)
                for value in locality.values()):
             raise ValueError("locality labels must be lowercase DNS labels of at most 63 characters")

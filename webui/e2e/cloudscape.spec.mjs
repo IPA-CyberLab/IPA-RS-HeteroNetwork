@@ -121,8 +121,9 @@ const overview = {
   },
 };
 
-async function installMockBackend(page) {
+async function installMockBackend(page, { localities } = {}) {
   const localOverview = JSON.parse(JSON.stringify(overview));
+  if (localities) localOverview.cluster_policy.overlay_node_localities = localities;
   const localTopology = JSON.parse(JSON.stringify(topology));
   await page.addInitScript(() => {
     sessionStorage.setItem("heteronetwork_operator_token", "e2e-operator-token");
@@ -422,21 +423,22 @@ test("HeteroNetwork console renders overview and hierarchical topology", async (
 });
 
 test("operators can configure node locality and see measured path cost", async ({ page }) => {
-  await installMockBackend(page);
+  await installMockBackend(page, { localities: { [nodes[0].node.node_id]: { network: "uplink-a" } } });
   await page.goto("/ui/#/topology");
   await expect(page.getByRole("heading", { name: "オーバーレイトポロジー" })).toBeVisible();
+  await expect(page.getByText("uplink-a")).toBeVisible();
   await page.getByRole("tab", { name: "接続" }).click();
   await expect(page.getByRole("cell", { name: "26 ms相当" })).toBeVisible();
   await page.getByLabel("リージョン").first().fill("INVALID!");
   await page.getByRole("button", { name: "設定を保存" }).click();
-  await expect(page.getByText("リージョンとゾーンは英小文字・数字・ハイフンで指定してください。")).toBeVisible();
+  await expect(page.getByText("リージョン・ゾーン・回線は英小文字・数字・ハイフンで指定してください。")).toBeVisible();
   await page.getByLabel("リージョン").first().fill("east");
   await page.getByLabel("ゾーン").first().fill("site-a");
   const saved = page.waitForRequest((request) => request.url().includes("/v1/admin/policy") && request.method() === "PUT");
   await page.getByRole("button", { name: "設定を保存" }).click();
   const request = await saved;
   expect(request.postDataJSON().cluster_policy.overlay_node_localities[nodes[0].node.node_id])
-    .toEqual({ region: "east", zone: "site-a" });
+    .toEqual({ region: "east", zone: "site-a", network: "uplink-a" });
   await expect(page.getByText("階層設定を保存しました。")).toBeVisible();
 });
 

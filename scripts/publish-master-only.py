@@ -12,7 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def files():
-    paths=['.gitignore','README.md','heteronet-admin','scripts/heteronet_admin.py','scripts/test_heteronet_admin.py',
+    paths=['.gitignore','README.md','heteronet-admin','scripts/heteronet_admin.py','scripts/heteronet_topology.py','scripts/test_heteronet_admin.py','scripts/test_heteronet_topology.py','scripts/reconcile-overlay-hierarchy.py','scripts/test_reconcile_overlay_hierarchy.py',
            'scripts/prune_overlay_dns_node.py','scripts/test_prune_overlay_dns_node.py',
            'scripts/prune_node_declarations.py','scripts/test_prune_node_declarations.py',
            'scripts/kubeadm-ha-node.sh','scripts/postgres-ha-node.sh','scripts/postgres-ha-autopilot.sh','scripts/keycloak-autopilot.sh','scripts/master-only-iac.py',

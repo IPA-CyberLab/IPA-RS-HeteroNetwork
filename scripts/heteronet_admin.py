@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retire a lost HeteroNetwork worker across its declared infrastructure."""
+"""Manage HeteroNetwork nodes and infrastructure topology."""
 import argparse
 import base64
 from contextlib import contextmanager
@@ -21,6 +21,7 @@ import tempfile
 import time
 from urllib.parse import urlparse
 import yaml
+import heteronet_topology
 
 from prune_overlay_dns_node import reconcile as reconcile_dns
 from prune_node_declarations import plan as plan_declarations
@@ -582,6 +583,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="kind", required=True)
     node = sub.add_parser("node")
+    heteronet_topology.add_parser(sub, default_work_dir)
     actions = node.add_subparsers(dest="action", required=True)
     remove = actions.add_parser("retire", help="retire a stopped physical worker")
     remove.add_argument("hostname")
@@ -597,6 +599,12 @@ def main():
     remove.add_argument("--dry-run", action="store_true")
     remove.add_argument("--no-push", action="store_true")
     args = parser.parse_args()
+    if args.kind == "topology":
+        try:
+            return heteronet_topology.dispatch(args, default_kubeconfig=default_kubeconfig, kube_tunnel=kube_tunnel)
+        except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+            print("Topology operation stopped: " + str(error), file=sys.stderr)
+            return 1
     if args.kubeconfig is None:
         args.kubeconfig = default_kubeconfig(args.work_dir)
     try:

@@ -1471,6 +1471,9 @@ pub struct OverlayNodeLocality {
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
+    /// Independent network or uplink failure domain, separate from site power.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

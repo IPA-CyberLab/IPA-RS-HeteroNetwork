@@ -163,6 +163,28 @@ API override is removed, and Terraform releases labels it manages. Labels
 owned outside this module are not silently deleted. Taints on dedicated
 control-plane nodes are unchanged.
 
+An optional `network` field identifies a shared network or uplink failure
+domain independently of the physical region and zone. Terraform publishes it
+as `heteronetwork.io/network-domain` and reconciles it into the HeteroNetwork
+policy. A different network label does not imply separate power or physical
+location. The topology prefers separate known uplinks for redundant
+representatives and keeps same-uplink leaf nodes together. Unknown labels do
+not count as independent. These are placement and topology preferences, not a
+guarantee that a partitioned database can retain quorum.
+
+The administrative CLI edits the same Terraform source and can apply it:
+
+```bash
+./heteronet-admin topology list
+./heteronet-admin topology set HOST --region shared-site --zone shared-room --network main-uplink
+./heteronet-admin topology plan --kubeconfig "$TF_VAR_kubeconfig_path"
+./heteronet-admin topology apply --kubeconfig "$TF_VAR_kubeconfig_path"
+```
+
+`set` accepts individual fields and `--clear-network`; `remove` explicitly
+removes the managed locality. `plan` and `apply` refuse unrelated Terraform
+changes. `apply` requires the same private owner token file described above.
+
 The `master-only-iac.py` wrapper checks the live hierarchy policy and schedules
 reconciliation for drift when that token is supplied. Its `check` action
 reports a null hierarchy result and exits 2 if no token was supplied, rather

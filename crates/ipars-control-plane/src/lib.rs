@@ -7609,15 +7609,19 @@ fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneErr
                 .as_str()
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-            || (locality.region.is_none() && locality.zone.is_none())
+            || (locality.region.is_none() && locality.zone.is_none() && locality.network.is_none())
         {
             return Err(ControlPlaneError::InvalidClusterPolicy(
                 "invalid node or empty overlay locality".to_string(),
             ));
         }
-        for label in [locality.region.as_deref(), locality.zone.as_deref()]
-            .into_iter()
-            .flatten()
+        for label in [
+            locality.region.as_deref(),
+            locality.zone.as_deref(),
+            locality.network.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if label.is_empty()
                 || label.len() > 63
@@ -8240,7 +8244,10 @@ fn overlay_locality_epoch(
         material.extend_from_slice(id);
         for tag in &node.tags {
             let value = tag.as_str();
-            if value.starts_with("topology-region-") || value.starts_with("topology-zone-") {
+            if value.starts_with("topology-region-")
+                || value.starts_with("topology-zone-")
+                || value.starts_with("topology-network-")
+            {
                 material.extend_from_slice(&(value.len() as u64).to_be_bytes());
                 material.extend_from_slice(value.as_bytes());
             }
@@ -8252,6 +8259,7 @@ fn overlay_locality_epoch(
             node.as_str(),
             locality.region.as_deref().unwrap_or(""),
             locality.zone.as_deref().unwrap_or(""),
+            locality.network.as_deref().unwrap_or(""),
         ] {
             material.extend_from_slice(&(value.len() as u64).to_be_bytes());
             material.extend_from_slice(value.as_bytes());
@@ -9940,6 +9948,7 @@ mod tests {
             ipars_types::OverlayNodeLocality {
                 region: Some("Tokyo West".into()),
                 zone: None,
+                network: None,
             },
         );
         assert!(validate_cluster_policy(&policy).is_err());
@@ -9949,6 +9958,24 @@ mod tests {
             .unwrap_or_else(|| panic!("locality was inserted"))
             .region = Some("tokyo-west".into());
         assert!(validate_cluster_policy(&policy).is_ok());
+        policy
+            .overlay_node_localities
+            .get_mut(&node_id("locality-node"))
+            .unwrap_or_else(|| panic!("locality was inserted"))
+            .network = Some("Bad Network".into());
+        assert!(validate_cluster_policy(&policy).is_err());
+        policy
+            .overlay_node_localities
+            .get_mut(&node_id("locality-node"))
+            .unwrap_or_else(|| panic!("locality was inserted"))
+            .network = Some("uplink-a".into());
+        assert!(validate_cluster_policy(&policy).is_ok());
+        let serialized = serde_json::to_value(&policy)
+            .unwrap_or_else(|error| panic!("serialize locality: {error}"));
+        assert_eq!(
+            serialized["overlay_node_localities"][node_id("locality-node").as_str()]["network"],
+            "uplink-a"
+        );
     }
 
     #[test]

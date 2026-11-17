@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
-    targetRevision: cfa16a90eb390c98ef5dfbbac52194b18dd4daf9
+    targetRevision: d2e4ef46e55ef5d87a98d031646ebc5b44a501aa
     path: deploy/helm/heterocloud-flash
     helm:
       releaseName: heterocloud-flash
@@ -21,8 +21,9 @@ spec:
           replicaCount: 2
           image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash-ssh-api:961d8e6e18b0c7b92de870e80e29e9e34bd5ae96@sha256:aea0c757952d556ee4df49a0fbe7b90a2ebbe0c8a652ba23939fd3c0766ed9e5"
         controller:
-          image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash-controller:cfa16a90eb390c98ef5dfbbac52194b18dd4daf9@sha256:5c6049002c4f68825a22a2f1cac99f8910d3d58cdd4a788ececbbf0dec41fc6c"
+          image: "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash-controller:d2e4ef46e55ef5d87a98d031646ebc5b44a501aa@sha256:4637137c1a5ba32b4aade30c232f4be7061e461e7dba8c6c4e05d38da3a35f81"
           zoneSpread: preferred
+          networkSpread: preferred
         publicDomain: flash.heterocloud.mizuame.app
         workloadIdentity:
           endpoint: https://heterocloud.mizuame.app/

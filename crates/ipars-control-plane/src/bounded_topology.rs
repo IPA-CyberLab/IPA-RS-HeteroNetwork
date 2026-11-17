@@ -421,7 +421,7 @@ impl BoundedTopology {
         let mut edge_placements = BTreeMap::<TopologyEdge, BTreeSet<TopologyEdgePlacement>>::new();
         let mut reserved_representative_degree = BTreeMap::new();
 
-        add_leaf_cycles(&hierarchy, &mut adjacency, &mut edge_placements);
+        add_leaf_cycles(&hierarchy, &mut adjacency, &mut edge_placements, &locality);
         allocate_representatives_and_hierarchy_edges(
             &mut hierarchy,
             config,
@@ -1159,6 +1159,7 @@ impl HierarchyGroup {
 struct TopologyLocality {
     region: String,
     zone: String,
+    network: String,
 }
 
 /// Topology labels are explicit join-token tags; missing data is never
@@ -1184,7 +1185,11 @@ fn topology_locality(
             );
             let zone =
                 configured.map_or_else(|| label("topology-zone-"), |value| value.zone.as_deref());
-            if region.is_none() && zone.is_none() {
+            let network = configured.map_or_else(
+                || label("topology-network-"),
+                |value| value.network.as_deref(),
+            );
+            if region.is_none() && zone.is_none() && network.is_none() {
                 return None;
             }
             Some((
@@ -1192,6 +1197,7 @@ fn topology_locality(
                 TopologyLocality {
                     region: region.unwrap_or("<unknown>").to_string(),
                     zone: zone.unwrap_or("<unknown>").to_string(),
+                    network: network.unwrap_or("<unknown>").to_string(),
                 },
             ))
         })
@@ -1208,6 +1214,7 @@ fn build_hierarchy(
     }
 
     let mut groups = Vec::new();
+    let network_aware = locality.values().any(|hint| hint.network != "<unknown>");
     build_hierarchy_group(
         node_ids.to_vec(),
         None,
@@ -1217,6 +1224,7 @@ fn build_hierarchy(
         Vec::new(),
         config,
         locality,
+        network_aware,
         &mut groups,
     )?;
     groups.sort_by(|left, right| {
@@ -1237,6 +1245,7 @@ fn build_hierarchy_group(
     prefix: Vec<(usize, usize)>,
     config: &BoundedTopologyConfig,
     locality: &BTreeMap<NodeId, TopologyLocality>,
+    network_aware: bool,
     groups: &mut Vec<HierarchyGroup>,
 ) -> Result<(), BoundedTopologyError> {
     node_ids.sort();
@@ -1257,7 +1266,13 @@ fn build_hierarchy_group(
         let mut buckets = BTreeMap::<usize, Vec<NodeId>>::new();
         for node_id in &node_ids {
             buckets
-                .entry(hash_prefix_digit(node_id, probe, config, locality))
+                .entry(hash_prefix_digit(
+                    node_id,
+                    probe,
+                    config,
+                    locality,
+                    network_aware,
+                ))
                 .or_default()
                 .push(node_id.clone());
         }
@@ -1301,6 +1316,7 @@ fn build_hierarchy_group(
             child_prefix,
             config,
             locality,
+            network_aware,
             groups,
         )?;
     }
@@ -1312,6 +1328,7 @@ fn hash_prefix_digit(
     hash_depth: usize,
     config: &BoundedTopologyConfig,
     locality: &BTreeMap<NodeId, TopologyLocality>,
+    network_aware: bool,
 ) -> usize {
     let mut material = Vec::new();
     append_hash_field(&mut material, b"ipars-hierarchy-prefix");
@@ -1321,7 +1338,7 @@ fn hash_prefix_digit(
     // Eight prefix digits per locality level keep nodes with the same
     // declared region/zone together without a cluster-wide probing mesh.
     // After those digits, node IDs provide the ordinary balanced split.
-    if !locality.is_empty() && hash_depth < 16 {
+    if !locality.is_empty() && (hash_depth < 16 || (network_aware && hash_depth < 24)) {
         let hint = locality.get(node_id);
         let region = hint.map_or("<unknown>", |value| value.region.as_str());
         append_hash_field(&mut material, region.as_bytes());
@@ -1334,6 +1351,13 @@ fn hash_prefix_digit(
             let zone = hint.map_or("<unknown>", |value| value.zone.as_str());
             append_hash_field(&mut material, zone.as_bytes());
             if zone == "<unknown>" {
+                append_hash_field(&mut material, node_id.as_str().as_bytes());
+            }
+        }
+        if hash_depth >= 16 {
+            let network = hint.map_or("<unknown>", |value| value.network.as_str());
+            append_hash_field(&mut material, network.as_bytes());
+            if network == "<unknown>" {
                 append_hash_field(&mut material, node_id.as_str().as_bytes());
             }
         }
@@ -1359,15 +1383,35 @@ fn add_leaf_cycles(
     hierarchy: &[HierarchyGroup],
     adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
     edge_placements: &mut BTreeMap<TopologyEdge, BTreeSet<TopologyEdgePlacement>>,
+    locality: &BTreeMap<NodeId, TopologyLocality>,
 ) {
     for group in hierarchy
         .iter()
         .filter(|group| group.child_block_ids.is_empty())
     {
+        let mut ordered = group.node_ids.clone();
+        if ordered.iter().any(|node| {
+            locality
+                .get(node)
+                .is_some_and(|hint| hint.network != "<unknown>")
+        }) {
+            ordered.sort_by_key(|node| {
+                let hint = locality.get(node);
+                let region = hint.map_or("<unknown>", |value| value.region.as_str());
+                let zone = hint.map_or("<unknown>", |value| value.zone.as_str());
+                let network = hint.map_or("<unknown>", |value| value.network.as_str());
+                (
+                    region.to_string(),
+                    zone.to_string(),
+                    network.to_string(),
+                    node.clone(),
+                )
+            });
+        }
         add_placed_cycle(
             adjacency,
             edge_placements,
-            &group.node_ids,
+            &ordered,
             TopologyEdgePlacement {
                 level: group.depth,
                 plane: 0,
@@ -1545,7 +1589,7 @@ fn select_group_representatives(
                                         && right.region != "<unknown>"
                                         && left.region != right.region =>
                                 {
-                                    2
+                                    3
                                 }
                                 (Some(left), Some(right))
                                     if left.region != "<unknown>"
@@ -1553,6 +1597,13 @@ fn select_group_representatives(
                                         && right.zone != "<unknown>"
                                         && left.region == right.region
                                         && left.zone != right.zone =>
+                                {
+                                    2
+                                }
+                                (Some(left), Some(right))
+                                    if left.network != "<unknown>"
+                                        && right.network != "<unknown>"
+                                        && left.network != right.network =>
                                 {
                                     1
                                 }
@@ -1627,6 +1678,7 @@ fn topology_epoch(
     append_hash_field(&mut material, config.block_size.to_string().as_bytes());
     append_hash_field(&mut material, config.permutation_seed.as_bytes());
     append_hash_field(&mut material, node_ids.len().to_string().as_bytes());
+    let network_aware = locality.values().any(|hint| hint.network != "<unknown>");
     for node_id in node_ids {
         append_hash_field(&mut material, node_id.as_str().as_bytes());
         if !locality.is_empty() {
@@ -1641,6 +1693,13 @@ fn topology_epoch(
                 hint.map_or("<unknown>", |value| value.zone.as_str())
                     .as_bytes(),
             );
+            if network_aware {
+                append_hash_field(
+                    &mut material,
+                    hint.map_or("<unknown>", |value| value.network.as_str())
+                        .as_bytes(),
+                );
+            }
         }
     }
     cryptographic_hash_u64(&material)
@@ -2192,6 +2251,7 @@ mod tests {
             OverlayNodeLocality {
                 region: Some("override-region".to_string()),
                 zone: Some("override-zone".to_string()),
+                network: None,
             },
         );
         let overridden = BoundedTopology::synthesize(
@@ -2268,6 +2328,7 @@ mod tests {
                     TopologyLocality {
                         region: if index < 4 { "east" } else { "west" }.to_string(),
                         zone: "one".to_string(),
+                        network: "<unknown>".to_string(),
                     },
                 )
             })
@@ -2289,6 +2350,135 @@ mod tests {
     }
 
     #[test]
+    fn network_partition_preserves_connectivity_within_the_shared_uplink() {
+        let mut nodes = records(5);
+        for (index, node) in nodes.iter_mut().enumerate() {
+            node.tags
+                .insert(Tag::from_string("topology-region-shared-site"));
+            node.tags
+                .insert(Tag::from_string("topology-zone-shared-room"));
+            node.tags.insert(Tag::from_string(if index < 4 {
+                "topology-network-main"
+            } else {
+                "topology-network-independent"
+            }));
+        }
+        let config = BoundedTopologyConfig::new(4).with_locality_aware(true);
+        let topology = BoundedTopology::synthesize(&nodes, &config)
+            .unwrap_or_else(|error| panic!("network topology: {error}"));
+        assert!(topology.invariants().are_satisfied());
+        let surviving = nodes[..4]
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        for source in &surviving {
+            let mut visited = BTreeSet::from([source.clone()]);
+            let mut queue = VecDeque::from([source.clone()]);
+            while let Some(current) = queue.pop_front() {
+                for neighbor in topology.neighbors(&current).into_iter().flatten() {
+                    if surviving.contains(neighbor) && visited.insert(neighbor.clone()) {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+            assert_eq!(
+                visited, surviving,
+                "the main uplink must remain connected after the other uplink is cut"
+            );
+        }
+        let before = topology.topology_epoch();
+        nodes[4]
+            .tags
+            .retain(|tag| !tag.as_str().starts_with("topology-network-"));
+        nodes[4]
+            .tags
+            .insert(Tag::from_string("topology-network-main"));
+        let changed = BoundedTopology::synthesize(&nodes, &config)
+            .unwrap_or_else(|error| panic!("changed network topology: {error}"));
+        assert_ne!(before, changed.topology_epoch());
+    }
+
+    #[test]
+    fn representatives_prefer_different_uplinks_within_one_room() {
+        let nodes = records(8);
+        let candidates = nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<Vec<_>>();
+        let adjacency = candidates
+            .iter()
+            .cloned()
+            .map(|node| (node, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        let locality = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                (
+                    node.clone(),
+                    TopologyLocality {
+                        region: "shared-site".into(),
+                        zone: "shared-room".into(),
+                        network: if index < 4 { "main" } else { "independent" }.into(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let representatives = select_group_representatives(
+            "network-diversity",
+            &candidates,
+            1,
+            &BTreeMap::new(),
+            &adjacency,
+            &BoundedTopologyConfig::new(4),
+            &locality,
+        )
+        .unwrap_or_else(|error| panic!("representative selection: {error}"));
+        assert_ne!(
+            locality[representatives[0].node_id()].network,
+            locality[representatives[1].node_id()].network
+        );
+    }
+
+    #[test]
+    fn thousand_node_network_groups_remain_connected_after_a_split() {
+        let mut nodes = records(1000);
+        for (index, node) in nodes.iter_mut().enumerate() {
+            node.tags.insert(Tag::from_string("topology-region-site"));
+            node.tags.insert(Tag::from_string("topology-zone-room"));
+            node.tags.insert(Tag::from_string(if index < 500 {
+                "topology-network-main"
+            } else {
+                "topology-network-other"
+            }));
+        }
+        let config = BoundedTopologyConfig::new(4).with_locality_aware(true);
+        let topology = BoundedTopology::synthesize(&nodes, &config)
+            .unwrap_or_else(|error| panic!("network topology: {error}"));
+        assert!(topology.invariants().are_satisfied());
+        for group in [&nodes[..500], &nodes[500..]] {
+            let surviving = group
+                .iter()
+                .map(|node| node.node_id.clone())
+                .collect::<BTreeSet<_>>();
+            let first = group[0].node_id.clone();
+            let mut visited = BTreeSet::from([first.clone()]);
+            let mut queue = VecDeque::from([first]);
+            while let Some(current) = queue.pop_front() {
+                for neighbor in topology.neighbors(&current).into_iter().flatten() {
+                    if surviving.contains(neighbor) && visited.insert(neighbor.clone()) {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+            assert_eq!(
+                visited, surviving,
+                "an uplink group must remain connected after a split"
+            );
+        }
+    }
+
+    #[test]
     fn missing_locality_is_not_treated_as_a_shared_failure_domain() {
         let nodes = records(3);
         let config = BoundedTopologyConfig::new(4).with_locality_aware(true);
@@ -2300,11 +2490,12 @@ mod tests {
             TopologyLocality {
                 region: "east".into(),
                 zone: "one".into(),
+                network: "<unknown>".into(),
             },
         );
         let prefix = |node: &NodeId, hints: &BTreeMap<NodeId, TopologyLocality>, start, end| {
             (start..end)
-                .map(|depth| hash_prefix_digit(node, depth, &config, hints))
+                .map(|depth| hash_prefix_digit(node, depth, &config, hints, false))
                 .collect::<Vec<_>>()
         };
         assert_ne!(
@@ -2317,6 +2508,7 @@ mod tests {
                 TopologyLocality {
                     region: "east".into(),
                     zone: "<unknown>".into(),
+                    network: "<unknown>".into(),
                 },
             );
         }
@@ -3477,7 +3669,12 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let mut edge_placements = BTreeMap::new();
         let mut reserved_degree = BTreeMap::new();
-        add_leaf_cycles(&hierarchy, &mut adjacency, &mut edge_placements);
+        add_leaf_cycles(
+            &hierarchy,
+            &mut adjacency,
+            &mut edge_placements,
+            &BTreeMap::new(),
+        );
         allocate_representatives_and_hierarchy_edges(
             &mut hierarchy,
             &config,

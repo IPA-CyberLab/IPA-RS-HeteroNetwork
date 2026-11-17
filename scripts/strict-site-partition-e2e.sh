@@ -19,8 +19,8 @@ policy = json.loads((root / 'site-policy.json').read_text())['cluster_policy']
 localities = {}
 for index in range(1, 7):
     node = json.loads((root / f'status-{index}.json').read_text())['node_id']
-    localities[node] = {'region': 'east' if index <= 3 else 'west',
-                        'zone': 'site-a' if index <= 3 else 'site-b'}
+    localities[node] = {'region': 'shared-site', 'zone': 'shared-room',
+                        'network': 'main-uplink' if index <= 4 else 'other-uplink'}
 policy['overlay_node_localities'] = localities
 (root / 'site-policy.json').write_text(json.dumps({'cluster_policy': policy}))
 (root / 'site-started-at').write_text(datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -28,7 +28,9 @@ PY
   chmod 600 "$work/site-policy.json"
   curl --config "$work/curl.conf" -fsS -X PUT -H 'Content-Type: application/json' \
     --data-binary @"$work/site-policy.json" "$control_url/v1/admin/policy" >"$work/site-policy-result.json"
-  jq -e '.cluster_policy.overlay_strict_hierarchy and (.cluster_policy.overlay_node_localities | length) == 6' \
+  jq -e '.cluster_policy.overlay_strict_hierarchy and (.cluster_policy.overlay_node_localities | length) == 6 and
+         ([.cluster_policy.overlay_node_localities[].zone] | unique) == ["shared-room"] and
+         ([.cluster_policy.overlay_node_localities[].network] | unique | length) == 2' \
     "$work/site-policy-result.json" >/dev/null
   changed=0
   for _ in $(seq 1 60); do
@@ -63,16 +65,16 @@ PY
     [[ "$ready" == 1 ]] || { echo "agent $i did not synchronize site-aware topology" >&2; return 1; }
   done
 
-  # Choose real topology edges within each site and across sites. This checks
-  # intra-site communication without relying on a path through the other site.
+  # The nodes share a physical site; choose edges within each uplink and
+  # across uplinks. This checks local communication during a network split.
   mapfile -t site_pairs < <(python3 - "$work" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 ids = {json.loads((root / f'status-{i}.json').read_text())['node_id']: i for i in range(1, 7)}
 edges = [(ids[e['source']], ids[e['target']]) for e in json.loads((root / 'site-topology.json').read_text())['edges']]
-for predicate in (lambda a,b: a <= 3 and b <= 3,
-                  lambda a,b: a > 3 and b > 3,
-                  lambda a,b: (a <= 3) != (b <= 3)):
+for predicate in (lambda a,b: a <= 4 and b <= 4,
+                  lambda a,b: a > 4 and b > 4,
+                  lambda a,b: (a <= 4) != (b <= 4)):
     edge = next(((a,b) for a,b in edges if predicate(a,b)), None)
     if edge is None:
         raise SystemExit('site-aware topology lacks a required physical edge')
@@ -94,7 +96,7 @@ PY
   done
   for i in 1 2 3 4 5 6; do
     for j in 1 2 3 4 5 6; do
-      if (( (i <= 3 && j > 3) || (i > 3 && j <= 3) )); then
+      if (( (i <= 4 && j > 4) || (i > 4 && j <= 4) )); then
         ip netns exec "${namespaces[i - 1]}" iptables -I OUTPUT 1 \
           -d "${subnet}.$((j + 1))" -p udp --dport 51820 \
           -m comment --comment hns-site-partition-e2e -j DROP
@@ -107,6 +109,22 @@ PY
     ip netns exec "${namespaces[src - 1]}" ping -n -q -c 2 -W 2 "$vpn" >/dev/null \
       || { echo 'intra-site communication failed during partition' >&2; return 1; }
   done
+  # Exercise all four nodes on the shared uplink, including paths that need
+  # more than a single physical edge. The control plane remains reachable.
+  for src in 1 2 3 4; do
+    for dst in 1 2 3 4; do
+      (( src == dst )) && continue
+      vpn="$(jq -r '.vpn_ip' "$work/status-${dst}.json")"
+      ready=0
+      for _ in $(seq 1 20); do
+        if ip netns exec "${namespaces[src - 1]}" ping -n -q -c 1 -W 1 "$vpn" >/dev/null 2>&1; then
+          ready=1; break
+        fi
+        sleep 1
+      done
+      [[ "$ready" == 1 ]] || { echo "same-uplink path $src to $dst did not recover" >&2; return 1; }
+    done
+  done
   read -r src dst <<<"${site_pairs[2]}"
   vpn="$(jq -r '.vpn_ip' "$work/status-${dst}.json")"
   if ip netns exec "${namespaces[src - 1]}" ping -n -q -c 3 -W 1 "$vpn" >/dev/null 2>&1; then
@@ -117,7 +135,7 @@ PY
   (( count > 0 )) || { echo 'the cross-site drop rule saw no traffic' >&2; return 1; }
   for i in 1 2 3 4 5 6; do
     for j in 1 2 3 4 5 6; do
-      if (( (i <= 3 && j > 3) || (i > 3 && j <= 3) )); then
+      if (( (i <= 4 && j > 4) || (i > 4 && j <= 4) )); then
         ip netns exec "${namespaces[i - 1]}" iptables -D OUTPUT \
           -d "${subnet}.$((j + 1))" -p udp --dport 51820 \
           -m comment --comment hns-site-partition-e2e -j DROP
@@ -132,5 +150,5 @@ PY
     sleep 1
   done
   [[ "$ready" == 1 ]] || { echo 'cross-site traffic did not recover after partition healed' >&2; return 1; }
-  echo 'site partition E2E passed: real WireGuard, intra-site continuity, blocked inter-site traffic, and recovery'
+  echo 'uplink partition E2E passed: real WireGuard, same-room domains, local continuity, blocked inter-uplink traffic, and recovery'
 }
