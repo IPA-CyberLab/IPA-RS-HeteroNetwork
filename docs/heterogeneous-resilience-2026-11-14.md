@@ -57,6 +57,27 @@ failures and still refuses to install an inconsistent path. The acceptance
 test records a sanitized category for HTTP failures and still fails on the
 first error; it does not hide the incident with retries.
 
+The same 503 reproduced after deploying the retry fix only to `uc-k8sp2` in
+[the targeted live run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44028570311).
+A further [targeted run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44029108961)
+failed while an independent probe on that host reported both control-plane
+endpoints unreachable from 06:10:49 to 06:10:58 UTC. Another gap was observed
+from 06:11:05 to 06:11:14 UTC, immediately after test client removal. These
+times are bounded by the probes' three-second timeout, not packet capture.
+Each node insertion and deletion advances the cluster-wide routing epoch; on
+epoch changes the agent currently invalidates all on-demand routes, not just
+routes affected by that client. Agent logs show overlay peer proxies restarting
+in the same interval. This behavior is a plausible contributor to the outage,
+but has not yet been proven as its sole cause. The epoch-mismatch retry fix
+alone must not be represented as resolving this 503 or as a guarantee that
+enrolling a client cannot interrupt unrelated routes.
+
+The independently tested retry fix was subsequently deployed through the
+checksum-pinned Terraform/Ansible rollout to all five active nodes, one at a
+time. All five Kubernetes nodes and all five Flash services reported ready
+afterward. This is a fix for the separate discarded-retry defect; the
+client-enrollment interruption above remains open.
+
 The [two-voter DCS partition E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44024432794)
 used the production etcd version in isolated network namespaces. After all
 peer TCP traffic was blocked and packet drops observed, neither voter accepted
