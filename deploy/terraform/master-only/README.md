@@ -153,7 +153,8 @@ the hostnames in `overlay-boot-peers.json`. For example, a known host can be
 entered as `"host-a": {"region": "east", "zone": "site-a"}` under `nodes`.
 Both fields must be lowercase DNS labels. Use one zone only for machines that
 share the same relevant site failure domain; do not infer independence from
-hostnames or IP addresses. Omit unknown nodes. Terraform applies those labels
+hostnames or IP addresses. Zone labels must be unique across regions. Omit
+unknown nodes. Terraform applies those labels
 to Kubernetes Nodes and reconciles the corresponding HeteroNetwork node IDs
 without overwriting unrelated locality entries. Existing labels owned by
 another field manager are not forcibly taken over. To remove a previously

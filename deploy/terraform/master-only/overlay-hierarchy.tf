@@ -13,6 +13,14 @@ resource "terraform_data" "overlay_locality_validation" {
       ])
       error_message = "Locality removals must be unique known hosts that are not also assigned a locality."
     }
+    precondition {
+      condition = alltrue(flatten([
+        for _, left in local.declared_node_localities.nodes : [
+          for _, right in local.declared_node_localities.nodes : left.zone != right.zone || left.region == right.region
+        ]
+      ]))
+      error_message = "A zone label must not be reused across regions."
+    }
   }
 }
 

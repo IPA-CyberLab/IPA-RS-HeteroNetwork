@@ -105,6 +105,8 @@ class HierarchyPolicyTest(unittest.TestCase):
                 {"nodes": {"host-a": {"region": "east", "zone": "site-a"}}, "remove": ["host-a"]},
                 {"nodes": {}, "remove": ["host-b", "host-b"]},
                 {"nodes": {"host-a": {"region": "east"}}, "remove": []},
+                {"nodes": {"host-a": {"region": "east", "zone": "site-a"},
+                           "host-b": {"region": "west", "zone": "site-a"}}, "remove": []},
             ):
                 localities.write_text(json.dumps(invalid))
                 with self.assertRaises(ValueError):

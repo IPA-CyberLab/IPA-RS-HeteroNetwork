@@ -58,12 +58,16 @@ def load_localities(config_path, roster_path):
             for value in hosts.values()) or len(set(hosts.values())) != len(hosts)):
         raise ValueError("invalid or duplicate node ID in overlay roster")
     desired = {}
+    zone_regions = {}
     for name, locality in nodes.items():
         if not isinstance(locality, dict) or set(locality) != {"region", "zone"}:
             raise ValueError("each managed locality requires a region and zone")
         if any(not isinstance(value, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value)
                for value in locality.values()):
             raise ValueError("locality labels must be lowercase DNS labels of at most 63 characters")
+        previous_region = zone_regions.setdefault(locality["zone"], locality["region"])
+        if previous_region != locality["region"]:
+            raise ValueError("a zone label must not be reused across regions")
         desired[hosts[name]] = locality
     return desired, {hosts[name] for name in removed}
 

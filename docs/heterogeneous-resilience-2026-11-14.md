@@ -5,6 +5,41 @@ or networks are in different buildings, regions, power feeds, or ISPs. The
 Kubernetes nodes do not currently declare region or zone labels. Do not infer
 geographic independence from hostnames or IP addresses.
 
+## Update: 2026-11-17
+
+The infrastructure module now accepts explicitly verified site assignments in
+`node-localities.json` and applies them to Kubernetes and the HeteroNetwork
+hierarchy. No assignment was inferred or applied while the physical sites are
+unknown. Unknown nodes are left untouched; only explicitly listed removals
+remove a HeteroNetwork override.
+
+Flash controller revision `cfa16a90eb390c98ef5dfbbac52194b18dd4daf9` was
+rolled out with zone spreading in `preferred` mode. Existing service
+generations are left unchanged to avoid an involuntary restart; multi-replica
+stateless services use the new policy on their next generation. The controller
+reached two ready replicas, all five existing Flash services remained ready,
+and their Pod UIDs and restart counts did not change during the rollout. The
+optional `required` mode leaves excess replicas pending without two eligible
+zones; it is not enabled in production. A single persistent ReadWriteOnce home
+is not made into a multi-writer by this policy.
+
+[Flash's isolated scheduler E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/44020856579)
+tested unknown zones, site unavailability and recovery using two real kind
+workers. [HeteroNetwork's isolated E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44020527068)
+tested six real WireGuard agents with synthetic site labels, dropped traffic
+between sites, verified local communication and checked recovery after healing.
+The control plane remained reachable during that test; it does not establish
+database quorum or storage availability during a real site partition.
+
+Two live VPN/browser runs failed before handshake because the acceptance
+client selected the cheapest gateway independently of the gateway placed first
+by the control plane. In strict mode only the assigned gateway has that client
+peer. Regression tests reproduced the mismatch; the acceptance client now
+uses the assigned first gateway, matching the native client bootstrap.
+[A subsequent live run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44022708170)
+passed authentication and the three-second console budget. This was a test
+client correction, not proof that every native-client failover case works.
+
 ## Public gateways
 
 - The two existing application workers, `uc-k8sp5` and `ichikawap1`, terminate
