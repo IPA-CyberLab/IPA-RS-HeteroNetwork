@@ -78,9 +78,20 @@ done
 ctl "$endpoints" put site-partition-check before >/dev/null
 for i in 1 2; do
   other=3; (( i == 2 )) && other=2
+  # etcd uses long-lived bidirectional peer streams, including replies from
+  # source port 2380 to an ephemeral destination port. Block every TCP packet
+  # between voters rather than only packets addressed to port 2380.
   ip netns exec "${namespaces[i - 1]}" iptables -I OUTPUT 1 -p tcp \
-    -d "${subnet}.${other}" --dport 2380 -m comment --comment hnn-dcs-partition -j DROP
+    -d "${subnet}.${other}" -m comment --comment hnn-dcs-partition -j DROP
 done
+sleep 3
+blocked=0
+for i in 1 2; do
+  count="$(ip netns exec "${namespaces[i - 1]}" iptables -nvx -L OUTPUT \
+    | awk '/hnn-dcs-partition/ {sum += $1} END {print sum+0}')"
+  blocked=$((blocked + count))
+done
+(( blocked > 0 )) || { echo 'the DCS partition rules did not block peer traffic' >&2; exit 1; }
 for i in 1 2; do
   if ctl "http://${subnet}.$((i + 1)):2379" put site-partition-check "unsafe-${i}" >/dev/null 2>&1; then
     echo "isolated DCS member $i accepted a write without quorum" >&2; exit 1
@@ -89,7 +100,7 @@ done
 for i in 1 2; do
   other=3; (( i == 2 )) && other=2
   ip netns exec "${namespaces[i - 1]}" iptables -D OUTPUT -p tcp \
-    -d "${subnet}.${other}" --dport 2380 -m comment --comment hnn-dcs-partition -j DROP
+    -d "${subnet}.${other}" -m comment --comment hnn-dcs-partition -j DROP
 done
 ready=0
 for _ in $(seq 1 45); do
