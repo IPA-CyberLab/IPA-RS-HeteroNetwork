@@ -17,6 +17,21 @@ describe the known topology, not independence from a common power failure.
 Terraform plan and apply operations. The management API requires an owner
 token to apply the declared HeteroNetwork policy.
 
+The network-aware control-plane binary has been rolled out serially and the
+Kubernetes labels are live. The HeteroNetwork locality policy still requires
+owner authentication and has not been verified as applied; do not treat its
+VPN route preferences as active until `reconcile-overlay-hierarchy.py --check`
+succeeds. The matching Agent binary and topology display have also been rolled
+out serially to all five nodes. The canonical gateway served the same UI bundle
+as the repository, all five nodes were Ready, and all six Flash services were
+ready after rollout.
+
+A transient Kubernetes API tunnel error interrupted Terraform while recording
+the Agent rollout. The remote state already contained the three completed
+control-plane node updates; a fresh targeted plan created only the remaining
+console configuration. That apply completed, with no force-unlock or state
+overwrite.
+
 Flash controller revision `d2e4ef46e55ef5d87a98d031646ebc5b44a501aa` is
 deployed with physical-zone and network-domain spreading independently set to
 `preferred`. The two controller Pods became ready and the five existing user
@@ -35,7 +50,10 @@ uplink groups in one room. It cut cross-uplink traffic, tested communication
 inside each group, and verified connectivity after restoring the link. The
 control plane remained reachable: this does not prove full database or
 application availability during a production partition. A 1,000-node topology
-test is a graph model, not a 1,000-machine production load test.
+test is a graph model, not a 1,000-machine production load test. A further
+[mixed-membership run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44060095098)
+verified that four declared same-uplink nodes remain mutually connected when
+additional peers have no declared locality.
 
 ## Update: 2026-11-17
 
