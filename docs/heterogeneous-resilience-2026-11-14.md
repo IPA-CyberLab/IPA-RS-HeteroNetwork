@@ -1,13 +1,45 @@
 # Current heterogeneous failure handling
 
-This is the observed configuration on 2026-11-14, not a guarantee that nodes
-or networks are in different buildings, regions, power feeds, or ISPs. The
-Kubernetes nodes do not currently declare region or zone labels. Do not infer
-geographic independence from hostnames or IP addresses.
+This record distinguishes observed configuration from verified failure
+domains. Never infer independent buildings, power feeds, or ISPs from
+hostnames or IP addresses. The observations from November 14 below are
+historical; see the later updates for the current configuration.
+
+## Update: shared room and independent uplinks, 2026-11-17
+
+The operator confirmed that all five nodes share one room and can fail
+together. `uc-k8sp1`, `uc-k8sp2`, `uc-k8s3p`, and `uc-k8sp5` share one
+uplink; `ichikawap1` is in the same room but uses a separate uplink. Terraform
+declares the shared site and room on every Kubernetes node, and assigns the
+four nodes `main-uplink` and `ichikawap1` `ichikawa-uplink`. These labels
+describe the known topology, not independence from a common power failure.
+`heteronet-admin topology` changes the same declarations and provides targeted
+Terraform plan and apply operations. The management API requires an owner
+token to apply the declared HeteroNetwork policy.
+
+Flash controller revision `d2e4ef46e55ef5d87a98d031646ebc5b44a501aa` is
+deployed with physical-zone and network-domain spreading independently set to
+`preferred`. The two controller Pods became ready and the five existing user
+Pods retained their UIDs and restart counts. New stateless, multi-replica
+generations consider both domains; existing generations are not restarted to
+force placement. `required` is available when an operator prefers pending Pods
+to an imbalanced placement. These constraints do not convert a single RWO
+persistent disk into shared storage.
+
+[The scheduler E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/44050110864)
+exercised required and preferred placement across two network labels in a
+single physical zone, using node taints to model loss and recovery. It did not
+cut a physical uplink. [The HeteroNetwork E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44055014302)
+used six actual WireGuard agents in isolated namespaces, with synthetic 4+2
+uplink groups in one room. It cut cross-uplink traffic, tested communication
+inside each group, and verified connectivity after restoring the link. The
+control plane remained reachable: this does not prove full database or
+application availability during a production partition. A 1,000-node topology
+test is a graph model, not a 1,000-machine production load test.
 
 ## Update: 2026-11-17
 
-The infrastructure module now accepts explicitly verified site assignments in
+At this earlier point the infrastructure module accepted explicitly verified site assignments in
 `node-localities.json` and applies them to Kubernetes and the HeteroNetwork
 hierarchy. No assignment was inferred or applied while the physical sites are
 unknown. Unknown nodes are left untouched; only explicitly listed removals
