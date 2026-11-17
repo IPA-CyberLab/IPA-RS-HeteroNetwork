@@ -67,6 +67,16 @@ class OverlayConsoleConvergenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify.generate_registration("node-a", ["node-a"])
 
+    def test_generated_identity_exercises_the_requested_gateway(self):
+        gateways = ["node-a", "node-b", "node-c", "node-d"]
+        _, _, _, client_id = verify.generate_registration("node-a", gateways, "node-c")
+        scores = {gateway: verify.gateway_rendezvous_score(client_id, gateway) for gateway in gateways}
+        self.assertEqual(max(scores, key=scores.get), "node-c")
+        self.assertLess(scores["node-a"], scores["node-c"])
+        for required in ("node-a", "node-missing"):
+            with self.assertRaises(ValueError):
+                verify.generate_registration("node-a", gateways, required)
+
     def test_initial_connection_uses_the_control_plane_selected_gateway(self):
         selected = {"node_id": "selected", "endpoint_candidates": [
             {"kind": "public_udp", "cost": 20, "priority": 1, "addr": "192.0.2.1:51820"},

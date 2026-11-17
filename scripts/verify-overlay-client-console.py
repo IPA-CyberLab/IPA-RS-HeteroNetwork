@@ -96,18 +96,30 @@ def gateway_rendezvous_score(client_id, gateway_id):
     return digest.digest()
 
 
-def generate_registration(avoid_gateway=None, candidate_gateways=()):
+def generate_registration(avoid_gateway=None, candidate_gateways=(), required_gateway=None):
     if avoid_gateway is not None and (avoid_gateway not in candidate_gateways or len(set(candidate_gateways)) < 2):
         raise ValueError("at least two known gateways are required for the alternate gateway test")
-    for _ in range(256):
+    if required_gateway is not None and (
+            required_gateway not in candidate_gateways or required_gateway == avoid_gateway):
+        raise ValueError("the required gateway must be an active candidate different from the avoided gateway")
+    for _ in range(8192):
         identity = Ed25519PrivateKey.generate()
         identity_public = identity.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         client_id = "node-" + hashlib.sha256(identity_public).digest()[:16].hex()
-        if avoid_gateway is None or all(
-            gateway_rendezvous_score(client_id, avoid_gateway) < gateway_rendezvous_score(client_id, candidate)
+        required_score = (gateway_rendezvous_score(client_id, required_gateway)
+                          if required_gateway is not None else None)
+        required_is_highest = required_gateway is None or all(
+            required_score > gateway_rendezvous_score(client_id, candidate)
+            for candidate in candidate_gateways if candidate != required_gateway
+        )
+        avoid_score = (gateway_rendezvous_score(client_id, avoid_gateway)
+                       if avoid_gateway is not None and required_gateway is None else None)
+        sponsor_is_lowest = required_gateway is not None or avoid_gateway is None or all(
+            avoid_score < gateway_rendezvous_score(client_id, candidate)
             for candidate in candidate_gateways if candidate != avoid_gateway
-        ):
+        )
+        if sponsor_is_lowest and required_is_highest:
             break
     else:
         raise RuntimeError("could not generate an alternate-gateway test identity")
@@ -868,6 +880,7 @@ def main():
     gateways.add_argument("--gateways")
     gateways.add_argument("--gateway-roster", type=Path)
     parser.add_argument("--avoid-sponsor-gateway", action="store_true")
+    parser.add_argument("--require-gateway", help="require a specific active gateway hostname from the roster")
     parser.add_argument("--credential-file", type=Path)
     parser.add_argument("--require-authenticated-console", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -895,14 +908,21 @@ def main():
             report["console_identity_reconciled"] = True
             report["console_identity_created"] = identity_result["created"]
         avoided_gateway = None
-        if args.avoid_sponsor_gateway:
+        required_gateway = None
+        if args.avoid_sponsor_gateway or args.require_gateway:
             if args.gateway_roster is None:
-                raise RuntimeError("--avoid-sponsor-gateway requires --gateway-roster")
+                raise RuntimeError("gateway selection requires --gateway-roster")
             roster = json.loads(args.gateway_roster.read_text())
-            bootstrap = json.loads((ROOT / "deploy/terraform/master-only/edge-nodes.json").read_text())["bootstrap"]["name"]
-            avoided_gateway = roster["hosts"][bootstrap]
+            if args.avoid_sponsor_gateway:
+                bootstrap = json.loads((ROOT / "deploy/terraform/master-only/edge-nodes.json").read_text())["bootstrap"]["name"]
+                avoided_gateway = roster["hosts"][bootstrap]
+            if args.require_gateway:
+                required_gateway = roster["hosts"].get(args.require_gateway)
+                if required_gateway is None:
+                    raise RuntimeError("required gateway hostname is not in the roster")
             candidates = [node["node_id"] for node in active_peers(roster)]
-            request_uri, identity, private_key, client_id = generate_registration(avoided_gateway, candidates)
+            request_uri, identity, private_key, client_id = generate_registration(
+                avoided_gateway, candidates, required_gateway)
         else:
             request_uri, identity, private_key, client_id = generate_registration()
         # The sponsor can commit registration even if its SSH response times
@@ -912,6 +932,8 @@ def main():
         peer, endpoint = select_gateway(profile)
         if avoided_gateway is not None and peer["node_id"] == avoided_gateway:
             raise RuntimeError("the control plane did not assign an alternate gateway")
+        if required_gateway is not None and peer["node_id"] != required_gateway:
+            raise RuntimeError("the control plane did not assign the required gateway")
         report.update({
             "client_id": client_id,
             "client_vpn_ip": profile["registration"]["client"]["vpn_ip"],

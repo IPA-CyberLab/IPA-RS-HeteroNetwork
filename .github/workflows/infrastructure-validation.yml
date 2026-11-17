@@ -2,6 +2,11 @@ name: Infrastructure acceptance checks
 
 on:
   workflow_dispatch:
+    inputs:
+      gateway_host:
+        description: 'Optional active gateway hostname for the live VPN check'
+        required: false
+        type: string
   push:
     paths:
       - 'deploy/terraform/master-only/**'
@@ -390,15 +395,20 @@ jobs:
       - name: Join HeteroNetwork and run Chromium through the VPN
         env:
           HNN_IAC_BECOME_PASSWORD: ${{ secrets.HNN_E2E_BECOME_PASSWORD }}
+          HNN_E2E_GATEWAY_HOST: ${{ inputs.gateway_host }}
         run: |
           set -euo pipefail
           node_path="$(dirname "$(command -v node)")"
+          gateway_args=(--avoid-sponsor-gateway)
+          if [[ -n "$HNN_E2E_GATEWAY_HOST" ]]; then
+            gateway_args+=(--require-gateway "$HNN_E2E_GATEWAY_HOST")
+          fi
           sudo --preserve-env=HNN_IAC_BECOME_PASSWORD,PLAYWRIGHT_BROWSERS_PATH \
             env "PATH=${node_path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             "$E2E_VENV/bin/python" scripts/verify-overlay-client-console.py \
               --work-dir "$E2E_ROOT" \
               --gateway-roster deploy/terraform/master-only/overlay-boot-peers.json \
-              --avoid-sponsor-gateway \
+              "${gateway_args[@]}" \
               --credential-file "$E2E_ROOT/console-credentials.json" \
               --require-authenticated-console \
               --output "$E2E_ROOT/report.json"
