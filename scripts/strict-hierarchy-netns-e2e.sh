@@ -517,4 +517,9 @@ for phrase in ('failed to register agent', 'failed to apply peer map', 'failed t
 PY
   exit 1
 fi
+if [[ "${HETERONETWORK_E2E_SITE_PARTITION:-0}" == 1 ]]; then
+  # shellcheck source=scripts/strict-site-partition-e2e.sh
+  source "$root/scripts/strict-site-partition-e2e.sh"
+  run_strict_site_partition_e2e
+fi
 echo "strict hierarchy E2E passed: real WireGuard, on-demand path, first-hop failure and bounded new-node join"

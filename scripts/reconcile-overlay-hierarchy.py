@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import urllib.error
@@ -39,7 +40,35 @@ def read_token(path):
     return token
 
 
-def reconcile(config, endpoint, token, check=False):
+def load_localities(config_path, roster_path):
+    """Resolve explicitly managed hostnames; omitted nodes are left unchanged."""
+    data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    roster = json.loads(Path(roster_path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or set(data) != {"nodes", "remove"}:
+        raise ValueError("localities must contain only nodes and remove")
+    nodes, removed = data["nodes"], data["remove"]
+    hosts = roster.get("hosts") if isinstance(roster, dict) else None
+    if not isinstance(nodes, dict) or not isinstance(removed, list) or not isinstance(hosts, dict):
+        raise ValueError("invalid localities or overlay roster")
+    if any(not isinstance(name, str) or name not in hosts for name in list(nodes) + removed):
+        raise ValueError("locality host is not in the declared overlay roster")
+    if len(set(removed)) != len(removed) or set(removed) & set(nodes):
+        raise ValueError("locality removals must be unique and separate from nodes")
+    if (any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value)
+            for value in hosts.values()) or len(set(hosts.values())) != len(hosts)):
+        raise ValueError("invalid or duplicate node ID in overlay roster")
+    desired = {}
+    for name, locality in nodes.items():
+        if not isinstance(locality, dict) or set(locality) != {"region", "zone"}:
+            raise ValueError("each managed locality requires a region and zone")
+        if any(not isinstance(value, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value)
+               for value in locality.values()):
+            raise ValueError("locality labels must be lowercase DNS labels of at most 63 characters")
+        desired[hosts[name]] = locality
+    return desired, {hosts[name] for name in removed}
+
+
+def reconcile(config, endpoint, token, check=False, localities=None, removed=()):
     if set(config) != {"overlay_strict_hierarchy"} or not isinstance(config["overlay_strict_hierarchy"], bool):
         raise ValueError("hierarchy policy must contain only a boolean overlay_strict_hierarchy")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirects())
@@ -65,14 +94,24 @@ def reconcile(config, endpoint, token, check=False):
     if not isinstance(policy, dict):
         raise RuntimeError("management API returned an invalid policy")
     desired = config["overlay_strict_hierarchy"]
-    if policy.get("overlay_strict_hierarchy", False) == desired:
+    existing = policy.get("overlay_node_localities", {})
+    if not isinstance(existing, dict):
+        raise RuntimeError("management API returned invalid node localities")
+    merged = dict(existing)
+    merged.update(localities or {})
+    for node_id in removed:
+        merged.pop(node_id, None)
+    if policy.get("overlay_strict_hierarchy", False) == desired and merged == existing:
         return 0
     if check:
         return 2
     policy["overlay_strict_hierarchy"] = desired
+    if merged != existing:
+        policy["overlay_node_localities"] = merged
     response = request("PUT", json.dumps({"cluster_policy": policy}, separators=(",", ":")).encode())
     updated = response.get("cluster_policy") if isinstance(response, dict) else None
-    if not isinstance(updated, dict) or updated.get("overlay_strict_hierarchy", False) != desired:
+    if (not isinstance(updated, dict) or updated.get("overlay_strict_hierarchy", False) != desired
+            or updated.get("overlay_node_localities", {}) != merged):
         raise RuntimeError("management API did not confirm the requested policy; inspect before retrying")
     return 0
 
@@ -80,6 +119,8 @@ def reconcile(config, endpoint, token, check=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument("--localities")
+    parser.add_argument("--roster")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--endpoint", default=os.environ.get("HNN_HIERARCHY_API_URL", "http://127.0.0.1:19088"))
     parser.add_argument("--token-file", default=os.environ.get("HNN_HIERARCHY_TOKEN_FILE"))
@@ -88,7 +129,10 @@ def main():
         parser.error("HNN_HIERARCHY_TOKEN_FILE must name a private owner OIDC token file")
     try:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        code = reconcile(config, args.endpoint, read_token(args.token_file), args.check)
+        if bool(args.localities) != bool(args.roster):
+            raise ValueError("localities and roster must be supplied together")
+        localities, removed = load_localities(args.localities, args.roster) if args.localities else ({}, set())
+        code = reconcile(config, args.endpoint, read_token(args.token_file), args.check, localities, removed)
         print("hierarchy policy " + ("differs" if code == 2 else "matches"))
         return code
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:

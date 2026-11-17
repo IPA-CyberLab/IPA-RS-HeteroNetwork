@@ -7,6 +7,7 @@ on:
     paths: &overlay_paths
       - '.github/workflows/hierarchy-e2e.yml'
       - 'scripts/strict-hierarchy-netns-e2e.sh'
+      - 'scripts/strict-site-partition-e2e.sh'
       - 'scripts/kubeadm-ha-*.sh'
       - 'scripts/postgres-ha-*.sh'
       - 'scripts/keycloak-*.sh'
@@ -95,6 +96,7 @@ jobs:
           sudo env PATH="/usr/sbin:/usr/bin:/sbin:/bin" \
             HETERONETWORK_E2E_IPARS="$PWD/target/release/ipars" \
             HETERONETWORK_E2E_IPARSD="$PWD/target/release/iparsd" \
+            HETERONETWORK_E2E_SITE_PARTITION=1 \
             scripts/strict-hierarchy-netns-e2e.sh
       - name: Verify event detection when conntrack snapshots fail
         run: |

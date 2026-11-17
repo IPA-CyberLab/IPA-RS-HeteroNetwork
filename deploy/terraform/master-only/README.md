@@ -137,8 +137,9 @@ waits for the enrollment Control Plane and Keycloak edge to recover.
 ## Apply
 
 `overlay-hierarchy.json` declares strict hierarchical routing. Terraform
-reconciles only that field through the normal management API after the
-control-plane and Agent rollouts; unrelated policy values are retained. The
+reconciles that field and explicitly managed node localities through the normal
+management API after the control-plane and Agent rollouts; unrelated policy
+values are retained. The
 API rejects activation until every active native Agent has reported a
 compatible signed build. Supply a short-lived owner OIDC access token in a
 private file owned by the operator (`0600`) as `HNN_HIERARCHY_TOKEN_FILE`.
@@ -146,6 +147,20 @@ Use `HNN_HIERARCHY_API_URL` for the management origin; cleartext HTTP is
 accepted only on loopback, for example via an authenticated SSH tunnel.
 Tokens are not put in Terraform state or process arguments. A management
 quorum, if enabled, is never bypassed by this reconciler.
+
+Declare verified physical failure domains in `node-localities.json`, keyed by
+the hostnames in `overlay-boot-peers.json`. For example, a known host can be
+entered as `"host-a": {"region": "east", "zone": "site-a"}` under `nodes`.
+Both fields must be lowercase DNS labels. Use one zone only for machines that
+share the same relevant site failure domain; do not infer independence from
+hostnames or IP addresses. Omit unknown nodes. Terraform applies those labels
+to Kubernetes Nodes and reconciles the corresponding HeteroNetwork node IDs
+without overwriting unrelated locality entries. Existing labels owned by
+another field manager are not forcibly taken over. To remove a previously
+managed locality, remove the host from `nodes` and list it in `remove`; the
+API override is removed, and Terraform releases labels it manages. Labels
+owned outside this module are not silently deleted. Taints on dedicated
+control-plane nodes are unchanged.
 
 The `master-only-iac.py` wrapper checks the live hierarchy policy and schedules
 reconciliation for drift when that token is supplied. Its `check` action

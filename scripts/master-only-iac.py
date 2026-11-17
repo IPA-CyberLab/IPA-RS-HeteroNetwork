@@ -35,7 +35,9 @@ def main():
     if env.get('HNN_HIERARCHY_TOKEN_FILE'):
         result = subprocess.run(
             ['python3', str(ROOT/'scripts/reconcile-overlay-hierarchy.py'), '--check',
-             '--config', str(MODULE/'overlay-hierarchy.json')],
+             '--config', str(MODULE/'overlay-hierarchy.json'),
+             '--localities', str(MODULE/'node-localities.json'),
+             '--roster', str(MODULE/'overlay-boot-peers.json')],
             env=env, text=True, capture_output=True)
         if result.returncode not in (0, 2):
             raise RuntimeError('Hierarchy policy check failed: '+result.stderr.strip())

@@ -72,6 +72,44 @@ class HierarchyPolicyTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             reconcile.reconcile({"acl_rules": []}, self.endpoint, "owner-token")
 
+    def test_localities_merge_preserves_unmanaged_nodes_and_removes_explicit_entries(self):
+        self.policy["overlay_strict_hierarchy"] = True
+        self.policy["overlay_node_localities"] = {
+            "node-unmanaged": {"region": "old", "zone": "site-a"},
+            "node-removed": {"region": "old", "zone": "site-b"},
+        }
+        desired = {"node-a": {"region": "east", "zone": "site-a"}}
+        config = {"overlay_strict_hierarchy": True}
+        self.assertEqual(reconcile.reconcile(config, self.endpoint, "owner-token", True, desired, {"node-removed"}), 2)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(reconcile.reconcile(config, self.endpoint, "owner-token", False, desired, {"node-removed"}), 0)
+        self.assertEqual(self.policy["overlay_node_localities"], {
+            "node-unmanaged": {"region": "old", "zone": "site-a"},
+            "node-a": {"region": "east", "zone": "site-a"},
+        })
+        self.assertEqual(reconcile.reconcile(config, self.endpoint, "owner-token", False, desired, {"node-removed"}), 0)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_locality_input_requires_known_hosts_and_real_dns_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            roster = root / "roster.json"
+            localities = root / "localities.json"
+            roster.write_text(json.dumps({"hosts": {"host-a": "node-a", "host-b": "node-b"}}))
+            localities.write_text(json.dumps({"nodes": {"host-a": {"region": "east", "zone": "site-a"}}, "remove": ["host-b"]}))
+            self.assertEqual(reconcile.load_localities(localities, roster),
+                             ({"node-a": {"region": "east", "zone": "site-a"}}, {"node-b"}))
+            for invalid in (
+                {"nodes": {"unknown": {"region": "east", "zone": "site-a"}}, "remove": []},
+                {"nodes": {"host-a": {"region": "Tokyo", "zone": "site-a"}}, "remove": []},
+                {"nodes": {"host-a": {"region": "east", "zone": "site-a"}}, "remove": ["host-a"]},
+                {"nodes": {}, "remove": ["host-b", "host-b"]},
+                {"nodes": {"host-a": {"region": "east"}}, "remove": []},
+            ):
+                localities.write_text(json.dumps(invalid))
+                with self.assertRaises(ValueError):
+                    reconcile.load_localities(localities, roster)
+
     def test_token_file_must_be_private_and_not_a_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "token"
