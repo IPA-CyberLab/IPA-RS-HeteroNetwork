@@ -1,0 +1,35 @@
+name: PostgreSQL DCS site partition E2E
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - 'scripts/postgres-dcs-partition-e2e.sh'
+      - '.github/workflows/postgres-dcs-partition-e2e.yml'
+  pull_request:
+    paths:
+      - 'scripts/postgres-dcs-partition-e2e.sh'
+      - '.github/workflows/postgres-dcs-partition-e2e.yml'
+permissions:
+  contents: read
+jobs:
+  isolated-two-voter-partition:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with: {persist-credentials: false}
+      - name: Install the same verified etcd version as production
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iptables
+          mkdir -p "$RUNNER_TEMP/hnn-dcs-bin"
+          curl --fail --location --silent --show-error --retry 2 https://github.com/etcd-io/etcd/releases/download/v3.6.11/etcd-v3.6.11-linux-amd64.tar.gz -o "$RUNNER_TEMP/hnn-dcs-bin/etcd.tar.gz"
+          echo '8756f7a4eaf921668a83de0bf13c0f65cae9186a165696e3ae8396afe6f557ed  '"$RUNNER_TEMP/hnn-dcs-bin/etcd.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/hnn-dcs-bin/etcd.tar.gz" -C "$RUNNER_TEMP/hnn-dcs-bin"
+      - name: Partition both voters and verify write safety and recovery
+        run: |
+          sudo env HNN_ETCD_PARTITION_E2E=isolated-only bash scripts/postgres-dcs-partition-e2e.sh \
+            "$RUNNER_TEMP/hnn-dcs-bin/etcd-v3.6.11-linux-amd64/etcd" \
+            "$RUNNER_TEMP/hnn-dcs-bin/etcd-v3.6.11-linux-amd64/etcdctl"
