@@ -45,6 +45,18 @@ joined through `10.250.0.6`, authenticated and opened the canonical console
 in 780 ms after route readiness; the temporary client was removed. Route
 readiness itself took 32.97 seconds and is not part of that page-open time.
 
+A [later live acceptance run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44024597974)
+failed with HTTP 503 while obtaining the client peer map after the WireGuard
+handshake. The test did not preserve the server's failure category, so its
+cause is not established. At roughly the same time an agent rejected resolved
+paths whose routing epoch differed from its neighbor map. This is a separate
+observed defect, not proof of the cause of the 503: the old path resolver
+discarded a destination after this rejection, even though the neighbor map
+could subsequently catch up. The source fix requeues only epoch-mismatch and missing-map
+failures and still refuses to install an inconsistent path. The acceptance
+test records a sanitized category for HTTP failures and still fails on the
+first error; it does not hide the incident with retries.
+
 The [two-voter DCS partition E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44024432794)
 used the production etcd version in isolated network namespaces. After all
 peer TCP traffic was blocked and packet drops observed, neither voter accepted

@@ -22575,9 +22575,24 @@ async fn resolve_pending_overlay_paths(
                     .record_resolved_overlay_path(path, chrono::Utc::now())
                     .await
                 {
+                    // A topology can change while the path and neighbor map are
+                    // fetched independently. Do not install a mismatched path,
+                    // but do not discard the destination either: no new packet
+                    // may arrive to trigger another lookup after convergence.
+                    // Classify the original rejection, not a later map snapshot:
+                    // the map itself can advance before this handler runs.
+                    let retry_queued = matches!(
+                        &error,
+                        AgentError::OverlayPathEpochMismatch { .. }
+                            | AgentError::PeerMapUnavailable(_)
+                    );
+                    if retry_queued {
+                        runtime.requeue_overlay_destination(destination).await;
+                    }
                     tracing::warn!(
                         %error,
                         %destination,
+                        retry_queued,
                         "rejected resolved bounded-overlay path"
                     );
                 }
@@ -25505,6 +25520,127 @@ mod tests {
             observed_at: now,
         };
         Ok((runtime, intent))
+    }
+
+    #[tokio::test]
+    async fn overlay_path_epoch_race_requeues_until_neighbor_map_catches_up() -> anyhow::Result<()>
+    {
+        for (topology_epoch, routing_epoch) in [(8, 7), (7, 8)] {
+            let (runtime, intent) = heartbeat_intent_runtime(false, false).await?;
+            let local_node = runtime.state().node_id.clone();
+            let mut target = node_record(intent.peer.as_str());
+            target.vpn_ip = intent.peer_vpn_ip;
+            let path = OverlayPath {
+                acknowledgement_timeout_ms: None,
+                topology_epoch,
+                routing_epoch,
+                source: local_node.clone(),
+                destination: intent.peer_vpn_ip.0,
+                target,
+                ordered_nodes: vec![local_node.clone(), intent.peer.clone()],
+                secondary_ordered_nodes: None,
+                generated_at: Utc::now(),
+            };
+            let (url, server) = spawn_test_http_service(Router::new().route(
+                "/v1/overlay-paths/query",
+                axum::routing::post(move || {
+                    let path = path.clone();
+                    async move { axum::Json(path) }
+                }),
+            ))
+            .await?;
+            let mut retries = OverlayPathNegativeRetryCache::new(&local_node);
+            runtime
+                .requeue_overlay_destination(intent.peer_vpn_ip.0)
+                .await;
+
+            resolve_pending_overlay_paths(
+                &reqwest::Client::new(),
+                &runtime,
+                &[url.clone()],
+                &mut retries,
+            )
+            .await;
+
+            assert_eq!(
+                runtime.take_pending_overlay_destinations(8).await,
+                vec![intent.peer_vpn_ip.0],
+                "a path rejected only because the neighbor map is behind must be retried"
+            );
+            let mut map = runtime
+                .neighbor_map_snapshot()
+                .await
+                .context("neighbor map")?;
+            map.topology_epoch = topology_epoch;
+            map.routing_epoch = routing_epoch;
+            map.generated_at += ChronoDuration::milliseconds(1);
+            runtime.record_neighbor_map_snapshot(map).await?;
+            runtime
+                .requeue_overlay_destination(intent.peer_vpn_ip.0)
+                .await;
+
+            resolve_pending_overlay_paths(&reqwest::Client::new(), &runtime, &[url], &mut retries)
+                .await;
+
+            assert!(
+                runtime
+                    .has_current_resolved_overlay_path(&intent.peer)
+                    .await
+            );
+            assert!(runtime
+                .take_pending_overlay_destinations(8)
+                .await
+                .is_empty());
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_path_invalid_target_is_not_retried_as_an_epoch_race() -> anyhow::Result<()> {
+        let (runtime, intent) = heartbeat_intent_runtime(false, false).await?;
+        let local_node = runtime.state().node_id.clone();
+        let mut target = node_record(intent.peer.as_str());
+        target.vpn_ip = intent.peer_vpn_ip;
+        target.cluster_id = ClusterId::from_string("other-cluster");
+        let path = OverlayPath {
+            acknowledgement_timeout_ms: None,
+            topology_epoch: 7,
+            routing_epoch: 7,
+            source: local_node.clone(),
+            destination: intent.peer_vpn_ip.0,
+            target,
+            ordered_nodes: vec![local_node.clone(), intent.peer.clone()],
+            secondary_ordered_nodes: None,
+            generated_at: Utc::now(),
+        };
+        let (url, server) = spawn_test_http_service(Router::new().route(
+            "/v1/overlay-paths/query",
+            axum::routing::post(move || {
+                let path = path.clone();
+                async move { axum::Json(path) }
+            }),
+        ))
+        .await?;
+        let mut retries = OverlayPathNegativeRetryCache::new(&local_node);
+        runtime
+            .requeue_overlay_destination(intent.peer_vpn_ip.0)
+            .await;
+
+        resolve_pending_overlay_paths(&reqwest::Client::new(), &runtime, &[url], &mut retries)
+            .await;
+
+        assert!(runtime
+            .take_pending_overlay_destinations(8)
+            .await
+            .is_empty());
+        assert!(
+            !runtime
+                .has_current_resolved_overlay_path(&intent.peer)
+                .await
+        );
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]

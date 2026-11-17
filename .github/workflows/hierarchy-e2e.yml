@@ -68,6 +68,8 @@ jobs:
           cargo test --locked -p ipars-daemon --bin iparsd overlay_dns_continues_serving_after_a_reply_send_failure
           cargo test --locked -p ipars-daemon --bin iparsd signal_node_upsert_
           cargo test --locked -p ipars-daemon --bin iparsd signal_path_request_fails_over_to_available_signal_service
+          cargo test --locked -p ipars-daemon --bin iparsd overlay_path_epoch_race_requeues_until_neighbor_map_catches_up
+          cargo test --locked -p ipars-daemon --bin iparsd overlay_path_invalid_target_is_not_retried_as_an_epoch_race
       - name: Reproduce and prevent Linux WireGuard session resets
         run: |
           set -euo pipefail

@@ -19,6 +19,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
@@ -512,8 +513,31 @@ def refresh_client_peers(identity, client_id, peer):
         f"http://{peer['vpn_ip']}/v1/clients/peers/query", data=body,
         headers={"Content-Type": "application/json"}, method="POST")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=5) as response:
-        data = json.load(response)
+    try:
+        with opener.open(request, timeout=5) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as error:
+        # Record the first failure rather than concealing it with an E2E retry.
+        # The upstream message can contain URLs or credentials; only expose a
+        # small set of known failure categories, never the response body.
+        category = "unclassified"
+        try:
+            payload = json.loads(error.read(4096))
+            message = payload.get("error", "") if isinstance(payload, dict) else ""
+            if isinstance(message, str):
+                lowered = message.lower()
+                for marker, label in (
+                    ("management proxy request failed", "proxy_transport"),
+                    ("no web ui endpoint is cached", "no_cached_endpoint"),
+                    ("all cached web ui endpoints failed", "cached_endpoints_failed"),
+                    ("no healthy web ui", "no_healthy_endpoint"),
+                ):
+                    if marker in lowered:
+                        category = label
+                        break
+        except (ValueError, OSError):
+            pass
+        raise RuntimeError(f"peer-map query failed: HTTP {error.code} ({category})") from None
     peers = data.get("peer_map", {}).get("peers", [])
     if not peers or peers[0].get("node_id") != peer["node_id"]:
         raise RuntimeError("control plane did not retain the active client gateway")

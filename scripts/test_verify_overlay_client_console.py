@@ -2,6 +2,7 @@
 """Unit checks for the live overlay console convergence gate."""
 
 import importlib.util
+import io
 import ipaddress
 import json
 from pathlib import Path
@@ -34,6 +35,18 @@ def dns_response(query, address, *, flags=0x8180, response_id=None):
 
 
 class OverlayConsoleConvergenceTests(unittest.TestCase):
+    def test_peer_map_failure_is_reported_without_retry_or_exposing_response(self):
+        identity = type("Identity", (), {"sign": lambda _, body: b"s" * 64})()
+        opener = unittest.mock.Mock()
+        body = b'{"error":"management proxy request failed: secret-value"}'
+        opener.open.side_effect = verify.urllib.error.HTTPError(
+            "http://10.250.0.5/v1/clients/peers/query", 503, "Unavailable", {}, io.BytesIO(body))
+        with (patch.object(verify.urllib.request, "build_opener", return_value=opener),
+              self.assertRaisesRegex(RuntimeError, r"HTTP 503 \(proxy_transport\)") as raised):
+            verify.refresh_client_peers(identity, "node-a", {"node_id": "node-b", "vpn_ip": "10.250.0.5"})
+        self.assertNotIn("secret-value", str(raised.exception))
+        self.assertEqual(opener.open.call_count, 1)
+
     def test_generated_identity_exercises_a_non_sponsor_gateway(self):
         gateways = ["node-a", "node-b", "node-c", "node-d"]
         _, _, _, client_id = verify.generate_registration("node-a", gateways)

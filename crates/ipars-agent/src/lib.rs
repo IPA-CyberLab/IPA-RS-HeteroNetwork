@@ -146,6 +146,13 @@ pub enum AgentError {
     InsecureStatePath(String),
     #[error("agent state is invalid: {0}")]
     InvalidState(String),
+    #[error("overlay path topology/routing epochs {path_topology}/{path_routing} do not match neighbor-map epochs {map_topology}/{map_routing}")]
+    OverlayPathEpochMismatch {
+        path_topology: u64,
+        path_routing: u64,
+        map_topology: u64,
+        map_routing: u64,
+    },
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
     #[error("stun probe error: {0}")]
@@ -4645,17 +4652,15 @@ impl AgentRuntime {
             .neighbor_map_snapshot()
             .await
             .ok_or_else(|| AgentError::PeerMapUnavailable(local_node.clone()))?;
-        if path.topology_epoch != neighbor_map.topology_epoch {
-            return Err(AgentError::InvalidState(format!(
-                "overlay path epoch {} does not match neighbor-map epoch {}",
-                path.topology_epoch, neighbor_map.topology_epoch
-            )));
-        }
-        if path.routing_epoch != neighbor_map.routing_epoch {
-            return Err(AgentError::InvalidState(format!(
-                "overlay path routing epoch {} does not match neighbor-map routing epoch {}",
-                path.routing_epoch, neighbor_map.routing_epoch
-            )));
+        if path.topology_epoch != neighbor_map.topology_epoch
+            || path.routing_epoch != neighbor_map.routing_epoch
+        {
+            return Err(AgentError::OverlayPathEpochMismatch {
+                path_topology: path.topology_epoch,
+                path_routing: path.routing_epoch,
+                map_topology: neighbor_map.topology_epoch,
+                map_routing: neighbor_map.routing_epoch,
+            });
         }
         if path.target.cluster_id != neighbor_map.cluster_id {
             return Err(AgentError::InvalidState(format!(
