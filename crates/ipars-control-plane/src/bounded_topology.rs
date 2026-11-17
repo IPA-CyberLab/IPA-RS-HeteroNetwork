@@ -2409,6 +2409,44 @@ mod tests {
     }
 
     #[test]
+    fn declared_uplink_survives_partition_with_unlabelled_peers() {
+        for count in [6, 25, 105] {
+            let mut nodes = records(count);
+            for (index, node) in nodes.iter_mut().take(5).enumerate() {
+                node.tags
+                    .insert(Tag::from_string("topology-region-shared-site"));
+                node.tags
+                    .insert(Tag::from_string("topology-zone-shared-room"));
+                node.tags.insert(Tag::from_string(if index < 4 {
+                    "topology-network-main"
+                } else {
+                    "topology-network-independent"
+                }));
+            }
+            let config = BoundedTopologyConfig::new(4).with_locality_aware(true);
+            let topology = BoundedTopology::synthesize(&nodes, &config)
+                .unwrap_or_else(|error| panic!("mixed-label topology: {error}"));
+            let main = nodes[..4]
+                .iter()
+                .map(|node| node.node_id.clone())
+                .collect::<BTreeSet<_>>();
+            let mut visited = BTreeSet::from([nodes[0].node_id.clone()]);
+            let mut queue = VecDeque::from([nodes[0].node_id.clone()]);
+            while let Some(current) = queue.pop_front() {
+                for neighbor in topology.neighbors(&current).into_iter().flatten() {
+                    if main.contains(neighbor) && visited.insert(neighbor.clone()) {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+            assert_eq!(
+                visited, main,
+                "four known nodes must remain connected among {count} peers"
+            );
+        }
+    }
+
+    #[test]
     fn representatives_prefer_different_uplinks_within_one_room() {
         let nodes = records(8);
         let candidates = nodes
