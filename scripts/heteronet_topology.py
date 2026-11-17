@@ -85,12 +85,18 @@ def planned_changes(plan):
 
 
 def run_plan(args):
-    reconciler().load_localities(CONFIG, ROSTER)
-    if args.action == "apply":
-        token_path = os.environ.get("HNN_HIERARCHY_TOKEN_FILE")
-        if not token_path:
-            raise ValueError("HNN_HIERARCHY_TOKEN_FILE must name a private owner token file")
-        reconciler().read_token(token_path)
+    policy_api = reconciler()
+    localities, removed = policy_api.load_localities(CONFIG, ROSTER)
+    token_path = os.environ.get("HNN_HIERARCHY_TOKEN_FILE")
+    if args.action == "apply" and not token_path:
+        raise ValueError("HNN_HIERARCHY_TOKEN_FILE must name a private owner token file")
+    policy_drift = None
+    if token_path:
+        token = policy_api.read_token(token_path)
+        config = json.loads((MODULE / "overlay-hierarchy.json").read_text(encoding="utf-8"))
+        endpoint = os.environ.get("HNN_HIERARCHY_API_URL", "http://127.0.0.1:19088")
+        policy_drift = policy_api.reconcile(config, endpoint, token, check=True,
+                                            localities=localities, removed=removed) == 2
     if not args.work_dir.is_dir():
         raise ValueError("work directory does not exist")
     environment = os.environ.copy()
@@ -102,13 +108,16 @@ def run_plan(args):
     })
     with tempfile.TemporaryDirectory(prefix="topology-plan-", dir=args.work_dir) as temporary:
         plan = str(Path(temporary) / "plan")
-        subprocess.run([args.terraform, "plan", "-no-color", "-input=false",
-                        "-target=terraform_data.overlay_hierarchy_policy", "-out=" + plan],
-                       cwd=MODULE, env=environment, check=True)
+        command = [args.terraform, "plan", "-no-color", "-input=false",
+                   "-target=terraform_data.overlay_hierarchy_policy", "-out=" + plan]
+        if policy_drift:
+            command.append("-replace=terraform_data.overlay_hierarchy_policy")
+        subprocess.run(command, cwd=MODULE, env=environment, check=True)
         result = subprocess.run([args.terraform, "show", "-json", plan], cwd=MODULE,
                                 env=environment, check=True, capture_output=True, text=True)
         changes = planned_changes(json.loads(result.stdout))
-        print(json.dumps({"changes": changes}), flush=True)
+        print(json.dumps({"changes": changes, "live_policy":
+                          "unchecked" if policy_drift is None else "differs" if policy_drift else "matches"}), flush=True)
         if args.action == "apply" and changes:
             subprocess.run([args.terraform, "apply", "-no-color", "-parallelism=1", plan],
                            cwd=MODULE, env=environment, check=True)

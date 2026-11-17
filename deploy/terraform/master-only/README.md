@@ -182,9 +182,13 @@ The administrative CLI edits the same Terraform source and can apply it:
 ./heteronet-admin topology apply --kubeconfig "$TF_VAR_kubeconfig_path"
 ```
 
-`set` accepts individual fields and `--clear-network`; `remove` explicitly
-removes the managed locality. `plan` and `apply` refuse unrelated Terraform
-changes. `apply` requires the same private owner token file described above.
+`set` accepts one or more hostnames, individual fields and `--clear-network`;
+`remove` explicitly removes the managed locality. `plan` and `apply` refuse
+unrelated Terraform changes. `apply` requires the same private owner token
+file described above, checks the live management policy, and schedules
+reconciliation if it drifted even when Terraform's state has no file changes.
+When a token is supplied, `plan` also compares the live policy; without one it
+reports `live_policy: unchecked` rather than claiming the live policy matches.
 
 The `master-only-iac.py` wrapper checks the live hierarchy policy and schedules
 reconciliation for drift when that token is supplied. Its `check` action

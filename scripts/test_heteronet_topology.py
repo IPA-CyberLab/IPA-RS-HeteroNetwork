@@ -1,7 +1,10 @@
 import json
+import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import heteronet_topology as topology
 
@@ -62,6 +65,44 @@ class TopologyCliTest(unittest.TestCase):
         plan["resource_changes"].append({"address": "terraform_data.host_configuration", "change": {"actions": ["delete", "create"]}})
         with self.assertRaisesRegex(RuntimeError, "unrelated"):
             topology.planned_changes(plan)
+
+    def test_apply_forces_reconciliation_when_live_policy_has_drifted(self):
+        args = SimpleNamespace(action="apply", work_dir=self.config.parent,
+                               kubeconfig=Path("/kubeconfig"), ssh_key=Path("/key"),
+                               terraform="terraform")
+        api = mock.Mock()
+        api.load_localities.return_value = ({"node-a": {"network": "main"}}, set())
+        api.read_token.return_value = "owner-token"
+        api.reconcile.return_value = 2
+        plan = {"resource_changes": [{"address": "terraform_data.overlay_hierarchy_policy",
+                                       "change": {"actions": ["delete", "create"]}}]}
+        result = SimpleNamespace(stdout=json.dumps(plan))
+        with mock.patch.dict(os.environ, {"HNN_HIERARCHY_TOKEN_FILE": "/private/token"}, clear=True), \
+             mock.patch.object(topology, "reconciler", return_value=api), \
+             mock.patch.object(topology.subprocess, "run", return_value=result) as run:
+            self.assertEqual(topology.run_plan(args), 0)
+        plan_command = run.call_args_list[0].args[0]
+        self.assertIn("-replace=terraform_data.overlay_hierarchy_policy", plan_command)
+        self.assertEqual(run.call_args_list[-1].args[0][1], "apply")
+        self.assertTrue(api.reconcile.call_args.kwargs["check"])
+
+    def test_plan_without_token_reports_unchecked_and_apply_requires_token(self):
+        args = SimpleNamespace(action="plan", work_dir=self.config.parent,
+                               kubeconfig=Path("/kubeconfig"), ssh_key=Path("/key"),
+                               terraform="terraform")
+        api = mock.Mock()
+        api.load_localities.return_value = ({}, set())
+        result = SimpleNamespace(stdout=json.dumps({"resource_changes": []}))
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(topology, "reconciler", return_value=api), \
+             mock.patch.object(topology.subprocess, "run", return_value=result) as run, \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(topology.run_plan(args), 0)
+            self.assertEqual(json.loads(printed.call_args.args[0])["live_policy"], "unchecked")
+            self.assertNotIn("-replace=terraform_data.overlay_hierarchy_policy", run.call_args_list[0].args[0])
+            args.action = "apply"
+            with self.assertRaisesRegex(ValueError, "owner token"):
+                topology.run_plan(args)
 
 
 if __name__ == "__main__":
