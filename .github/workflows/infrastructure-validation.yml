@@ -398,6 +398,7 @@ jobs:
             "$E2E_VENV/bin/python" scripts/verify-overlay-client-console.py \
               --work-dir "$E2E_ROOT" \
               --gateway-roster deploy/terraform/master-only/overlay-boot-peers.json \
+              --avoid-sponsor-gateway \
               --credential-file "$E2E_ROOT/console-credentials.json" \
               --require-authenticated-console \
               --output "$E2E_ROOT/report.json"

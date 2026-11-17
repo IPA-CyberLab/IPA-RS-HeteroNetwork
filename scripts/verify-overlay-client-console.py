@@ -22,7 +22,7 @@ import time
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-from node_lifecycle import gateway_ips
+from node_lifecycle import active_peers, gateway_ips
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -86,16 +86,35 @@ def timestamp(value):
     return value.isoformat().replace("+00:00", "Z")
 
 
-def generate_registration():
-    identity = Ed25519PrivateKey.generate()
+def gateway_rendezvous_score(client_id, gateway_id):
+    digest = hashlib.sha256(b"HeteroNetwork client gateway rendezvous v1\0")
+    for value in (client_id, gateway_id):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.digest()
+
+
+def generate_registration(avoid_gateway=None, candidate_gateways=()):
+    if avoid_gateway is not None and (avoid_gateway not in candidate_gateways or len(set(candidate_gateways)) < 2):
+        raise ValueError("at least two known gateways are required for the alternate gateway test")
+    for _ in range(256):
+        identity = Ed25519PrivateKey.generate()
+        identity_public = identity.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        client_id = "node-" + hashlib.sha256(identity_public).digest()[:16].hex()
+        if avoid_gateway is None or all(
+            gateway_rendezvous_score(client_id, avoid_gateway) < gateway_rendezvous_score(client_id, candidate)
+            for candidate in candidate_gateways if candidate != avoid_gateway
+        ):
+            break
+    else:
+        raise RuntimeError("could not generate an alternate-gateway test identity")
     wireguard = X25519PrivateKey.generate()
-    identity_public = identity.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     wireguard_public = wireguard.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     identity_public_b64 = base64.b64encode(identity_public).decode("ascii")
     wireguard_public_b64 = base64.b64encode(wireguard_public).decode("ascii")
-    client_id = "node-" + hashlib.sha256(identity_public).digest()[:16].hex()
     issued_at = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     expires_at = issued_at + datetime.timedelta(minutes=15)
     nonce = b64url(secrets.token_bytes(24))
@@ -819,6 +838,7 @@ def main():
     gateways = parser.add_mutually_exclusive_group(required=True)
     gateways.add_argument("--gateways")
     gateways.add_argument("--gateway-roster", type=Path)
+    parser.add_argument("--avoid-sponsor-gateway", action="store_true")
     parser.add_argument("--credential-file", type=Path)
     parser.add_argument("--require-authenticated-console", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -845,12 +865,24 @@ def main():
             identity_result = reconcile_console_identity(inventory, args.credential_file)
             report["console_identity_reconciled"] = True
             report["console_identity_created"] = identity_result["created"]
-        request_uri, identity, private_key, client_id = generate_registration()
+        avoided_gateway = None
+        if args.avoid_sponsor_gateway:
+            if args.gateway_roster is None:
+                raise RuntimeError("--avoid-sponsor-gateway requires --gateway-roster")
+            roster = json.loads(args.gateway_roster.read_text())
+            bootstrap = json.loads((ROOT / "deploy/terraform/master-only/edge-nodes.json").read_text())["bootstrap"]["name"]
+            avoided_gateway = roster["hosts"][bootstrap]
+            candidates = [node["node_id"] for node in active_peers(roster)]
+            request_uri, identity, private_key, client_id = generate_registration(avoided_gateway, candidates)
+        else:
+            request_uri, identity, private_key, client_id = generate_registration()
         # The sponsor can commit registration even if its SSH response times
         # out, so begin cleanup responsibility before sending the request.
         sponsorship_attempted = True
         profile = decode_profile(sponsor(inventory, request_uri))
         peer, endpoint = select_gateway(profile)
+        if avoided_gateway is not None and peer["node_id"] == avoided_gateway:
+            raise RuntimeError("the control plane did not assign an alternate gateway")
         report.update({
             "client_id": client_id,
             "client_vpn_ip": profile["registration"]["client"]["vpn_ip"],
