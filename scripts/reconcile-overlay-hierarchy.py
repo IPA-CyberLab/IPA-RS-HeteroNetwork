@@ -60,15 +60,17 @@ def load_localities(config_path, roster_path):
     desired = {}
     zone_regions = {}
     for name, locality in nodes.items():
-        if (not isinstance(locality, dict) or not {"region", "zone"} <= set(locality)
+        if (not isinstance(locality, dict) or not locality
                 or set(locality) - {"region", "zone", "network"}):
-            raise ValueError("each managed locality requires a region and zone and may specify a network domain")
+            raise ValueError("each managed locality needs at least one region, zone or network domain")
         if any(not isinstance(value, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value)
                for value in locality.values()):
             raise ValueError("locality labels must be lowercase DNS labels of at most 63 characters")
-        previous_region = zone_regions.setdefault(locality["zone"], locality["region"])
-        if previous_region != locality["region"]:
-            raise ValueError("a zone label must not be reused across regions")
+        if "zone" in locality:
+            region = locality.get("region", "<unknown>")
+            previous_region = zone_regions.setdefault(locality["zone"], region)
+            if previous_region != region:
+                raise ValueError("a zone label must not be reused across regions")
         desired[hosts[name]] = locality
     return desired, {hosts[name] for name in removed}
 

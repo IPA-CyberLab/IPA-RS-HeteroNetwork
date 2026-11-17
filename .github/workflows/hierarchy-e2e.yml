@@ -65,6 +65,7 @@ jobs:
           cargo test --locked -p ipars-control-plane --lib network_partition_preserves_connectivity_within_the_shared_uplink
           cargo test --locked -p ipars-control-plane --lib representatives_prefer_different_uplinks_within_one_room
           cargo test --locked -p ipars-control-plane --lib thousand_node_network_groups_remain_connected_after_a_split
+          cargo test --locked -p ipars-control-plane --lib network_groups_work_when_physical_location_is_unknown
           cargo test --locked -p ipars-agent --lib strict_hierarchy
           cargo test --locked -p ipars-agent --lib canonical_wireguard_key_preserves_identity_and_is_idempotent
           cargo test --locked -p ipars-agent --lib peer_map_application_

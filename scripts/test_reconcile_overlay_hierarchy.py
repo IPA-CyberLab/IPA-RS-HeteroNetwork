@@ -101,13 +101,15 @@ class HierarchyPolicyTest(unittest.TestCase):
                              ({"node-a": {"region": "east", "zone": "site-a"}}, {"node-b"}))
             localities.write_text(json.dumps({"nodes": {"host-a": {"region": "east", "zone": "site-a", "network": "uplink-a"}}, "remove": []}))
             self.assertEqual(reconcile.load_localities(localities, roster)[0]["node-a"]["network"], "uplink-a")
+            localities.write_text(json.dumps({"nodes": {"host-a": {"network": "uplink-a"}}, "remove": []}))
+            self.assertEqual(reconcile.load_localities(localities, roster)[0]["node-a"], {"network": "uplink-a"})
             for invalid in (
                 {"nodes": {"unknown": {"region": "east", "zone": "site-a"}}, "remove": []},
                 {"nodes": {"host-a": {"region": "Tokyo", "zone": "site-a"}}, "remove": []},
                 {"nodes": {"host-a": {"region": "east", "zone": "site-a", "network": "Bad network"}}, "remove": []},
                 {"nodes": {"host-a": {"region": "east", "zone": "site-a"}}, "remove": ["host-a"]},
                 {"nodes": {}, "remove": ["host-b", "host-b"]},
-                {"nodes": {"host-a": {"region": "east"}}, "remove": []},
+                {"nodes": {"host-a": {}}, "remove": []},
                 {"nodes": {"host-a": {"region": "east", "zone": "site-a"},
                            "host-b": {"region": "west", "zone": "site-a"}}, "remove": []},
             ):

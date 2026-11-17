@@ -1341,21 +1341,34 @@ fn hash_prefix_digit(
     if !locality.is_empty() && (hash_depth < 16 || (network_aware && hash_depth < 24)) {
         let hint = locality.get(node_id);
         let region = hint.map_or("<unknown>", |value| value.region.as_str());
+        let zone = hint.map_or("<unknown>", |value| value.zone.as_str());
+        let network = hint.map_or("<unknown>", |value| value.network.as_str());
         append_hash_field(&mut material, region.as_bytes());
-        // Unknown locality is not evidence of co-location. Spread unknown
-        // regions independently, while still grouping an explicitly known region.
+        // A known network can group nodes even when their physical site is
+        // unknown. This does not declare that they share a power domain.
         if region == "<unknown>" {
-            append_hash_field(&mut material, node_id.as_str().as_bytes());
-        }
-        if hash_depth >= 8 {
-            let zone = hint.map_or("<unknown>", |value| value.zone.as_str());
-            append_hash_field(&mut material, zone.as_bytes());
-            if zone == "<unknown>" {
+            if zone != "<unknown>" {
+                append_hash_field(&mut material, b"known-zone");
+                append_hash_field(&mut material, zone.as_bytes());
+            } else if network != "<unknown>" {
+                append_hash_field(&mut material, b"known-network");
+                append_hash_field(&mut material, network.as_bytes());
+            } else {
                 append_hash_field(&mut material, node_id.as_str().as_bytes());
             }
         }
+        if hash_depth >= 8 {
+            append_hash_field(&mut material, zone.as_bytes());
+            if zone == "<unknown>" {
+                if network != "<unknown>" {
+                    append_hash_field(&mut material, b"known-network");
+                    append_hash_field(&mut material, network.as_bytes());
+                } else {
+                    append_hash_field(&mut material, node_id.as_str().as_bytes());
+                }
+            }
+        }
         if hash_depth >= 16 {
-            let network = hint.map_or("<unknown>", |value| value.network.as_str());
             append_hash_field(&mut material, network.as_bytes());
             if network == "<unknown>" {
                 append_hash_field(&mut material, node_id.as_str().as_bytes());
@@ -1592,10 +1605,8 @@ fn select_group_representatives(
                                     3
                                 }
                                 (Some(left), Some(right))
-                                    if left.region != "<unknown>"
-                                        && left.zone != "<unknown>"
+                                    if left.zone != "<unknown>"
                                         && right.zone != "<unknown>"
-                                        && left.region == right.region
                                         && left.zone != right.zone =>
                                 {
                                     2
@@ -2476,6 +2487,35 @@ mod tests {
                 "an uplink group must remain connected after a split"
             );
         }
+    }
+
+    #[test]
+    fn network_groups_work_when_physical_location_is_unknown() {
+        let mut nodes = records(80);
+        for (index, node) in nodes.iter_mut().enumerate() {
+            node.tags.insert(Tag::from_string(if index < 40 {
+                "topology-network-main"
+            } else {
+                "topology-network-other"
+            }));
+        }
+        let config = BoundedTopologyConfig::new(4).with_locality_aware(true);
+        let topology = BoundedTopology::synthesize(&nodes, &config)
+            .unwrap_or_else(|error| panic!("network-only topology: {error}"));
+        let hints = topology_locality(&nodes, &BTreeMap::new());
+        for group in topology.groups().iter().filter(|group| group.is_leaf()) {
+            let networks = group
+                .node_ids()
+                .iter()
+                .map(|node| hints[node].network.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                networks.len(),
+                1,
+                "a leaf should not combine known independent networks"
+            );
+        }
+        assert!(topology.invariants().are_satisfied());
     }
 
     #[test]

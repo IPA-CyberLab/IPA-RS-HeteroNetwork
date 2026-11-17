@@ -2,7 +2,8 @@ locals {
   declared_node_localities = jsondecode(file("${path.module}/node-localities.json"))
   overlay_locality_roster  = jsondecode(file("${path.module}/overlay-boot-peers.json")).hosts
   overlay_zone_regions = {
-    for locality in values(local.declared_node_localities.nodes) : locality.zone => locality.region...
+    for locality in values(local.declared_node_localities.nodes) : locality.zone => try(locality.region, "<unknown>")...
+    if try(locality.zone, null) != null
   }
 }
 
@@ -35,9 +36,11 @@ resource "kubernetes_labels" "overlay_node_locality" {
   field_manager = "heteronetwork-node-locality"
   force         = false
   labels = merge(
-    {
+    try(each.value.region, null) == null ? {} : {
       "topology.kubernetes.io/region" = each.value.region
-      "topology.kubernetes.io/zone"   = each.value.zone
+    },
+    try(each.value.zone, null) == null ? {} : {
+      "topology.kubernetes.io/zone" = each.value.zone
     },
     try(each.value.network, null) == null ? {} : {
       "heteronetwork.io/network-domain" = each.value.network
@@ -46,8 +49,8 @@ resource "kubernetes_labels" "overlay_node_locality" {
   depends_on = [terraform_data.overlay_locality_validation]
   lifecycle {
     precondition {
-      condition = contains(keys(local.overlay_locality_roster), each.key) && alltrue([
-        for label in concat([each.value.region, each.value.zone], try(each.value.network, null) == null ? [] : [each.value.network]) :
+      condition = contains(keys(local.overlay_locality_roster), each.key) && length(keys(each.value)) > 0 && length(setsubtract(toset(keys(each.value)), toset(["region", "zone", "network"]))) == 0 && alltrue([
+        for label in values(each.value) :
         can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", label))
       ])
       error_message = "Each locality must reference an existing overlay host and valid region/zone labels."

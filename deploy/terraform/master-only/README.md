@@ -151,10 +151,11 @@ quorum, if enabled, is never bypassed by this reconciler.
 Declare verified physical failure domains in `node-localities.json`, keyed by
 the hostnames in `overlay-boot-peers.json`. For example, a known host can be
 entered as `"host-a": {"region": "east", "zone": "site-a"}` under `nodes`.
-Both fields must be lowercase DNS labels. Use one zone only for machines that
+Fields that are known must be lowercase DNS labels; unknown dimensions may
+be omitted. Use one zone only for machines that
 share the same relevant site failure domain; do not infer independence from
 hostnames or IP addresses. Zone labels must be unique across regions. Omit
-unknown nodes. Terraform applies those labels
+unknown dimensions. Terraform applies the supplied labels
 to Kubernetes Nodes and reconciles the corresponding HeteroNetwork node IDs
 without overwriting unrelated locality entries. Existing labels owned by
 another field manager are not forcibly taken over. To remove a previously
