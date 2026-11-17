@@ -34,6 +34,26 @@ def dns_response(query, address, *, flags=0x8180, response_id=None):
 
 
 class OverlayConsoleConvergenceTests(unittest.TestCase):
+    def test_initial_connection_uses_the_control_plane_selected_gateway(self):
+        selected = {"node_id": "selected", "endpoint_candidates": [
+            {"kind": "public_udp", "cost": 20, "priority": 1, "addr": "192.0.2.1:51820"},
+            {"kind": "public_udp", "cost": 10, "priority": 1, "addr": "192.0.2.2:51820"},
+        ]}
+        alternate = {"node_id": "alternate", "endpoint_candidates": [
+            {"kind": "public_udp", "cost": 0, "priority": 10, "addr": "192.0.2.3:51820"},
+        ]}
+        profile = {"registration": {"peer_map": {"peers": [selected, alternate]}}}
+        self.assertEqual(verify.select_gateway(profile), (selected, "192.0.2.2:51820"))
+
+    def test_initial_connection_does_not_silently_choose_an_unassigned_gateway(self):
+        selected = {"node_id": "selected", "endpoint_candidates": []}
+        alternate = {"node_id": "alternate", "endpoint_candidates": [
+            {"kind": "public_udp", "cost": 0, "priority": 1, "addr": "192.0.2.1:51820"},
+        ]}
+        profile = {"registration": {"peer_map": {"peers": [selected, alternate]}}}
+        with self.assertRaisesRegex(RuntimeError, "selected gateway"):
+            verify.select_gateway(profile)
+
     def test_authenticated_browser_requires_acl_and_palette_evidence(self):
         checks = [{"check": name, "status": 200} for name in (
             "Authenticated overview", "Overview after reload",

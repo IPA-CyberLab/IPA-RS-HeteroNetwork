@@ -239,20 +239,25 @@ def decode_profile(uri):
 
 def select_gateway(profile):
     peers = profile["registration"]["peer_map"]["peers"]
+    if not peers:
+        raise RuntimeError("import profile has no selected gateway")
+    # The control plane projects the selected gateway first. In strict
+    # hierarchy only that gateway receives this client's WireGuard peer; a
+    # cheaper alternate cannot be used until an authenticated selection
+    # change is propagated. Match the native client bootstrap behavior.
+    peer = peers[0]
     choices = []
-    for peer in peers:
-        for candidate in peer["endpoint_candidates"]:
-            if candidate["kind"] not in ("ipv6", "public_udp"):
-                continue
-            # GitHub-hosted runners do not advertise usable IPv6. Prefer the
-            # public IPv4/UDP endpoint so the live CI path is deterministic,
-            # while retaining IPv6 as a fallback for other environments.
-            choices.append((0 if candidate["kind"] == "public_udp" else 1,
-                            candidate["cost"], -candidate["priority"],
-                            candidate["addr"], peer))
+    for candidate in peer["endpoint_candidates"]:
+        if candidate["kind"] not in ("ipv6", "public_udp"):
+            continue
+        # Prefer IPv4 on GitHub-hosted runners, but only within the selected
+        # gateway; the other gateways have not accepted this peer yet.
+        choices.append((0 if candidate["kind"] == "public_udp" else 1,
+                        candidate["cost"], -candidate["priority"],
+                        candidate["addr"]))
     if not choices:
-        raise RuntimeError("import profile has no public WireGuard gateway")
-    _, _, _, endpoint, peer = min(choices, key=lambda value: value[:4])
+        raise RuntimeError("selected gateway has no public WireGuard endpoint")
+    _, _, _, endpoint = min(choices)
     return peer, endpoint
 
 
