@@ -39,6 +39,19 @@ uses the assigned first gateway, matching the native client bootstrap.
 [A subsequent live run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44022708170)
 passed authentication and the three-second console budget. This was a test
 client correction, not proof that every native-client failover case works.
+The acceptance check was then made deterministic: it generates a signed test
+identity that must be assigned away from the sponsoring node. The [live run](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44023883591)
+joined through `10.250.0.6`, authenticated and opened the canonical console
+in 780 ms after route readiness; the temporary client was removed. Route
+readiness itself took 32.97 seconds and is not part of that page-open time.
+
+The [two-voter DCS partition E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44024432794)
+used the production etcd version in isolated network namespaces. After all
+peer TCP traffic was blocked and packet drops observed, neither voter accepted
+a write; quorum and writes recovered after the partition healed. The first
+test attempt only blocked traffic by destination port and allowed an existing
+bidirectional stream; the fixture was corrected before the passing result.
+This checks etcd behavior only, not a full Patroni/PostgreSQL site failover.
 
 ## Public gateways
 

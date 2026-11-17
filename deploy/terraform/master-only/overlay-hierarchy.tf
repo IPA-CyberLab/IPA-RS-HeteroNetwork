@@ -1,6 +1,9 @@
 locals {
   declared_node_localities = jsondecode(file("${path.module}/node-localities.json"))
   overlay_locality_roster  = jsondecode(file("${path.module}/overlay-boot-peers.json")).hosts
+  overlay_zone_regions = {
+    for locality in values(local.declared_node_localities.nodes) : locality.zone => locality.region...
+  }
 }
 
 resource "terraform_data" "overlay_locality_validation" {
@@ -14,11 +17,7 @@ resource "terraform_data" "overlay_locality_validation" {
       error_message = "Locality removals must be unique known hosts that are not also assigned a locality."
     }
     precondition {
-      condition = alltrue(flatten([
-        for _, left in local.declared_node_localities.nodes : [
-          for _, right in local.declared_node_localities.nodes : left.zone != right.zone || left.region == right.region
-        ]
-      ]))
+      condition     = alltrue([for regions in values(local.overlay_zone_regions) : length(toset(regions)) == 1])
       error_message = "A zone label must not be reused across regions."
     }
   }
