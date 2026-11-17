@@ -76,7 +76,18 @@ The independently tested retry fix was subsequently deployed through the
 checksum-pinned Terraform/Ansible rollout to all five active nodes, one at a
 time. All five Kubernetes nodes and all five Flash services reported ready
 afterward. This is a fix for the separate discarded-retry defect; the
-client-enrollment interruption above remains open.
+client-enrollment interruption above remains open. The [post-rollout run
+targeting the same gateway](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44030594776)
+again failed with both cached control-plane endpoints unreachable.
+
+Kubernetes events from the earlier 05:25 UTC live run also show an etcd
+connection to `uc-k8sp2` returning `no route to host` at 05:25:59, when the
+Whisper authentication service Pod was deleted. Its replacement was created
+at 05:26:39 and started at 05:27:11. The cause of the deletion is not established
+by those events, so the timing is evidence of impact, not proof that the VPN
+test caused the deletion. The service was ready in the later health check.
+Do not repeatedly run production enrollment tests while this issue remains
+unfixed; use isolated environments for investigation.
 
 The [two-voter DCS partition E2E](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/44024432794)
 used the production etcd version in isolated network namespaces. After all
