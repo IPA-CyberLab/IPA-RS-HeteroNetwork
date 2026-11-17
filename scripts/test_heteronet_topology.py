@@ -43,6 +43,16 @@ class TopologyCliTest(unittest.TestCase):
         data = topology.update(self.config, self.roster, "a", clear_network=True)
         self.assertNotIn("network", data["nodes"]["a"])
 
+    def test_bulk_update_moves_one_shared_zone_atomically(self):
+        topology.update(self.config, self.roster, "b", region="site", zone="room", network="other")
+        original = self.config.read_bytes()
+        with self.assertRaises(ValueError):
+            topology.update(self.config, self.roster, "a", region="new-site")
+        self.assertEqual(self.config.read_bytes(), original)
+        data = topology.update(self.config, self.roster, ["a", "b"], region="new-site")
+        self.assertEqual(data["nodes"]["a"]["region"], "new-site")
+        self.assertEqual(data["nodes"]["b"]["region"], "new-site")
+
     def test_plan_guard_rejects_unrelated_changes(self):
         plan = {"resource_changes": [
             {"address": 'kubernetes_labels.overlay_node_locality["a"]', "change": {"actions": ["create"]}},

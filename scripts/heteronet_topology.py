@@ -31,23 +31,25 @@ def update(config, roster, host, *, remove=False, region=None, zone=None, networ
     validator = reconciler()
     validator.load_localities(config, roster)
     known = json.loads(Path(roster).read_text(encoding="utf-8"))["hosts"]
-    if host not in known:
-        raise ValueError("node is not in the declared overlay roster")
-    if remove:
-        data["nodes"].pop(host, None)
-        if host not in data["remove"]:
-            data["remove"].append(host)
-    else:
-        if region is None and zone is None and network is None and not clear_network:
-            raise ValueError("specify at least one locality field")
-        entry = dict(data["nodes"].get(host, {}))
-        for key, value in (("region", region), ("zone", zone), ("network", network)):
-            if value is not None:
-                entry[key] = value
-        if clear_network:
-            entry.pop("network", None)
-        data["nodes"][host] = entry
-        data["remove"] = [name for name in data["remove"] if name != host]
+    hosts = [host] if isinstance(host, str) else list(host)
+    if not hosts or len(set(hosts)) != len(hosts) or any(name not in known for name in hosts):
+        raise ValueError("nodes must be unique members of the declared overlay roster")
+    if not remove and region is None and zone is None and network is None and not clear_network:
+        raise ValueError("specify at least one locality field")
+    for name in hosts:
+        if remove:
+            data["nodes"].pop(name, None)
+            if name not in data["remove"]:
+                data["remove"].append(name)
+        else:
+            entry = dict(data["nodes"].get(name, {}))
+            for key, value in (("region", region), ("zone", zone), ("network", network)):
+                if value is not None:
+                    entry[key] = value
+            if clear_network:
+                entry.pop("network", None)
+            data["nodes"][name] = entry
+            data["remove"] = [removed for removed in data["remove"] if removed != name]
     data["nodes"] = dict(sorted(data["nodes"].items()))
     data["remove"].sort()
     content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
@@ -118,14 +120,14 @@ def add_parser(subparsers, default_work_dir):
     actions = topology.add_subparsers(dest="action", required=True)
     actions.add_parser("list", help="show the declared node failure domains")
     set_cmd = actions.add_parser("set", help="set a node's declared failure domains")
-    set_cmd.add_argument("hostname")
+    set_cmd.add_argument("hostname", nargs="+")
     set_cmd.add_argument("--region")
     set_cmd.add_argument("--zone")
     network = set_cmd.add_mutually_exclusive_group()
     network.add_argument("--network")
     network.add_argument("--clear-network", action="store_true")
     remove = actions.add_parser("remove", help="remove a node's managed locality")
-    remove.add_argument("hostname")
+    remove.add_argument("hostname", nargs="+")
     for name in ("plan", "apply"):
         command = actions.add_parser(name, help=f"{name} the declared topology through Terraform")
         command.add_argument("--work-dir", type=Path, default=default_work_dir())

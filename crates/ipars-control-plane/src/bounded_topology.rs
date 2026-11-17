@@ -1179,16 +1179,15 @@ fn topology_locality(
                 })
             };
             let configured = overrides.get(&node.node_id);
-            let region = configured.map_or_else(
-                || label("topology-region-"),
-                |value| value.region.as_deref(),
-            );
-            let zone =
-                configured.map_or_else(|| label("topology-zone-"), |value| value.zone.as_deref());
-            let network = configured.map_or_else(
-                || label("topology-network-"),
-                |value| value.network.as_deref(),
-            );
+            let region = configured
+                .and_then(|value| value.region.as_deref())
+                .or_else(|| label("topology-region-"));
+            let zone = configured
+                .and_then(|value| value.zone.as_deref())
+                .or_else(|| label("topology-zone-"));
+            let network = configured
+                .and_then(|value| value.network.as_deref())
+                .or_else(|| label("topology-network-"));
             if region.is_none() && zone.is_none() && network.is_none() {
                 return None;
             }
@@ -2516,6 +2515,28 @@ mod tests {
             );
         }
         assert!(topology.invariants().are_satisfied());
+    }
+
+    #[test]
+    fn network_override_preserves_existing_site_tags() {
+        let mut nodes = records(1);
+        nodes[0]
+            .tags
+            .insert(Tag::from_string("topology-region-east"));
+        nodes[0].tags.insert(Tag::from_string("topology-zone-room"));
+        let overrides = BTreeMap::from([(
+            nodes[0].node_id.clone(),
+            OverlayNodeLocality {
+                region: None,
+                zone: None,
+                network: Some("uplink-a".into()),
+            },
+        )]);
+        let localities = topology_locality(&nodes, &overrides);
+        let locality = &localities[&nodes[0].node_id];
+        assert_eq!(locality.region, "east");
+        assert_eq!(locality.zone, "room");
+        assert_eq!(locality.network, "uplink-a");
     }
 
     #[test]
