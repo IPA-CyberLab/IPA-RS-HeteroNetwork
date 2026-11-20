@@ -5,6 +5,25 @@ domains. Never infer independent buildings, power feeds, or ISPs from
 hostnames or IP addresses. The observations from November 14 below are
 historical; see the later updates for the current configuration.
 
+## Update: network locality activated, 2026-11-20
+
+After owner authentication, `heteronet-admin topology apply` reconciled the
+declared locality policy. An independent management API check confirmed
+strict hierarchy and all five site, room, and uplink assignments. The live
+topology contained five nodes and six edges; the four `main-uplink` nodes
+formed a connected subgraph. This was a graph inspection, not a production
+network partition. All five Kubernetes nodes and all six Flash services were
+Ready after the change.
+
+The management API and console Agent on `uc-k8sp5` were listening on its
+HeteroNetwork address. Direct checks of ports 19088 and 9781 on both existing
+public gateway addresses did not connect. This is a point-in-time check, not
+an exhaustive firewall audit. The owner-authentication verification page is
+on the public HeteroCloud identity provider, which is also used by HeteroCloud
+users; it is not itself VPN-only. For this activation the operator connected
+to the internal management API through an authenticated SSH tunnel, so do not
+describe the operator's own connection as a HeteroNetwork VPN session.
+
 ## Update: shared room and independent uplinks, 2026-11-17
 
 The operator confirmed that all five nodes share one room and can fail
@@ -18,10 +37,9 @@ Terraform plan and apply operations. The management API requires an owner
 token to apply the declared HeteroNetwork policy.
 
 The network-aware control-plane binary has been rolled out serially and the
-Kubernetes labels are live. The HeteroNetwork locality policy still requires
-owner authentication and has not been verified as applied; do not treat its
-VPN route preferences as active until `reconcile-overlay-hierarchy.py --check`
-succeeds. The matching Agent binary and topology display have also been rolled
+Kubernetes labels are live. At this point the HeteroNetwork locality policy
+had not yet been applied; see the November 20 update above. The matching
+Agent binary and topology display have also been rolled
 out serially to all five nodes. The canonical gateway served the same UI bundle
 as the repository, all five nodes were Ready, and all six Flash services were
 ready after rollout.
