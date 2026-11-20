@@ -164,8 +164,8 @@ class Keycloak:
             command += ["-q", key + "=" + value]
         return json.loads(self.run(command))
 
-    def update_client(self, client_uuid, updates):
-        command = ["update", "clients/" + client_uuid, "-r", REALM]
+    def update_client(self, client_uuid, updates, *, realm=REALM):
+        command = ["update", "clients/" + client_uuid, "-r", realm]
         for key, value in updates.items():
             command += ["-s", key + "=" + json.dumps(value, separators=(",", ":"))]
         self.run(command)

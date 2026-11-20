@@ -11,6 +11,8 @@ resource "terraform_data" "private_identity_client" {
   triggers_replace = [
     filesha256("${path.module}/ansible/private-identity-client.yaml"),
     filesha256("${local.repo_root}/scripts/reconcile-private-oidc-client.py"),
+    filesha256("${local.repo_root}/scripts/verify-private-owner-proof.py"),
+    filesha256("${local.repo_root}/scripts/private-owner-device-proof.py"),
     sha256(jsonencode(var.heteronetwork_private_console_origins)),
   ]
 

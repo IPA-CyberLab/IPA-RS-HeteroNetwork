@@ -10,8 +10,18 @@ on:
       - 'deploy/gitops/cluster-dns/keycloak-ha-connector.yaml'
       - 'deploy/gitops/cluster-dns/test_overlay_dns_service_discovery.py'
       - 'scripts/private-identity-proxy-e2e.py'
+      - 'scripts/private-identity-vpn-e2e.py'
       - 'scripts/reconcile-private-*.py'
+      - 'scripts/verify-private-owner-proof.py'
+      - 'scripts/private-owner-device-proof.py'
+      - 'scripts/retire-public-owner-client.py'
       - 'scripts/test_reconcile_private_*.py'
+      - 'scripts/test_verify_private_owner_proof.py'
+      - 'scripts/test_private_owner_device_proof.py'
+      - 'scripts/test_retire_public_owner_client.py'
+      - 'scripts/reconcile-owner-console-auth.sh'
+      - 'scripts/test_reconcile_owner_console_auth.py'
+      - 'deploy/terraform/master-only/ansible/private-*.yaml'
   pull_request:
     paths: *private_paths
 
@@ -27,9 +37,12 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y haproxy python3-yaml
+          sudo apt-get install -y curl haproxy python3-yaml wireguard-tools
       - name: Verify private identity configuration
         run: |
-          PYTHONPATH=scripts python3 -B -m unittest test_reconcile_private_oidc_client test_reconcile_private_console_auth
+          PYTHONPATH=scripts python3 -B -m unittest test_reconcile_private_oidc_client test_reconcile_private_console_auth test_verify_private_owner_proof test_private_owner_device_proof test_retire_public_owner_client
           python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py
           python3 -B scripts/private-identity-proxy-e2e.py
+          sudo env PYTHONPATH=scripts python3 -B -m unittest test_reconcile_owner_console_auth
+      - name: Verify isolated WireGuard access
+        run: sudo python3 -B scripts/private-identity-vpn-e2e.py

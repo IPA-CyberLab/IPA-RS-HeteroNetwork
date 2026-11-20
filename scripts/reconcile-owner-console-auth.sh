@@ -43,6 +43,20 @@ decode_entry() {
   printf '%s' "$encoded" | base64 --decode
 }
 
+# A native release must not silently move an already-private owner console
+# back to the public HeteroCloud realm.
+current_issuer="$(decode_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_ISSUER_URL_B64 || true)"
+if [[ "$current_issuer" =~ ^https?://[a-z0-9.-]+\.heteronetwork\.internal(:[0-9]+)?/realms/heteronetwork$ ]]; then
+  current_client="$(decode_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_CLIENT_ID_B64 || true)"
+  current_owner="$(decode_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64 || true)"
+  current_origin="$(decode_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_DEVICE_VERIFICATION_ORIGIN_B64 || true)"
+  [[ "$current_client" == "$client_id" && "${current_owner,,}" == "${owner_email,,}" \
+     && "$current_origin" == "${current_issuer%/realms/heteronetwork}" ]] \
+    || fail "private owner configuration does not match the declared owner"
+  printf 'reconcile-owner-console-auth: preserved VPN-only owner authentication\n'
+  exit 0
+fi
+
 replace_entry() {
   local key="$1" value="$2" temporary
   temporary="$(mktemp "$(dirname "$bootstrap_env")/.bootstrap.env.XXXXXX")"

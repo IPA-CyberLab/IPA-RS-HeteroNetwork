@@ -1,0 +1,28 @@
+- name: Restore the previous protected bootstrap
+  ansible.builtin.copy:
+    content: "{{ hostvars[rollback_host].hnn_previous_bootstrap.content | b64decode }}"
+    dest: /etc/heteronetwork/public-services/bootstrap.env
+    owner: root
+    group: root
+    mode: '0600'
+  delegate_to: "{{ rollback_host }}"
+  no_log: true
+- name: Restore the previous active authentication configuration
+  ansible.builtin.command:
+    argv: [systemctl, restart, --no-block, heteronetwork-public-services-autopilot.service]
+  delegate_to: "{{ rollback_host }}"
+  changed_when: true
+- name: Wait for the previous issuer to be served after rollback
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[rollback_host].vpn_ip }}:19088/ui/config"
+    status_code: 200
+    return_content: true
+    use_proxy: false
+    timeout: 3
+  delegate_to: "{{ rollback_host }}"
+  register: hnn_rollback_config
+  until: >-
+    hnn_rollback_config.status | default(0) == 200 and
+    hnn_rollback_config.json.issuer_url | default('') == hostvars[rollback_host].hnn_previous_public_config.json.issuer_url
+  retries: 30
+  delay: 2

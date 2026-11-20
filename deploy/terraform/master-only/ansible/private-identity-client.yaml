@@ -8,13 +8,17 @@
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
     hnn_private_origins: "{{ lookup('env', 'HNN_PRIVATE_CONSOLE_ORIGINS') | from_json }}"
   tasks:
-    - name: Install the scoped private identity reconciler
+    - name: Install the scoped private identity helpers
       ansible.builtin.copy:
-        src: "{{ hnn_repo_root }}/scripts/reconcile-private-oidc-client.py"
-        dest: /opt/heteronetwork/libexec/reconcile-private-oidc-client.py
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/libexec/{{ item }}"
         owner: root
         group: root
         mode: '0755'
+      loop:
+        - reconcile-private-oidc-client.py
+        - verify-private-owner-proof.py
+        - private-owner-device-proof.py
     - name: Preserve the existing private owner and reconcile console callbacks
       ansible.builtin.command:
         argv: "{{ ['python3', '/opt/heteronetwork/libexec/reconcile-private-oidc-client.py'] + (hnn_private_origins | map('regex_replace', '^', '--console-origin=') | list) }}"

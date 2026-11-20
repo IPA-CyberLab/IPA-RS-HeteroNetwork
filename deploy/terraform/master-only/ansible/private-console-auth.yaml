@@ -1,3 +1,30 @@
+- name: Verify the existing owner can sign in privately
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_private_origin: "{{ lookup('env', 'HNN_PRIVATE_IDENTITY_ORIGIN') }}"
+    hnn_private_proof: "{{ lookup('env', 'HNN_PRIVATE_OWNER_PROOF_PATH') }}"
+  tasks:
+    - name: Require a protected, temporary owner proof
+      ansible.builtin.assert:
+        that: hnn_private_proof is match('^/tmp/hnn-private-owner-[A-Za-z0-9_-]+/token$')
+    - name: Install the private owner proof verifier
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/verify-private-owner-proof.py"
+        dest: /opt/heteronetwork/libexec/verify-private-owner-proof.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Confirm the private identity belongs to the configured owner
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/libexec/verify-private-owner-proof.py, "--token-file={{ hnn_private_proof }}", "--identity-origin={{ hnn_private_origin }}", "--proof-owner={{ ansible_user }}"]
+      changed_when: false
+      no_log: true
+
 - name: Switch the owner console to its VPN-only identity realm
   hosts: bootstrap:enrollment_issuer
   gather_facts: false
@@ -9,48 +36,65 @@
     ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
     hnn_private_origin: "{{ lookup('env', 'HNN_PRIVATE_IDENTITY_ORIGIN') }}"
     hnn_private_ips: "{{ lookup('env', 'HNN_PRIVATE_IDENTITY_IPS') | from_json }}"
+    hnn_private_proof: "{{ lookup('env', 'HNN_PRIVATE_OWNER_PROOF_PATH') }}"
     hnn_private_issuer: "{{ hnn_private_origin }}/realms/heteronetwork"
+    hnn_bootstrap_host: "{{ groups['bootstrap'][0] }}"
   tasks:
-    - name: Install the scoped private console reconciler
-      ansible.builtin.copy:
-        src: "{{ hnn_repo_root }}/scripts/reconcile-private-console-auth.py"
-        dest: /opt/heteronetwork/libexec/reconcile-private-console-auth.py
-        owner: root
-        group: root
-        mode: '0755'
-    - name: Verify another control plane is healthy before changing authentication
-      ansible.builtin.uri:
-        url: "http://{{ item }}:19088/healthz"
-        status_code: 200
-        use_proxy: false
-        timeout: 3
-      loop: "{{ hnn_private_ips | difference([vpn_ip]) }}"
-      register: hnn_peer_health
-      failed_when: false
-      changed_when: false
-    - name: Refuse to change the last healthy control plane
-      ansible.builtin.assert:
-        that: hnn_peer_health.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 200) | list | length >= 1
-    - name: Confirm this gateway can reach the private identity issuer
-      ansible.builtin.uri:
-        url: "http://{{ vpn_ip }}:18079/realms/heteronetwork/.well-known/openid-configuration"
-        headers:
-          Host: "{{ hnn_private_origin | urlsplit('netloc') }}"
-        status_code: 200
-        return_content: true
-        use_proxy: false
-        timeout: 5
-      register: hnn_private_discovery
-      until: hnn_private_discovery.status | default(0) == 200 and hnn_private_discovery.json.issuer | default('') == hnn_private_issuer
-      retries: 15
-      delay: 2
-    - name: Capture the existing protected bootstrap for rollback
-      ansible.builtin.slurp:
-        src: /etc/heteronetwork/public-services/bootstrap.env
-      register: hnn_previous_bootstrap
-      no_log: true
     - name: Apply and verify private owner authentication
       block:
+        - name: Install the scoped private console reconciler
+          ansible.builtin.copy:
+            src: "{{ hnn_repo_root }}/scripts/reconcile-private-console-auth.py"
+            dest: /opt/heteronetwork/libexec/reconcile-private-console-auth.py
+            owner: root
+            group: root
+            mode: '0755'
+        - name: Capture the existing protected bootstrap for rollback
+          ansible.builtin.slurp:
+            src: /etc/heteronetwork/public-services/bootstrap.env
+          register: hnn_previous_bootstrap
+          no_log: true
+        - name: Capture the currently served authentication issuer for rollback
+          ansible.builtin.uri:
+            url: "http://{{ vpn_ip }}:19088/ui/config"
+            status_code: 200
+            return_content: true
+            use_proxy: false
+            timeout: 4
+          register: hnn_previous_public_config
+          failed_when: hnn_previous_public_config.json.issuer_url | default('') | length == 0
+        - name: Recheck the private owner proof before changing this host
+          ansible.builtin.command:
+            argv: [python3, /opt/heteronetwork/libexec/verify-private-owner-proof.py, "--token-file={{ hnn_private_proof }}", "--identity-origin={{ hnn_private_origin }}", "--proof-owner={{ hostvars[hnn_bootstrap_host].ansible_user | default('mizuame') }}"]
+          delegate_to: "{{ hnn_bootstrap_host }}"
+          changed_when: false
+          no_log: true
+        - name: Verify another control plane is healthy before changing authentication
+          ansible.builtin.uri:
+            url: "http://{{ item }}:19088/healthz"
+            status_code: 200
+            use_proxy: false
+            timeout: 3
+          loop: "{{ hnn_private_ips | difference([vpn_ip]) }}"
+          register: hnn_peer_health
+          failed_when: false
+          changed_when: false
+        - name: Refuse to change the last healthy control plane
+          ansible.builtin.assert:
+            that: hnn_peer_health.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 200) | list | length >= 1
+        - name: Confirm this gateway can reach the private identity issuer
+          ansible.builtin.uri:
+            url: "http://{{ vpn_ip }}:18079/realms/heteronetwork/.well-known/openid-configuration"
+            headers:
+              Host: "{{ hnn_private_origin | urlsplit('netloc') }}"
+            status_code: 200
+            return_content: true
+            use_proxy: false
+            timeout: 5
+          register: hnn_private_discovery
+          until: hnn_private_discovery.status | default(0) == 200 and hnn_private_discovery.json.issuer | default('') == hnn_private_issuer
+          retries: 15
+          delay: 2
         - name: Reconcile only owner OIDC configuration
           ansible.builtin.command:
             argv: "{{ ['python3', '/opt/heteronetwork/libexec/reconcile-private-console-auth.py', '--identity-origin=' + hnn_private_origin] + (hnn_private_ips | map('regex_replace', '^', '--fallback=') | list) }}"
@@ -76,6 +120,12 @@
             hnn_private_config.json.client_id | default('') == 'ipars-web'
           retries: 45
           delay: 2
+        - name: Verify the private owner can access this control plane
+          ansible.builtin.command:
+            argv: [python3, /opt/heteronetwork/libexec/verify-private-owner-proof.py, "--token-file={{ hnn_private_proof }}", "--identity-origin={{ hnn_private_origin }}", "--proof-owner={{ hostvars[hnn_bootstrap_host].ansible_user | default('mizuame') }}", "--control-plane={{ vpn_ip }}"]
+          delegate_to: "{{ hnn_bootstrap_host }}"
+          changed_when: false
+          no_log: true
         - name: Verify this control plane recovered
           ansible.builtin.uri:
             url: "http://{{ vpn_ip }}:19088/healthz"
@@ -87,28 +137,14 @@
           retries: 30
           delay: 2
       rescue:
-        - name: Restore the previous protected bootstrap
-          ansible.builtin.copy:
-            content: "{{ hnn_previous_bootstrap.content | b64decode }}"
-            dest: /etc/heteronetwork/public-services/bootstrap.env
-            owner: root
-            group: root
-            mode: '0600'
-          no_log: true
-        - name: Restore the previous active authentication configuration
-          ansible.builtin.command:
-            argv: [systemctl, restart, --no-block, heteronetwork-public-services-autopilot.service]
-          changed_when: true
-        - name: Wait for the control plane after rollback
-          ansible.builtin.uri:
-            url: "http://{{ vpn_ip }}:19088/healthz"
-            status_code: 200
-            use_proxy: false
-            timeout: 3
-          register: hnn_rollback_health
-          until: hnn_rollback_health.status | default(0) == 200
-          retries: 30
-          delay: 2
+        - name: Restore each changed control plane one at a time
+          ansible.builtin.include_tasks: private-console-rollback-host.yaml
+          loop: "{{ [inventory_hostname] + ((groups['bootstrap'] + groups['enrollment_issuer']) | difference([inventory_hostname])) }}"
+          loop_control:
+            loop_var: rollback_host
+          when: >-
+            hostvars[rollback_host].hnn_previous_bootstrap.content is defined and
+            hostvars[rollback_host].hnn_previous_public_config.json.issuer_url is defined
         - name: Stop instead of proceeding to another control plane
           ansible.builtin.fail:
-            msg: Private authentication activation failed; the previous bootstrap was restored.
+            msg: Private authentication activation failed; the previous bootstraps were restored.

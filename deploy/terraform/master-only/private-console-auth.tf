@@ -21,7 +21,9 @@ resource "terraform_data" "private_console_auth" {
   count = var.heteronetwork_private_console_auth_enabled ? 1 : 0
   triggers_replace = [
     filesha256("${path.module}/ansible/private-console-auth.yaml"),
+    filesha256("${path.module}/ansible/private-console-rollback-host.yaml"),
     filesha256("${local.repo_root}/scripts/reconcile-private-console-auth.py"),
+    filesha256("${local.repo_root}/scripts/verify-private-owner-proof.py"),
     var.heteronetwork_private_identity_origin,
     sha256(jsonencode(local.heteronetwork_private_identity_ips)),
   ]

@@ -1,0 +1,32 @@
+- name: Retire the old public HeteroNetwork owner client
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_private_origin: "{{ lookup('env', 'HNN_PRIVATE_IDENTITY_ORIGIN') }}"
+    hnn_private_ips: "{{ lookup('env', 'HNN_PRIVATE_IDENTITY_IPS') | from_json }}"
+    hnn_private_proof: "{{ lookup('env', 'HNN_PRIVATE_OWNER_PROOF_PATH') }}"
+  tasks:
+    - name: Require a protected, temporary owner proof
+      ansible.builtin.assert:
+        that: hnn_private_proof is match('^/tmp/hnn-private-owner-[A-Za-z0-9_-]+/token$')
+    - name: Install scoped identity helpers
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/libexec/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - retire-public-owner-client.py
+        - verify-private-owner-proof.py
+        - reconcile-private-oidc-client.py
+    - name: Verify both private control planes and disable only the legacy public client
+      ansible.builtin.command:
+        argv: "{{ ['python3', '/opt/heteronetwork/libexec/retire-public-owner-client.py', '--token-file=' + hnn_private_proof, '--identity-origin=' + hnn_private_origin, '--proof-owner=' + ansible_user] + (hnn_private_ips | map('regex_replace', '^', '--control-plane=') | list) }}"
+      register: hnn_public_owner_retirement
+      changed_when: (hnn_public_owner_retirement.stdout | from_json).changed
+      no_log: true
