@@ -1,0 +1,22 @@
+- name: Prepare the VPN-only HeteroNetwork owner client
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_private_origins: "{{ lookup('env', 'HNN_PRIVATE_CONSOLE_ORIGINS') | from_json }}"
+  tasks:
+    - name: Install the scoped private identity reconciler
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/reconcile-private-oidc-client.py"
+        dest: /opt/heteronetwork/libexec/reconcile-private-oidc-client.py
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Preserve the existing private owner and reconcile console callbacks
+      ansible.builtin.command:
+        argv: "{{ ['python3', '/opt/heteronetwork/libexec/reconcile-private-oidc-client.py'] + (hnn_private_origins | map('regex_replace', '^', '--console-origin=') | list) }}"
+      register: hnn_private_client
+      changed_when: (hnn_private_client.stdout | from_json).changed

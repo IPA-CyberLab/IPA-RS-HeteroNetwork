@@ -69,6 +69,7 @@ def files():
            'scripts/heteronetwork-console-e2e.sh','scripts/heteronetwork-console-browser-e2e.mjs',
            'scripts/verify-overlay-client-console.py','scripts/test_verify_overlay_client_console.py',
            'scripts/reconcile-console-e2e-user.py','scripts/reconcile-console-issuer.py',
+           'scripts/reconcile-private-oidc-client.py','scripts/test_reconcile_private_oidc_client.py',
            'scripts/test_reconcile_console_issuer.py',
            'scripts/verify-gpu-runtime.py',
            'scripts/gpu_inventory.py','scripts/test_gpu_inventory.py',
