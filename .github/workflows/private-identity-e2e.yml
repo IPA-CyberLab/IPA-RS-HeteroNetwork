@@ -1,0 +1,35 @@
+name: Private identity connector E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: &private_paths
+      - '.github/workflows/private-identity-e2e.yml'
+      - 'deploy/gitops/cluster-dns/keycloak-haproxy.cfg'
+      - 'deploy/gitops/cluster-dns/keycloak-ha-connector.yaml'
+      - 'deploy/gitops/cluster-dns/test_overlay_dns_service_discovery.py'
+      - 'scripts/private-identity-proxy-e2e.py'
+      - 'scripts/reconcile-private-*.py'
+      - 'scripts/test_reconcile_private_*.py'
+  pull_request:
+    paths: *private_paths
+
+permissions:
+  contents: read
+
+jobs:
+  connector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y haproxy python3-yaml
+      - name: Verify private identity configuration
+        run: |
+          PYTHONPATH=scripts python3 -B -m unittest test_reconcile_private_oidc_client test_reconcile_private_console_auth
+          python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py
+          python3 -B scripts/private-identity-proxy-e2e.py
