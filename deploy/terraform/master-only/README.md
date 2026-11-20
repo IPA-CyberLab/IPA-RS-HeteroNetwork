@@ -196,6 +196,46 @@ reports a null hierarchy result and exits 2 if no token was supplied, rather
 than reporting the policy as verified. An apply that needs to change the
 hierarchy fails closed if the credential or required quorum is unavailable.
 
+### VPN-only owner authentication
+
+The HeteroNetwork owner console uses a separate private identity realm. Its
+identity origin and console callback must resolve through HeteroNetwork; the
+public HeteroCloud login uses its own realm and remains available. The private
+identity connector has VPN-addressed entry points on control-plane-only nodes,
+without placing its Pods on those nodes.
+
+Initial migration requires proof that the existing owner can authenticate
+through the private realm. On the bootstrap host, as the same unprivileged SSH
+user used by Ansible, run:
+
+```bash
+python3 /opt/heteronetwork/libexec/private-owner-device-proof.py \
+  --gateway http://127.0.0.1:18079 \
+  --identity-origin http://console.heteronetwork.internal:18079
+```
+
+Complete the displayed device login from a browser connected to HeteroNetwork.
+The helper writes the short-lived access token only to a private temporary file
+on the bootstrap host and prints its path. Set `HNN_PRIVATE_OWNER_PROOF_PATH`
+to that path in the Terraform operator's environment, along with the usual
+Ansible become credential. Do not copy the token into Terraform variables,
+state, logs, or a repository.
+
+Enable `heteronetwork_private_console_auth_enabled` and review a targeted plan
+for `terraform_data.private_console_auth[0]`. The apply checks the owner proof,
+switches control planes one at a time, verifies owner authorization on each,
+and restores the previous configuration if activation fails. Only after both
+control planes accept the private owner should
+`heteronetwork_retire_public_owner_client` be enabled and the targeted
+`terraform_data.retire_public_owner_client[0]` plan applied with the same
+still-valid proof. It disables the legacy public owner client without changing
+the public HeteroCloud client. Remove the temporary proof file after the
+operation. An expired proof requires a new device login.
+
+The private identity CI exercises a real WireGuard tunnel in an isolated
+runner with a mock identity backend. It does not replace the owner login and
+authorization checks against the production HeteroNetwork.
+
 Install Terraform >=1.16.4, ansible-core 2.19.5, Python with PyYAML and kubectl.
 The lockfile pins the Terraform providers. Use an operator kubeconfig that can
 reach the existing cluster, the authorized SSH key, and a private work directory:
