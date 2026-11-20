@@ -92,9 +92,18 @@ kind: Service
 metadata:
   name: keycloak-ha-connector
   namespace: kube-system
+  annotations:
+    networking.heteronetwork.io/overlay-dns-name: identity.heteronetwork.internal
 spec:
   # Stable virtual address, not a physical node IP. OIDC Host stays unchanged.
   clusterIP: 10.96.180.79
+  # HeteroNetwork DNS resolves the console name to the client's gateway.
+  # The three control-plane-only nodes have no native identity edge; expose
+  # this Service on their VPN IPs without scheduling workload Pods there.
+  externalIPs:
+    - 10.250.0.4
+    - 10.250.0.5
+    - 10.250.0.6
   selector:
     app.kubernetes.io/name: keycloak-ha-connector
   ports:

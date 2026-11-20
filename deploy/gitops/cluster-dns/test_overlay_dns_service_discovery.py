@@ -58,6 +58,29 @@ def endpoint_slice(namespace, service_name, endpoints):
 
 
 class OverlayDnsServiceDiscoveryTests(unittest.TestCase):
+    def test_private_identity_dns_tracks_ready_connector_nodes(self):
+        documents = yaml.safe_load_all(Path(__file__).with_name("keycloak-ha-connector.yaml").read_text())
+        connector = next(document for document in documents
+                         if document and document.get("kind") == "Service")
+        name = "identity.heteronetwork.internal"
+        self.assertEqual(connector["metadata"]["annotations"][discovery.DNS_ANNOTATION], name)
+        self.assertEqual(connector["spec"]["ports"][0]["port"], 18079)
+        nodes_file = Path(__file__).resolve().parents[2] / "terraform/master-only/nodes.json"
+        managed_nodes = json.loads(nodes_file.read_text())
+        self.assertEqual(set(connector["spec"]["externalIPs"]),
+                         {entry["vpn_ip"] for entry in managed_nodes.values()})
+        nodes = [node("a", "10.250.0.2"), node("b", "10.250.0.10")]
+        endpoints = endpoint_slice("kube-system", "keycloak-ha-connector", [
+            {"nodeName": "a", "conditions": {"ready": True}},
+            {"nodeName": "b", "conditions": {"ready": True}},
+        ])
+        base = {"schema_version": 1, "records": {}, "gateway_records": {}}
+        effective, _ = discovery.build_effective_zone(base, [connector], [endpoints], nodes, [])
+        self.assertEqual(effective["records"][name], ["10.250.0.2", "10.250.0.10"])
+        endpoints["endpoints"][0]["conditions"]["ready"] = False
+        effective, _ = discovery.build_effective_zone(base, [connector], [endpoints], nodes, [])
+        self.assertEqual(effective["records"][name], ["10.250.0.10"])
+
     def test_controller_can_move_from_a_stopped_node_without_entering_control_plane(self):
         resources = yaml.safe_load_all(Path(__file__).with_name("overlay-dns-service-discovery.yaml").read_text())
         deployment = next(resource for resource in resources if resource and resource.get("kind") == "Deployment")
