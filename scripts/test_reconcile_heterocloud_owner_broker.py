@@ -144,6 +144,14 @@ class CloudOwnerBrokerTests(unittest.TestCase):
         actual["config"]["clientSecret"] = "another-secret"
         self.assertEqual(broker.mismatched_fields(actual, desired, ignore_secret=True), ["config.issuer"])
 
+    def test_missing_default_visibility_is_visible_but_true_is_rejected(self):
+        desired = broker.provider_representation(ISSUER, SECRET, enabled=True)
+        actual = copy.deepcopy(desired)
+        actual["config"].pop("hideOnLoginPage")
+        self.assertTrue(broker.matches(actual, desired, ignore_secret=True))
+        actual["config"]["hideOnLoginPage"] = "true"
+        self.assertFalse(broker.matches(actual, desired, ignore_secret=True))
+
 
 if __name__ == "__main__":
     unittest.main()

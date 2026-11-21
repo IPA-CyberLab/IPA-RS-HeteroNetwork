@@ -119,6 +119,9 @@ def matches(actual, expected, *, ignore_secret=False):
     for key, value in expected.items():
         if ignore_secret and key == "clientSecret":
             continue
+        # Keycloak omits this default-valued field from its REST representation.
+        if key == "hideOnLoginPage" and value == "false" and key not in actual:
+            continue
         if isinstance(value, dict):
             if not matches(actual.get(key), value, ignore_secret=ignore_secret):
                 return False
@@ -133,6 +136,8 @@ def mismatched_fields(actual, expected, *, prefix="", ignore_secret=False):
     fields = []
     for key, value in expected.items():
         if ignore_secret and key == "clientSecret":
+            continue
+        if key == "hideOnLoginPage" and value == "false" and key not in actual:
             continue
         name = prefix + key
         if isinstance(value, dict):
