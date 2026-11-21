@@ -110,4 +110,19 @@ jobs:
             tail -n 30 "$RUNNER_TEMP/keycloak-e2e.log"
             exit 1
           fi
-          python3 -B scripts/private-owner-broker-keycloak-e2e.py
+          if ! python3 -B scripts/private-owner-broker-keycloak-e2e.py; then
+            python3 - "$RUNNER_TEMP/keycloak-e2e.log" <<'PY'
+          import re,sys
+          for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
+              if 'org.keycloak.events' in line and 'ERROR' in line:
+                  fields=[]
+                  for key in ('type','realmName','error'):
+                      match=re.search(key+r'="?([A-Za-z0-9_.-]+)',line)
+                      fields.append(key+'='+(match.group(1) if match else '-'))
+                  print('Keycloak test event:', ' '.join(fields))
+              if 'Caused by:' in line:
+                  value=line.split('Caused by:',1)[1].strip().split('?',1)[0]
+                  print('Keycloak test cause:',value[:200])
+          PY
+            exit 1
+          fi

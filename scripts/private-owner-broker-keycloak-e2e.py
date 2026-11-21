@@ -115,13 +115,15 @@ def login(username):
     fields = {**parser.hidden, "username": username, "password": TEST_PASSWORD, "login": "Sign In"}
     status, location, body = fetch(opener, action, fields=fields,
         headers={"Origin": "https://cloud.example.test:18443", "Referer": destination})
+    trace = [{"stage": "cloud_login_submit", "status": status}]
     for _ in range(10):
         if status not in (302, 303) or not location:
-            return opener, verifier, state, callback, None, status
+            return opener, verifier, state, callback, None, status, trace
         location = urljoin(action, location)
         target = urlsplit(location)
+        trace.append({"status": status, "origin": target.scheme + "://" + target.netloc, "path": target.path})
         if target.scheme == "http" and target.netloc == "console.heteronetwork.internal" and target.path == "/ui/callback":
-            return opener, verifier, state, callback, parse_qs(target.query), status
+            return opener, verifier, state, callback, parse_qs(target.query), status, trace
         if not ((target.scheme == "http" and target.netloc == "console.heteronetwork.internal:18079")
                 or (target.scheme == "https" and target.netloc == "cloud.example.test:18443")):
             raise RuntimeError("test authentication redirected to an unexpected origin")
@@ -177,9 +179,9 @@ def run():
         if broker.reconcile(kc, EMAIL, ISSUER, ORIGIN):
             raise RuntimeError("real identity broker was not idempotent")
 
-        opener, verifier, state, callback, result, status = login(EMAIL)
+        opener, verifier, state, callback, result, status, trace = login(EMAIL)
         if not result or result.get("state") != [state] or len(result.get("code", [])) != 1:
-            raise RuntimeError("existing cloud owner did not complete private authentication")
+            raise RuntimeError("existing cloud owner did not complete private authentication: " + json.dumps(trace))
         status, _, raw = fetch(opener, ORIGIN + "/realms/heteronetwork/protocol/openid-connect/token",
                                fields={"grant_type": "authorization_code", "client_id": "ipars-web",
                                        "code": result["code"][0], "redirect_uri": callback,
@@ -196,7 +198,7 @@ def run():
         if status != 200 or identity.get("sub") != private_owner["id"] or identity.get("email") != EMAIL:
             raise RuntimeError("private token does not belong to the existing owner")
         del token
-        _, _, _, _, rejected, rejected_status = login(OTHER)
+        _, _, _, _, rejected, rejected_status, _ = login(OTHER)
         if rejected and rejected.get("code"):
             raise RuntimeError("unlinked cloud account obtained a private token")
         users = kc.get("users", realm=broker.PRIVATE_REALM, query={"max": "100"})
