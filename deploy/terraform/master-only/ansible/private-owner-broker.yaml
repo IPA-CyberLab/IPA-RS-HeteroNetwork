@@ -1,0 +1,27 @@
+- name: Link the cloud owner to private network authentication
+  hosts: bootstrap
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    ansible_become_password: "{{ lookup('env', 'HNN_IAC_BECOME_PASSWORD') }}"
+    ansible_remote_tmp: /tmp/heteronetwork-ansible-mizuame
+    hnn_cloud_issuer: "{{ lookup('env', 'HNN_CLOUD_IDENTITY_ISSUER') }}"
+    hnn_private_origin: "{{ lookup('env', 'HNN_PRIVATE_IDENTITY_ORIGIN') }}"
+  tasks:
+    - name: Install protected identity reconciliation helpers
+      ansible.builtin.copy:
+        src: "{{ hnn_repo_root }}/scripts/{{ item }}"
+        dest: "/opt/heteronetwork/libexec/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - reconcile-private-oidc-client.py
+        - reconcile-heterocloud-owner-broker.py
+    - name: Reconcile the owner-only cloud identity link
+      ansible.builtin.command:
+        argv: [python3, /opt/heteronetwork/libexec/reconcile-heterocloud-owner-broker.py, "--cloud-issuer={{ hnn_cloud_issuer }}", "--private-origin={{ hnn_private_origin }}"]
+      register: hnn_owner_broker
+      changed_when: (hnn_owner_broker.stdout | from_json).changed
+      no_log: true

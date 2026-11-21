@@ -39,5 +39,5 @@ resource "terraform_data" "private_console_auth" {
       ANSIBLE_STDOUT_CALLBACK     = "hnn_json"
     }
   }
-  depends_on = [local_file.inventory, local_file.known_hosts, terraform_data.private_identity_client]
+  depends_on = [local_file.inventory, local_file.known_hosts, terraform_data.private_identity_client, terraform_data.private_cloud_owner_broker]
 }

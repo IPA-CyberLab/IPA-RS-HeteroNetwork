@@ -14,6 +14,9 @@ on:
       - 'scripts/reconcile-private-*.py'
       - 'scripts/verify-private-owner-proof.py'
       - 'scripts/private-owner-device-proof.py'
+      - 'scripts/reconcile-heterocloud-owner-broker.py'
+      - 'scripts/test_reconcile_heterocloud_owner_broker.py'
+      - 'scripts/private-owner-broker-keycloak-e2e.py'
       - 'scripts/retire-public-owner-client.py'
       - 'scripts/test_reconcile_private_*.py'
       - 'scripts/test_verify_private_owner_proof.py'
@@ -31,7 +34,7 @@ permissions:
 jobs:
   connector:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install test dependencies
@@ -40,9 +43,41 @@ jobs:
           sudo apt-get install -y curl haproxy python3-yaml wireguard-tools
       - name: Verify private identity configuration
         run: |
-          PYTHONPATH=scripts python3 -B -m unittest test_reconcile_private_oidc_client test_reconcile_private_console_auth test_verify_private_owner_proof test_private_owner_device_proof test_retire_public_owner_client
+          PYTHONPATH=scripts python3 -B -m unittest test_reconcile_private_oidc_client test_reconcile_private_console_auth test_reconcile_heterocloud_owner_broker test_verify_private_owner_proof test_private_owner_device_proof test_retire_public_owner_client
           python3 -B -m unittest discover -s deploy/gitops/cluster-dns -p test_overlay_dns_service_discovery.py
           python3 -B scripts/private-identity-proxy-e2e.py
           sudo env PYTHONPATH=scripts python3 -B -m unittest test_reconcile_owner_console_auth
       - name: Verify isolated WireGuard access
         run: sudo python3 -B scripts/private-identity-vpn-e2e.py
+      - name: Verify owner broker against real Keycloak
+        run: |
+          set -euo pipefail
+          export JAVA_HOME="$JAVA_HOME_21_X64"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          archive="$RUNNER_TEMP/keycloak-26.6.4.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/keycloak/keycloak/releases/download/26.6.4/keycloak-26.6.4.tar.gz
+          echo "386b566bbea05527226e275c43e5cf6f218896ad2441ac4be5c39f1226772e8f  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          export KEYCLOAK_TEST_KCADM="$RUNNER_TEMP/keycloak-26.6.4/bin/kcadm.sh"
+          export KEYCLOAK_TEST_ADMIN_PASSWORD="$(openssl rand -hex 32)"
+          export KC_BOOTSTRAP_ADMIN_USERNAME=admin
+          export KC_BOOTSTRAP_ADMIN_PASSWORD="$KEYCLOAK_TEST_ADMIN_PASSWORD"
+          "$RUNNER_TEMP/keycloak-26.6.4/bin/kc.sh" start-dev \
+            --http-host=127.0.0.1 --http-port=18080 --hostname-strict=false \
+            > "$RUNNER_TEMP/keycloak-e2e.log" 2>&1 &
+          keycloak_pid=$!
+          trap 'kill "$keycloak_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in $(seq 1 90); do
+            if curl --silent --fail http://127.0.0.1:18080/realms/master/.well-known/openid-configuration > /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != true ]]; then
+            tail -n 30 "$RUNNER_TEMP/keycloak-e2e.log"
+            exit 1
+          fi
+          python3 -B scripts/private-owner-broker-keycloak-e2e.py

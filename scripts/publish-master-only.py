@@ -71,6 +71,7 @@ def files():
            'scripts/reconcile-console-e2e-user.py','scripts/reconcile-console-issuer.py',
            'scripts/reconcile-private-oidc-client.py','scripts/test_reconcile_private_oidc_client.py',
            'scripts/reconcile-private-console-auth.py','scripts/test_reconcile_private_console_auth.py',
+           'scripts/reconcile-heterocloud-owner-broker.py','scripts/test_reconcile_heterocloud_owner_broker.py',
            'scripts/verify-private-owner-proof.py','scripts/test_verify_private_owner_proof.py',
            'scripts/private-owner-device-proof.py','scripts/test_private_owner_device_proof.py',
            'scripts/retire-public-owner-client.py','scripts/test_retire_public_owner_client.py',
