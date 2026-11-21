@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import ssl
 import tempfile
@@ -121,7 +122,11 @@ def login(username):
             return opener, verifier, state, callback, None, status, trace
         location = urljoin(action, location)
         target = urlsplit(location)
-        trace.append({"status": status, "origin": target.scheme + "://" + target.netloc, "path": target.path})
+        entry = {"status": status, "origin": target.scheme + "://" + target.netloc, "path": target.path}
+        execution = parse_qs(target.query).get("execution", [""])[0]
+        if re.fullmatch(r"[A-Z_]{3,64}", execution):
+            entry["required_action"] = execution
+        trace.append(entry)
         if target.scheme == "http" and target.netloc == "console.heteronetwork.internal" and target.path == "/ui/callback":
             return opener, verifier, state, callback, parse_qs(target.query), status, trace
         if not ((target.scheme == "http" and target.netloc == "console.heteronetwork.internal:18079")
@@ -150,11 +155,12 @@ def run():
                                           (broker.PRIVATE_REALM, "private-owner", False)):
             kc.mutate("create", "users", realm=realm,
                       body={"username": username, "email": EMAIL, "enabled": True,
-                            "emailVerified": verified,
+                            "emailVerified": verified, "firstName": "Test", "lastName": "Owner",
                             "credentials": [{"type": "password", "value": TEST_PASSWORD, "temporary": False}]
                                            if realm == broker.CLOUD_REALM else []})
         kc.mutate("create", "users", realm=broker.CLOUD_REALM,
                   body={"username": OTHER, "email": OTHER, "enabled": True, "emailVerified": True,
+                        "firstName": "Test", "lastName": "Other",
                         "credentials": [{"type": "password", "value": TEST_PASSWORD, "temporary": False}]})
         kc.mutate("create", "authentication/flows", realm=broker.PRIVATE_REALM,
                   body={"alias": broker.DENY_FLOW, "providerId": "basic-flow",
