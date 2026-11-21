@@ -204,6 +204,15 @@ public HeteroCloud login uses its own realm and remains available. The private
 identity connector has VPN-addressed entry points on control-plane-only nodes,
 without placing its Pods on those nodes.
 
+The private sign-in page offers **HeteroCloud**. That option delegates to the
+existing HeteroCloud account and returns to the private broker callback over
+the VPN. HeteroCloud's normal sign-in page remains public. The cloud issuer is
+declared in `private-owner-broker.json`; change it when hosting HeteroCloud on a
+different domain. Terraform reconciles a dedicated confidential OIDC client
+and explicitly links the existing owner by the cloud account's subject. A
+deny flow rejects unlinked accounts; no passwords are copied and the broker's
+client secret is not stored in Terraform state or the repository.
+
 Initial migration requires proof that the existing owner can authenticate
 through the private realm. On the bootstrap host, as the same unprivileged SSH
 user used by Ansible, run:
