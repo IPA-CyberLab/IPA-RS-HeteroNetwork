@@ -127,6 +127,21 @@ def matches(actual, expected, *, ignore_secret=False):
     return True
 
 
+def mismatched_fields(actual, expected, *, prefix="", ignore_secret=False):
+    if not isinstance(actual, dict):
+        return [prefix.rstrip(".") or "representation"]
+    fields = []
+    for key, value in expected.items():
+        if ignore_secret and key == "clientSecret":
+            continue
+        name = prefix + key
+        if isinstance(value, dict):
+            fields.extend(mismatched_fields(actual.get(key), value, prefix=name + ".", ignore_secret=ignore_secret))
+        elif actual.get(key) != value:
+            fields.append(name)
+    return fields
+
+
 def unique_owner(kc, realm, email, *, verified=False):
     users = kc.get("users", realm=realm, query={"email": email, "exact": "true", "max": "2"})
     if not isinstance(users, list):
@@ -259,8 +274,11 @@ def reconcile(kc, email, issuer, origin):
                   realm=PRIVATE_REALM, body=updated)
         verified = kc.get("identity-provider/instances", realm=PRIVATE_REALM)
         verified = [item for item in verified if item.get("alias") == PROVIDER_ALIAS]
-        if len(verified) != 1 or not matches(verified[0], desired_provider, ignore_secret=True):
+        if len(verified) != 1:
             raise RuntimeError("private identity provider update was not confirmed")
+        differences = mismatched_fields(verified[0], desired_provider, ignore_secret=True)
+        if differences:
+            raise RuntimeError("private identity provider has unexpected fields: " + ", ".join(differences))
         changed = True
     return changed
 

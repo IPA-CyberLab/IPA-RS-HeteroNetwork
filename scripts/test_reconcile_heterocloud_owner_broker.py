@@ -137,6 +137,13 @@ class CloudOwnerBrokerTests(unittest.TestCase):
             broker.reconcile(self.kc, OWNER, "http://cloud.example/id/realms/heterocloud", ORIGIN)
         self.assertFalse(self.kc.events)
 
+    def test_diagnostics_show_only_field_names(self):
+        desired = broker.provider_representation(ISSUER, SECRET, enabled=True)
+        actual = copy.deepcopy(desired)
+        actual["config"]["issuer"] = "unexpected-sensitive-value"
+        actual["config"]["clientSecret"] = "another-secret"
+        self.assertEqual(broker.mismatched_fields(actual, desired, ignore_secret=True), ["config.issuer"])
+
 
 if __name__ == "__main__":
     unittest.main()
