@@ -7,15 +7,13 @@ count before the recovery manifest is saved. A failed source or readback cannot
 produce a successful recovery-set result. Restore requires an explicit manifest
 snapshot and an empty, owner-only directory; it never replaces a running cluster.
 
-This is the transport and verification layer, **not an automated complete
-cluster recovery**. PostgreSQL and etcd source programs are included, but they
-are not installed or scheduled. Secret Manager, Flash, Registry and Syouyu
-sources are not supplied yet. It does not provision a destination or restore
-live systems. Data-level restore and
-cross-component consistency still need separate acceptance tests. A manifest's
-`required_components_present` value says only that the six expected source
-names exist; it does not prove those sources contain every database or object.
-Do not treat it as proof of site disaster recovery.
+The recovery-set tool includes PostgreSQL and etcd source programs. Production
+requires destination credentials, a schedule and an inventory of the databases,
+Secret Manager snapshots, Flash disks, Registry and Syouyu objects to preserve.
+The [independent backup module](../deploy/terraform/flash-offsite-r2/README.md)
+manages dedicated private buckets for control-plane data and Flash backups.
+Provision and verify the restored applications in an isolated environment
+before redirecting any production traffic.
 
 ## Configuration and trust
 
@@ -58,23 +56,25 @@ Initialize the dedicated empty restic repository separately using protected
 
 ```sh
 python3 scripts/control_plane_dr.py backup --config /secure/heterocloud-dr/config.json
+python3 scripts/control_plane_dr.py list --config /secure/heterocloud-dr/config.json --limit 8
+python3 scripts/control_plane_dr.py inspect --config /secure/heterocloud-dr/config.json --snapshot SNAPSHOT_ID --require-component postgres
 python3 scripts/control_plane_dr.py verify --config /secure/heterocloud-dr/config.json --snapshot SNAPSHOT_ID
 install -d -m 0700 /secure/heterocloud-dr/restore
 python3 scripts/control_plane_dr.py restore --config /secure/heterocloud-dr/config.json --snapshot SNAPSHOT_ID --target /secure/heterocloud-dr/restore
 ```
 
-The explicit snapshot ID is the manifest ID returned by the completed backup,
-not a component snapshot or `latest`. The restore directory will contain
-sensitive plaintext and must be on protected storage. Verify the restored
-PostgreSQL and other applications in an isolated environment before using any
-data for a real recovery. Original source programs are not required on the
-recovery host; a recovery config can omit `sources`.
+`list` shows committed recovery points, their capture and commit times, and the
+component names and sizes. Older sets only carry the commit time. Use a manifest
+ID from `list` or `backup` for `inspect`, `verify` and `restore`. Restore checks
+the component inventory and size limits before writing any data. The restore
+directory will contain sensitive plaintext and must be on protected storage.
+A recovery config can omit `sources`.
 
-`--require-complete` rejects a source list missing any of `postgres`, `etcd`,
-`secret-manager`, `flash-catalog`, `registry`, or `syouyu`. This is a source
-inventory guard only: it cannot validate application consistency or physical
-failure-domain separation. Separate repositories may be needed when different
-data sets have different retention, authority and recovery requirements.
+Use `--require-complete` with `backup`, `inspect`, `verify` or `restore` to
+require all of `postgres`, `etcd`, `secret-manager`, `flash-catalog`, `registry`
+and `syouyu`. Repeat `--require-component` to require a custom set of sources or
+components. The manifest confirms the names are present. Application recovery
+tests check that the restored services can actually consume the data.
 
 ## Included source programs
 
@@ -106,5 +106,18 @@ source requires a private `tmpfs` mount with `noswap`; it refuses an ordinary
 temporary directory even when `/proc/swaps` reports no swap, since sandboxes
 can hide the host's swap configuration. `control_plane_dr_s3_e2e.py` creates and removes a small,
 scoped Syouyu fixture bucket and tests the actual HTTPS S3 path. Its fixture is
-in the same cluster and therefore does **not** verify an offsite failure domain.
-None of these tests uses customer data.
+in the same cluster.
+
+The GitHub Actions workflow runs an isolated recovery drill on Sundays at
+03:43 UTC and on demand. `control_plane_dr_stack_e2e.py` backs up fixture data
+over authenticated HTTPS S3, removes the source services' state, and restores
+into empty destinations. It checks that the original Keycloak administrator
+authenticates, that two original fixture shares unlock the restored Secret
+Manager data, and that the original Coder workspace's agent starts and reads
+its restored home directory. The report measures time from starting the restore
+to the agent proof, and age of the oldest fixture capture at restore start.
+
+The drill uses synthetic records, a disposable S3 service, and a local Coder
+agent. Production acceptance also requires testing the VPN console login, the
+real Flash disk and image restore paths, and access to recovery credentials and
+enough Secret Manager unseal shares after loss of the site.

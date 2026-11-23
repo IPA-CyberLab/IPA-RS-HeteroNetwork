@@ -1,6 +1,9 @@
 name: Control plane recovery set
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 3 * * 0'
   push:
     paths:
       - 'scripts/control_plane_dr*.py'
@@ -24,7 +27,7 @@ permissions:
 jobs:
   encrypted-recovery:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -49,7 +52,7 @@ jobs:
       - name: Install fixture PostgreSQL
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends postgresql-16
+          sudo apt-get install -y --no-install-recommends postgresql-16 socat
       - name: Restore a real isolated PostgreSQL database
         run: |
           sudo python3 -B scripts/control_plane_dr_postgres_e2e.py \
@@ -73,3 +76,38 @@ jobs:
         run: |
           sudo python3 -B scripts/control_plane_dr_etcd_e2e.py \
             --restic "$RUNNER_TEMP/restic" --etcd-bin "$RUNNER_TEMP/etcd-bin"
+      - name: Install pinned site recovery fixture binaries
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          download() {
+            curl --fail --silent --show-error --location --retry 3 --max-time 180 "$1" -o "$2"
+            printf '%s  %s\n' "$3" "$2" | sha256sum --check
+          }
+          download https://github.com/keycloak/keycloak/releases/download/26.6.4/keycloak-26.6.4.tar.gz \
+            keycloak.tar.gz 386b566bbea05527226e275c43e5cf6f218896ad2441ac4be5c39f1226772e8f
+          download https://github.com/openbao/openbao/releases/download/v2.6.3/openbao_2.6.3_linux_amd64.tar.gz \
+            openbao.tar.gz c6463ddd4fdc4214b62a7ffdeaa0fc6df170f7e6b75c6dea2c5e525bdc932ed3
+          download https://github.com/coder/coder/releases/download/v2.37.3/coder_2.37.3_linux_amd64.tar.gz \
+            coder.tar.gz c941bef3b2656da89e9ea9b509884085b99b7d7a08620abd8484c50d77f41eed
+          download https://garagehq.deuxfleurs.fr/_releases/v2.3.0/x86_64-unknown-linux-musl/garage \
+            garage f98d317942bb341151a2775162016bb50cf86b865d0108de03eb5db16e2120cd
+          download https://releases.hashicorp.com/terraform/1.15.5/terraform_1.15.5_linux_amd64.zip \
+            terraform.zip 702b2136af6728c8ff037f843dd2dbce2b7ad88786b7381d1d72aefa250f601c
+          tar -xzf keycloak.tar.gz
+          tar -xzf openbao.tar.gz bao
+          tar -xzf coder.tar.gz ./coder
+          unzip -o -q terraform.zip terraform
+          chmod 0755 garage
+      - name: Restore the owner, secrets and original Coder workspace from HTTPS S3
+        run: |
+          set -euo pipefail
+          sudo python3 -B scripts/control_plane_dr_stack_e2e.py \
+            --restic "$RUNNER_TEMP/restic" --garage "$RUNNER_TEMP/garage" --socat /usr/bin/socat \
+            --keycloak "$RUNNER_TEMP/keycloak-26.6.4/bin/kc.sh" --java-home "$JAVA_HOME_21_X64" \
+            --bao "$RUNNER_TEMP/bao" --coder "$RUNNER_TEMP/coder" --terraform "$RUNNER_TEMP/terraform" \
+            --pg-bin /usr/lib/postgresql/16/bin | tee "$RUNNER_TEMP/site-restore-result.txt"
+          printf '\n### Site recovery drill\n\n' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 1 "$RUNNER_TEMP/site-restore-result.txt" | jq -er \
+            'select(.passed == true) | "Restored fixture owner, secret and original Coder workspace in \(.recovery_seconds) seconds."' \
+            >> "$GITHUB_STEP_SUMMARY"

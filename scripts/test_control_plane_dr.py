@@ -130,6 +130,11 @@ class RealResticTests(unittest.TestCase):
     def test_real_encrypted_backup_verify_and_restore(self):
         result = dr.backup(self.config, RESTIC)
         self.assertFalse(result['required_components_present'])
+        catalog = dr.list_sets(self.config, RESTIC, 1)['recovery_sets']
+        self.assertEqual(len(catalog), 1)
+        self.assertTrue(catalog[0]['snapshot'].startswith(result['snapshot']))
+        self.assertEqual(catalog[0]['components'], [{'name': 'postgres', 'size': len(self.marker)}])
+        self.assertLessEqual(catalog[0]['capture_started_at'], catalog[0]['created_at'])
         self.assertEqual(dr.verify(self.config, RESTIC, result['snapshot'])['components_verified'], 1)
         target = self.root / 'restore'
         target.mkdir(mode=0o700)
@@ -165,6 +170,18 @@ class RealResticTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'empty'):
             dr.restore(self.config, RESTIC, result['snapshot'], target)
         self.assertEqual((target / 'keep').read_text(), 'do not touch')
+
+    def test_restore_rejects_missing_components_and_oversized_sets_before_writing(self):
+        result = dr.backup(self.config, RESTIC)
+        snapshot = result['snapshot']
+        target = self.root / 'restore'
+        target.mkdir(mode=0o700)
+        with self.assertRaisesRegex(ValueError, 'secret-manager'):
+            dr.restore(self.config, RESTIC, snapshot, target, required_components={'secret-manager'})
+        bounded = {**self.config, 'max_total_bytes': len(self.marker) - 1}
+        with self.assertRaisesRegex(ValueError, 'restore size budget'):
+            dr.restore(bounded, RESTIC, snapshot, target)
+        self.assertEqual(list(target.iterdir()), [])
 
     def test_source_program_does_not_receive_s3_or_repository_secrets(self):
         source = Path(self.raw_config['sources'][0]['executable'])

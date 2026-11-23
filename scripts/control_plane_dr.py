@@ -245,6 +245,7 @@ def backup(config, restic, require_complete=False):
     env = restic_env(config)
     timeout = config['timeout_seconds']
     run_id = uuid.uuid4().hex
+    started_at = int(time.time())
     components = []
     total = 0
     with tempfile.TemporaryDirectory(prefix='hc-dr-', dir='/dev/shm') as private:
@@ -264,6 +265,7 @@ def backup(config, restic, require_complete=False):
             components.append({'name': name, 'snapshot': snapshot, **expected})
             total += expected['size']
         manifest = {'schema_version': 1, 'run_id': run_id, 'created_at': int(time.time()),
+                    'capture_started_at': started_at,
                     'required_components_present': REQUIRED <= names, 'components': components}
         payload = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
         committed = summary(invoke([restic, '--json', '--quiet', 'backup', '--stdin',
@@ -277,7 +279,7 @@ def backup(config, restic, require_complete=False):
                 'components': [item['name'] for item in components]}
 
 
-def load_manifest(config, restic, snapshot):
+def load_manifest(config, restic, snapshot, *, required_components=()):
     if not SNAPSHOT.fullmatch(snapshot):
         raise ValueError('An explicit recovery snapshot is required')
     env = restic_env(config)
@@ -286,26 +288,68 @@ def load_manifest(config, restic, snapshot):
         value = json.loads(output)
     except ValueError:
         raise ValueError('Invalid recovery manifest') from None
-    if (value.get('schema_version') != 1 or not re.fullmatch(r'[0-9a-f]{32}', value.get('run_id', ''))
+    if (not isinstance(value, dict) or value.get('schema_version') != 1
+            or not isinstance(value.get('run_id'), str)
+            or not re.fullmatch(r'[0-9a-f]{32}', value['run_id'])
             or not isinstance(value.get('components'), list) or not value['components']
             or len(value['components']) > 32):
         raise ValueError('Invalid recovery manifest')
+    committed_at = value.get('created_at')
+    started_at = value.get('capture_started_at', committed_at)
+    if (type(committed_at) is not int or type(started_at) is not int
+            or not 0 < started_at <= committed_at):
+        raise ValueError('Invalid recovery manifest timestamps')
     names = set()
+    total = 0
     for item in value['components']:
-        if (not isinstance(item, dict) or not NAME.fullmatch(item.get('name', ''))
-                or item['name'] in names or not SNAPSHOT.fullmatch(item.get('snapshot', ''))
-                or not HEX.fullmatch(item.get('sha256', ''))
+        if (not isinstance(item, dict) or not isinstance(item.get('name'), str)
+                or not NAME.fullmatch(item['name']) or item['name'] in names
+                or not isinstance(item.get('snapshot'), str) or not SNAPSHOT.fullmatch(item['snapshot'])
+                or not isinstance(item.get('sha256'), str) or not HEX.fullmatch(item['sha256'])
                 or not isinstance(item.get('size'), int) or isinstance(item.get('size'), bool)
                 or not 0 < item['size'] <= MAX_BACKUP_BYTES):
             raise ValueError('Invalid recovery component')
         names.add(item['name'])
+        total += item['size']
     if value.get('required_components_present') is not (REQUIRED <= names):
         raise ValueError('Recovery completeness does not match the components')
+    missing = set(required_components) - names
+    if missing:
+        raise ValueError('Recovery set is missing required components: ' + ', '.join(sorted(missing)))
+    if (total > config['max_total_bytes']
+            or any(item['size'] > config['max_component_bytes'] for item in value['components'])):
+        raise ValueError('Recovery set exceeds the configured restore size budget')
     return env, value
 
 
-def verify(config, restic, snapshot):
-    env, manifest = load_manifest(config, restic, snapshot)
+def describe(snapshot, manifest):
+    return {'snapshot': snapshot, 'created_at': manifest['created_at'],
+            'capture_started_at': manifest.get('capture_started_at'),
+            'required_components_present': manifest['required_components_present'],
+            'components': [{'name': item['name'], 'size': item['size']}
+                           for item in manifest['components']]}
+
+
+def list_sets(config, restic, limit):
+    if not 1 <= limit <= 32:
+        raise ValueError('List limit must be between one and 32')
+    raw = invoke([restic, 'snapshots', '--json', '--tag', 'hc-dr-commit', '--group-by', '',
+                  '--latest', str(limit)], restic_env(config), config['timeout_seconds'])
+    rows = json.loads(raw)
+    if not isinstance(rows, list) or len(rows) > limit:
+        raise RuntimeError('Recovery catalog returned invalid snapshot metadata')
+    sets = []
+    for row in rows:
+        snapshot = row.get('id') if isinstance(row, dict) else None
+        if not isinstance(snapshot, str) or not HEX.fullmatch(snapshot):
+            raise RuntimeError('Recovery catalog returned an invalid snapshot identifier')
+        _, manifest = load_manifest(config, restic, snapshot)
+        sets.append(describe(snapshot, manifest))
+    return {'recovery_sets': sorted(sets, key=lambda item: item['created_at'], reverse=True)}
+
+
+def verify(config, restic, snapshot, *, required_components=()):
+    env, manifest = load_manifest(config, restic, snapshot, required_components=required_components)
     for item in manifest['components']:
         actual = dump(restic, env, config['timeout_seconds'], item['snapshot'], item['name'],
                       max_bytes=item['size'])
@@ -316,8 +360,8 @@ def verify(config, restic, snapshot):
             'components_verified': len(manifest['components'])}
 
 
-def restore(config, restic, snapshot, target):
-    env, manifest = load_manifest(config, restic, snapshot)
+def restore(config, restic, snapshot, target, *, required_components=()):
+    env, manifest = load_manifest(config, restic, snapshot, required_components=required_components)
     path = Path(target)
     if not path.is_absolute() or path.is_symlink():
         raise ValueError('A private absolute recovery directory is required')
@@ -359,25 +403,40 @@ def main():
         stream_source(sys.argv[2], sys.argv[3], int(sys.argv[4]))
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['backup', 'verify', 'restore'])
+    parser.add_argument('command', choices=['backup', 'list', 'inspect', 'verify', 'restore'])
     parser.add_argument('--config', required=True)
     parser.add_argument('--restic', default='restic')
     parser.add_argument('--snapshot')
     parser.add_argument('--target')
+    parser.add_argument('--limit', type=int, default=8)
     parser.add_argument('--require-complete', action='store_true')
+    parser.add_argument('--require-component', action='append', default=[])
     parser.add_argument('--allow-local-test-repository', action='store_true')
     args = parser.parse_args()
     config = read_config(args.config, args.allow_local_test_repository, args.command == 'backup')
+    if any(not NAME.fullmatch(name) for name in args.require_component):
+        parser.error('Invalid --require-component name')
+    required = set(args.require_component) | (REQUIRED if args.require_complete else set())
     if args.command == 'backup':
+        if required - {source['name'] for source in config['sources']}:
+            parser.error('The configured recovery set is missing required sources')
         result = backup(config, args.restic, args.require_complete)
-    elif args.command == 'verify':
+    elif args.command == 'list':
+        if required:
+            parser.error('Use inspect, verify or restore to enforce required components')
+        result = list_sets(config, args.restic, args.limit)
+    else:
         if not args.snapshot:
             parser.error('An explicit --snapshot is required')
-        result = verify(config, args.restic, args.snapshot)
-    else:
-        if not args.snapshot or not args.target:
-            parser.error('An explicit --snapshot and --target are required')
-        result = restore(config, args.restic, args.snapshot, args.target)
+        if args.command == 'inspect':
+            _, manifest = load_manifest(config, args.restic, args.snapshot, required_components=required)
+            result = describe(args.snapshot, manifest)
+        elif args.command == 'verify':
+            result = verify(config, args.restic, args.snapshot, required_components=required)
+        else:
+            if not args.target:
+                parser.error('An explicit --target is required')
+            result = restore(config, args.restic, args.snapshot, args.target, required_components=required)
     print(json.dumps(result, sort_keys=True))
 
 
