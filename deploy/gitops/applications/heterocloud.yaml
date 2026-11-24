@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: 08b73baca40e68d80a3dcd6b0744f8d4fe0b6aa6
+    targetRevision: 878940525ba9d5e7af9b49fb0bfc3a2eb7bffb88
     path: deploy/helm/heterocloud
     helm:
       releaseName: heterocloud
@@ -26,7 +26,7 @@ spec:
             - 10.96.0.1/32
             - 10.250.0.0/24
         image:
-          tag: "0.1.117@sha256:8c21c08f31d8bbecc1f3786e256de088eb690e0ef4923897295da3b45d2d7ed3"
+          tag: "security-878940525ba9d5e7af9b49fb0bfc3a2eb7bffb88-45421901520@sha256:76b539f9e29da0daca3ee4e328322ff6cbb2c534ab7e7e6972a0ebcf458190c2"
         flashSsh:
           enabled: true
           hostKeySecretName: heterocloud-flash-ssh-host
