@@ -11,5 +11,6 @@ resources:
   - storage-policy.yaml
   - registry-storage.yaml
   - recovery-backend-routing.yaml
+  - share-manager-startup.yaml
   - instance-manager-cpu.yaml
   - snapshot-replica-reconcile.yaml
