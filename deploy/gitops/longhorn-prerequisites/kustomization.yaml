@@ -10,5 +10,6 @@ resources:
   - syouyu-storage-class.yaml
   - storage-policy.yaml
   - registry-storage.yaml
+  - recovery-backend-routing.yaml
   - instance-manager-cpu.yaml
   - snapshot-replica-reconcile.yaml
